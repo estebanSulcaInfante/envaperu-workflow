@@ -32,12 +32,12 @@ def test_lote_polimorfismo_completo(client, app):
         data = l1.to_dict()
         
         # 1. Verificar Semáforo de Columnas
-        assert data['peso_kg_calc'] is not None  # ACTIVO (Columna D)
-        assert data['cant_kg_calc'] is None      # INACTIVO (Columna C)
-        assert data['stock_kg_manual'] is None   # INACTIVO (Columna E)
+        assert data['Peso (Kg)'] is not None  # ACTIVO (Columna D)
+        assert data['Por Cantidad (Kg)'] is None      # INACTIVO (Columna C)
+        assert data['Stock (Kg)'] is None   # INACTIVO (Columna E)
 
         # 2. Verificar Matemática (600 / 3 = 200)
-        assert data['peso_kg_calc'] == 200.0
+        assert data['Peso (Kg)'] == 200.0
 
 
         # =================================================================
@@ -62,14 +62,14 @@ def test_lote_polimorfismo_completo(client, app):
         data_c = l_c1.to_dict()
 
         # 1. Verificar Semáforo
-        assert data_c['cant_kg_calc'] is not None # ACTIVO (Columna C)
-        assert data_c['peso_kg_calc'] is None     # INACTIVO
-        assert data_c['stock_kg_manual'] is None  # INACTIVO
+        assert data_c['Por Cantidad (Kg)'] is not None # ACTIVO (Columna C)
+        assert data_c['Peso (Kg)'] is None     # INACTIVO
+        assert data_c['Stock (Kg)'] is None  # INACTIVO
 
         # 2. Verificar Matemática
         # Fórmula: (100 Doc * 12 * 50gr / 1000) = 60 Kg Totales
         # Reparto: 60 Kg / 2 Colores = 30 Kg por color
-        assert data_c['cant_kg_calc'] == 30.0
+        assert data_c['Por Cantidad (Kg)'] == 30.0
 
 
         # =================================================================
@@ -96,9 +96,9 @@ def test_lote_polimorfismo_completo(client, app):
         data_s = l_s1.to_dict()
 
         # 1. Verificar Semáforo
-        assert data_s['stock_kg_manual'] == 25.5 # ACTIVO (Columna E)
-        assert data_s['cant_kg_calc'] is None    # INACTIVO
-        assert data_s['peso_kg_calc'] is None    # INACTIVO
+        assert data_s['Stock (Kg)'] == 25.5 # ACTIVO (Columna E)
+        assert data_s['Por Cantidad (Kg)'] is None    # INACTIVO
+        assert data_s['Peso (Kg)'] is None    # INACTIVO
         
         # 2. Verificar que el cálculo de coladas use este valor base
         # (Aunque sea manual, el sistema debe reconocerlo como el peso objetivo)
