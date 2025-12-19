@@ -22,9 +22,9 @@ def test_lote_polimorfismo_completo(client, app):
         db.session.commit()
 
         # Agregamos 3 Lotes (Colores) -> La meta se debe dividir entre 3
-        l1 = LoteColor(orden_id=orden_peso.id, color_nombre="Rojo")
-        l2 = LoteColor(orden_id=orden_peso.id, color_nombre="Verde")
-        l3 = LoteColor(orden_id=orden_peso.id, color_nombre="Azul")
+        l1 = LoteColor(numero_op=orden_peso.numero_op, color_nombre="Rojo")
+        l2 = LoteColor(numero_op=orden_peso.numero_op, color_nombre="Verde")
+        l3 = LoteColor(numero_op=orden_peso.numero_op, color_nombre="Azul")
         db.session.add_all([l1, l2, l3])
         db.session.commit()
 
@@ -53,8 +53,8 @@ def test_lote_polimorfismo_completo(client, app):
         db.session.commit()
 
         # Agregamos 2 Lotes -> Meta repartida entre 2
-        l_c1 = LoteColor(orden_id=orden_cant.id, color_nombre="Amarillo")
-        l_c2 = LoteColor(orden_id=orden_cant.id, color_nombre="Negro")
+        l_c1 = LoteColor(numero_op=orden_cant.numero_op, color_nombre="Amarillo")
+        l_c2 = LoteColor(numero_op=orden_cant.numero_op, color_nombre="Negro")
         db.session.add_all([l_c1, l_c2])
         db.session.commit()
 
@@ -85,7 +85,7 @@ def test_lote_polimorfismo_completo(client, app):
 
         # Input Manual en el Lote (Stock manual)
         l_s1 = LoteColor(
-            orden_id=orden_stock.id, 
+            numero_op=orden_stock.numero_op, 
             color_nombre="Blanco", 
             stock_kg_manual=25.5 # Usuario escribió esto
         )

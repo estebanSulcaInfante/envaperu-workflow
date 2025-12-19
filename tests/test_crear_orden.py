@@ -35,10 +35,10 @@ def test_crear_orden_post(client, app): # Removed db argument
                 "color_nombre": "ROJO",
                 "personas": 3,
                 "materiales": [
-                    {"materia_prima_id": mp_id, "fraccion": 1.0}
+                    {"nombre": "TEST MP", "tipo": "VIRGEN", "fraccion": 1.0}
                 ],
                 "pigmentos": [
-                    {"colorante_id": col_id, "gramos": 15.0}
+                    {"nombre": "TEST COL", "gramos": 15.0}
                 ]
             }
         ]

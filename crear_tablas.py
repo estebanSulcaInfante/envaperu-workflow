@@ -89,14 +89,13 @@ def inicializar_bd():
             ("Rojo",    [(pig_rojo, 40.0), (pig_dioxido, 5.0)], 1),
             ("Magenta", [(pig_magenta, 40.0), (pig_dioxido, 5.0)], 1),
             ("Verde",   [(pig_verde, 20.0), (pig_amarillo, 5.0), (pig_dioxido, 5.0)], 1),
-            ("Dioxido", [(pig_dioxido, 5.0), (pig_magenta, 40.0), (pig_azul, 42.0)], 1), # Usando pigmentos mezclados segun tabla? Tabla dice Dioxido, Magenta, Azul?
-            # Tabla Dioxido: "5g Dioxido, 40g Magenta, 42g Azul" -> Strange recipe for "Dioxido" color, but following instructions.
+            ("Lila", [(pig_dioxido, 5.0), (pig_magenta, 40.0), (pig_azul, 42.0)], 1), 
         ]
 
         for nombre_color, lista_pigmentos, num_personas in lotes_config:
             # Crear Lote
             lote = LoteColor(
-                orden_id=orden.id,
+                numero_op=orden.numero_op,
                 color_nombre=nombre_color,
                 personas=num_personas
             )

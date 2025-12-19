@@ -7,7 +7,7 @@ class LoteColor(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     
     # Relación con el Padre
-    orden_id = db.Column(db.Integer, db.ForeignKey('orden_produccion.id'), nullable=False)
+    numero_op = db.Column(db.String(20), db.ForeignKey('orden_produccion.numero_op'), nullable=False)
     color_nombre = db.Column(db.String(50), nullable=False)
 
     # --- INPUT MANUAL (Solo para estrategia STOCK) ---

@@ -1,0 +1,1248 @@
+[
+  {
+    "celda": "B1",
+    "fila": 1,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "ORDEN DE PRODUCCION:    "
+  },
+  {
+    "celda": "D1",
+    "fila": 1,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "OP1322"
+  },
+  {
+    "celda": "B3",
+    "fila": 3,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Fecha"
+  },
+  {
+    "celda": "C3",
+    "fila": 3,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "2025-12-19 00:00:00"
+  },
+  {
+    "celda": "B4",
+    "fila": 4,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Producto:"
+  },
+  {
+    "celda": "C4",
+    "fila": 4,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Balde Payero Romano"
+  },
+  {
+    "celda": "D4",
+    "fila": 4,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "Y"
+  },
+  {
+    "celda": "F4",
+    "fila": 4,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "Maquina:"
+  },
+  {
+    "celda": "G4",
+    "fila": 4,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "HT-320 A"
+  },
+  {
+    "celda": "B5",
+    "fila": 5,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Total DOC:"
+  },
+  {
+    "celda": "C5",
+    "fila": 5,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "1005.7471264367815"
+  },
+  {
+    "celda": "G5",
+    "fila": 5,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "https://docs.google.com/forms/d/e/1FAIpQLSdf85x8DVmY_szgqvlwBgOWcdJWLqJZI5IafMdygaNk-QcA8g/viewform?"
+  },
+  {
+    "celda": "G6",
+    "fila": 6,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "BALDE+PLAYERO+ROMANO"
+  },
+  {
+    "celda": "B7",
+    "fila": 7,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "BALDE PLAYERO ROMANO"
+  },
+  {
+    "celda": "B8",
+    "fila": 8,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Dias:"
+  },
+  {
+    "celda": "C8",
+    "fila": 8,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "2.186406796601699"
+  },
+  {
+    "celda": "E8",
+    "fila": 8,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Peso Unitario:"
+  },
+  {
+    "celda": "G8",
+    "fila": 8,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "87"
+  },
+  {
+    "celda": "B9",
+    "fila": 9,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Turno:"
+  },
+  {
+    "celda": "C9",
+    "fila": 9,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "23"
+  },
+  {
+    "celda": "E9",
+    "fila": 9,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Peso Colada:"
+  },
+  {
+    "celda": "G9",
+    "fila": 9,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "176"
+  },
+  {
+    "celda": "B10",
+    "fila": 10,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Cavidad:"
+  },
+  {
+    "celda": "C10",
+    "fila": 10,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "2"
+  },
+  {
+    "celda": "E10",
+    "fila": 10,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Merma:"
+  },
+  {
+    "celda": "G10",
+    "fila": 10,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "0.011363636363636364"
+  },
+  {
+    "celda": "B11",
+    "fila": 11,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Cola. x Hora"
+  },
+  {
+    "celda": "C11",
+    "fila": 11,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "120"
+  },
+  {
+    "celda": "E11",
+    "fila": 11,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Fecha:"
+  },
+  {
+    "celda": "G11",
+    "fila": 11,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "20/11 a 22/11"
+  },
+  {
+    "celda": "B14",
+    "fila": 14,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Color"
+  },
+  {
+    "celda": "C14",
+    "fila": 14,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Peso Produccion"
+  },
+  {
+    "celda": "E14",
+    "fila": 14,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Merma a Recuperar KG"
+  },
+  {
+    "celda": "G14",
+    "fila": 14,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Cantidad Coladas"
+  },
+  {
+    "celda": "B15",
+    "fila": 15,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Amarillo"
+  },
+  {
+    "celda": "C15",
+    "fila": 15,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "176.98863636363637"
+  },
+  {
+    "celda": "E15",
+    "fila": 15,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "2.0112345041322315"
+  },
+  {
+    "celda": "G15",
+    "fila": 15,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "1017.1760710553815"
+  },
+  {
+    "celda": "B16",
+    "fila": 16,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Azul"
+  },
+  {
+    "celda": "C16",
+    "fila": 16,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "176.98863636363637"
+  },
+  {
+    "celda": "E16",
+    "fila": 16,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "2.0112345041322315"
+  },
+  {
+    "celda": "G16",
+    "fila": 16,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "1017.1760710553815"
+  },
+  {
+    "celda": "B17",
+    "fila": 17,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Rojo"
+  },
+  {
+    "celda": "C17",
+    "fila": 17,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "176.98863636363637"
+  },
+  {
+    "celda": "E17",
+    "fila": 17,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "2.0112345041322315"
+  },
+  {
+    "celda": "G17",
+    "fila": 17,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "1017.1760710553815"
+  },
+  {
+    "celda": "B18",
+    "fila": 18,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Fucsia"
+  },
+  {
+    "celda": "C18",
+    "fila": 18,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "176.98863636363637"
+  },
+  {
+    "celda": "E18",
+    "fila": 18,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "2.0112345041322315"
+  },
+  {
+    "celda": "G18",
+    "fila": 18,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "1017.1760710553815"
+  },
+  {
+    "celda": "B19",
+    "fila": 19,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Verde"
+  },
+  {
+    "celda": "C19",
+    "fila": 19,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "176.98863636363637"
+  },
+  {
+    "celda": "E19",
+    "fila": 19,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "2.0112345041322315"
+  },
+  {
+    "celda": "G19",
+    "fila": 19,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "1017.1760710553815"
+  },
+  {
+    "celda": "B20",
+    "fila": 20,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Lila"
+  },
+  {
+    "celda": "C20",
+    "fila": 20,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "176.98863636363637"
+  },
+  {
+    "celda": "E20",
+    "fila": 20,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "2.0112345041322315"
+  },
+  {
+    "celda": "G20",
+    "fila": 20,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "1017.1760710553815"
+  },
+  {
+    "celda": "C21",
+    "fila": 21,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "1061.9318181818182"
+  },
+  {
+    "celda": "E21",
+    "fila": 21,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "12.067407024793388"
+  },
+  {
+    "celda": "G21",
+    "fila": 21,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "6103.056426332289"
+  },
+  {
+    "celda": "B23",
+    "fila": 23,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Materia Prima"
+  },
+  {
+    "celda": "F24",
+    "fila": 24,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "Peso (Kg)"
+  },
+  {
+    "celda": "D25",
+    "fila": 25,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "0"
+  },
+  {
+    "celda": "F25",
+    "fila": 25,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "536.9996126033059"
+  },
+  {
+    "celda": "D26",
+    "fila": 26,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "0"
+  },
+  {
+    "celda": "F26",
+    "fila": 26,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "D27",
+    "fila": 27,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "0"
+  },
+  {
+    "celda": "F27",
+    "fila": 27,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "536.9996126033059"
+  },
+  {
+    "celda": "F28",
+    "fila": 28,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "1073.9992252066118"
+  },
+  {
+    "celda": "B30",
+    "fila": 30,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Materia Prima por Color"
+  },
+  {
+    "celda": "B31",
+    "fila": 31,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Color "
+  },
+  {
+    "celda": "C31",
+    "fila": 31,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Virgen 1"
+  },
+  {
+    "celda": "D31",
+    "fila": 31,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "Peso"
+  },
+  {
+    "celda": "E31",
+    "fila": 31,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Virgen 2"
+  },
+  {
+    "celda": "F31",
+    "fila": 31,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "Peso"
+  },
+  {
+    "celda": "G31",
+    "fila": 31,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Segunda"
+  },
+  {
+    "celda": "H31",
+    "fila": 31,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "Peso"
+  },
+  {
+    "celda": "B32",
+    "fila": 32,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Amarillo"
+  },
+  {
+    "celda": "C32",
+    "fila": 32,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "PP Clarif. (Mayor 80 ) = 3/6"
+  },
+  {
+    "celda": "D32",
+    "fila": 32,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "F32",
+    "fila": 32,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G32",
+    "fila": 32,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "PP Iny. Molido Segunda = 3/6"
+  },
+  {
+    "celda": "H32",
+    "fila": 32,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "B33",
+    "fila": 33,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Azul"
+  },
+  {
+    "celda": "C33",
+    "fila": 33,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "PP Clarif. (Mayor 80 ) = 3/6"
+  },
+  {
+    "celda": "D33",
+    "fila": 33,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "F33",
+    "fila": 33,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G33",
+    "fila": 33,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "PP Iny. Molido Segunda = 3/6"
+  },
+  {
+    "celda": "H33",
+    "fila": 33,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "B34",
+    "fila": 34,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Rojo"
+  },
+  {
+    "celda": "C34",
+    "fila": 34,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "PP Clarif. (Mayor 80 ) = 3/6"
+  },
+  {
+    "celda": "D34",
+    "fila": 34,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "F34",
+    "fila": 34,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G34",
+    "fila": 34,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "PP Iny. Molido Segunda = 3/6"
+  },
+  {
+    "celda": "H34",
+    "fila": 34,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "B35",
+    "fila": 35,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Fucsia"
+  },
+  {
+    "celda": "C35",
+    "fila": 35,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "PP Clarif. (Mayor 80 ) = 3/6"
+  },
+  {
+    "celda": "D35",
+    "fila": 35,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "F35",
+    "fila": 35,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G35",
+    "fila": 35,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "PP Iny. Molido Segunda = 3/6"
+  },
+  {
+    "celda": "H35",
+    "fila": 35,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "B36",
+    "fila": 36,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Verde"
+  },
+  {
+    "celda": "C36",
+    "fila": 36,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "PP Clarif. (Mayor 80 ) = 3/6"
+  },
+  {
+    "celda": "D36",
+    "fila": 36,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "F36",
+    "fila": 36,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G36",
+    "fila": 36,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "PP Iny. Molido Segunda = 3/6"
+  },
+  {
+    "celda": "H36",
+    "fila": 36,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "B37",
+    "fila": 37,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Lila"
+  },
+  {
+    "celda": "C37",
+    "fila": 37,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "PP Clarif. (Mayor 80 ) = 3/6"
+  },
+  {
+    "celda": "D37",
+    "fila": 37,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "F37",
+    "fila": 37,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G37",
+    "fila": 37,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "PP Iny. Molido Segunda = 3/6"
+  },
+  {
+    "celda": "H37",
+    "fila": 37,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "89.49993543388432"
+  },
+  {
+    "celda": "D38",
+    "fila": 38,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "536.9996126033059"
+  },
+  {
+    "celda": "F38",
+    "fila": 38,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "H38",
+    "fila": 38,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "536.9996126033059"
+  },
+  {
+    "celda": "B40",
+    "fila": 40,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "Colorante"
+  },
+  {
+    "celda": "C40",
+    "fila": 40,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "x 1 Bolsa (25Kg)"
+  },
+  {
+    "celda": "C41",
+    "fila": 41,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Amarillo"
+  },
+  {
+    "celda": "D41",
+    "fila": 41,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "Gr."
+  },
+  {
+    "celda": "E41",
+    "fila": 41,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Azul"
+  },
+  {
+    "celda": "F41",
+    "fila": 41,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "Gr."
+  },
+  {
+    "celda": "G41",
+    "fila": 41,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Rojo"
+  },
+  {
+    "celda": "H41",
+    "fila": 41,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "Gr."
+  },
+  {
+    "celda": "C42",
+    "fila": 42,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Amarillo CH 1041"
+  },
+  {
+    "celda": "D42",
+    "fila": 42,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "60"
+  },
+  {
+    "celda": "E42",
+    "fila": 42,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Azul UltramarEP-24"
+  },
+  {
+    "celda": "F42",
+    "fila": 42,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "120"
+  },
+  {
+    "celda": "G42",
+    "fila": 42,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Rojo R120"
+  },
+  {
+    "celda": "H42",
+    "fila": 42,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "80"
+  },
+  {
+    "celda": "C43",
+    "fila": 43,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Dioxido de Titanio 2220"
+  },
+  {
+    "celda": "D43",
+    "fila": 43,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "10"
+  },
+  {
+    "celda": "E43",
+    "fila": 43,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Dioxido de Titanio 2220"
+  },
+  {
+    "celda": "F43",
+    "fila": 43,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "10"
+  },
+  {
+    "celda": "G43",
+    "fila": 43,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Dioxido de Titanio 2220"
+  },
+  {
+    "celda": "H43",
+    "fila": 43,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "10"
+  },
+  {
+    "celda": "C44",
+    "fila": 44,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "0"
+  },
+  {
+    "celda": "D44",
+    "fila": 44,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "0"
+  },
+  {
+    "celda": "E44",
+    "fila": 44,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "0"
+  },
+  {
+    "celda": "F44",
+    "fila": 44,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G44",
+    "fila": 44,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "0"
+  },
+  {
+    "celda": "H44",
+    "fila": 44,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "0"
+  },
+  {
+    "celda": "C48",
+    "fila": 48,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "0"
+  },
+  {
+    "celda": "D48",
+    "fila": 48,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "0"
+  },
+  {
+    "celda": "E48",
+    "fila": 48,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "0"
+  },
+  {
+    "celda": "F48",
+    "fila": 48,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G48",
+    "fila": 48,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "0"
+  },
+  {
+    "celda": "H48",
+    "fila": 48,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "0"
+  },
+  {
+    "celda": "C49",
+    "fila": 49,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Fucsia"
+  },
+  {
+    "celda": "E49",
+    "fila": 49,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Verde"
+  },
+  {
+    "celda": "G49",
+    "fila": 49,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Lila"
+  },
+  {
+    "celda": "C50",
+    "fila": 50,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Magenta 21"
+  },
+  {
+    "celda": "D50",
+    "fila": 50,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "80"
+  },
+  {
+    "celda": "E50",
+    "fila": 50,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Verde 7041"
+  },
+  {
+    "celda": "F50",
+    "fila": 50,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "40"
+  },
+  {
+    "celda": "G50",
+    "fila": 50,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Dioxido de Titanio 2220"
+  },
+  {
+    "celda": "H50",
+    "fila": 50,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "10"
+  },
+  {
+    "celda": "C51",
+    "fila": 51,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "Dioxido de Titanio 2220"
+  },
+  {
+    "celda": "D51",
+    "fila": 51,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "10"
+  },
+  {
+    "celda": "E51",
+    "fila": 51,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Amarillo CH 1041"
+  },
+  {
+    "celda": "F51",
+    "fila": 51,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "10"
+  },
+  {
+    "celda": "G51",
+    "fila": 51,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Magenta 21"
+  },
+  {
+    "celda": "H51",
+    "fila": 51,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "80"
+  },
+  {
+    "celda": "C52",
+    "fila": 52,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "0"
+  },
+  {
+    "celda": "D52",
+    "fila": 52,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "0"
+  },
+  {
+    "celda": "E52",
+    "fila": 52,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "Dioxido de Titanio 2220"
+  },
+  {
+    "celda": "F52",
+    "fila": 52,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "10"
+  },
+  {
+    "celda": "G52",
+    "fila": 52,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "Azul UltramarEP-24"
+  },
+  {
+    "celda": "H52",
+    "fila": 52,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "84"
+  },
+  {
+    "celda": "C56",
+    "fila": 56,
+    "columna": 3,
+    "col_letra": "C",
+    "valor": "0"
+  },
+  {
+    "celda": "D56",
+    "fila": 56,
+    "columna": 4,
+    "col_letra": "D",
+    "valor": "0"
+  },
+  {
+    "celda": "E56",
+    "fila": 56,
+    "columna": 5,
+    "col_letra": "E",
+    "valor": "0"
+  },
+  {
+    "celda": "F56",
+    "fila": 56,
+    "columna": 6,
+    "col_letra": "F",
+    "valor": "0"
+  },
+  {
+    "celda": "G56",
+    "fila": 56,
+    "columna": 7,
+    "col_letra": "G",
+    "valor": "0"
+  },
+  {
+    "celda": "H56",
+    "fila": 56,
+    "columna": 8,
+    "col_letra": "H",
+    "valor": "0"
+  },
+  {
+    "celda": "B59",
+    "fila": 59,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "CALIDAD"
+  },
+  {
+    "celda": "B60",
+    "fila": 60,
+    "columna": 2,
+    "col_letra": "B",
+    "valor": "OK"
+  }
+]

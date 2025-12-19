@@ -4,8 +4,7 @@ from datetime import datetime, timezone, timedelta
 class OrdenProduccion(db.Model):
     __tablename__ = 'orden_produccion'
 
-    id = db.Column(db.Integer, primary_key=True)
-    numero_op = db.Column(db.String(20), unique=True, nullable=False)
+    numero_op = db.Column(db.String(20), primary_key=True)
     fecha_creacion = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     fecha_inicio = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     
@@ -149,7 +148,6 @@ class OrdenProduccion(db.Model):
 
     def to_dict(self):
         return {
-            'id': self.id,
             'numero_op': self.numero_op,
             'producto': self.producto,
             'maquina': self.maquina_id,

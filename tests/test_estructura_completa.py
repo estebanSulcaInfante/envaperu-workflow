@@ -41,7 +41,7 @@ def test_estructura_completa_json(client, app):
 
         # 3. SETUP: LOTE (1 solo lote -> 1000kg)
         lote = LoteColor(
-            orden_id=orden.id,
+            numero_op=orden.numero_op,
             color_nombre="AZUL TEST",
             personas=2 # 2 Operarios
         )

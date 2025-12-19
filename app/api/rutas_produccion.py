@@ -48,7 +48,7 @@ def crear_orden():
         lotes_data = data.get('lotes', [])
         for l_data in lotes_data:
             nuevo_lote = LoteColor(
-                orden_id=nueva_orden.id,
+                numero_op=nueva_orden.numero_op,
                 color_nombre=l_data.get('color_nombre'),
                 personas=l_data.get('personas', 1),
                 stock_kg_manual=l_data.get('stock_kg_manual')
@@ -109,10 +109,91 @@ def obtener_ordenes():
     Equivale a abrir tu Excel de 'Control de Producción'.
     """
     # 1. Consultar BD (Select * from ordenes)
-    lista_ordenes = OrdenProduccion.query.order_by(OrdenProduccion.id.desc()).all()
+    lista_ordenes = OrdenProduccion.query.order_by(OrdenProduccion.fecha_creacion.desc()).all()
     
     # 2. Convertir a JSON usando los métodos que acabamos de crear
     respuesta = [orden.to_dict() for orden in lista_ordenes]
     
     # 3. Responder
     return jsonify(respuesta), 200
+
+
+@produccion_bp.route('/ordenes/<numero_op>/excel', methods=['GET'])
+def descargar_excel(numero_op):
+    """
+    Genera y descarga el Excel de una Orden de Producción específica.
+    Usa la pestaña 'IMPRIMIR OP' de la plantilla.
+    """
+    from flask import send_file
+    from app.services.excel_service import generar_op_excel
+    
+    # Buscar la orden
+    orden = OrdenProduccion.query.get(numero_op)
+    if not orden:
+        return jsonify({'error': f'Orden {numero_op} no encontrada'}), 404
+    
+    try:
+        # Generar Excel
+        excel_buffer = generar_op_excel(orden)
+        
+        # Retornar como descarga
+        filename = f"{orden.numero_op}.xlsx"
+        return send_file(
+            excel_buffer,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@produccion_bp.route('/ordenes/<numero_op>/qr', methods=['GET'])
+def obtener_qr_imagen(numero_op):
+    """
+    Genera y retorna el QR como imagen PNG.
+    Query params:
+        - size: tamaño en px (default 200)
+    """
+    from flask import send_file
+    from app.services.qr_service import generar_qr_imagen
+    
+    orden = OrdenProduccion.query.get(numero_op)
+    if not orden:
+        return jsonify({'error': f'Orden {numero_op} no encontrada'}), 404
+    
+    size = request.args.get('size', 200, type=int)
+    
+    try:
+        qr_buffer = generar_qr_imagen(orden, size)
+        return send_file(
+            qr_buffer,
+            mimetype='image/png',
+            as_attachment=False,
+            download_name=f"QR-{orden.numero_op}.png"
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@produccion_bp.route('/ordenes/<numero_op>/qr-data', methods=['GET'])
+def obtener_qr_data(numero_op):
+    """
+    Retorna el QR como base64 y la URL del form (útil para frontend).
+    """
+    from app.services.qr_service import generar_qr_base64, generar_url_form
+    
+    orden = OrdenProduccion.query.get(numero_op)
+    if not orden:
+        return jsonify({'error': f'Orden {numero_op} no encontrada'}), 404
+    
+    size = request.args.get('size', 200, type=int)
+    
+    try:
+        return jsonify({
+            'numero_op': orden.numero_op,
+            'qr_base64': generar_qr_base64(orden, size),
+            'form_url': generar_url_form(orden)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

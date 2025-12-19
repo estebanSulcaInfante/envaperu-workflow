@@ -128,8 +128,8 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
         db.session.commit()
         
         # Agregamos Lotes (Simulando input manual en columna E)
-        l1 = LoteColor(orden_id=op_stock.id, color_nombre="A", stock_kg_manual=50.0)
-        l2 = LoteColor(orden_id=op_stock.id, color_nombre="B", stock_kg_manual=50.0)
+        l1 = LoteColor(numero_op=op_stock.numero_op, color_nombre="A", stock_kg_manual=50.0)
+        l2 = LoteColor(numero_op=op_stock.numero_op, color_nombre="B", stock_kg_manual=50.0)
         db.session.add_all([l1, l2])
         db.session.commit()
         
