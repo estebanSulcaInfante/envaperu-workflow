@@ -113,12 +113,13 @@ class OrdenProduccion(db.Model):
         horas = 0.0
         dias = 0.0
         if p_inc_colada > 0 and self.tiempo_ciclo:
-             # Golpes = (KgTotal * 1000) / PesoTiro
-             golpes = (peso_real_entregar * 1000) / p_inc_colada
-             segundos = golpes * self.tiempo_ciclo
-             horas = segundos / 3600
-             if self.horas_turno > 0:
-                 dias = horas / self.horas_turno
+            # Golpes = (KgTotal * 1000) / PesoTiro
+            golpes = (peso_real_entregar * 1000) / p_inc_colada
+            # Días = (TotalGolpes * Ciclo) / 3600 / HorasTurno
+            segundos = golpes * self.tiempo_ciclo
+            horas = segundos / 3600
+            if self.horas_turno and self.horas_turno > 0:
+                dias = horas / self.horas_turno
         
         # F. Fin: WORKDAY(FechaInicio, Dias) -> Aprox: Sumar dias naturales
         fecha_fin = None

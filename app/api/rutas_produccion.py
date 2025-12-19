@@ -6,6 +6,7 @@ from app.extensions import db
 from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
+from app.models.materiales import MateriaPrima, Colorante
 from datetime import datetime, timezone
 
 # Definimos el "Blueprint" (un grupo de rutas)
@@ -55,22 +56,41 @@ def crear_orden():
             db.session.add(nuevo_lote)
             db.session.flush() # ID para recetas
 
-            # 3a. Materiales (SeCompone)
+            # 3a. Materiales (SeCompone) - buscar o crear por nombre
             materiales = l_data.get('materiales', [])
             for m_data in materiales:
+                nombre_material = m_data.get('nombre')
+                tipo_material = m_data.get('tipo', 'VIRGEN')
+                
+                # Buscar materia prima existente o crear nueva
+                materia = MateriaPrima.query.filter_by(nombre=nombre_material).first()
+                if not materia:
+                    materia = MateriaPrima(nombre=nombre_material, tipo=tipo_material)
+                    db.session.add(materia)
+                    db.session.flush()
+                
                 receta_mat = SeCompone(
                     lote_id=nuevo_lote.id,
-                    materia_prima_id=m_data.get('materia_prima_id'),
+                    materia_prima_id=materia.id,
                     fraccion=m_data.get('fraccion', 0.0)
                 )
                 db.session.add(receta_mat)
 
-            # 3b. Pigmentos (SeColorea)
+            # 3b. Pigmentos (SeColorea) - buscar o crear por nombre
             pigmentos = l_data.get('pigmentos', [])
             for p_data in pigmentos:
+                nombre_pigmento = p_data.get('nombre')
+                
+                # Buscar colorante existente o crear nuevo
+                colorante = Colorante.query.filter_by(nombre=nombre_pigmento).first()
+                if not colorante:
+                    colorante = Colorante(nombre=nombre_pigmento)
+                    db.session.add(colorante)
+                    db.session.flush()
+                
                 receta_pig = SeColorea(
                     lote_id=nuevo_lote.id,
-                    colorante_id=p_data.get('colorante_id'),
+                    colorante_id=colorante.id,
                     gramos=p_data.get('gramos', 0.0)
                 )
                 db.session.add(receta_pig)
