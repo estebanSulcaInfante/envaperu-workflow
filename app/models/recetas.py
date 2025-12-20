@@ -16,7 +16,16 @@ class SeCompone(db.Model):
     def peso_kg(self):
         if not self.lote: return 0.0
         # Peso Total del Lote (Base + Extra)
-        peso_total = self.lote.peso_total_objetivo + self.lote.extra_kg_asignado
+        peso_base_mas_extra = self.lote.peso_total_objetivo + self.lote.extra_kg_asignado
+        
+        # Ajuste Discrepancia F28: Excel suma "Merma a Recuperar" al total de materiales
+        # F28 = Sum(Lotes) * (1 + %Merma)
+        merma_pct = 0.0
+        if self.lote.orden and self.lote.orden.resumen_totales:
+            merma_pct = self.lote.orden.resumen_totales.get('%Merma', 0.0)
+            
+        peso_total = peso_base_mas_extra * (1 + merma_pct)
+        
         return peso_total * self.fraccion
 
     # Relaciones

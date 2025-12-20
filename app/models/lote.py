@@ -115,9 +115,17 @@ class LoteColor(db.Model):
         extra_kg_lote = self.extra_kg_asignado # Refactored to property
         
         peso_total_maquina = peso_puro + extra_kg_lote
-        coladas = (peso_total_maquina * 1000) / self.orden.peso_inc_colada
         
-        return math.ceil(coladas)
+        # Fórmula Excel: (TotalKg * 1000) / PesoUnitario / Cavidades
+        # NOTA: Excel usa peso NETO (sin colada), no el peso del tiro.
+        peso_neto_tiro = self.orden.peso_unitario_gr * self.orden.cavidades
+        
+        if peso_neto_tiro == 0:
+            return 0.0
+            
+        coladas = (peso_total_maquina * 1000) / peso_neto_tiro
+        
+        return coladas
 
     @property
     def horas_hombre(self):
@@ -150,8 +158,8 @@ class LoteColor(db.Model):
             'Stock (Kg)': vals['col_E'],
             
             # --- NUEVOS CAMPOS (Informe MD) ---
-            'Extra (Kg)': round(extra_kg, 2),
-            'TOTAL + EXTRA (Kg)': round(total_mas_extra, 2),
+            'Extra (Kg)': extra_kg,
+            'TOTAL + EXTRA (Kg)': total_mas_extra,
             
             # --- LISTAS DINÁMICAS ---
             'materiales': [
@@ -159,7 +167,7 @@ class LoteColor(db.Model):
                     'nombre': m.materia.nombre,
                     'tipo': m.materia.tipo,
                     'fraccion': m.fraccion,
-                    'peso_kg': round(m.peso_kg, 2)
+                    'peso_kg': m.peso_kg
                 } for m in self.materias_primas
             ],
             
@@ -172,7 +180,7 @@ class LoteColor(db.Model):
             
             'mano_obra': {
                 'personas': self.personas,
-                'horas_hombre': round(self.horas_hombre, 2)
+                'horas_hombre': self.horas_hombre
             },
 
             # --- RESULTADOS TÉCNICOS ---

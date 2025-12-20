@@ -42,24 +42,24 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
         # Fórm: (PesoTiro - (PesoUnit * Cav)) / PesoTiro
         # Calc: (176 - (87 * 2)) / 176 = 2 / 176 = 0.01136...
         merma_esperada = (176 - (87 * 2)) / 176
-        assert data_peso['%Merma'] == round(merma_esperada, 4)
+        assert data_peso['%Merma'] == pytest.approx(merma_esperada, abs=0.0001)
         
         # 2. % EXTRA (Regla de Negocio)
         # Como 1.13% < 5%, se cobra el 100% de la merma.
-        assert data_peso['% EXTRA'] == round(merma_esperada, 4)
+        assert data_peso['% EXTRA'] == pytest.approx(merma_esperada, abs=0.0001)
 
         # 3. EXTRA (Kg)
         # Fórm: MetaKg * %Extra
         # Calc: 1050 * 0.01136... = 11.93
         extra_kg_esperado = 1050.0 * merma_esperada
-        assert data_peso['EXTRA'] == round(extra_kg_esperado, 2)
+        assert data_peso['EXTRA'] == pytest.approx(extra_kg_esperado, abs=0.01)
         
         # 4. CANTIDAD DOC (La fórmula condicional H21)
         # Al ser POR PESO -> Convertimos Kg a Docenas
         # Fórm: (Kg * 1000) / P.Unit / 12
         # Calc: 1,050,000 / 87 / 12 = 1005.747...
         docenas_calc = (1050.0 * 1000) / 87.0 / 12
-        assert data_peso['Cantidad DOC'] == round(docenas_calc, 2)
+        assert data_peso['Cantidad DOC'] == pytest.approx(docenas_calc, abs=0.01)
 
 
         # =================================================================
@@ -107,7 +107,7 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
         
         # 5. EXTRA (Kg)
         # 54 Kg * 5% = 2.7 Kg
-        assert data_cant['EXTRA'] == 2.7
+        assert data_cant['EXTRA'] == pytest.approx(2.7, abs=0.01)
 
 
         # =================================================================
@@ -147,4 +147,4 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
         # Fórm: (100 Kg * 1000) / P.Unit / 12
         # Calc: 100,000 / 100 = 1000 un. / 12 = 83.33 docenas
         docenas_stock = (100.0 * 1000) / 100.0 / 12
-        assert data_stock['Cantidad DOC'] == round(docenas_stock, 2)
+        assert data_stock['Cantidad DOC'] == pytest.approx(docenas_stock, abs=0.01)

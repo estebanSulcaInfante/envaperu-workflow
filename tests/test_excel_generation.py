@@ -73,7 +73,7 @@ def test_endpoint_excel_descarga(client, app):
     """
     with app.app_context():
         # Usar la orden creada en crear_tablas.py (OP-1322)
-        orden = OrdenProduccion.query.get("OP-1322")
+        orden = db.session.get(OrdenProduccion, "OP-1322")
         
         if not orden:
             # Si no existe, crear una orden de prueba

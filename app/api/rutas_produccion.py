@@ -128,7 +128,7 @@ def descargar_excel(numero_op):
     from app.services.excel_service import generar_op_excel
     
     # Buscar la orden
-    orden = OrdenProduccion.query.get(numero_op)
+    orden = db.session.get(OrdenProduccion, numero_op)
     if not orden:
         return jsonify({'error': f'Orden {numero_op} no encontrada'}), 404
     
@@ -158,7 +158,7 @@ def obtener_qr_imagen(numero_op):
     from flask import send_file
     from app.services.qr_service import generar_qr_imagen
     
-    orden = OrdenProduccion.query.get(numero_op)
+    orden = db.session.get(OrdenProduccion, numero_op)
     if not orden:
         return jsonify({'error': f'Orden {numero_op} no encontrada'}), 404
     
@@ -183,7 +183,7 @@ def obtener_qr_data(numero_op):
     """
     from app.services.qr_service import generar_qr_base64, generar_url_form
     
-    orden = OrdenProduccion.query.get(numero_op)
+    orden = db.session.get(OrdenProduccion, numero_op)
     if not orden:
         return jsonify({'error': f'Orden {numero_op} no encontrada'}), 404
     

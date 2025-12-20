@@ -128,21 +128,20 @@ class OrdenProduccion(db.Model):
 
         return {
             'Peso(Kg) PRODUCCION': peso_produccion_kg,
-            'Peso (Kg) Inc. Merma': round(peso_inc_merma, 2), # Nuevo
-            '%Merma': round(merma_pct, 4),
-            'Merma Natural Kg': round(merma_natural_kg, 2),   # Nuevo
+            'Peso (Kg) Inc. Merma': peso_inc_merma, # Nuevo
+            '%Merma': merma_pct,
+            'Merma Natural Kg': merma_natural_kg,   # Nuevo
             
-            'Cantidad DOC': round(cantidad_docenas, 2),
+            'Cantidad DOC': cantidad_docenas,
             'Total DOC': total_doc,                           # Nuevo
             
-            '% EXTRA': round(extra_pct_calc, 4),
-            'EXTRA': round(extra_kg, 2),
-            'Peso Kg REAL PARA ENTREGAR A MAQUINA': round(peso_real_entregar, 2), # Markdown dice "Peso REAL A ENTREGAR" pero codigo usa esto. Ajustare a Markdown si estricto. Markdown dice: "Peso REAL A ENTREGAR". Dejare el key anterior por compatibilidad o cambiare?
-            # El usuario pidio "modelo vaya acorde a este informe". Cambiare al nombre del informe.
-            'Peso REAL A ENTREGAR': round(peso_real_entregar, 2),
+            '% EXTRA': extra_pct_calc,
+            'EXTRA': extra_kg,
+            'Peso Kg REAL PARA ENTREGAR A MAQUINA': peso_real_entregar, 
+            'Peso REAL A ENTREGAR': peso_real_entregar,
             
-            'Horas': round(horas, 2),
-            'Días': round(dias, 2), # Markdown dice "Días" con tilde
+            'Horas': horas,
+            'Días': dias, # Markdown dice "Días" con tilde
             'F. Fin': fecha_fin.isoformat() if fecha_fin else None # Nuevo
         }
 
@@ -160,5 +159,19 @@ class OrdenProduccion(db.Model):
             'tipo': self.tipo_estrategia,
             'meta_kg': self.meta_total_kg,
             'lotes': [lote.to_dict() for lote in self.lotes],
-            'resumen_totales': self.resumen_totales
+            'resumen_totales': self._round_dict(self.resumen_totales)
         }
+
+    def _round_dict(self, data):
+        """Redondea los valores del diccionario para presentación (Frontend)."""
+        rounded = {}
+        for k, v in data.items():
+            if isinstance(v, float):
+                # Porcentajes a 4 decimales, resto a 2
+                if '%' in k or 'Merma' in k and v < 1: 
+                    rounded[k] = round(v, 4)
+                else:
+                    rounded[k] = round(v, 2)
+            else:
+                rounded[k] = v
+        return rounded

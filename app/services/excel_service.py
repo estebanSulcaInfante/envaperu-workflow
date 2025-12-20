@@ -50,7 +50,7 @@ def generar_op_excel(orden) -> BytesIO:
     coladas_hora = 0
     if orden.tiempo_ciclo and orden.tiempo_ciclo > 0:
         coladas_hora = 3600 / orden.tiempo_ciclo
-    ws['C11'] = round(coladas_hora, 0)
+    ws['C11'] = coladas_hora
     
     # Rango de fechas
     fecha_inicio = orden.fecha_inicio.strftime('%d/%m') if orden.fecha_inicio else ''
@@ -89,7 +89,7 @@ def generar_op_excel(orden) -> BytesIO:
         # Merma a recuperar (calculada)
         merma_pct = resumen.get('%Merma', 0)
         merma_lote = peso_lote * merma_pct if merma_pct else 0
-        ws[f'E{row}'] = round(merma_lote, 2)
+        ws[f'E{row}'] = merma_lote
         total_merma += merma_lote
         
         # Cantidad coladas
@@ -98,9 +98,9 @@ def generar_op_excel(orden) -> BytesIO:
         total_coladas += coladas
     
     # Fila de totales (21)
-    ws['C21'] = round(total_peso, 2)
-    ws['E21'] = round(total_merma, 2)
-    ws['G21'] = round(total_coladas, 2)
+    ws['C21'] = total_peso
+    ws['E21'] = total_merma
+    ws['G21'] = total_coladas
     
     # =========================================================================
     # 3. MATERIA PRIMA TOTALES (Filas 23-28)
@@ -118,14 +118,14 @@ def generar_op_excel(orden) -> BytesIO:
                 materiales_nombres[tipo] = mat.materia.nombre
     
     ws['D25'] = materiales_nombres.get('VIRGEN', '')
-    ws['F25'] = round(materiales_totales.get('VIRGEN', 0), 2)
+    ws['F25'] = materiales_totales.get('VIRGEN', 0)
     ws['D26'] = materiales_nombres.get('VIRGEN_2', '')
-    ws['F26'] = round(materiales_totales.get('VIRGEN_2', 0), 2)
+    ws['F26'] = materiales_totales.get('VIRGEN_2', 0)
     ws['D27'] = materiales_nombres.get('MOLIDO', '')
-    ws['F27'] = round(materiales_totales.get('MOLIDO', 0), 2)
+    ws['F27'] = materiales_totales.get('MOLIDO', 0)
     
     total_material = sum(materiales_totales.values())
-    ws['F28'] = round(total_material, 2)
+    ws['F28'] = total_material
     
     # =========================================================================
     # 4. MATERIA PRIMA POR COLOR (Filas 30-38)
@@ -144,7 +144,7 @@ def generar_op_excel(orden) -> BytesIO:
             peso = mat.peso_kg
             materiales_lote[tipo] = {
                 'nombre': f"{nombre} = {int(fraccion*6)}/6" if fraccion else nombre,
-                'peso': round(peso, 2)
+                'peso': peso
             }
         
         # Virgen 1 (C, D)
@@ -165,9 +165,9 @@ def generar_op_excel(orden) -> BytesIO:
             ws[f'H{row}'] = materiales_lote['MOLIDO']['peso']
     
     # Totales materiales por color (fila 38)
-    ws['D38'] = round(materiales_totales.get('VIRGEN', 0), 2)
-    ws['F38'] = round(materiales_totales.get('VIRGEN_2', 0), 2)
-    ws['H38'] = round(materiales_totales.get('MOLIDO', 0), 2)
+    ws['D38'] = materiales_totales.get('VIRGEN', 0)
+    ws['F38'] = materiales_totales.get('VIRGEN_2', 0)
+    ws['H38'] = materiales_totales.get('MOLIDO', 0)
     
     # =========================================================================
     # 5. COLORANTES (Filas 40-56)
@@ -229,8 +229,12 @@ def _llenar_colorantes_grupo(ws, lotes_grupo, start_header_row, start_data_row):
         ws[f'{col_gramos}{start_header_row}'] = 'Gr.'
         
         # Colorantes (hasta 7 filas)
-        for i, colorante in enumerate(lote.colorantes[:7]):
+        # Data: Colorantes
+        for i, pig in enumerate(lote.colorantes):
             row = start_data_row + i
-            nombre_pig = colorante.pigmento.nombre if colorante.pigmento else ''
-            ws[f'{col_nombre}{row}'] = nombre_pig
-            ws[f'{col_gramos}{row}'] = colorante.gramos or 0
+            if row > start_data_row + 20: # Limite seguridad
+                break
+                
+            ws[f'{col_nombre}{row}'] = pig.pigmento.nombre if pig.pigmento else ''
+            ws[f'{col_gramos}{row}'] = (pig.gramos or 0) * 2  # Multiplicador x2 por requerimiento de impresión
+

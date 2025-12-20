@@ -110,8 +110,7 @@ def test_estructura_completa_json(client, app):
         horas_maq = 100000 / 3600
         dias_maq = horas_maq / 24
         
-        # The system uses the rounded 'Días' from resumen (2 decimals)
-        dias_rounded = round(dias_maq, 2)
-        hh_esperadas = dias_rounded * 24 * 2
+        # The system now uses full precision for 'Días'
+        hh_esperadas = dias_maq * 24 * 2
         
-        assert mo['horas_hombre'] == round(hh_esperadas, 2)
+        assert mo['horas_hombre'] == pytest.approx(hh_esperadas, abs=0.01)
