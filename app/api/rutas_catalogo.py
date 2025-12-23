@@ -123,3 +123,13 @@ def obtener_producto(cod_sku_pt):
             'cantidad': cp.cantidad
         } for cp in producto.composicion_piezas]
     })
+
+
+@catalogo_bp.route('/maquinas', methods=['GET'])
+def listar_maquinas():
+    """
+    Lista todas las máquinas disponibles.
+    """
+    from app.models.maquina import Maquina
+    maquinas = Maquina.query.all()
+    return jsonify([m.to_dict() for m in maquinas])

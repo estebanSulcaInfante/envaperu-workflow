@@ -1,5 +1,6 @@
 from app.extensions import db
 from datetime import datetime
+from app.models.maquina import Maquina  # Import for relationship resolution
 
 class RegistroDiarioProduccion(db.Model):
     __tablename__ = 'registro_diario_produccion'

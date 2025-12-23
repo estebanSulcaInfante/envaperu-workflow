@@ -149,6 +149,46 @@ def inicializar_bd():
         reg.actualizar_metricas()
         
         db.session.add(reg)
+        
+        # Registro 2: Otro turno
+        reg2 = RegistroDiarioProduccion(
+            orden_id=orden.numero_op,
+            maquina_id=maq_iny05.id,
+            fecha=datetime.now(timezone.utc).date(),
+            turno="NOCHE",
+            maquinista="CARLOS RAMIREZ",
+            molde=orden.molde,
+            pieza_color="BALDE-ROJO",
+            coladas=450,
+            horas_trabajadas=7.5,
+            peso_real_kg=76.2,
+            snapshot_cavidades=orden.cavidades,
+            snapshot_ciclo_seg=orden.tiempo_ciclo,
+            snapshot_peso_unitario_gr=orden.peso_unitario_gr
+        )
+        reg2.actualizar_metricas()
+        db.session.add(reg2)
+        
+        # Registro 3: Turno tarde
+        from datetime import timedelta
+        reg3 = RegistroDiarioProduccion(
+            orden_id=orden.numero_op,
+            maquina_id=maq_ht320a.id,
+            fecha=(datetime.now(timezone.utc) - timedelta(days=1)).date(),
+            turno="TARDE",
+            maquinista="MARIO LOPEZ",
+            molde=orden.molde,
+            pieza_color="BALDE-AZUL",
+            coladas=520,
+            horas_trabajadas=8.0,
+            peso_real_kg=88.1,
+            snapshot_cavidades=orden.cavidades,
+            snapshot_ciclo_seg=orden.tiempo_ciclo,
+            snapshot_peso_unitario_gr=orden.peso_unitario_gr
+        )
+        reg3.actualizar_metricas()
+        db.session.add(reg3)
+        
         db.session.commit()
 
         # ---------------------------------------------------------
