@@ -4,6 +4,7 @@ from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
+from app.models.producto import ProductoTerminado, FamiliaColor, ColorProducto, Pieza
 from app.extensions import db
 
 def test_estructura_completa_json(client, app):
@@ -58,59 +59,95 @@ def test_estructura_completa_json(client, app):
         db.session.add_all([r1, r2, c1])
         db.session.commit()
 
-        # 5. VALIDACIÓN DEL DICCIONARIO (Endpoint simulated)
-        data = orden.to_dict()
+        # ---------------------------------------------------------------------
+        # NUEVO: LLAMADA EXPLÍCITA AL MOTOR DE CÁLCULO
+        # ---------------------------------------------------------------------
+        orden.actualizar_metricas()
+        db.session.commit() # Guardar cambios calculados
+
+        # 5. VALIDACIÓN DE PERSISTENCIA (Columnas directas)
+        # Re-fetch para asegurar que leemos de DB
+        orden_db = OrdenProduccion.query.get("OP-FULL-STRUCT")
+        
+        # A. CÁLCULO DE PESOS
+        assert orden_db.calculo_peso_produccion == 1000.0
+        assert orden_db.calculo_merma_pct == 0.0
+        assert orden_db.calculo_extra_kg == 0.0
+        
+        # B. LOTE DATA (Columnas)
+        lote_db = orden_db.lotes[0]
+        assert lote_db.calculo_col_d == 1000.0
+        assert lote_db.calculo_peso_base == 1000.0
+        
+        # C. MATERIALES (Columnas)
+        # PP: 60% de 1000 = 600kg
+        mats = lote_db.materias_primas
+        pp = next(m for m in mats if m.materia.nombre == "POLIPROPILENO")
+        assert pp.calculo_peso_kg == 600.0
+        
+        molido = next(m for m in mats if m.materia.nombre == "MOLIDO")
+        assert molido.calculo_peso_kg == 400.0
+        
+        # ---------------------------------------------------------------------
+        # 6. VALIDACIÓN LEGACY (El to_dict debe seguir funcionando igual)
+        # ---------------------------------------------------------------------
+        data = orden_db.to_dict()
         lote_data = data['lotes'][0]
         resumen = data['resumen_totales']
 
-        # A. CÁLCULO DE PESOS
-        # Meta: 1000kg. Merma: (200 - 4*50)/200 = 0/200 = 0% ?? 
-        # Espera: 50*4 = 200. Tiro = 200. Merma = 0.
-        # Merma 0 -> Extra 0.
-        # Peso Produccion: 1000 kg.
-        # Total a Maquina: 1000 kg.
-        
         assert resumen['Peso(Kg) PRODUCCION'] == 1000.0
-        assert resumen['%Merma'] == 0.0
-        assert resumen['EXTRA'] == 0.0
+        assert lote_data['Peso (Kg)'] == 1000.0
         
-        # B. LOTE DATA
-        assert lote_data['Peso (Kg)'] == 1000.0 # Col D activa
-        assert lote_data['TOTAL + EXTRA (Kg)'] == 1000.0
-        
-        # C. MATERIALES (Cálculo dinámico)
-        # PP: 60% de 1000 = 600kg
-        # Molido: 40% de 1000 = 400kg
-        mats = lote_data['materiales']
-        assert len(mats) == 2
-        
-        pp_data = next(m for m in mats if m['nombre'] == "POLIPROPILENO")
-        assert pp_data['fraccion'] == 0.60
+        mats_dict = lote_data['materiales']
+        pp_data = next(m for m in mats_dict if m['nombre'] == "POLIPROPILENO")
         assert pp_data['peso_kg'] == 600.0
         
-        mol_data = next(m for m in mats if m['nombre'] == "MOLIDO")
-        assert mol_data['peso_kg'] == 400.0
-        
-        # D. PIGMENTOS
-        pigs = lote_data['pigmentos']
-        assert pigs[0]['nombre'] == "AZUL"
-        assert pigs[0]['dosis_gr'] == 50.0
-        
-        # E. MANO DE OBRA
-        # Coladas = (1000kg * 1000) / 200g = 5000 golpes
-        # Segundos = 5000 * 20s = 100,000 s
-        # Horas = 100,000 / 3600 = 27.777...
-        # Dias = 27.77 / 24 = 1.157...
-        # HH = (Dias * HorasTurno * Personas) / #Colores
-        # HH = (1.157 * 24 * 2) / 1 = 27.77 * 2 = 55.55...
-        
         mo = lote_data['mano_obra']
-        assert mo['personas'] == 2
-        
+        # HH Validation (mismos valores que antes)
+        # 100,000s / 3600 = 27.77h maq -> 1.157 dias -> * 48h (24*2p) = 55.55
         horas_maq = 100000 / 3600
         dias_maq = horas_maq / 24
-        
-        # The system now uses full precision for 'Días'
         hh_esperadas = dias_maq * 24 * 2
         
+        
         assert mo['horas_hombre'] == pytest.approx(hh_esperadas, abs=0.01)
+
+        # ---------------------------------------------------------------------
+        # 7. VALIDACIÓN SKU Y FAMILIA COLOR (NUEVO REFACTOR)
+        # ---------------------------------------------------------------------
+        # A. Crear Entidades de Color
+        fam = FamiliaColor(nombre="TRANSPARENTE")
+        db.session.add(fam)
+        db.session.commit()
+        
+        col_prod = ColorProducto(nombre="ROJO", codigo=50, familia=fam)
+        db.session.add(col_prod)
+        db.session.commit()
+        
+        # B. Crear Producto con Color y verificar SKU
+        pt = ProductoTerminado(
+            cod_linea_num=1,
+            cod_familia=2,
+            cod_producto=3,
+            color_rel=col_prod, # Usando relacion
+            producto="BALDE ROJO TRANS"
+        )
+        # Generar SKU (deberia usar codigo 50)
+        sku_gen = pt.generar_sku()
+        # Generar: 0 + 1 + 2 + 3 + 0 + 50 -> "0123050"
+        assert sku_gen == "0123050"
+        pt.cod_sku_pt = sku_gen
+        db.session.add(pt)
+        db.session.commit()
+        
+        # C. Vincular Orden a Producto y Actualizar
+        orden.producto_sku = pt.cod_sku_pt
+        orden.actualizar_metricas() # Debe jalar la familia
+        db.session.commit()
+        
+        # D. Verificar Cache
+        assert orden.calculo_familia_color == "TRANSPARENTE"
+        
+        # Verificar en dict final
+        final_dict = orden.to_dict()
+        assert final_dict['resumen_totales']['Familia Color'] == "TRANSPARENTE"

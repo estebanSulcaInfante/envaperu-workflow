@@ -21,65 +21,114 @@ class LoteColor(db.Model):
     colorantes = db.relationship('SeColorea', backref='lote', lazy=True)
 
     # -------------------------------------------------------------------------
-    # 1. CEREBRO POLIMÓRFICO (Replica filas 13 del Excel: C, D, E)
+    # PERSISTENCIA DE CÁLCULOS
     # -------------------------------------------------------------------------
-    @property
-    def valores_polimorficos(self):
-        """
-        Determina qué columna (C, D, E) tiene valor según la estrategia.
-        Retorna también el peso base en KG para cálculos internos.
-        """
-        # Si no hay orden asociada, retornamos vacíos
-        if not self.orden:
-            return {}
+    calculo_peso_base = db.Column(db.Float, default=0.0)
+    calculo_col_c = db.Column(db.Float, nullable=True)
+    calculo_col_d = db.Column(db.Float, nullable=True)
+    calculo_col_e = db.Column(db.Float, nullable=True)
+    
+    calculo_extra_kg = db.Column(db.Float, default=0.0)
+    calculo_coladas = db.Column(db.Float, default=0.0)
+    calculo_horas_hombre = db.Column(db.Float, default=0.0)
 
-        estrategia = self.orden.tipo_estrategia or "POR_PESO"
+    # -------------------------------------------------------------------------
+    # MÉTODO DE ACTUALIZACIÓN (REEMPLAZA @property valores_polimorficos)
+    # -------------------------------------------------------------------------
+    def actualizar_metricas(self, contexto_orden=None):
+        """
+        Recalcula métricas del lote usando el contexto de la orden (para evitar queries lazy).
+        Luego cascada a sus recetas.
+        """
+        orden_padre = contexto_orden or self.orden
+        if not orden_padre:
+            return 
+
+        # 1. VALORES POLIMÓRFICOS
+        estrategia = orden_padre.tipo_estrategia or "POR_PESO"
         
-        # Variables visuales (Solo una tendrá valor, las otras None)
-        col_cantidad_kg = None # Visual "Por Cantidad" (Col C) - Valor en KG
-        col_peso_kg = None     # Visual "Por Peso" (Col D)
-        col_stock_kg = None    # Visual "Stock" (Col E)
-        
-        # Peso base para la máquina (Lo que se va a inyectar realmente antes de extras)
+        # Reset
+        self.calculo_col_c = None
+        self.calculo_col_d = None
+        self.calculo_col_e = None
         peso_base = 0.0
         
-        # Evitar división por cero
-        n_colores = self.orden.num_colores_activos
+        # Leemos el numero de colores YA CALCULADO de la orden
+        n_colores = orden_padre.calculo_colores_activos
+        if not n_colores or n_colores < 1: n_colores = 1
 
-        # --- CASO A: POR CANTIDAD (Docenas -> Kilos Repartidos) ---
+        # --- CASO A: POR CANTIDAD ---
         if estrategia == 'POR_CANTIDAD':
-            # Datos del Padre
-            meta_doc = self.orden.meta_total_doc or 0.0
-            peso_u = self.orden.peso_unitario_gr or 0.0
+            # Usamos los valores cacheados de la orden si existen, sino recalculamos lo minimo
+            # Pero la idea es que la orden ya se calculo antes de llamar a esto.
+            # calculo_peso_produccion tiene el TOTAL KG
+            kilos_totales = orden_padre.calculo_peso_produccion
             
-            # Fórmula C13 Excel: (MetaDoc * 12 * P.Unit / 1000) / NroColores
-            kilos_totales_teoricos = (meta_doc * 12 * peso_u) / 1000
-            
-            valor_calculado = kilos_totales_teoricos / n_colores
-            col_cantidad_kg = valor_calculado
+            valor_calculado = kilos_totales / n_colores
+            self.calculo_col_c = valor_calculado
             peso_base = valor_calculado
 
         # --- CASO B: POR PESO (Kilos Repartidos) ---
         elif estrategia == 'POR_PESO':
-            meta_kg = self.orden.meta_total_kg or 0.0
+            kilos_totales = orden_padre.calculo_peso_produccion
+            # En POR_PESO, meta_total_kg es directo, pero orden.calculo_peso_produccion ya lo tiene.
             
-            # Fórmula D13 Excel: MetaKg / NroColores
-            valor_calculado = meta_kg / n_colores
-            col_peso_kg = valor_calculado
+            valor_calculado = kilos_totales / n_colores
+            self.calculo_col_d = valor_calculado
             peso_base = valor_calculado
 
         # --- CASO C: STOCK (Input Manual) ---
         elif estrategia == 'STOCK':
-            # Fórmula E13 Excel: Directo del input manual del Lote
             valor_manual = self.stock_kg_manual or 0.0
-            col_stock_kg = valor_manual
+            self.calculo_col_e = valor_manual
             peso_base = valor_manual
 
+        self.calculo_peso_base = peso_base
+        
+        # 2. EXTRA KG ASIGNADO
+        # Proporcional: TotalExtraOrden / NColores
+        total_extra = orden_padre.calculo_extra_kg or 0.0
+        self.calculo_extra_kg = total_extra / n_colores
+        
+        # 3. COLADAS
+        if orden_padre.peso_inc_colada and orden_padre.peso_inc_colada > 0:
+            peso_total_maquina = peso_base + self.calculo_extra_kg
+            peso_neto_tiro = orden_padre.peso_unitario_gr * orden_padre.cavidades
+            
+            if peso_neto_tiro > 0:
+                self.calculo_coladas = (peso_total_maquina * 1000) / peso_neto_tiro
+            else:
+                self.calculo_coladas = 0.0
+        else:
+            self.calculo_coladas = 0.0
+            
+        # 4. HORAS HOMBRE
+        # HH = (Dias * HorasTurno * Personas) / #Colores
+        dias_orden = orden_padre.calculo_dias or 0.0
+        horas_turno = orden_padre.horas_turno or 24.0
+        self.calculo_horas_hombre = (dias_orden * horas_turno * self.personas) / n_colores
+
+        # --- CASCADE TO RECIPES ---
+        for receta in self.materias_primas:
+            receta.actualizar_metricas(contexto_lote=self)
+            
+        # Nota: SeColorea (Pigmentos) es input manual en gramos, ¿necesita calculo?
+        # Revisando reglas: SeColorea tiene 'gramos' directo. No parece depender de % o totales dinamicos.
+        # "Dosis por bolsa??" - En tu codigo actual es un input directo.
+        # Lo dejamos asi por ahora.
+
+
+    # -------------------------------------------------------------------------
+    # PROPIEDADES DE LECTURA (Facades para compatibilidad o comodidad)
+    # -------------------------------------------------------------------------
+    @property
+    def valores_polimorficos(self):
+        """Retorna dict leido de columnas persistidas."""
         return {
-            'col_C': col_cantidad_kg,
-            'col_D': col_peso_kg,
-            'col_E': col_stock_kg,
-            'peso_base': peso_base
+            'col_C': self.calculo_col_c,
+            'col_D': self.calculo_col_d,
+            'col_E': self.calculo_col_e,
+            'peso_base': self.calculo_peso_base
         }
 
     # -------------------------------------------------------------------------
@@ -88,57 +137,20 @@ class LoteColor(db.Model):
     @property
     def peso_total_objetivo(self):
         """Devuelve los Kg base del lote, venga de donde venga (C, D o E)."""
-        return self.valores_polimorficos.get('peso_base', 0.0)
+        return self.calculo_peso_base or 0.0
 
     @property
     def extra_kg_asignado(self):
         """Calcula la parte proporcional del desperdicio asignada a este lote."""
-        if not self.orden: 
-            return 0.0
-            
-        resumen = self.orden.resumen_totales
-        # Usamos safely get, aunque resumen_totales devuelve keys constantes
-        total_extra_orden = resumen.get('EXTRA', 0.0)
-        n_colores = self.orden.num_colores_activos
-        return total_extra_orden / n_colores
+        return self.calculo_extra_kg or 0.0
 
     @property
     def cantidad_coladas_calculada(self):
-        """
-        Calcula coladas usando el peso dinámico + el extra asignado.
-        Replica la lógica de Columnas G y H del Excel.
-        """
-        if not self.orden or not self.orden.peso_inc_colada or self.orden.peso_inc_colada == 0:
-            return 0
-        
-        peso_puro = self.peso_total_objetivo
-        extra_kg_lote = self.extra_kg_asignado # Refactored to property
-        
-        peso_total_maquina = peso_puro + extra_kg_lote
-        
-        # Fórmula Excel: (TotalKg * 1000) / PesoUnitario / Cavidades
-        # NOTA: Excel usa peso NETO (sin colada), no el peso del tiro.
-        peso_neto_tiro = self.orden.peso_unitario_gr * self.orden.cavidades
-        
-        if peso_neto_tiro == 0:
-            return 0.0
-            
-        coladas = (peso_total_maquina * 1000) / peso_neto_tiro
-        
-        return coladas
+        return self.calculo_coladas or 0.0
 
     @property
     def horas_hombre(self):
-        # Fórmula: (TotalDias * HorasTurno * #Personas) / #Colores
-        if not self.orden: return 0.0
-        
-        # Necesitamos 'TotalDias' del resumen
-        resumen = self.orden.resumen_totales
-        dias = resumen.get('Días', 0.0) # Ojo con la tilde
-        horas_turno = self.orden.horas_turno or 24.0
-        n_colores = self.orden.num_colores_activos
-        
-        return (dias * horas_turno * self.personas) / n_colores
+        return self.calculo_horas_hombre or 0.0
 
     def to_dict(self):
         vals = self.valores_polimorficos

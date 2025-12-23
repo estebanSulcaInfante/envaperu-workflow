@@ -1,7 +1,7 @@
 import openpyxl
 
 def inspect_formulas():
-    path = 'app/templates/excel/OP1322-BALDE ROMANO.xlsm'
+    path = 'app/templates/excel/OrdenProduccion/OP1322-BALDE ROMANO.xlsm'
     wb = openpyxl.load_workbook(path, data_only=False)
     ws = wb['IMPRIMIR OP']
     

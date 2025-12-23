@@ -11,22 +11,36 @@ class SeCompone(db.Model):
     # INPUT: Participación en la mezcla (0.0 - 1.0)
     fraccion = db.Column(db.Float, nullable=False, default=0.0)
 
-    # CALCULADO: Kilos reales requeridos
-    @property
-    def peso_kg(self):
-        if not self.lote: return 0.0
+    # INPUT: Participación en la mezcla (0.0 - 1.0)
+    fraccion = db.Column(db.Float, nullable=False, default=0.0)
+
+    # PERSISTENCIA
+    calculo_peso_kg = db.Column(db.Float, default=0.0)
+
+    def actualizar_metricas(self, contexto_lote=None):
+        """
+        Calcula kilos reales requeridos usando el peso total del lote.
+        """
+        lote_padre = contexto_lote or self.lote
+        if not lote_padre:
+            return
+
         # Peso Total del Lote (Base + Extra)
-        peso_base_mas_extra = self.lote.peso_total_objetivo + self.lote.extra_kg_asignado
+        peso_base_mas_extra = lote_padre.calculo_peso_base + lote_padre.calculo_extra_kg
         
         # Ajuste Discrepancia F28: Excel suma "Merma a Recuperar" al total de materiales
-        # F28 = Sum(Lotes) * (1 + %Merma)
+        # Pero ojo: el lote NO tiene merma_pct directa, hay que sacarla del padre.
         merma_pct = 0.0
-        if self.lote.orden and self.lote.orden.resumen_totales:
-            merma_pct = self.lote.orden.resumen_totales.get('%Merma', 0.0)
-            
+        # Intentamos obtener contexto del padre del lote si es posible, o usamos relaciones
+        orden = lote_padre.orden # Ojo: aqui podria ser lazy load si no vieine en contexto
+        if orden:
+             merma_pct = orden.calculo_merma_pct or 0.0
+
         peso_total = peso_base_mas_extra * (1 + merma_pct)
-        
-        return peso_total * self.fraccion
+        self.calculo_peso_kg = peso_total * self.fraccion
+    @property
+    def peso_kg(self):
+        return self.calculo_peso_kg or 0.0
 
     # Relaciones
     materia = db.relationship('MateriaPrima')

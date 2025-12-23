@@ -1,4 +1,8 @@
 
+import os
+# Force SQLite for tests -> MUST be done before importing app.config
+os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+
 import pytest
 from app import create_app, db
 

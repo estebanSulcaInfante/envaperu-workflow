@@ -10,7 +10,7 @@ from datetime import datetime
 import os
 
 # Ruta a la plantilla Excel
-TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'templates', 'excel', 'Book1.xlsx')
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'templates', 'excel', 'OrdenProduccion', 'Book1.xlsx')
 
 
 def generar_op_excel(orden) -> BytesIO:
