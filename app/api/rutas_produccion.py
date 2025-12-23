@@ -7,6 +7,7 @@ from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
+from app.models.registro import RegistroDiarioProduccion
 from datetime import datetime, timezone
 
 # Definimos el "Blueprint" (un grupo de rutas)
@@ -197,3 +198,91 @@ def obtener_qr_data(numero_op):
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@produccion_bp.route('/ordenes/<numero_op>/registros', methods=['GET'])
+def listar_registros(numero_op):
+    """
+    Retorna la lista de Registros Diarios, simulando la vista del Excel de Producción.
+    Incluye todos los cálculos y datos "repetidos" de la orden para completar la vista.
+    """
+    orden = db.session.get(OrdenProduccion, numero_op)
+    if not orden:
+        return jsonify({'error': 'Orden no encontrada'}), 404
+        
+    resultados = []
+    
+    # Iterar sobre registros (asumiendo que están ordenados por fecha/turno o ID)
+    registros = RegistroDiarioProduccion.query.filter_by(orden_id=numero_op).all()
+    
+    for r in registros:
+        # Calcular fecha desglosada
+        mes = r.fecha.month if r.fecha else None
+        ano = r.fecha.year if r.fecha else None
+        semana = r.fecha.isocalendar()[1] if r.fecha else None
+        
+        # Recuperar datos que vienen de la máquina (aunque ahora está en registro, el user pide Tipo Maq)
+        tipo_maquina = r.maquina.tipo if r.maquina else None
+        nombre_maquina = r.maquina.nombre if r.maquina else None
+        
+        # Snapshots vs Live Data (usamos snapshots del registro para consistencia histórica)
+        cav_sku = r.orden.cavidades # Or snapshot if available
+        # En la implementación pusimos snapshots en el registro
+        cav_reg = r.snapshot_cavidades
+        ciclo_reg = r.snapshot_ciclo_seg
+        peso_unit_reg = r.snapshot_peso_unitario_gr
+        
+        # Construir fila plana tipo Excel
+        fila = {
+            # Datos Generales (Input / Contexto)
+            "Hora de Ingreso": r.hora_ingreso,
+            "Tipo Maq": tipo_maquina,
+            "Maquina": nombre_maquina,
+            "FECHA": r.fecha.isoformat() if r.fecha else None,
+            "MES": mes,
+            "AÑO": ano,
+            "SEMANA": semana,
+            "Maquinista": r.maquinista,
+            "Turno": r.turno,
+            
+            # Datos Producto
+            "Molde": r.molde,
+            "Pieza-Color": r.pieza_color,
+            "Nº OP": r.orden_id,
+            
+            # Producción Inputs
+            "Coladas": r.coladas,
+            "Horas Trab.": r.horas_trabajadas,
+            "Peso Real (Kg)": r.peso_real_kg,
+            
+            # Empaque
+            "Cantidad x Bulto": r.cantidad_x_bulto,
+            "#Bultos": r.numero_bultos,
+            "#Doc. Registro": r.doc_registro_nro,
+            
+            # Merma
+            "Color Merma": r.color_merma,
+            "Peso Merma": r.peso_merma,
+            "Peso Chancaca": r.peso_chancaca,
+            "Fracion Virgen": r.fraccion_virgen, 
+            
+            # CALCULADOS (Metricas del Registro)
+            "Peso Aprox. (Kg)": r.calculo_peso_aprox_kg,
+            "Peso (kg)": r.peso_real_kg, # User: "Peso(kg) = Peso Real(kg) ??????" - Confirmado
+            "Peso unitario (Gr)": peso_unit_reg, # Del snapshot
+            "Cantidad Real": r.calculo_cantidad_real,
+            "DOC": r.calculo_doc, # Cantidad Piezas
+            "Produccion esperada": r.calculo_produccion_esperada_kg,
+            
+            # DATOS SKU / ORDEN (Repetidos para vista)
+            "Cavidades": cav_reg, # Del registro (Snapshot)
+            "Kg Virgen": "PLACEHOLDER", # User asked to leave as placeholder
+            "Kg Segunda": "PLACEHOLDER",
+            
+            # Datos Técnicos SKU (Originales de Orden para comparar)
+            "Cavidades SKU": r.orden.cavidades,
+            "Ciclo SKU": r.orden.tiempo_ciclo,
+            "Peso Unit SKU": r.orden.peso_unitario_gr
+        }
+        resultados.append(fila)
+        
+    return jsonify(resultados), 200

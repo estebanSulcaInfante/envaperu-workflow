@@ -5,6 +5,8 @@ from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
 from app.models.producto import ProductoTerminado, FamiliaColor, ColorProducto, Pieza
+from app.models.maquina import Maquina
+from app.models.registro import RegistroDiarioProduccion
 from app.extensions import db
 
 def test_estructura_completa_json(client, app):
@@ -25,6 +27,11 @@ def test_estructura_completa_json(client, app):
         db.session.add_all([mp1, mp2, color])
         db.session.commit()
 
+        # 1.5 SETUP: MAQUINA
+        maquina_test = Maquina(nombre="MAQ-TEST", tipo="TEST 100T")
+        db.session.add(maquina_test)
+        db.session.commit()
+
         # 2. SETUP: ORDEN (Por Peso)
         orden = OrdenProduccion(
             numero_op="OP-FULL-STRUCT",
@@ -35,7 +42,8 @@ def test_estructura_completa_json(client, app):
             cavidades=4,
             tiempo_ciclo=20.0,
             horas_turno=24.0,
-            fecha_inicio=datetime.now(timezone.utc)
+            fecha_inicio=datetime.now(timezone.utc),
+            maquina_id=maquina_test.id  # FK a Maquina
         )
         db.session.add(orden)
         db.session.commit()
@@ -151,3 +159,48 @@ def test_estructura_completa_json(client, app):
         # Verificar en dict final
         final_dict = orden.to_dict()
         assert final_dict['resumen_totales']['Familia Color'] == "TRANSPARENTE"
+        # ---------------------------------------------------------------------
+        # 8. VALIDAR REGISTRO DIARIO
+        # ---------------------------------------------------------------------
+        # Crear registro asociado a la orden y maquina
+        registro = RegistroDiarioProduccion(
+            orden_id=orden.numero_op,
+            maquina_id=maquina_test.id,
+            fecha=datetime.now(timezone.utc).date(),
+            turno="DIA",
+            maquinista="TEST OPERATOR",
+            molde=orden.molde,
+            pieza_color="TEST-PIEZA-COLOR",
+            coladas=100,
+            horas_trabajadas=5.0,
+            peso_real_kg=19.5, # Supongamos un valor
+            
+            # Snapshots (Copiados de la Orden)
+            snapshot_cavidades=orden.cavidades, # 4
+            snapshot_ciclo_seg=orden.tiempo_ciclo, # 20.0
+            snapshot_peso_unitario_gr=orden.peso_unitario_gr # 50.0
+        )
+        
+        registro.actualizar_metricas()
+        db.session.add(registro)
+        db.session.commit()
+        
+        # Validar Cálculos
+        
+        # 1. Peso Aprox = (PesoUnit * Cavs * Coladas) / 1000
+        # (50 * 4 * 100) / 1000 = 20,000 / 1000 = 20.0 kg
+        assert registro.calculo_peso_aprox_kg == pytest.approx(20.0)
+        
+        # 2. Cantidad Real = (PesoReal * 1000) / PesoUnit
+        # (19.5 * 1000) / 50 = 390 piezas
+        assert registro.calculo_cantidad_real == 390.0
+        
+        # 3. Produccion Esperada = (Horas * Ciclos/H * PesoTiro) / 1000
+        # Ciclos/H = 3600 / 20 = 180
+        # PesoTiro = 50 * 4 = 200g
+        # Esperado = (5 * 180 * 200) / 1000 = 180,000 / 1000 = 180.0 kg
+        assert registro.calculo_produccion_esperada_kg == pytest.approx(180.0)
+        
+        # Validar Relationships
+        assert len(orden.registros_diarios) == 1
+        assert orden.registros_diarios[0].maquinista == "TEST OPERATOR"

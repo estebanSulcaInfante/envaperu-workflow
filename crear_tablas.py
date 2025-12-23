@@ -9,6 +9,8 @@ from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.producto import ProductoTerminado, Pieza, ProductoPieza
+from app.models.maquina import Maquina
+from app.models.registro import RegistroDiarioProduccion
 
 app = create_app()
 
@@ -50,13 +52,22 @@ def inicializar_bd():
         db.session.commit()
 
         # ---------------------------------------------------------
+        # 1.5 CATALOGO DE MAQUINAS
+        # ---------------------------------------------------------
+        maq_iny05 = Maquina(nombre="INY-05", tipo="HAI TIAN 350T")
+        maq_ht320a = Maquina(nombre="HT-320 A", tipo="HAI TIAN 320T")
+        maq_iny02 = Maquina(nombre="INY-02", tipo="HAI TIAN 250T")
+        
+        db.session.add_all([maq_iny05, maq_ht320a, maq_iny02])
+        db.session.commit()
+
+        # ---------------------------------------------------------
         # 2. ORDEN DE PRODUCCIÓN: OP-1322 (Balde Romano)
         # ---------------------------------------------------------
         orden = OrdenProduccion(
             numero_op="OP-1322",
-            maquina_id="INY-05", 
+            maquina_id=maq_iny05.id,  # FK a Maquina
             fecha_inicio=datetime.now(timezone.utc),
-            tipo_maquina="HAI TIAN 350T",
             producto="BALDE ROMANO",
             molde="BALDE PLAYERO ROMANO",
             
@@ -111,6 +122,33 @@ def inicializar_bd():
             for pig_obj, dosis in lista_pigmentos:
                 db.session.add(SeColorea(lote_id=lote.id, colorante_id=pig_obj.id, gramos=dosis))
         
+        db.session.commit()
+
+        # ---------------------------------------------------------
+        # 4. REGISTRO DIARIO (Simulacion)
+        # ---------------------------------------------------------
+        # Simulamos que en Iny-05, OP-1322, fecha hoy, se produjo algo
+        reg = RegistroDiarioProduccion(
+            orden_id=orden.numero_op,
+            maquina_id=maq_iny05.id,
+            fecha=datetime.now(timezone.utc).date(),
+            turno="DIA",
+            maquinista="JUAN PEREZ",
+            molde=orden.molde,
+            pieza_color="BALDE-AMARILLO",
+            coladas=500,
+            horas_trabajadas=8.0,
+            peso_real_kg=85.5,
+            
+            # Snapshots
+            snapshot_cavidades=orden.cavidades,
+            snapshot_ciclo_seg=orden.tiempo_ciclo,
+            snapshot_peso_unitario_gr=orden.peso_unitario_gr
+        )
+        # Calcular
+        reg.actualizar_metricas()
+        
+        db.session.add(reg)
         db.session.commit()
 
         # ---------------------------------------------------------

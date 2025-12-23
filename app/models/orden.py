@@ -9,10 +9,9 @@ class OrdenProduccion(db.Model):
     fecha_inicio = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     
     # --- CABECERA ---
-    maquina_id = db.Column(db.String(50))
-    tipo_maquina = db.Column(db.String(50))
-    maquina_id = db.Column(db.String(50))
-    tipo_maquina = db.Column(db.String(50))
+    # FK a la entidad Maquina (preparado para Fase 2: Registro Diario)
+    maquina_id = db.Column(db.Integer, db.ForeignKey('maquina.id'), nullable=True)
+    # maquina_ref backref es definido en Maquina.ordenes
 
     # --- RELACION A PRODUCTO ---
     # Vinculo fuerte por SKU para sacar datos tecnicos (familia, color, pesos teoricos)
@@ -237,7 +236,8 @@ class OrdenProduccion(db.Model):
         return {
             'numero_op': self.numero_op,
             'producto': self.producto,
-            'maquina': self.maquina_id,
+            'maquina': self.maquina_ref.nombre if self.maquina_ref else None,
+            'tipo_maquina': self.maquina_ref.tipo if self.maquina_ref else None,
             'fecha': self.fecha_creacion.isoformat() if self.fecha_creacion else None,
             'fecha_inicio': self.fecha_inicio.isoformat() if self.fecha_inicio else None,
             'molde': self.molde,
