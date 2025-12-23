@@ -75,3 +75,62 @@ def test_listar_registros_json(client, app):
         assert row['Turno'] == "NOCHE"
         # Check calculation: DOC = Cavs * Coladas = 4 * 100 = 400
         assert row['DOC'] == 400.0
+
+def test_crear_registro_api(client, app):
+    """
+    Verifica el endpoint POST /ordenes/<op>/registros
+    """
+    with app.app_context():
+        # Setup Maquina
+        maq = Maquina(nombre="MAQ-POST", tipo="INYECCION")
+        db.session.add(maq)
+        db.session.commit()
+        
+        # Setup Orden
+        orden = OrdenProduccion(
+            numero_op="OP-POST-REG",
+            maquina_id=maq.id,
+            tipo_estrategia="POR_PESO",
+            peso_unitario_gr=100.0,
+            tiempo_ciclo=30.0,
+            cavidades=2
+        )
+        db.session.add(orden)
+        db.session.commit()
+        
+        # Payload
+        payload = {
+            "maquina_id": maq.id,
+            "fecha": "2025-12-23",
+            "turno": "TARDE",
+            "hora_ingreso": "14:00",
+            "maquinista": "OPERARIO POST",
+            "molde": "MOLDE-X",
+            "pieza_color": "PIEZA-ROJA",
+            "coladas": 50,
+            "horas_trabajadas": 4.0,
+            "peso_real_kg": 9.8
+        }
+        
+        # Call Endpoint
+        response = client.post(f'/api/ordenes/{orden.numero_op}/registros', json=payload)
+        assert response.status_code == 201
+        
+        data = response.get_json()
+        
+        # Verify Response Structure
+        assert data['maquinista'] == "OPERARIO POST"
+        assert 'calculos' in data
+        
+        # Verify Calculations
+        # DOC = Cavs * Coladas = 2 * 50 = 100
+        assert data['calculos']['doc_cantidad'] == 100.0
+        
+        # Peso Aprox = (P.Unit * Cavs * Coladas) / 1000
+        # (100 * 2 * 50) / 1000 = 10.0 kg
+        assert data['calculos']['peso_aprox'] == 10.0
+        
+        # Verify DB Persistence
+        reg_db = RegistroDiarioProduccion.query.filter_by(orden_id="OP-POST-REG").first()
+        assert reg_db is not None
+        assert reg_db.peso_real_kg == 9.8

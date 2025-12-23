@@ -286,3 +286,67 @@ def listar_registros(numero_op):
         resultados.append(fila)
         
     return jsonify(resultados), 200
+
+@produccion_bp.route('/ordenes/<numero_op>/registros', methods=['POST'])
+def crear_registro(numero_op):
+    """
+    Crea un nuevo Registro Diario de Producción.
+    Realiza los cálculos automáticos y guarda snapshots de la orden.
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Payload JSON requerido'}), 400
+        
+    orden = db.session.get(OrdenProduccion, numero_op)
+    if not orden:
+        return jsonify({'error': 'Orden no encontrada'}), 404
+        
+    try:
+        # Validar campos obligatorios minimos
+        if 'maquina_id' not in data or 'fecha' not in data:
+             return jsonify({'error': 'Faltan campos obligatorios (maquina_id, fecha)'}), 400
+             
+        # Crear instancia
+        nuevo_registro = RegistroDiarioProduccion(
+            orden_id=orden.numero_op,
+            maquina_id=data.get('maquina_id'),
+            fecha=datetime.fromisoformat(data.get('fecha')).date(),
+            turno=data.get('turno'),
+            hora_ingreso=data.get('hora_ingreso'),
+            maquinista=data.get('maquinista'),
+            molde=data.get('molde'),
+            pieza_color=data.get('pieza_color'),
+            
+            # Produccion
+            coladas=data.get('coladas', 0),
+            horas_trabajadas=data.get('horas_trabajadas', 0.0),
+            peso_real_kg=data.get('peso_real_kg', 0.0),
+            
+            # Empaque
+            cantidad_x_bulto=data.get('cantidad_x_bulto', 0),
+            numero_bultos=data.get('numero_bultos', 0),
+            doc_registro_nro=data.get('doc_registro_nro'),
+            
+            # Merma
+            color_merma=data.get('color_merma'),
+            peso_merma=data.get('peso_merma', 0.0),
+            peso_chancaca=data.get('peso_chancaca', 0.0),
+            fraccion_virgen=data.get('fraccion_virgen', 0.0),
+            
+            # Snapshots (Tomados de la Orden actual)
+            snapshot_cavidades=orden.cavidades,
+            snapshot_ciclo_seg=orden.tiempo_ciclo,
+            snapshot_peso_unitario_gr=orden.peso_unitario_gr
+        )
+        
+        # Ejecutar calculos
+        nuevo_registro.actualizar_metricas()
+        
+        db.session.add(nuevo_registro)
+        db.session.commit()
+        
+        return jsonify(nuevo_registro.to_dict()), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
