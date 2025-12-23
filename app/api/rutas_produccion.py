@@ -7,7 +7,7 @@ from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
-from app.models.registro import RegistroDiarioProduccion
+from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from datetime import datetime, timezone
 
 # Definimos el "Blueprint" (un grupo de rutas)
@@ -119,6 +119,17 @@ def obtener_ordenes():
     return jsonify(respuesta), 200
 
 
+@produccion_bp.route('/ordenes/<numero_op>', methods=['GET'])
+def obtener_orden(numero_op):
+    """
+    Retorna los detalles de una orden específica.
+    """
+    orden = db.session.get(OrdenProduccion, numero_op)
+    if not orden:
+        return jsonify({'error': 'Orden no encontrada'}), 404
+    return jsonify(orden.to_dict()), 200
+
+
 @produccion_bp.route('/ordenes/<numero_op>/excel', methods=['GET'])
 def descargar_excel(numero_op):
     """
@@ -225,63 +236,26 @@ def listar_registros(numero_op):
         nombre_maquina = r.maquina.nombre if r.maquina else None
         
         # Snapshots vs Live Data (usamos snapshots del registro para consistencia histórica)
-        cav_sku = r.orden.cavidades # Or snapshot if available
-        # En la implementación pusimos snapshots en el registro
         cav_reg = r.snapshot_cavidades
-        ciclo_reg = r.snapshot_ciclo_seg
-        peso_unit_reg = r.snapshot_peso_unitario_gr
+        ciclo_reg = r.tiempo_ciclo_reportado
+        peso_unit_reg = r.snapshot_peso_neto_gr # Asumiendo peso neto es el unitario
         
         # Construir fila plana tipo Excel
+        # Construir fila plana tipo Excel (AHORA RESUMIDA PORQUE ES HEADER)
         fila = {
-            # Datos Generales (Input / Contexto)
-            "Hora de Ingreso": r.hora_ingreso,
-            "Tipo Maq": tipo_maquina,
-            "Maquina": nombre_maquina,
+            "ID Registro": r.id,
             "FECHA": r.fecha.isoformat() if r.fecha else None,
-            "MES": mes,
-            "AÑO": ano,
-            "SEMANA": semana,
-            "Maquinista": r.maquinista,
             "Turno": r.turno,
+            "Maquina": nombre_maquina,
+            "Hora Inicio": r.hora_inicio,
+            "Colada Ini": r.colada_inicial,
+            "Colada Fin": r.colada_final,
+            "Total Coladas (Calc)": r.total_coladas_calculada,
+            "Total Piezas (Est)": r.total_piezas_buenas,
+            "Total Kg (Est)": r.total_kg_real,
             
-            # Datos Producto
-            "Molde": r.molde,
-            "Pieza-Color": r.pieza_color,
-            "Nº OP": r.orden_id,
-            
-            # Producción Inputs
-            "Coladas": r.coladas,
-            "Horas Trab.": r.horas_trabajadas,
-            "Peso Real (Kg)": r.peso_real_kg,
-            
-            # Empaque
-            "Cantidad x Bulto": r.cantidad_x_bulto,
-            "#Bultos": r.numero_bultos,
-            "#Doc. Registro": r.doc_registro_nro,
-            
-            # Merma
-            "Color Merma": r.color_merma,
-            "Peso Merma": r.peso_merma,
-            "Peso Chancaca": r.peso_chancaca,
-            "Fracion Virgen": r.fraccion_virgen, 
-            
-            # CALCULADOS (Metricas del Registro)
-            "Peso Aprox. (Kg)": r.calculo_peso_aprox_kg,
-            "Peso (kg)": r.peso_real_kg, # User: "Peso(kg) = Peso Real(kg) ??????" - Confirmado
-            "Peso unitario (Gr)": peso_unit_reg, # Del snapshot
-            "Cantidad Real": r.calculo_cantidad_real,
-            "DOC": r.calculo_doc, # Cantidad Piezas
-            "Produccion esperada": r.calculo_produccion_esperada_kg,
-            
-            # DATOS SKU / ORDEN (Repetidos para vista)
-            "Cavidades": cav_reg, # Del registro (Snapshot)
-            "Kg Virgen": "PLACEHOLDER", # User asked to leave as placeholder
-            "Kg Segunda": "PLACEHOLDER",
-            
-            # Datos Técnicos SKU (Originales de Orden para comparar)
-            "Cavidades SKU": r.orden.cavidades,
-            "Ciclo SKU": r.orden.tiempo_ciclo,
-            "Peso Unit SKU": r.orden.peso_unitario_gr
+            # Detalles anidados para el frontend
+            "detalles": [d.to_dict() for d in r.detalles]
         }
         resultados.append(fila)
         
@@ -290,8 +264,21 @@ def listar_registros(numero_op):
 @produccion_bp.route('/ordenes/<numero_op>/registros', methods=['POST'])
 def crear_registro(numero_op):
     """
-    Crea un nuevo Registro Diario de Producción.
-    Realiza los cálculos automáticos y guarda snapshots de la orden.
+    Crea un nuevo Registro Diario de Producción (CABECERA) y detalles iniciales.
+    Payload:
+    {
+       "fecha": "YYYY-MM-DD",
+       "turno": "DIA",
+       "hora_inicio": "07:00",
+       "colada_inicial": 1000,
+       "colada_final": 1500,
+       "tiempo_ciclo": 30.0,
+       ...
+       "detalles": [
+          {"hora": "07:00", "coladas": 50, "maquinista": "...", "color": "ROJO"},
+          ...
+       ]
+    }
     """
     data = request.get_json()
     if not data:
@@ -302,50 +289,54 @@ def crear_registro(numero_op):
         return jsonify({'error': 'Orden no encontrada'}), 404
         
     try:
-        # Validar campos obligatorios minimos
+        # Validar minimos
         if 'maquina_id' not in data or 'fecha' not in data:
              return jsonify({'error': 'Faltan campos obligatorios (maquina_id, fecha)'}), 400
-             
-        # Crear instancia
-        nuevo_registro = RegistroDiarioProduccion(
+
+        # Crear Cabecera
+        cabecera = RegistroDiarioProduccion(
             orden_id=orden.numero_op,
             maquina_id=data.get('maquina_id'),
             fecha=datetime.fromisoformat(data.get('fecha')).date(),
             turno=data.get('turno'),
-            hora_ingreso=data.get('hora_ingreso'),
-            maquinista=data.get('maquinista'),
-            molde=data.get('molde'),
-            pieza_color=data.get('pieza_color'),
+            hora_inicio=data.get('hora_inicio'),
+            colada_inicial=data.get('colada_inicial', 0),
+            colada_final=data.get('colada_final', 0),
+            tiempo_ciclo_reportado=data.get('tiempo_ciclo', 0.0),
+            tiempo_enfriamiento=data.get('tiempo_enfriamiento', 0.0),
+            cantidad_por_hora_meta=data.get('meta_hora', 0),
             
-            # Produccion
-            coladas=data.get('coladas', 0),
-            horas_trabajadas=data.get('horas_trabajadas', 0.0),
-            peso_real_kg=data.get('peso_real_kg', 0.0),
-            
-            # Empaque
-            cantidad_x_bulto=data.get('cantidad_x_bulto', 0),
-            numero_bultos=data.get('numero_bultos', 0),
-            doc_registro_nro=data.get('doc_registro_nro'),
-            
-            # Merma
-            color_merma=data.get('color_merma'),
-            peso_merma=data.get('peso_merma', 0.0),
-            peso_chancaca=data.get('peso_chancaca', 0.0),
-            fraccion_virgen=data.get('fraccion_virgen', 0.0),
-            
-            # Snapshots (Tomados de la Orden actual)
+            # Snapshots
             snapshot_cavidades=orden.cavidades,
-            snapshot_ciclo_seg=orden.tiempo_ciclo,
-            snapshot_peso_unitario_gr=orden.peso_unitario_gr
+            snapshot_peso_neto_gr=orden.peso_unitario_gr, # Asumiendo peso unit es pieza
+            snapshot_peso_colada_gr=0.0, # TO-DO: Agregar a Orden si hace falta
+            snapshot_peso_extra_gr=0.0
         )
         
-        # Ejecutar calculos
-        nuevo_registro.actualizar_metricas()
+        # Calcular totales cabecera
+        cabecera.actualizar_totales()
+        db.session.add(cabecera)
+        db.session.flush() # Para tener ID
         
-        db.session.add(nuevo_registro)
+        # Procesar Detalles
+        detalles_data = data.get('detalles', [])
+        peso_tiro = (cabecera.snapshot_peso_neto_gr * cabecera.snapshot_cavidades)
+        
+        for d in detalles_data:
+            detalle = DetalleProduccionHora(
+                registro_id=cabecera.id,
+                hora=d.get('hora'),
+                maquinista=d.get('maquinista'),
+                color=d.get('color'),
+                observacion=d.get('observacion'),
+                coladas_realizadas=d.get('coladas', 0)
+            )
+            # Calcular metricas del detalle
+            detalle.calcular_metricas(cabecera.snapshot_cavidades, peso_tiro)
+            db.session.add(detalle)
+            
         db.session.commit()
-        
-        return jsonify(nuevo_registro.to_dict()), 201
+        return jsonify(cabecera.to_dict()), 201
         
     except Exception as e:
         db.session.rollback()

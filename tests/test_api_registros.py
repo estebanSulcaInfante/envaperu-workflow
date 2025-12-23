@@ -1,18 +1,36 @@
 import pytest
-from datetime import datetime, timezone
-from app.models.orden import OrdenProduccion
-from app.models.registro import RegistroDiarioProduccion
-from app.models.maquina import Maquina
+from app import create_app
 from app.extensions import db
+from app.models.orden import OrdenProduccion
+from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
+from app.models.maquina import Maquina
+from datetime import date
+
+@pytest.fixture
+def app():
+    app = create_app()
+    app.config.update({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:"
+    })
+    
+    with app.app_context():
+        db.create_all()
+        yield app
+        db.session.remove()
+        db.drop_all()
+
+@pytest.fixture
+def client(app):
+    return app.test_client()
 
 def test_listar_registros_json(client, app):
     """
-    Verifica el endpoint GET /ordenes/<op>/registros
-    Debe retornar una lista de objetos con las claves exactas requeridas para la vista Excel.
+    Verifica que el endpoint GET retorne la estructura jerárquica correcta.
     """
     with app.app_context():
         # Setup Maquina
-        maq = Maquina(nombre="MAQ-API", tipo="HYBRID")
+        maq = Maquina(nombre="MAQ-API-REG", tipo="INYECCION")
         db.session.add(maq)
         db.session.commit()
         
@@ -28,57 +46,51 @@ def test_listar_registros_json(client, app):
         db.session.add(orden)
         db.session.commit()
         
-        # Setup Registro
+        # Setup Registro (Header)
         reg = RegistroDiarioProduccion(
             orden_id=orden.numero_op,
             maquina_id=maq.id,
-            fecha=datetime.now(timezone.utc).date(),
+            fecha=date(2025, 1, 15),
             turno="NOCHE",
-            maquinista="TESTER",
-            coladas=100,
-            snapshot_cavidades=4,
-            snapshot_peso_unitario_gr=50.0,
-            snapshot_ciclo_seg=20.0
+            hora_inicio="19:00",
+            colada_inicial=1000,
+            colada_final=1100, # 100 calc
+            
+            # Snapshots
+            snapshot_cavidades=orden.cavidades,
+            snapshot_peso_neto_gr=orden.peso_unitario_gr,
+            snapshot_peso_colada_gr=10.0
         )
-        reg.actualizar_metricas()
+        reg.actualizar_totales()
         db.session.add(reg)
+        db.session.flush()
+        
+        # Setup Detalles
+        det = DetalleProduccionHora(
+            registro_id=reg.id,
+            hora="19:00",
+            maquinista="TESTER",
+            coladas_realizadas=100
+        )
+        det.calcular_metricas(reg.snapshot_cavidades, (reg.snapshot_peso_neto_gr * reg.snapshot_cavidades))
+        db.session.add(det)
         db.session.commit()
         
-        # Call Endpoint
+        # Test GET
         response = client.get(f'/api/ordenes/{orden.numero_op}/registros')
         assert response.status_code == 200
-        
         data = response.get_json()
-        assert isinstance(data, list)
         assert len(data) == 1
         
         row = data[0]
-        
-        # Verify Key Columns
-        expected_keys = [
-            "Hora de Ingreso", "Tipo Maq", "Maquina", "FECHA", "MES", "AÑO", "SEMANA",
-            "Maquinista", "Turno", "Molde", "Pieza-Color", "Nº OP", 
-            "Coladas", "Horas Trab.", "Peso Real (Kg)",
-            "Peso Aprox. (Kg)", "Peso (kg)", "Peso unitario (Gr)", "Cantidad Real",
-            "DOC", "Produccion esperada", 
-            "Cavidades", "Kg Virgen", "Kg Segunda",
-            "Cavidades SKU", "Ciclo SKU", "Peso Unit SKU"
-        ]
-        
-        for k in expected_keys:
-            assert k in row, f"Falta la columna {k} en la respuesta JSON"
-            
-        # Verify Values
-        assert row['Maquina'] == "MAQ-API"
-        assert row['Tipo Maq'] == "HYBRID"
-        assert row['Nº OP'] == "OP-API-REG"
         assert row['Turno'] == "NOCHE"
-        # Check calculation: DOC = Cavs * Coladas = 4 * 100 = 400
-        assert row['DOC'] == 400.0
+        assert row['Total Coladas (Calc)'] == 100
+        assert len(row['detalles']) == 1
+        assert row['detalles'][0]['coladas'] == 100
 
 def test_crear_registro_api(client, app):
     """
-    Verifica el endpoint POST /ordenes/<op>/registros
+    Verifica el endpoint POST /ordenes/<op>/registros con estructura master-detail
     """
     with app.app_context():
         # Setup Maquina
@@ -103,13 +115,14 @@ def test_crear_registro_api(client, app):
             "maquina_id": maq.id,
             "fecha": "2025-12-23",
             "turno": "TARDE",
-            "hora_ingreso": "14:00",
-            "maquinista": "OPERARIO POST",
-            "molde": "MOLDE-X",
-            "pieza_color": "PIEZA-ROJA",
-            "coladas": 50,
-            "horas_trabajadas": 4.0,
-            "peso_real_kg": 9.8
+            "hora_inicio": "14:00",
+            "colada_inicial": 100,
+            "colada_final": 200, # 100 coladas total
+            "tiempo_ciclo": 30.0,
+            "detalles": [
+                {"hora": "14:00", "coladas": 50, "maquinista": "TESTER", "color": "ROJO"},
+                {"hora": "15:00", "coladas": 50, "maquinista": "TESTER", "color": "ROJO"}
+            ]
         }
         
         # Call Endpoint
@@ -118,19 +131,16 @@ def test_crear_registro_api(client, app):
         
         data = response.get_json()
         
-        # Verify Response Structure
-        assert data['maquinista'] == "OPERARIO POST"
-        assert 'calculos' in data
+        # Verify Response Structure (Header info)
+        assert data['contadores']['total'] == 100
+        assert len(data['detalles']) == 2
         
         # Verify Calculations
-        # DOC = Cavs * Coladas = 2 * 50 = 100
-        assert data['calculos']['doc_cantidad'] == 100.0
-        
-        # Peso Aprox = (P.Unit * Cavs * Coladas) / 1000
-        # (100 * 2 * 50) / 1000 = 10.0 kg
-        assert data['calculos']['peso_aprox'] == 10.0
+        # Piezas = Total Coladas * Cavidades = 100 * 2 = 200
+        assert data['totales_estimados']['piezas'] == 200
         
         # Verify DB Persistence
         reg_db = RegistroDiarioProduccion.query.filter_by(orden_id="OP-POST-REG").first()
         assert reg_db is not None
-        assert reg_db.peso_real_kg == 9.8
+        assert reg_db.total_coladas_calculada == 100
+        assert len(reg_db.detalles) == 2

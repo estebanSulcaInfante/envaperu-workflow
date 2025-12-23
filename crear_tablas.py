@@ -128,67 +128,63 @@ def inicializar_bd():
         # 4. REGISTRO DIARIO (Simulacion)
         # ---------------------------------------------------------
         # Simulamos que en Iny-05, OP-1322, fecha hoy, se produjo algo
-        reg = RegistroDiarioProduccion(
+        # ---------------------------------------------------------
+        # 4. REGISTRO DIARIO (Simulacion Master-Detail)
+        # ---------------------------------------------------------
+        # Importar modelos detalle si no están arriba
+        from app.models.registro import DetalleProduccionHora
+        
+        # Crear Cabecera (Sheet)
+        reg_header = RegistroDiarioProduccion(
             orden_id=orden.numero_op,
             maquina_id=maq_iny05.id,
             fecha=datetime.now(timezone.utc).date(),
             turno="DIA",
-            maquinista="JUAN PEREZ",
-            molde=orden.molde,
-            pieza_color="BALDE-AMARILLO",
-            coladas=500,
-            horas_trabajadas=8.0,
-            peso_real_kg=85.5,
+            hora_inicio="07:00",
+            
+            # Contadores
+            colada_inicial=1000,
+            colada_final=1500, # 500 coladas total
+            
+            # Parametros
+            tiempo_ciclo_reportado=30.5,
+            cantidad_por_hora_meta=120,
+            tiempo_enfriamiento=5.0,
             
             # Snapshots
             snapshot_cavidades=orden.cavidades,
-            snapshot_ciclo_seg=orden.tiempo_ciclo,
-            snapshot_peso_unitario_gr=orden.peso_unitario_gr
+            snapshot_peso_neto_gr=orden.peso_unitario_gr,
+            snapshot_peso_colada_gr=10.0,
+            snapshot_peso_extra_gr=0.0
         )
-        # Calcular
-        reg.actualizar_metricas()
         
-        db.session.add(reg)
+        # Calcular totales cabecera
+        reg_header.actualizar_totales()
+        db.session.add(reg_header)
+        db.session.flush()
         
-        # Registro 2: Otro turno
-        reg2 = RegistroDiarioProduccion(
-            orden_id=orden.numero_op,
-            maquina_id=maq_iny05.id,
-            fecha=datetime.now(timezone.utc).date(),
-            turno="NOCHE",
-            maquinista="CARLOS RAMIREZ",
-            molde=orden.molde,
-            pieza_color="BALDE-ROJO",
-            coladas=450,
-            horas_trabajadas=7.5,
-            peso_real_kg=76.2,
-            snapshot_cavidades=orden.cavidades,
-            snapshot_ciclo_seg=orden.tiempo_ciclo,
-            snapshot_peso_unitario_gr=orden.peso_unitario_gr
-        )
-        reg2.actualizar_metricas()
-        db.session.add(reg2)
+        # Crear Detalles (Horas)
+        detalles_muestra = [
+            ("07:00", "JUAN PEREZ", "AMARILLO", 50),
+            ("08:00", "JUAN PEREZ", "AMARILLO", 110),
+            ("09:00", "JUAN PEREZ", "ROJO", 100), # Cambio color
+            ("10:00", "JUAN PEREZ", "ROJO", 0),   # Parada?
+        ]
         
-        # Registro 3: Turno tarde
-        from datetime import timedelta
-        reg3 = RegistroDiarioProduccion(
-            orden_id=orden.numero_op,
-            maquina_id=maq_ht320a.id,
-            fecha=(datetime.now(timezone.utc) - timedelta(days=1)).date(),
-            turno="TARDE",
-            maquinista="MARIO LOPEZ",
-            molde=orden.molde,
-            pieza_color="BALDE-AZUL",
-            coladas=520,
-            horas_trabajadas=8.0,
-            peso_real_kg=88.1,
-            snapshot_cavidades=orden.cavidades,
-            snapshot_ciclo_seg=orden.tiempo_ciclo,
-            snapshot_peso_unitario_gr=orden.peso_unitario_gr
-        )
-        reg3.actualizar_metricas()
-        db.session.add(reg3)
+        peso_tiro = (reg_header.snapshot_peso_neto_gr * reg_header.snapshot_cavidades)
         
+        for hora, maq, col, cant in detalles_muestra:
+            det = DetalleProduccionHora(
+                registro_id=reg_header.id,
+                hora=hora,
+                maquinista=maq,
+                color=col,
+                observacion="Normal" if cant > 0 else "Parada Mantenimiento",
+                coladas_realizadas=cant
+            )
+            det.calcular_metricas(reg_header.snapshot_cavidades, peso_tiro)
+            db.session.add(det)
+            
         db.session.commit()
 
         # ---------------------------------------------------------
@@ -201,10 +197,9 @@ def inicializar_bd():
         print(f"   Peso Tiro (inc. colada): {orden.peso_inc_colada} gr")
         print(f"   T/C: {orden.tiempo_ciclo} seg")
         print("-" * 50)
-        print(f"🎨 Lotes Generados: {len(orden.lotes)}")
-        for l in orden.lotes:
-            coladas = l.cantidad_coladas_calculada if hasattr(l, 'cantidad_coladas_calculada') else "?"
-            print(f"   - {l.color_nombre}: {coladas} coladas")
+        print(f"📝 Registro Diario Generado: ID {reg_header.id}")
+        print(f"   Total Coladas: {reg_header.total_coladas_calculada}")
+        print(f"   Detalles Hora: {len(detalles_muestra)}")
 
 if __name__ == "__main__":
     inicializar_bd()
