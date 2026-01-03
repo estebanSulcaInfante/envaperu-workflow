@@ -48,6 +48,7 @@ class RegistroDiarioProduccion(db.Model):
     orden = db.relationship('OrdenProduccion', backref='registros_diarios', lazy=True)
     maquina = db.relationship('Maquina', backref='registros_diarios', lazy=True)
     detalles = db.relationship('DetalleProduccionHora', backref='cabecera', cascade="all, delete-orphan", lazy=True)
+    controles_peso = db.relationship('ControlPeso', backref='registro', cascade="all, delete-orphan", lazy=True)
     
     def actualizar_totales(self):
         """

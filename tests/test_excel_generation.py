@@ -10,6 +10,16 @@ from app.services.excel_service import generar_op_excel
 from app.extensions import db
 from datetime import datetime, timezone
 
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
+
+@pytest.fixture(autouse=True)
+def check_dependencies():
+    if qrcode is None:
+        pytest.skip("skipping Excel/QR tests because qrcode module is missing", allow_module_level=True)
+
 
 def test_generar_excel_basico(client, app):
     """

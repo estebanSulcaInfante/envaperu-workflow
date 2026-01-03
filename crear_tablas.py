@@ -3,14 +3,14 @@ from app.extensions import db
 from datetime import datetime, timezone
 
 # Importamos TODOS los modelos necesarios
-# Asegúrate de que lote.py, materiales.py y recetas.py existan en tu carpeta models/
 from app.models.materiales import MateriaPrima, Colorante
 from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
-from app.models.producto import ProductoTerminado, Pieza, ProductoPieza
+from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, FamiliaColor, ColorProducto
 from app.models.maquina import Maquina
-from app.models.registro import RegistroDiarioProduccion
+from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
+from app.models.control_peso import ControlPeso
 
 app = create_app()
 
@@ -24,8 +24,7 @@ def inicializar_bd():
         except UnicodeDecodeError as e:
             print("\n❌ ERROR DE CODIFICACIÓN EN LA CONEXIÓN A LA BASE DE DATOS")
             print("   Parece que tu contraseña o usuario en '.env' tiene caracteres especiales (tildes, ñ, etc).")
-            print("   Por favor, reemplaza esos caracteres con su código URL (ej: 'ó' -> '%C3%B3').")
-            print(f"   Detalle del error: {e}")
+            print("   Detalle del error: {e}")
             return
         except Exception as e:
             print(f"\n❌ Ocurrió un error inesperado al conectar con la BD: {e}")
@@ -62,6 +61,72 @@ def inicializar_bd():
         db.session.commit()
 
         # ---------------------------------------------------------
+        # 1.6 CATALOGO DE PRODUCTOS (Color, Pieza, Producto)
+        # ---------------------------------------------------------
+        
+        # Familia y Colores de Producto
+        fam_solido = FamiliaColor(nombre="Solido")
+        db.session.add(fam_solido)
+        db.session.flush()
+
+        col_amarillo_prod = ColorProducto(nombre="Amarillo", codigo=1, familia_id=fam_solido.id)
+        col_rojo_prod = ColorProducto(nombre="Rojo", codigo=2, familia_id=fam_solido.id)
+        db.session.add_all([col_amarillo_prod, col_rojo_prod])
+        db.session.flush()
+
+        # Piezas
+        pieza_balde = Pieza(
+            sku="10101-BALDE",
+            piezas="Cuerpo Balde 20L",
+            cod_linea=1, linea="Industrial",
+            familia="Baldes",
+            cod_pieza=1,
+            cod_col="01",
+            tipo_color="Solido",
+            cavidad=1,
+            peso=600.0,
+            cod_extru=1, tipo_extruccion="Inyeccion",
+            cod_mp="MP01", mp="PP"
+        )
+        pieza_asa = Pieza(
+            sku="10102-ASA",
+            piezas="Asa Balde 20L",
+            cod_linea=1, linea="Industrial",
+            familia="Baldes",
+            cod_pieza=2,
+            cod_col="01",
+            tipo_color="Solido",
+            cavidad=2,
+            peso=50.0,
+            cod_extru=1, tipo_extruccion="Inyeccion",
+            cod_mp="MP02", mp="HDPE"
+        )
+        db.session.add_all([pieza_balde, pieza_asa])
+        db.session.flush()
+
+        # Producto Terminado
+        pt_balde_romano = ProductoTerminado(
+            cod_sku_pt="PT-BALDE-ROMANO",
+            producto="Balde Romano 20L Completo",
+            linea="Industrial", cod_linea_num=1,
+            familia="Baldes", cod_familia=10,
+            cod_producto=100,
+            cod_color=1, familia_color="Solido",
+            color_id=col_amarillo_prod.id,
+            um="UND",
+            peso_g=650.0,
+            status="ACTIVO"
+        )
+        db.session.add(pt_balde_romano)
+        db.session.flush()
+
+        # Relacion Producto-Pieza
+        db.session.add(ProductoPieza(producto_terminado_id=pt_balde_romano.cod_sku_pt, pieza_sku=pieza_balde.sku, cantidad=1))
+        db.session.add(ProductoPieza(producto_terminado_id=pt_balde_romano.cod_sku_pt, pieza_sku=pieza_asa.sku, cantidad=1))
+        
+        db.session.commit()
+
+        # ---------------------------------------------------------
         # 2. ORDEN DE PRODUCCIÓN: OP-1322 (Balde Romano)
         # ---------------------------------------------------------
         orden = OrdenProduccion(
@@ -69,6 +134,7 @@ def inicializar_bd():
             maquina_id=maq_iny05.id,  # FK a Maquina
             fecha_inicio=datetime.now(timezone.utc),
             producto="BALDE ROMANO",
+            producto_sku=pt_balde_romano.cod_sku_pt,
             molde="BALDE PLAYERO ROMANO",
             
             # --- PARAMETROS TÉCNICOS ---
@@ -93,8 +159,6 @@ def inicializar_bd():
         # ---------------------------------------------------------
         
         # DATASET DE COLORES Y RECETAS
-        # Estructura: (NombreColor, [(PigmentoObj, Dosis)], Personas)
-        # Nota: Materiales son siempre 50/50 PP y Segunda.
         lotes_config = [
             ("Amarillo", [(pig_amarillo, 30.0), (pig_dioxido, 5.0)], 1),
             ("Azul",    [(pig_azul, 60.0), (pig_dioxido, 5.0)], 1),
@@ -127,12 +191,6 @@ def inicializar_bd():
         # ---------------------------------------------------------
         # 4. REGISTRO DIARIO (Simulacion)
         # ---------------------------------------------------------
-        # Simulamos que en Iny-05, OP-1322, fecha hoy, se produjo algo
-        # ---------------------------------------------------------
-        # 4. REGISTRO DIARIO (Simulacion Master-Detail)
-        # ---------------------------------------------------------
-        # Importar modelos detalle si no están arriba
-        from app.models.registro import DetalleProduccionHora
         
         # Crear Cabecera (Sheet)
         reg_header = RegistroDiarioProduccion(
@@ -188,6 +246,32 @@ def inicializar_bd():
         db.session.commit()
 
         # ---------------------------------------------------------
+        # 5. CONTROL DE PESO (Simulacion)
+        # ---------------------------------------------------------
+        bultos_sample = [
+            (10.0, "AMARILLO"),
+            (10.0, "AMARILLO"),
+            (10.0, "AMARILLO"),
+            (10.0, "AMARILLO"),
+            (10.0, "AMARILLO"),
+            (10.0, "ROJO"),
+            (10.0, "ROJO"),
+            (10.0, "ROJO"),
+            (7.0, "ROJO"),
+        ]
+        
+        for peso, col in bultos_sample:
+            ctrl = ControlPeso(
+                registro_id=reg_header.id,
+                peso_real_kg=peso,
+                color_nombre=col,
+                hora_registro=datetime.now(timezone.utc)
+            )
+            db.session.add(ctrl)
+            
+        db.session.commit()
+
+        # ---------------------------------------------------------
         # VERIFICACIÓN FINAL
         # ---------------------------------------------------------
         print("\n✅ ¡Base de Datos Inicializada con Éxito!")
@@ -200,6 +284,7 @@ def inicializar_bd():
         print(f"📝 Registro Diario Generado: ID {reg_header.id}")
         print(f"   Total Coladas: {reg_header.total_coladas_calculada}")
         print(f"   Detalles Hora: {len(detalles_muestra)}")
+        print(f"   Bultos Pesados: {len(bultos_sample)}")
 
 if __name__ == "__main__":
     inicializar_bd()

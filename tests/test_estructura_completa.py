@@ -168,20 +168,22 @@ def test_estructura_completa_json(client, app):
             maquina_id=maquina_test.id,
             fecha=datetime.now(timezone.utc).date(),
             turno="DIA",
-            maquinista="TEST OPERATOR",
-            molde=orden.molde,
-            pieza_color="TEST-PIEZA-COLOR",
-            coladas=100,
-            horas_trabajadas=5.0,
-            peso_real_kg=19.5, # Supongamos un valor
+            # maquinista="TEST OPERATOR", # Removed
+            # molde=orden.molde, # Removed
+            # pieza_color="TEST-PIEZA-COLOR", # Removed
+            colada_inicial=0,
+            colada_final=100, # coladas=100
+            # horas_trabajadas=5.0, # Removed
             
             # Snapshots (Copiados de la Orden)
             snapshot_cavidades=orden.cavidades, # 4
-            snapshot_ciclo_seg=orden.tiempo_ciclo, # 20.0
-            snapshot_peso_unitario_gr=orden.peso_unitario_gr # 50.0
+            tiempo_ciclo_reportado=orden.tiempo_ciclo,
+            snapshot_peso_neto_gr=orden.peso_unitario_gr, # 50.0
+            snapshot_peso_colada_gr=0.0,
+            snapshot_peso_extra_gr=0.0
         )
         
-        registro.actualizar_metricas()
+        registro.actualizar_totales()
         db.session.add(registro)
         db.session.commit()
         
@@ -189,18 +191,16 @@ def test_estructura_completa_json(client, app):
         
         # 1. Peso Aprox = (PesoUnit * Cavs * Coladas) / 1000
         # (50 * 4 * 100) / 1000 = 20,000 / 1000 = 20.0 kg
-        assert registro.calculo_peso_aprox_kg == pytest.approx(20.0)
+        assert registro.total_kg_real == pytest.approx(20.0)
         
-        # 2. Cantidad Real = (PesoReal * 1000) / PesoUnit
-        # (19.5 * 1000) / 50 = 390 piezas
-        assert registro.calculo_cantidad_real == 390.0
+        # 2. Cantidad Real = Coladas * Cavs
+        # 100 * 4 = 400
+        assert registro.total_piezas_buenas == 400
         
-        # 3. Produccion Esperada = (Horas * Ciclos/H * PesoTiro) / 1000
-        # Ciclos/H = 3600 / 20 = 180
-        # PesoTiro = 50 * 4 = 200g
-        # Esperado = (5 * 180 * 200) / 1000 = 180,000 / 1000 = 180.0 kg
-        assert registro.calculo_produccion_esperada_kg == pytest.approx(180.0)
+        # 3. Produccion Esperada 
+        # No existe campo "calculo_produccion_esperada_kg" en el modelo actual.
+        # Lo omitimos si no es parte del modelo actual.
         
         # Validar Relationships
         assert len(orden.registros_diarios) == 1
-        assert orden.registros_diarios[0].maquinista == "TEST OPERATOR"
+        # assert orden.registros_diarios[0].maquinista == "TEST OPERATOR" # Removed as field does not exist

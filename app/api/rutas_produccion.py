@@ -28,7 +28,7 @@ def crear_orden():
         nueva_orden = OrdenProduccion(
             numero_op=data.get('numero_op'),
             maquina_id=data.get('maquina_id'),
-            tipo_maquina=data.get('tipo_maquina'),
+            # tipo_maquina is derived from relation, not stored directly
             producto=data.get('producto'),
             molde=data.get('molde'),
             # cliente=data.get('cliente'), Removed
@@ -341,3 +341,141 @@ def crear_registro(numero_op):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
+
+# ==================== OCR ENDPOINTS ====================
+
+@produccion_bp.route('/ocr/scan-registro', methods=['POST'])
+def scan_registro_ocr():
+    """
+    Escanea una imagen de un registro de producción y extrae los datos.
+    
+    Acepta:
+    - multipart/form-data con campo 'file' (imagen)
+    - JSON con campo 'image' (base64)
+    """
+    from app.services.ocr_service import extract_data_from_image, extract_from_base64
+    import os
+    
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return jsonify({'error': 'GEMINI_API_KEY not configured on server'}), 500
+    
+    try:
+        # Check if it's a file upload or base64
+        if request.files and 'file' in request.files:
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'error': 'No file selected'}), 400
+            image_bytes = file.read()
+            result = extract_data_from_image(image_bytes, api_key)
+        elif request.json and 'image' in request.json:
+            base64_image = request.json['image']
+            result = extract_from_base64(base64_image, api_key)
+        else:
+            return jsonify({'error': 'No image provided. Send file or base64 image.'}), 400
+        
+        return jsonify(result), 200 if result.get('success') else 500
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== CONTROL DE PESO ENDPOINTS ====================
+
+@produccion_bp.route('/registros/<int:registro_id>/bultos', methods=['GET'])
+def listar_bultos(registro_id):
+    """
+    Lista los bultos pesados asociados a un Registro de Producción.
+    """
+    from app.models.control_peso import ControlPeso
+    
+    bultos = ControlPeso.query.filter_by(registro_id=registro_id).order_by(ControlPeso.hora_registro.asc()).all()
+    results = [b.to_dict() for b in bultos]
+    
+    return jsonify(results), 200
+
+@produccion_bp.route('/registros/<int:registro_id>/bultos', methods=['POST'])
+def agregar_bulto(registro_id):
+    """
+    Registra el peso de un bulto.
+    Payload:
+    {
+        "peso": 15.4,     # Kg
+        "color": "ROJO",  # String o ID
+        "color_id": 5     # Opcional si se usa ID
+    }
+    """
+    from app.models.control_peso import ControlPeso
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Payload JSON requerido'}), 400
+        
+    registro = db.session.get(RegistroDiarioProduccion, registro_id)
+    if not registro:
+        return jsonify({'error': 'Registro no encontrado'}), 404
+        
+    try:
+        nuevo_bulto = ControlPeso(
+            registro_id=registro_id,
+            peso_real_kg=data.get('peso'),
+            color_nombre=data.get('color'),
+            color_id=data.get('color_id'),
+            hora_registro=datetime.now(timezone.utc)
+        )
+        db.session.add(nuevo_bulto)
+        db.session.commit()
+        
+        return jsonify(nuevo_bulto.to_dict()), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@produccion_bp.route('/bultos/<int:bulto_id>', methods=['DELETE'])
+def eliminar_bulto(bulto_id):
+    """
+    Elimina un registro de peso (bulto).
+    """
+    from app.models.control_peso import ControlPeso
+    
+    bulto = db.session.get(ControlPeso, bulto_id)
+    if not bulto:
+        return jsonify({'error': 'Bulto no encontrado'}), 404
+        
+    try:
+        db.session.delete(bulto)
+        db.session.commit()
+        return jsonify({'message': 'Bulto eliminado'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+@produccion_bp.route('/registros/<int:registro_id>/validacion-peso', methods=['GET'])
+def validar_peso_registro(registro_id):
+    """
+    Compara el peso total reportado en la cabecera vs la suma de bultos pesados.
+    """
+    from app.models.control_peso import ControlPeso
+    
+    registro = db.session.get(RegistroDiarioProduccion, registro_id)
+    if not registro:
+        return jsonify({'error': 'Registro no encontrado'}), 404
+        
+    # Sumar pesos de bultos
+    bultos = ControlPeso.query.filter_by(registro_id=registro_id).all()
+    total_pesado_kg = sum(b.peso_real_kg for b in bultos)
+    
+    # Peso reportado por maquinista (teórico o manual si existiera campo manual total)
+    # Usamos total_kg_real que es el calculado en base a coladas x peso_tiro
+    peso_teorico_kg = registro.total_kg_real
+    
+    diferencia = total_pesado_kg - peso_teorico_kg
+    
+    return jsonify({
+        'registro_id': registro.id,
+        'total_pesado_kg': round(total_pesado_kg, 2),
+        'peso_teorico_kg': round(peso_teorico_kg, 2),
+        'diferencia_kg': round(diferencia, 2),
+        'coincide': abs(diferencia) < 5.0 # Margen de tolerancia ejemplo 5kg
+    }), 200

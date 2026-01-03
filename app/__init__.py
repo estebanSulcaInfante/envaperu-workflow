@@ -12,7 +12,7 @@ def create_app():
     # --- IMPORTAR MODELOS ---
     # Es crucial importar los modelos aquí para que SQLAlchemy los registre
     # antes de que cualquier blueprint intente usarlos.
-    from app.models import orden, lote, materiales, recetas, producto
+    from app.models import orden, lote, materiales, recetas, producto, registro, control_peso
 
     # --- REGISTRO DE RUTAS ---
     from app.api.rutas_produccion import produccion_bp
