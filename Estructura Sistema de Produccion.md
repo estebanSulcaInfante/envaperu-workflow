@@ -17,12 +17,14 @@ Es la entidad padre (`OrdenProduccion`). Contiene la configuración técnica de 
 | **Máquina** | Input (Usuario) | ID de la máquina asignada. | - |
 | **Tipo Máquina** | Input (Usuario) | Clasificación técnica (ej. Hidráulica 500T). | - |
 | **Tipo de Orden** | Input (Select) | Estrategia: *Por Peso, Por Cantidad, Stock*. | - |
-| **T/C (Ciclo)** | Input (Técnico) | Tiempo de ciclo en segundos. | - |
+| **Activa** | Automático | Estado de la orden (abierta/cerrada). Default: `true`. Una OP cerrada no permite crear nuevos Registros Diarios. | `Boolean` |
+| **Tiempo Ciclo (seg)** | Input (Técnico) | Duración de un ciclo de inyección en segundos. | - |
 | **P Unit (g)** | Input (Técnico) | Peso de una pieza limpia. | - |
 | **Cavidades** | Input (Técnico) | Número de piezas por golpe. | - |
 | **P Inc Cola (g)** | Input (Técnico) | Peso total del tiro (Piezas + Colada). | - |
 | **Ciclos** | Input (Técnico) | Cantidad de ciclos teóricos (si aplica). | - |
 | **Horas Turno** | Input (Técnico) | Horas laborales por día (ej. 23 o 24). | - |
+| **T/C (Tipo Cambio)** | Input (Finanzas) | Tipo de cambio USD/PEN al crear la orden (para costeo). | - |
 
 ---
 
@@ -157,3 +159,113 @@ Estructura de respuesta sugerida para el endpoint `GET /api/ordenes/<id>`. Inclu
     "Peso Kg REAL PARA ENTREGAR A MAQUINA": 1062.00
   }
 }
+```
+
+---
+
+## 7. Entidad: Registro Diario de Producción (Hoja de Producción)
+
+Representa la "Hoja de Producción" física que se llena por turno. Es hija de `OrdenProduccion` y contiene la producción real reportada por los maquinistas.
+
+| Atributo / Campo | Origen de Dato | Descripción | Fórmula / Lógica |
+| :--- | :--- | :--- | :--- |
+| **ID Registro** | Auto (BD) | Identificador único del registro diario. | `AUTOINCREMENT` |
+| **Orden ID (FK)** | Selección | Referencia a la Orden de Producción padre. | - |
+| **Máquina ID (FK)** | Selección | Máquina donde se ejecutó la producción. | - |
+| **Fecha** | Input (Manual) | Fecha del turno de producción. | - |
+| **Turno** | Input (Select) | DIURNO, NOCTURNO, o EXTRA. | - |
+| **Hora Inicio** | Input (Manual) | Hora de arranque (ej. 07:00). | - |
+| **Colada Inicial** | Input (Manual) | Contador de la máquina al inicio del turno. | - |
+| **Colada Final** | Input (Manual) | Contador de la máquina al final del turno. | - |
+| **Tiempo Ciclo Reportado** | Input (Manual) | T/C observado en el panel (segundos). | - |
+| **Tiempo Enfriamiento** | Input (Manual) | Tiempo de enfriamiento observado (seg). | - |
+
+### Snapshots (Captura al Crear)
+
+Se copian de la `OrdenProduccion` al momento de crear el registro para mantener consistencia histórica.
+
+| Atributo | Origen | Descripción |
+| :--- | :--- | :--- |
+| **snapshot_cavidades** | Orden | Número de cavidades al crear el registro. |
+| **snapshot_peso_neto_gr** | Orden | Peso unitario de pieza (gramos). |
+| **snapshot_peso_colada_gr** | Orden | Peso del ramal/colada (gramos). |
+
+### Totalizadores (Calculados)
+
+| Atributo | Descripción | Fórmula |
+| :--- | :--- | :--- |
+| **Total Coladas** | Ciclos realizados en el turno. | `colada_final - colada_inicial` |
+| **Total Piezas** | Piezas buenas producidas. | `total_coladas * snapshot_cavidades` |
+| **Total Kg Real** | Peso teórico producido (antes de pesaje). | `(total_coladas * peso_tiro_gr) / 1000` |
+
+> **Nota:** `peso_tiro_gr = (snapshot_peso_neto_gr * snapshot_cavidades) + snapshot_peso_colada_gr`
+
+---
+
+## 8. Entidad: Detalle Producción Hora (Tabla Interna)
+
+Cada `RegistroDiarioProduccion` tiene N filas de detalle, una por cada hora trabajada. Permite el seguimiento hora-a-hora.
+
+| Atributo | Origen | Descripción |
+| :--- | :--- | :--- |
+| **Hora** | Auto | Franja horaria (ej. "07:00 - 08:00"). |
+| **Maquinista** | Input | Nombre del operador en esa hora. |
+| **Color** | Input | Color producido (puede cambiar por hora). |
+| **Coladas Realizadas** | Input | Cantidad de ciclos en esa hora. |
+| **Observación** | Input | Notas (parada, cambio de molde, etc.). |
+| **Cantidad Piezas** | Calculado | `coladas_realizadas * cavidades` |
+| **Kg Producidos** | Calculado | `(coladas_realizadas * peso_tiro_gr) / 1000` |
+
+---
+
+## 9. Entidad: Control de Peso (Doble Verificación)
+
+Sistema de pesaje individual de "bultos" para contrastar con la producción reportada. Sirve como doble verificación y control de calidad.
+
+| Atributo | Origen | Descripción |
+| :--- | :--- | :--- |
+| **ID** | Auto | Identificador del pesaje. |
+| **Registro ID (FK)** | Sistema | Vinculado al Registro Diario padre. |
+| **Peso Real (Kg)** | Input/Balanza | Peso medido del bulto. |
+| **Color** | Input | Color o identificador del bulto. |
+| **Hora Registro** | Automático | Timestamp del pesaje. |
+
+### Validación de Peso
+
+| Métrica | Descripción | Fórmula |
+| :--- | :--- | :--- |
+| **Total Pesado** | Suma de todos los bultos. | `SUM(peso_real_kg)` |
+| **Peso Teórico** | Peso calculado del registro. | `registro.total_kg_real` |
+| **Diferencia** | Discrepancia entre ambos. | `total_pesado - peso_teorico` |
+| **Coincide** | Validación con tolerancia. | `ABS(diferencia) < 5 Kg` |
+
+---
+
+## 10. Estructura JSON: Registro Diario (Referencia)
+
+Estructura de respuesta sugerida para `GET /api/ordenes/<op>/registros`.
+
+```json
+{
+  "ID Registro": 1,
+  "FECHA": "2023-11-21",
+  "Turno": "DIURNO",
+  "Maquina": "INY-05",
+  "Hora Inicio": "07:00",
+  "Colada Ini": 1000,
+  "Colada Fin": 1500,
+  "Total Coladas (Calc)": 500,
+  "Total Piezas (Est)": 1000,
+  "Total Kg (Est)": 87.0,
+  "detalles": [
+    {
+      "hora": "07:00 - 08:00",
+      "maquinista": "Juan Perez",
+      "color": "AMARILLO",
+      "coladas": 50,
+      "piezas": 100,
+      "kg": 8.7
+    }
+  ]
+}
+```

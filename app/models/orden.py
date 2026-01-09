@@ -37,6 +37,9 @@ class OrdenProduccion(db.Model):
     
     # T/C: Tipo de Cambio al momento de crear la orden
     tipo_cambio = db.Column(db.Float, nullable=True)
+    
+    # Estado de la orden (True = abierta para registros, False = cerrada)
+    activa = db.Column(db.Boolean, default=True)
 
     # Relaciones
     # Relaciones
@@ -246,6 +249,7 @@ class OrdenProduccion(db.Model):
             'ciclo_seg': self.tiempo_ciclo,
             'tipo': self.tipo_estrategia,
             'meta_kg': self.meta_total_kg,
+            'activa': self.activa,
             'lotes': [lote.to_dict() for lote in self.lotes],
             'resumen_totales': self._round_dict(self.resumen_totales)
         }

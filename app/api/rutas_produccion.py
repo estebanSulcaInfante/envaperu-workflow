@@ -130,6 +130,32 @@ def obtener_orden(numero_op):
     return jsonify(orden.to_dict()), 200
 
 
+@produccion_bp.route('/ordenes/<numero_op>/estado', methods=['PUT'])
+def toggle_estado_orden(numero_op):
+    """
+    Cambia el estado de una Orden (activa/cerrada).
+    Payload: { "activa": true/false }
+    """
+    orden = db.session.get(OrdenProduccion, numero_op)
+    if not orden:
+        return jsonify({'error': 'Orden no encontrada'}), 404
+    
+    data = request.get_json()
+    if data is None or 'activa' not in data:
+        return jsonify({'error': 'Campo activa requerido'}), 400
+    
+    try:
+        orden.activa = bool(data['activa'])
+        db.session.commit()
+        return jsonify({
+            'message': f"Orden {'abierta' if orden.activa else 'cerrada'} correctamente",
+            'activa': orden.activa
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
 @produccion_bp.route('/ordenes/<numero_op>/excel', methods=['GET'])
 def descargar_excel(numero_op):
     """
@@ -261,6 +287,56 @@ def listar_registros(numero_op):
         
     return jsonify(resultados), 200
 
+
+@produccion_bp.route('/registros', methods=['GET'])
+def obtener_todos_registros():
+    """
+    Obtiene todos los registros diarios de producción (para dashboard y vista global).
+    Soporta filtros: ?fecha=YYYY-MM-DD&orden_id=OP-XXX&limit=N
+    """
+    from datetime import date
+    
+    query = RegistroDiarioProduccion.query
+    
+    # Filtros opcionales
+    fecha_str = request.args.get('fecha')
+    if fecha_str:
+        try:
+            fecha_filter = datetime.fromisoformat(fecha_str).date()
+            query = query.filter(RegistroDiarioProduccion.fecha == fecha_filter)
+        except:
+            pass
+    
+    orden_id = request.args.get('orden_id')
+    if orden_id:
+        query = query.filter(RegistroDiarioProduccion.orden_id == orden_id)
+    
+    limit = request.args.get('limit', type=int)
+    
+    query = query.order_by(RegistroDiarioProduccion.fecha.desc(), RegistroDiarioProduccion.id.desc())
+    
+    if limit:
+        registros = query.limit(limit).all()
+    else:
+        registros = query.all()
+    
+    resultados = []
+    for r in registros:
+        fila = {
+            "id": r.id,
+            "orden_id": r.orden_id,
+            "fecha": r.fecha.isoformat() if r.fecha else None,
+            "turno": r.turno,
+            "maquina_id": r.maquina_id,
+            "total_coladas": r.total_coladas_calculada,
+            "total_kg": r.total_kg_real,
+            "total_piezas": r.total_piezas_buenas,
+            "orden_activa": r.orden.activa if r.orden else True
+        }
+        resultados.append(fila)
+        
+    return jsonify(resultados), 200
+
 @produccion_bp.route('/ordenes/<numero_op>/registros', methods=['POST'])
 def crear_registro(numero_op):
     """
@@ -289,6 +365,10 @@ def crear_registro(numero_op):
         return jsonify({'error': 'Orden no encontrada'}), 404
         
     try:
+        # Validar que la orden esté activa
+        if not orden.activa:
+            return jsonify({'error': 'No se pueden crear registros para una Orden cerrada'}), 400
+            
         # Validar minimos
         if 'maquina_id' not in data or 'fecha' not in data:
              return jsonify({'error': 'Faltan campos obligatorios (maquina_id, fecha)'}), 400
