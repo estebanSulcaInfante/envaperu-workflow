@@ -27,6 +27,10 @@ def test_lote_polimorfismo_completo(client, app):
         l3 = LoteColor(numero_op=orden_peso.numero_op, color_nombre="Azul")
         db.session.add_all([l1, l2, l3])
         db.session.commit()
+        
+        # Actualizar métricas
+        orden_peso.actualizar_metricas()
+        db.session.commit()
 
         # VALIDACIÓN LOTE 1
         data = l1.to_dict()
@@ -56,6 +60,10 @@ def test_lote_polimorfismo_completo(client, app):
         l_c1 = LoteColor(numero_op=orden_cant.numero_op, color_nombre="Amarillo")
         l_c2 = LoteColor(numero_op=orden_cant.numero_op, color_nombre="Negro")
         db.session.add_all([l_c1, l_c2])
+        db.session.commit()
+        
+        # Actualizar métricas
+        orden_cant.actualizar_metricas()
         db.session.commit()
 
         # VALIDACIÓN LOTE
@@ -90,6 +98,10 @@ def test_lote_polimorfismo_completo(client, app):
             stock_kg_manual=25.5 # Usuario escribió esto
         )
         db.session.add(l_s1)
+        db.session.commit()
+        
+        # Actualizar métricas
+        orden_stock.actualizar_metricas()
         db.session.commit()
 
         # VALIDACIÓN LOTE

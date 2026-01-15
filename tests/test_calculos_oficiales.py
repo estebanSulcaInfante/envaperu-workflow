@@ -33,6 +33,10 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
         db.session.add(op_peso)
         db.session.commit()
         
+        # Actualizar métricas calculadas
+        op_peso.actualizar_metricas()
+        db.session.commit()
+        
         # Obtenemos los cálculos
         data_peso = op_peso.to_dict()['resumen_totales']
         
@@ -79,6 +83,10 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
             tiempo_ciclo=20.0
         )
         db.session.add(op_cant)
+        db.session.commit()
+        
+        # Actualizar métricas calculadas
+        op_cant.actualizar_metricas()
         db.session.commit()
         
         data_cant = op_cant.to_dict()['resumen_totales']
@@ -131,6 +139,10 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
         l1 = LoteColor(numero_op=op_stock.numero_op, color_nombre="A", stock_kg_manual=50.0)
         l2 = LoteColor(numero_op=op_stock.numero_op, color_nombre="B", stock_kg_manual=50.0)
         db.session.add_all([l1, l2])
+        db.session.commit()
+        
+        # Actualizar métricas calculadas
+        op_stock.actualizar_metricas()
         db.session.commit()
         
         data_stock = op_stock.to_dict()['resumen_totales']

@@ -110,7 +110,12 @@ class Pieza(db.Model):
     linea = db.Column(db.String(50))
     familia = db.Column(db.String(100))
     
-    # Eliminada FK directa, ahora se usa tabla intermedia ProductoPieza
+    # Tipo de pieza: SIMPLE, KIT, COMPONENTE
+    tipo = db.Column(db.String(20), default="SIMPLE")
+    
+    # Relación 1:N con Molde (1 Molde → N Piezas, 1 Pieza → 1 Molde)
+    molde_id = db.Column(db.String(50), db.ForeignKey('molde.codigo'), nullable=True)
+    molde = db.relationship('Molde', backref=db.backref('piezas_producidas', lazy='dynamic'))
     
     cod_pieza = db.Column(db.Integer)
     piezas = db.Column(db.String(200)) # Nombre Pieza
@@ -154,3 +159,39 @@ class Pieza(db.Model):
             return f"{self.cod_linea}{self.cod_pieza}{self.cod_col}{self.cod_extru}{c_int}"
         except:
             return None
+
+
+class PiezaComponente(db.Model):
+    """
+    Relación auto-referencial para Kits.
+    Un Kit (Pieza) puede tener múltiples componentes (otras Piezas).
+    """
+    __tablename__ = 'pieza_componente'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    
+    kit_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku'), nullable=False)
+    componente_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku'), nullable=False)
+    cantidad = db.Column(db.Integer, default=1)
+    
+    # Relaciones
+    kit = db.relationship('Pieza', foreign_keys=[kit_sku], backref='componentes')
+    componente = db.relationship('Pieza', foreign_keys=[componente_sku])
+    
+    # Constraint único
+    __table_args__ = (
+        db.UniqueConstraint('kit_sku', 'componente_sku', name='uq_pieza_componente'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'kit_sku': self.kit_sku,
+            'componente_sku': self.componente_sku,
+            'componente_nombre': self.componente.piezas if self.componente else None,
+            'cantidad': self.cantidad
+        }
+    
+    def __repr__(self):
+        return f'<PiezaComponente {self.kit_sku} -> {self.componente_sku} x{self.cantidad}>'
+

@@ -19,7 +19,11 @@ class OrdenProduccion(db.Model):
     producto_ref = db.relationship('ProductoTerminado', backref='ordenes')
 
     producto = db.Column(db.String(100)) # Nombre (Legacy o Cache Visual)
-    molde = db.Column(db.String(100))
+    molde = db.Column(db.String(100))    # Nombre legacy
+    
+    # --- RELACION A MOLDE (Catálogo) ---
+    molde_id = db.Column(db.String(50), db.ForeignKey('molde.codigo'), nullable=True)
+    molde_ref = db.relationship('Molde', backref='ordenes_produccion')
     
     # --- PARAMETROS TÉCNICOS ---
     peso_unitario_gr = db.Column(db.Float, default=0.0) 

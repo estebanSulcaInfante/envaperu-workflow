@@ -37,6 +37,10 @@ def test_calculo_materiales_con_merma(client, app):
         receta = SeCompone(lote_id=lote.id, materia_prima_id=mp.id, fraccion=1.0)
         db.session.add(receta)
         db.session.commit()
+        
+        # Actualizar métricas en cascada
+        orden.actualizar_metricas()
+        db.session.commit()
 
         # Cálculos Esperados
         # 1. Merma %
