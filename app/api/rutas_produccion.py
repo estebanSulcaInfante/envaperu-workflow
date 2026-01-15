@@ -134,8 +134,16 @@ def obtener_orden(numero_op):
 def toggle_estado_orden(numero_op):
     """
     Cambia el estado de una Orden (activa/cerrada).
-    Payload: { "activa": true/false }
+    Registra el cambio en el historial.
+    
+    Payload: { 
+        "activa": true/false,
+        "usuario": "opcional",
+        "motivo": "opcional"
+    }
     """
+    from app.models.historial_estado import registrar_cambio_estado
+    
     orden = db.session.get(OrdenProduccion, numero_op)
     if not orden:
         return jsonify({'error': 'Orden no encontrada'}), 404
@@ -145,15 +153,49 @@ def toggle_estado_orden(numero_op):
         return jsonify({'error': 'Campo activa requerido'}), 400
     
     try:
-        orden.activa = bool(data['activa'])
-        db.session.commit()
+        nuevo_estado = bool(data['activa'])
+        usuario = data.get('usuario')
+        motivo = data.get('motivo')
+        
+        historial = registrar_cambio_estado(orden, nuevo_estado, usuario, motivo)
+        
+        if not historial:
+            return jsonify({
+                'message': 'Sin cambios (mismo estado)',
+                'activa': orden.activa
+            }), 200
+        
         return jsonify({
             'message': f"Orden {'abierta' if orden.activa else 'cerrada'} correctamente",
-            'activa': orden.activa
+            'activa': orden.activa,
+            'historial': historial.to_dict()
         }), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
+
+@produccion_bp.route('/ordenes/<numero_op>/historial', methods=['GET'])
+def obtener_historial_orden(numero_op):
+    """
+    Retorna el historial de cambios de estado de una orden.
+    Ordenado del más reciente al más antiguo.
+    """
+    from app.models.historial_estado import HistorialEstadoOrden
+    
+    orden = db.session.get(OrdenProduccion, numero_op)
+    if not orden:
+        return jsonify({'error': 'Orden no encontrada'}), 404
+    
+    historial = HistorialEstadoOrden.query.filter_by(
+        numero_op=numero_op
+    ).order_by(HistorialEstadoOrden.fecha.desc()).all()
+    
+    return jsonify({
+        'numero_op': numero_op,
+        'activa': orden.activa,
+        'historial': [h.to_dict() for h in historial]
+    })
 
 
 @produccion_bp.route('/ordenes/<numero_op>/excel', methods=['GET'])

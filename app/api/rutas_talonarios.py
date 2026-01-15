@@ -147,3 +147,64 @@ def consumir_correlativo():
         'talonario_id': talonario.id,
         'disponibles_restantes': talonario.disponibles
     })
+
+
+@talonarios_bp.route('/reservar', methods=['POST'])
+def reservar_correlativos():
+    """
+    Reserva múltiples correlativos para cache offline de un dispositivo.
+    
+    Request:
+    {
+        "cantidad": 100
+    }
+    
+    Response:
+    {
+        "correlativos": [30001, 30002, ...],
+        "cantidad": 100,
+        "disponibles_restantes": 400
+    }
+    """
+    data = request.get_json() or {}
+    cantidad = min(int(data.get('cantidad', 100)), 500)  # Max 500 por request
+    
+    correlativos = []
+    
+    while len(correlativos) < cantidad:
+        talonario = Talonario.query.filter(
+            Talonario.activo == True,
+            db.or_(
+                Talonario.ultimo_usado.is_(None),
+                Talonario.ultimo_usado < Talonario.hasta
+            )
+        ).order_by(Talonario.desde).first()
+        
+        if not talonario:
+            break  # No hay más disponibles
+        
+        # Cuántos quedan en este talonario
+        disponibles_talonario = talonario.disponibles
+        a_consumir = min(disponibles_talonario, cantidad - len(correlativos))
+        
+        for _ in range(a_consumir):
+            corr = talonario.consumir()
+            if corr:
+                correlativos.append(corr)
+    
+    db.session.commit()
+    
+    if not correlativos:
+        return jsonify({
+            'error': 'No hay correlativos disponibles',
+            'correlativos': [],
+            'cantidad': 0
+        }), 404
+    
+    return jsonify({
+        'correlativos': correlativos,
+        'cantidad': len(correlativos),
+        'disponibles_restantes': Talonario.query.filter_by(activo=True).with_entities(
+            db.func.sum(Talonario.hasta - db.func.coalesce(Talonario.ultimo_usado, Talonario.desde - 1))
+        ).scalar() or 0
+    })
