@@ -18,12 +18,12 @@ Es la entidad padre (`OrdenProduccion`). Contiene la configuración técnica de 
 | **Tipo Máquina** | Input (Usuario) | Clasificación técnica (ej. Hidráulica 500T). | - |
 | **Tipo de Orden** | Input (Select) | Estrategia: *Por Peso, Por Cantidad, Stock*. | - |
 | **Activa** | Automático | Estado de la orden (abierta/cerrada). Default: `true`. Una OP cerrada no permite crear nuevos Registros Diarios. | `Boolean` |
-| **Tiempo Ciclo (seg)** | Input (Técnico) | Duración de un ciclo de inyección en segundos. | - |
-| **P Unit (g)** | Input (Técnico) | Peso de una pieza limpia. | - |
-| **Cavidades** | Input (Técnico) | Número de piezas por golpe. | - |
-| **P Inc Cola (g)** | Input (Técnico) | Peso total del tiro (Piezas + Colada). | - |
+| **Snapshot T. Ciclo (seg)** | Input (Técnico) | Duración de un ciclo de inyección en segundos (Snapshot). | - |
+| **Snapshot P Unit (g)** | Input (Técnico) | Peso de una pieza limpia (Snapshot). | - |
+| **Snapshot Cavidades** | Input (Técnico) | Número de piezas por golpe (Snapshot). | - |
+| **Snapshot P Inc Cola (g)** | Input (Técnico) | Peso total del tiro (Piezas + Colada) (Snapshot). | - |
 | **Ciclos** | Input (Técnico) | Cantidad de ciclos teóricos (si aplica). | - |
-| **Horas Turno** | Input (Técnico) | Horas laborales por día (ej. 23 o 24). | - |
+| **Snapshot Horas Turno** | Input (Técnico) | Horas laborales por día (ej. 23 o 24) (Snapshot). | - |
 | **T/C (Tipo Cambio)** | Input (Finanzas) | Tipo de cambio USD/PEN al crear la orden (para costeo). | - |
 
 ---

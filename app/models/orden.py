@@ -26,13 +26,13 @@ class OrdenProduccion(db.Model):
     molde_ref = db.relationship('Molde', backref='ordenes_produccion')
     
     # --- PARAMETROS TÉCNICOS ---
-    peso_unitario_gr = db.Column(db.Float, default=0.0) 
-    peso_inc_colada = db.Column(db.Float, default=0.0)
-    cavidades = db.Column(db.Integer, default=1)
+    snapshot_peso_unitario_gr = db.Column(db.Float, default=0.0) 
+    snapshot_peso_inc_colada = db.Column(db.Float, default=0.0)
+    snapshot_cavidades = db.Column(db.Integer, default=1)
     
-    tiempo_ciclo = db.Column(db.Float, default=0.0) 
+    snapshot_tiempo_ciclo = db.Column(db.Float, default=0.0) 
     ciclos = db.Column(db.Float) 
-    horas_turno = db.Column(db.Float, default=24.0) 
+    snapshot_horas_turno = db.Column(db.Float, default=24.0) 
 
     # --- ESTRATEGIA (STI) ---
     tipo_estrategia = db.Column(db.String(20), nullable=False)
@@ -98,9 +98,9 @@ class OrdenProduccion(db.Model):
         Tambien dispara la actualizacion en cascada a los Lotes hijos.
         """
         # Valores seguros
-        p_inc_colada = self.peso_inc_colada or 0.0
-        p_unit = self.peso_unitario_gr or 0.0
-        cavs = self.cavidades or 1
+        p_inc_colada = self.snapshot_peso_inc_colada or 0.0
+        p_unit = self.snapshot_peso_unitario_gr or 0.0
+        cavs = self.snapshot_cavidades or 1
         
         # 0. Actualizar contador de colores
         count = len(self.lotes)
@@ -168,12 +168,12 @@ class OrdenProduccion(db.Model):
         # 6. TIEMPOS ESTIMADOS
         horas = 0.0
         dias = 0.0
-        if p_inc_colada > 0 and self.tiempo_ciclo:
+        if p_inc_colada > 0 and self.snapshot_tiempo_ciclo:
             golpes = (peso_real_entregar * 1000) / p_inc_colada
-            segundos = golpes * self.tiempo_ciclo
+            segundos = golpes * self.snapshot_tiempo_ciclo
             horas = segundos / 3600
-            if self.horas_turno and self.horas_turno > 0:
-                dias = horas / self.horas_turno
+            if self.snapshot_horas_turno and self.snapshot_horas_turno > 0:
+                dias = horas / self.snapshot_horas_turno
         
         self.calculo_horas = horas
         self.calculo_dias = dias
@@ -221,7 +221,7 @@ class OrdenProduccion(db.Model):
             # Recalculamos docenas exactas inversa si es necesario, o usamos el guardado
             # En la version anterior 'Cantidad DOC' era float exacto, 'Total DOC' redondeado.
             # Aqui podemos derivarlo o guardarlo. 
-            'Cantidad DOC': (self.calculo_peso_produccion * 1000 / (self.peso_unitario_gr * 12)) if self.peso_unitario_gr and self.peso_unitario_gr > 0 else 0.0,
+            'Cantidad DOC': (self.calculo_peso_produccion * 1000 / (self.snapshot_peso_unitario_gr * 12)) if self.snapshot_peso_unitario_gr and self.snapshot_peso_unitario_gr > 0 else 0.0,
             'Total DOC': self.calculo_total_doc or 0.0,
             
             '% EXTRA': self.calculo_extra_pct or 0.0,
@@ -253,9 +253,9 @@ class OrdenProduccion(db.Model):
             'fecha': self.fecha_creacion.isoformat() if self.fecha_creacion else None,
             'fecha_inicio': self.fecha_inicio.isoformat() if self.fecha_inicio else None,
             'molde': self.molde,
-            'cavidades': self.cavidades,
-            'peso_tiro': self.peso_inc_colada,
-            'ciclo_seg': self.tiempo_ciclo,
+            'cavidades': self.snapshot_cavidades,
+            'peso_tiro': self.snapshot_peso_inc_colada,
+            'ciclo_seg': self.snapshot_tiempo_ciclo,
             'tipo': self.tipo_estrategia,
             'meta_kg': self.meta_total_kg,
             'activa': self.activa,

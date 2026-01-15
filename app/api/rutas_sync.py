@@ -3,6 +3,7 @@ from app.extensions import db
 from app.models.registro import RegistroDiarioProduccion
 from app.models.control_peso import ControlPeso
 from app.models.maquina import Maquina
+from app.models.orden import OrdenProduccion
 from datetime import datetime
 
 sync_bp = Blueprint('sync', __name__)
@@ -63,6 +64,12 @@ def sync_pesajes():
             ).first()
             
             if not rdp:
+                # Buscar Orden para snapshots
+                orden = db.session.get(OrdenProduccion, orden_id)
+                if not orden:
+                    errors.append({'local_id': p['local_id'], 'error': f"Orden {orden_id} no encontrada"})
+                    continue
+
                 # Crear RDP on-the-fly
                 rdp = RegistroDiarioProduccion(
                     orden_id=orden_id,
@@ -71,7 +78,11 @@ def sync_pesajes():
                     turno=turno,
                     hora_inicio="00:00", # Placeholder
                     colada_inicial=0,
-                    colada_final=0
+                    colada_final=0,
+                    # Snapshots
+                    snapshot_cavidades=orden.snapshot_cavidades,
+                    snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr,
+                    tiempo_ciclo_reportado=orden.snapshot_tiempo_ciclo or 0.0
                 )
                 db.session.add(rdp)
                 db.session.flush() # Para obtener ID

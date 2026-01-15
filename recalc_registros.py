@@ -13,7 +13,7 @@ with app.app_context():
         # Debug info
         print(f"DEBUG Reg {r.id}: OrdenID={r.orden_id}, OrdenObj={r.orden}")
         if r.orden:
-             print(f"   -> Orden PesoTiro: {r.orden.peso_inc_colada}")
+             print(f"   -> Orden PesoTiro: {r.orden.snapshot_peso_inc_colada}")
              
         r.actualizar_totales()
         print(f"   -> New Kg: {r.total_kg_real}")

@@ -24,11 +24,11 @@ def test_crear_orden_post(client, app): # Removed db argument
         "producto": "P1",
         "tipo_estrategia": "POR_PESO",
         "meta_total_kg": 100.0,
-        "peso_unitario_gr": 10.0,
-        "peso_inc_colada": 12.0,
-        "cavidades": 2,
-        "tiempo_ciclo": 10.0,
-        "horas_turno": 8.0,
+        "snapshot_peso_unitario_gr": 10.0,
+        "snapshot_peso_inc_colada": 12.0,
+        "snapshot_cavidades": 2,
+        "snapshot_tiempo_ciclo": 10.0,
+        "snapshot_horas_turno": 8.0,
         
         "lotes": [
             {
