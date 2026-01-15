@@ -11,6 +11,8 @@ from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, Familia
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.control_peso import ControlPeso
+from app.models.talonario import Talonario
+from app.models.molde import Molde, MoldePieza
 
 app = create_app()
 
@@ -272,6 +274,17 @@ def inicializar_bd():
         db.session.commit()
 
         # ---------------------------------------------------------
+        # 6. TALONARIOS RDP (Seed)
+        # ---------------------------------------------------------
+        talonario1 = Talonario(
+            desde=30001,
+            hasta=30500,
+            descripcion="Lote Inicial 2026"
+        )
+        db.session.add(talonario1)
+        db.session.commit()
+
+        # ---------------------------------------------------------
         # VERIFICACIÓN FINAL
         # ---------------------------------------------------------
         print("\n✅ ¡Base de Datos Inicializada con Éxito!")
@@ -285,6 +298,9 @@ def inicializar_bd():
         print(f"   Total Coladas: {reg_header.total_coladas_calculada}")
         print(f"   Detalles Hora: {len(detalles_muestra)}")
         print(f"   Bultos Pesados: {len(bultos_sample)}")
+        print("-" * 50)
+        print(f"📋 Talonario RDP: {talonario1.desde}-{talonario1.hasta}")
+        print(f"   Correlativos disponibles: {talonario1.disponibles}")
 
 if __name__ == "__main__":
     inicializar_bd()

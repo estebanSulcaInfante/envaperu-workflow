@@ -8,3 +8,4 @@ from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.control_peso import ControlPeso
 from app.models.molde import Molde, MoldePieza
+from app.models.talonario import Talonario
