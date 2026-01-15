@@ -125,8 +125,22 @@ class TestFlujoOPCompleto:
         # 7. Verificar en central (opcional, depende de si sync fue exitoso inmediato)
         # Podríamos consultar los registros de la OP
         print("7. Verificando en central...")
-        # (Aquí podríamos agregar un GET para verificar que los kilos subieron)
+        # Get OP details from Central to check calculations
+        # Esperar un momento para asegurar que el proceso Async o Sync termino (si fuera async)
+        time.sleep(1) 
         
+        resp_op = requests.get(f'{CENTRAL_URL}/api/ordenes/{op_numero}')
+        assert resp_op.status_code == 200
+        data_op_central = resp_op.json()
+        
+        real_kg = data_op_central.get('avance_real_kg', 0)
+        expected_kg = 10.5 + 11.2 + 9.8
+        print(f"   Avance Real Kg en Central: {real_kg} (Esperado: {expected_kg})")
+        
+        # Check exactness with small float tolerance
+        assert abs(real_kg - expected_kg) < 0.01, \
+            f"CALCULO INCORRECTO: Central tiene {real_kg}, se esperaba {expected_kg}"
+
         # 8. Cerrar OP con historial
         print("8. Cerrando OP...")
         response = requests.put(f'{CENTRAL_URL}/api/ordenes/{op_numero}/estado', json={

@@ -240,6 +240,11 @@ class OrdenProduccion(db.Model):
         }
 
     def to_dict(self):
+        # Calcular avance real sumando registros diarios
+        # Usamos 'or 0' para evitar None
+        avance_real_kg = sum([r.total_kg_real or 0.0 for r in self.registros_diarios])
+        avance_real_coladas = sum([r.total_coladas_calculada or 0 for r in self.registros_diarios])
+
         return {
             'numero_op': self.numero_op,
             'producto': self.producto,
@@ -255,7 +260,10 @@ class OrdenProduccion(db.Model):
             'meta_kg': self.meta_total_kg,
             'activa': self.activa,
             'lotes': [lote.to_dict() for lote in self.lotes],
-            'resumen_totales': self._round_dict(self.resumen_totales)
+            'resumen_totales': self._round_dict(self.resumen_totales),
+            # Datos de avance real
+            'avance_real_kg': round(avance_real_kg, 2),
+            'avance_real_coladas': avance_real_coladas
         }
 
     def _round_dict(self, data):

@@ -53,19 +53,58 @@ class RegistroDiarioProduccion(db.Model):
     def actualizar_totales(self):
         """
         Recalcula totales basados en contadores y detalles.
+        Si los contadores son 0, usa la suma de los detalles horarios.
         """
-        # Validator de contadores
-        if self.colada_final >= self.colada_inicial:
-            self.total_coladas_calculada = self.colada_final - self.colada_inicial
-        else:
-             self.total_coladas_calculada = 0
+        # 1. Calcular desde contadores
+        diff_contadores = 0
+        if self.colada_final is not None and self.colada_inicial is not None:
+             if self.colada_final >= self.colada_inicial:
+                diff_contadores = self.colada_final - self.colada_inicial
              
-        # Producción teórica basada en contadores
-        self.total_piezas_buenas = self.total_coladas_calculada * self.snapshot_cavidades
+        # 2. Calcular desde suma de horas (Fallback)
+        sum_detalles = 0
+        if self.detalles:
+             sum_detalles = sum([d.coladas_realizadas or 0 for d in self.detalles])
         
-        # Peso Teórico (Kg) = (Coladas * (PesoNeto + PesoColada)) / 1000
-        peso_tiro_gr = (self.snapshot_peso_neto_gr * self.snapshot_cavidades) + self.snapshot_peso_colada_gr
-        self.total_kg_real = (self.total_coladas_calculada * peso_tiro_gr) / 1000.0
+        # Calcular suma de Pesajes (ControlPeso) via Query directo para ver datos flushed
+        from app.models.control_peso import ControlPeso
+        from sqlalchemy import func
+        
+        sum_pesos_control = 0.0
+        # Check ID existence to avoid query on transient object if needed
+        if self.id:
+            q_sum = db.session.query(func.sum(ControlPeso.peso_real_kg)).filter(ControlPeso.registro_id == self.id).scalar()
+            sum_pesos_control = q_sum or 0.0
+            
+        print(f"DEBUG: updating totals query. ID: {self.id}, Sum: {sum_pesos_control}")
+
+        # 3. Decidir cuál usar para COLADAS
+        if diff_contadores > 0:
+            self.total_coladas_calculada = diff_contadores
+        else:
+            self.total_coladas_calculada = sum_detalles
+             
+        # Producción teórica (Piezas)
+        cavs = self.snapshot_cavidades or 1
+        self.total_piezas_buenas = self.total_coladas_calculada * cavs
+        
+        # 4. Decidir KG REAL
+        # Prioridad 1: Pesajes Reales (ControlPeso)
+        if sum_pesos_control > 0:
+            self.total_kg_real = sum_pesos_control
+        else:
+            # Prioridad 2: Calculo por Coladas * Peso Tiro
+            # Peso Teórico (Kg) = (Coladas * (PesoNeto + PesoColada)) / 1000
+            p_neto = self.snapshot_peso_neto_gr or 0.0
+            p_colada = self.snapshot_peso_colada_gr or 0.0
+            
+            peso_tiro_gr = (p_neto * cavs) + p_colada
+            
+            # Fallback: Si el snapshot es 0, intentar sacar de la orden actual (si existe)
+            if peso_tiro_gr == 0 and self.orden:
+                 peso_tiro_gr = self.orden.peso_inc_colada or 0.0
+                 
+            self.total_kg_real = (self.total_coladas_calculada * peso_tiro_gr) / 1000.0
 
     def to_dict(self):
         return {

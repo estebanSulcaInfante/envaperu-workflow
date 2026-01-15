@@ -18,10 +18,12 @@ def create_app():
     from app.api.rutas_produccion import produccion_bp
     from app.api.rutas_catalogo import catalogo_bp
     from app.api.rutas_talonarios import talonarios_bp
+    from app.api.rutas_sync import sync_bp
     
     # Todo lo que esté en ese archivo empezará con /api
     app.register_blueprint(produccion_bp, url_prefix='/api')
     app.register_blueprint(catalogo_bp, url_prefix='/api')
-    app.register_blueprint(talonarios_bp)  # Ya tiene url_prefix='/api/talonarios'
+    app.register_blueprint(talonarios_bp)
+    app.register_blueprint(sync_bp, url_prefix='/api')
 
     return app
