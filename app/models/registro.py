@@ -102,7 +102,7 @@ class RegistroDiarioProduccion(db.Model):
             
             # Fallback: Si el snapshot es 0, intentar sacar de la orden actual (si existe)
             if peso_tiro_gr == 0 and self.orden:
-                 peso_tiro_gr = self.orden.peso_inc_colada or 0.0
+                 peso_tiro_gr = self.orden.snapshot_peso_inc_colada or 0.0
                  
             self.total_kg_real = (self.total_coladas_calculada * peso_tiro_gr) / 1000.0
 

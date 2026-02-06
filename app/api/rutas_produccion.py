@@ -8,6 +8,8 @@ from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
+from app.models.producto import Pieza
+from app.models.producto import ProductoTerminado, ProductoPieza, ColorProducto
 from datetime import datetime, timezone
 
 # Definimos el "Blueprint" (un grupo de rutas)
@@ -23,15 +25,40 @@ def crear_orden():
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
 
+    # Validar campos obligatorios
+    if not data.get('numero_op'):
+        return jsonify({'error': 'Número de OP requerido'}), 400
+    if not data.get('maquina_id'):
+        return jsonify({'error': 'Máquina requerida'}), 400
+
     try:
-        # 1. Cabecera de Orden
+        # Validación N:M: Si hay Producto Y Molde, verificar compatibilidad
+        # Si solo hay Molde (sin Producto), se permite (Producción de Componente puro)
+        if data.get('producto_sku') and data.get('molde_id'):
+            prod_sku = data.get('producto_sku')
+            molde_code = data.get('molde_id')
+            
+            # Buscar si alguna pieza del molde pertenece al producto (N:M)
+            match_pieza = db.session.query(Pieza).join(ProductoPieza).filter(
+                ProductoPieza.producto_terminado_id == prod_sku,
+                Pieza.molde_id == molde_code
+            ).first()
+            
+            if not match_pieza:
+                # Advertencia pero no bloqueo estricto para componentes universales
+                # Cambiar a error si se requiere validación estricta
+                print(f"WARN: Molde '{molde_code}' no tiene piezas directas del producto '{prod_sku}'. Puede ser componente compartido.")
+
+
+        # ... (Cabecera Orden)
         nueva_orden = OrdenProduccion(
+            # ... (mismo código)
             numero_op=data.get('numero_op'),
             maquina_id=data.get('maquina_id'),
-            # tipo_maquina is derived from relation, not stored directly
             producto=data.get('producto'),
+            producto_sku=data.get('producto_sku'), 
             molde=data.get('molde'),
-            # cliente=data.get('cliente'), Removed
+            molde_id=data.get('molde_id'),
             tipo_estrategia=data.get('tipo_estrategia'),
             meta_total_kg=data.get('meta_total_kg'),
             meta_total_doc=data.get('meta_total_doc'),
@@ -43,14 +70,63 @@ def crear_orden():
             fecha_inicio=datetime.fromisoformat(data.get('fecha_inicio')) if data.get('fecha_inicio') else datetime.now(timezone.utc)
         )
         db.session.add(nueva_orden)
-        db.session.flush() # Para obtener nueva_orden.id
+        db.session.flush()
 
         # 2. Lotes
         lotes_data = data.get('lotes', [])
         for l_data in lotes_data:
+            
+            # ... (Color Resolution Logic)
+            color_id = l_data.get('color_id')
+            c_nombre = l_data.get('color_nombre')
+            
+            if not color_id and c_nombre:
+                # ... (Logic Color On-Fly same as before)
+                color_obj = ColorProducto.query.filter(ColorProducto.nombre.ilike(c_nombre)).first()
+                if color_obj:
+                    color_id = color_obj.id
+                else:
+                    try:
+                        max_codigo = db.session.query(db.func.max(ColorProducto.codigo)).scalar() or 0
+                        nuevo_color = ColorProducto(nombre=c_nombre.upper(), codigo=max_codigo + 1)
+                        db.session.add(nuevo_color)
+                        db.session.flush()
+                        color_id = nuevo_color.id
+                    except Exception as e:
+                        print(f"Error creating color on-the-fly: {e}")
+                        continue
+
+            # 2.2 AUTO-DISCOVERY SKU (Prioritizando Cabecera de Orden)
+            # Si la orden ya tiene un producto definido, intentamos usar ese primero.
+            # Solo si no calza (ej. Familia Color distinta), buscamos alternativa.
+            computed_sku = nueva_orden.producto_sku
+            
+            # Validar compatibilidad de Familia Color si es estricto
+            # Pero por ahora, para cumplir "Rol de Producto", asumimos que si el usuario eligió un producto
+            # y metió un lote, ese lote ES del producto.
+            # Solo si NO hay producto en la orden (caso raro), buscamos.
+            
+            if not computed_sku and nueva_orden.molde_id and color_id:
+                # Fallback: Auto-Discovery puro
+                color_seleccionado = ColorProducto.query.get(color_id)
+                familia_color_id = color_seleccionado.familia_id if color_seleccionado else None
+                
+                if familia_color_id:
+                    piezas_molde = [p.sku for p in Pieza.query.filter_by(molde_id=nueva_orden.molde_id).all()]
+                    if piezas_molde:
+                        match_prod = db.session.query(ProductoTerminado)\
+                            .join(ProductoPieza, ProductoPieza.producto_terminado_id == ProductoTerminado.cod_sku_pt)\
+                            .filter(
+                                ProductoPieza.pieza_sku.in_(piezas_molde),
+                                ProductoTerminado.familia_color_id == familia_color_id
+                            ).first()
+                        if match_prod:
+                            computed_sku = match_prod.cod_sku_pt
+
             nuevo_lote = LoteColor(
                 numero_op=nueva_orden.numero_op,
-                color_nombre=l_data.get('color_nombre'),
+                color_id=color_id, # DB Column
+                producto_sku_output=computed_sku, # DB Column
                 personas=l_data.get('personas', 1),
                 stock_kg_manual=l_data.get('stock_kg_manual')
             )
@@ -429,9 +505,10 @@ def crear_registro(numero_op):
             cantidad_por_hora_meta=data.get('meta_hora', 0),
             
             # Snapshots
-            snapshot_cavidades=orden.cavidades,
-            snapshot_peso_neto_gr=orden.peso_unitario_gr, # Asumiendo peso unit es pieza
-            snapshot_peso_colada_gr=0.0, # TO-DO: Agregar a Orden si hace falta
+            snapshot_cavidades=orden.snapshot_cavidades,
+            snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr, 
+            # Calcular peso colada (runner) si el peso total inyectado es mayor a la suma de piezas
+            snapshot_peso_colada_gr=max(0.0, (orden.snapshot_peso_inc_colada or 0.0) - ((orden.snapshot_peso_unitario_gr or 0.0) * (orden.snapshot_cavidades or 1))),
             snapshot_peso_extra_gr=0.0
         )
         
@@ -604,3 +681,38 @@ def validar_peso_registro(registro_id):
 
 
 
+@produccion_bp.route('/ordenes/<numero_op>/metricas', methods=['PUT'])
+def actualizar_metricas_orden(numero_op):
+    """
+    Permite editar metricas tecnicas de una orden ACTIVA.
+    Caso de uso: Molde Dañado (reduccion de cavidades), ajuste de ciclo real.
+    """
+    orden = db.session.get(OrdenProduccion, numero_op)
+    if not orden:
+        return jsonify({'error': 'Orden no encontrada'}), 404
+        
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Payload requerido'}), 400
+        
+    try:
+        # Solo permitimos editar ciertos campos tecnicos
+        if 'snapshot_cavidades' in data:
+            orden.snapshot_cavidades = data['snapshot_cavidades']
+            # OJO: Si cambia cavidades, cambian calculos base?
+            # Si, deberiamos llamar a orden.actualizar_metricas()
+            
+        if 'snapshot_tiempo_ciclo' in data:
+            orden.snapshot_tiempo_ciclo = data['snapshot_tiempo_ciclo']
+            
+        if 'snapshot_peso_inc_colada' in data:
+            orden.snapshot_peso_inc_colada = data['snapshot_peso_inc_colada']
+            
+        # Recalcular todo
+        orden.actualizar_metricas()
+        db.session.commit()
+        
+        return jsonify(orden.to_dict()), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500

@@ -38,8 +38,8 @@ def test_sync_pesajes_logic(client, app):
             molde="MOLDE TEST",
             tipo_estrategia='POR_PESO',
             meta_total_kg=100, 
-            peso_unitario_gr=1, 
-            peso_inc_colada=10
+            snapshot_peso_unitario_gr=1, 
+            snapshot_peso_inc_colada=10
         )
         db.session.add(op)
         

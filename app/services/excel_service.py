@@ -40,16 +40,16 @@ def generar_op_excel(orden) -> BytesIO:
     ws['C5'] = resumen.get('Cantidad DOC', 0)
     ws['B7'] = orden.molde or ''
     ws['C8'] = resumen.get('Días', 0)
-    ws['G8'] = orden.peso_unitario_gr or 0
-    ws['C9'] = orden.horas_turno or 24
-    ws['G9'] = orden.peso_inc_colada or 0
-    ws['C10'] = orden.cavidades or 1
+    ws['G8'] = orden.snapshot_peso_unitario_gr or 0
+    ws['C9'] = orden.snapshot_horas_turno or 24
+    ws['G9'] = orden.snapshot_peso_inc_colada or 0
+    ws['C10'] = orden.snapshot_cavidades or 1
     ws['G10'] = resumen.get('%Merma', 0)
     
     # Coladas por hora: 3600 / tiempo_ciclo
     coladas_hora = 0
-    if orden.tiempo_ciclo and orden.tiempo_ciclo > 0:
-        coladas_hora = 3600 / orden.tiempo_ciclo
+    if orden.snapshot_tiempo_ciclo and orden.snapshot_tiempo_ciclo > 0:
+        coladas_hora = 3600 / orden.snapshot_tiempo_ciclo
     ws['C11'] = coladas_hora
     
     # Rango de fechas
@@ -79,7 +79,7 @@ def generar_op_excel(orden) -> BytesIO:
         lote_data = lote.to_dict()
         
         # Nombre del color
-        ws[f'B{row}'] = lote.color_nombre
+        ws[f'B{row}'] = lote.color_rel.nombre if lote.color_rel else 'Sin Color'
         
         # Peso producción por color (peso base + extra)
         peso_lote = lote_data.get('TOTAL + EXTRA (Kg)', 0)
@@ -133,7 +133,7 @@ def generar_op_excel(orden) -> BytesIO:
     for i, lote in enumerate(lotes):
         row = 32 + i  # Filas 32-37
         
-        ws[f'B{row}'] = lote.color_nombre
+        ws[f'B{row}'] = lote.color_rel.nombre if lote.color_rel else 'Sin Color'
         
         # Procesar materiales del lote
         materiales_lote = {'VIRGEN': None, 'VIRGEN_2': None, 'MOLIDO': None}
@@ -225,7 +225,7 @@ def _llenar_colorantes_grupo(ws, lotes_grupo, start_header_row, start_data_row):
         col_nombre, col_gramos = columnas[idx]
         
         # Header: Nombre del color
-        ws[f'{col_nombre}{start_header_row}'] = lote.color_nombre
+        ws[f'{col_nombre}{start_header_row}'] = lote.color_rel.nombre if lote.color_rel else 'Sin Color'
         ws[f'{col_gramos}{start_header_row}'] = 'Gr.'
         
         # Colorantes (hasta 7 filas)

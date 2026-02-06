@@ -34,14 +34,14 @@ def test_listar_registros_json(client, app):
         db.session.add(maq)
         db.session.commit()
         
-        # Setup Orden
+        # Setup Orden (usando nombres snapshot_*)
         orden = OrdenProduccion(
             numero_op="OP-API-REG",
             maquina_id=maq.id,
             tipo_estrategia="POR_PESO",
-            peso_unitario_gr=50.0,
-            tiempo_ciclo=20.0,
-            cavidades=4
+            snapshot_peso_unitario_gr=50.0,
+            snapshot_tiempo_ciclo=20.0,
+            snapshot_cavidades=4
         )
         db.session.add(orden)
         db.session.commit()
@@ -57,8 +57,8 @@ def test_listar_registros_json(client, app):
             colada_final=1100, # 100 calc
             
             # Snapshots
-            snapshot_cavidades=orden.cavidades,
-            snapshot_peso_neto_gr=orden.peso_unitario_gr,
+            snapshot_cavidades=orden.snapshot_cavidades,
+            snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr,
             snapshot_peso_colada_gr=10.0
         )
         reg.actualizar_totales()
@@ -98,14 +98,14 @@ def test_crear_registro_api(client, app):
         db.session.add(maq)
         db.session.commit()
         
-        # Setup Orden
+        # Setup Orden (usando nombres snapshot_*)
         orden = OrdenProduccion(
             numero_op="OP-POST-REG",
             maquina_id=maq.id,
             tipo_estrategia="POR_PESO",
-            peso_unitario_gr=100.0,
-            tiempo_ciclo=30.0,
-            cavidades=2
+            snapshot_peso_unitario_gr=100.0,
+            snapshot_tiempo_ciclo=30.0,
+            snapshot_cavidades=2
         )
         db.session.add(orden)
         db.session.commit()
@@ -144,3 +144,4 @@ def test_crear_registro_api(client, app):
         assert reg_db is not None
         assert reg_db.total_coladas_calculada == 100
         assert len(reg_db.detalles) == 2
+

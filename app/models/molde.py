@@ -57,8 +57,8 @@ class Molde(db.Model):
         # Obtener lista de piezas (preferir relación directa)
         if hasattr(self, 'piezas_producidas') and self.piezas_producidas.count() > 0:
             piezas_list = [{
-                'sku': p.sku,
-                'nombre': p.piezas,
+                'pieza_sku': p.sku,
+                'pieza_nombre': p.piezas,
                 'cavidades': p.cavidad,
                 'peso_unitario_gr': p.peso
             } for p in self.piezas_producidas]

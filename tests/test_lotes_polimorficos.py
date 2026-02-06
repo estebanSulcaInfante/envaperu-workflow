@@ -1,6 +1,7 @@
 import pytest
 from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
+from app.models.producto import ColorProducto
 from app.extensions import db
 
 def test_lote_polimorfismo_completo(client, app):
@@ -16,15 +17,22 @@ def test_lote_polimorfismo_completo(client, app):
             numero_op="OP-TEST-PESO",
             tipo_estrategia="POR_PESO",
             meta_total_kg=600.0, # Input Global
-            peso_unitario_gr=10.0
+            snapshot_peso_unitario_gr=10.0
         )
         db.session.add(orden_peso)
         db.session.commit()
 
+        # Agregar colores para tests
+        c_rojo = ColorProducto(nombre="Rojo", codigo=1)
+        c_verde = ColorProducto(nombre="Verde", codigo=2)
+        c_azul = ColorProducto(nombre="Azul", codigo=3)
+        db.session.add_all([c_rojo, c_verde, c_azul])
+        db.session.commit()
+        
         # Agregamos 3 Lotes (Colores) -> La meta se debe dividir entre 3
-        l1 = LoteColor(numero_op=orden_peso.numero_op, color_nombre="Rojo")
-        l2 = LoteColor(numero_op=orden_peso.numero_op, color_nombre="Verde")
-        l3 = LoteColor(numero_op=orden_peso.numero_op, color_nombre="Azul")
+        l1 = LoteColor(numero_op=orden_peso.numero_op, color_id=c_rojo.id)
+        l2 = LoteColor(numero_op=orden_peso.numero_op, color_id=c_verde.id)
+        l3 = LoteColor(numero_op=orden_peso.numero_op, color_id=c_azul.id)
         db.session.add_all([l1, l2, l3])
         db.session.commit()
         
@@ -51,14 +59,20 @@ def test_lote_polimorfismo_completo(client, app):
             numero_op="OP-TEST-CANT",
             tipo_estrategia="POR_CANTIDAD",
             meta_total_doc=100.0,  # Input Global: 100 Docenas
-            peso_unitario_gr=50.0, # P.Unitario necesario para conversión
+            snapshot_peso_unitario_gr=50.0, # P.Unitario necesario para conversión
         )
         db.session.add(orden_cant)
         db.session.commit()
 
+        # Agregar colores para tests
+        c_amarillo = ColorProducto(nombre="Amarillo", codigo=4)
+        c_negro = ColorProducto(nombre="Negro", codigo=5)
+        db.session.add_all([c_amarillo, c_negro])
+        db.session.commit()
+        
         # Agregamos 2 Lotes -> Meta repartida entre 2
-        l_c1 = LoteColor(numero_op=orden_cant.numero_op, color_nombre="Amarillo")
-        l_c2 = LoteColor(numero_op=orden_cant.numero_op, color_nombre="Negro")
+        l_c1 = LoteColor(numero_op=orden_cant.numero_op, color_id=c_amarillo.id)
+        l_c2 = LoteColor(numero_op=orden_cant.numero_op, color_id=c_negro.id)
         db.session.add_all([l_c1, l_c2])
         db.session.commit()
         
@@ -91,10 +105,15 @@ def test_lote_polimorfismo_completo(client, app):
         db.session.add(orden_stock)
         db.session.commit()
 
+        # Agregar color para test
+        c_blanco = ColorProducto(nombre="Blanco", codigo=6)
+        db.session.add(c_blanco)
+        db.session.commit()
+        
         # Input Manual en el Lote (Stock manual)
         l_s1 = LoteColor(
             numero_op=orden_stock.numero_op, 
-            color_nombre="Blanco", 
+            color_id=c_blanco.id, 
             stock_kg_manual=25.5 # Usuario escribió esto
         )
         db.session.add(l_s1)

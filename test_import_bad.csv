@@ -1,0 +1,3 @@
+Cod Linea,Linea,Cod Familia,Familia,Cod Producto,Producto,Cod Color,Familia Color,COD SKU PT,PESO g.,Precio Estimado
+L1,Lin1,F1,Fam1,P1,Prod1,C1,Azul,SKU-BAD,BAD_WEIGHT,10.5
+L2,Lin2,F2,Fam2,P2,Prod2,C2,Rojo,SKU-GOOD,50.5,BAD_PRICE

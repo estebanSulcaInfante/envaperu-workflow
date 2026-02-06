@@ -1,6 +1,7 @@
 import pytest
 from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
+from app.models.producto import ColorProducto
 from app.extensions import db
 
 def test_calculos_tabla_auxiliar_por_estrategia(client, app):
@@ -24,11 +25,11 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
             meta_total_kg=1050.0,  # <-- INPUT USUARIO (D10)
             
             # Datos Técnicos (D7, E7, F7...)
-            peso_unitario_gr=87.0, # D7
-            cavidades=2,           # E7
-            peso_inc_colada=176.0, # F7 (Tiro)
-            tiempo_ciclo=30.0,
-            horas_turno=23.0
+            snapshot_peso_unitario_gr=87.0, # D7
+            snapshot_cavidades=2,           # E7
+            snapshot_peso_inc_colada=176.0, # F7 (Tiro)
+            snapshot_tiempo_ciclo=30.0,
+            snapshot_horas_turno=23.0
         )
         db.session.add(op_peso)
         db.session.commit()
@@ -77,10 +78,10 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
             tipo_estrategia="POR_CANTIDAD",
             meta_total_doc=100.0,  # <-- INPUT USUARIO (C10)
             
-            peso_unitario_gr=45.0,
-            cavidades=4,
-            peso_inc_colada=200.0, # Tiro más grande => Más merma
-            tiempo_ciclo=20.0
+            snapshot_peso_unitario_gr=45.0,
+            snapshot_cavidades=4,
+            snapshot_peso_inc_colada=200.0, # Tiro más grande => Más merma
+            snapshot_tiempo_ciclo=20.0
         )
         db.session.add(op_cant)
         db.session.commit()
@@ -128,16 +129,22 @@ def test_calculos_tabla_auxiliar_por_estrategia(client, app):
             numero_op="OP-STOCK-CALC",
             tipo_estrategia="STOCK",
             
-            peso_unitario_gr=100.0,
-            cavidades=1,
-            peso_inc_colada=110.0
+            snapshot_peso_unitario_gr=100.0,
+            snapshot_cavidades=1,
+            snapshot_peso_inc_colada=110.0
         )
         db.session.add(op_stock)
         db.session.commit()
         
         # Agregamos Lotes (Simulando input manual en columna E)
-        l1 = LoteColor(numero_op=op_stock.numero_op, color_nombre="A", stock_kg_manual=50.0)
-        l2 = LoteColor(numero_op=op_stock.numero_op, color_nombre="B", stock_kg_manual=50.0)
+        # Crear colores primero
+        c_a = ColorProducto(nombre="A", codigo=10)
+        c_b = ColorProducto(nombre="B", codigo=11)
+        db.session.add_all([c_a, c_b])
+        db.session.commit()
+        
+        l1 = LoteColor(numero_op=op_stock.numero_op, color_id=c_a.id, stock_kg_manual=50.0)
+        l2 = LoteColor(numero_op=op_stock.numero_op, color_id=c_b.id, stock_kg_manual=50.0)
         db.session.add_all([l1, l2])
         db.session.commit()
         

@@ -29,9 +29,9 @@ def test_control_peso_flow(client, app):
         "producto": "Producto Test Peso",
         "tipo_estrategia": "POR_CANTIDAD",
         "meta_total_doc": 100,
-        "peso_unitario_gr": 50.0, # 50g por pieza
-        "peso_inc_colada": 60.0,  # 60g tiro
-        "cavidades": 2,
+        "snapshot_peso_unitario_gr": 50.0, # 50g por pieza
+        "snapshot_peso_inc_colada": 60.0,  # 60g tiro
+        "snapshot_cavidades": 2,
         "maquina_id": 1
     }
     

@@ -18,17 +18,22 @@ def test_calculo_materiales_con_merma(client, app):
             numero_op="OP-MERMA-TEST",
             tipo_estrategia="POR_PESO",
             meta_total_kg=1000.0,
-            peso_unitario_gr=50.0,
-            peso_inc_colada=110.0, 
-            cavidades=2,
-            tiempo_ciclo=20.0,
-            horas_turno=24.0
+            snapshot_peso_unitario_gr=50.0,
+            snapshot_peso_inc_colada=110.0, 
+            snapshot_cavidades=2,
+            snapshot_tiempo_ciclo=20.0,
+            snapshot_horas_turno=24.0
         )
         db.session.add(orden)
         db.session.commit()
 
-        # Lote
-        lote = LoteColor(numero_op=orden.numero_op, color_nombre="A")
+        # Lote - crear color primero
+        from app.models.producto import ColorProducto
+        c_test = ColorProducto(nombre="A", codigo=1)
+        db.session.add(c_test)
+        db.session.commit()
+        
+        lote = LoteColor(numero_op=orden.numero_op, color_id=c_test.id)
         db.session.add(lote)
         db.session.commit()
 

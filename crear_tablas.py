@@ -7,7 +7,7 @@ from app.models.materiales import MateriaPrima, Colorante
 from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
-from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, FamiliaColor, ColorProducto
+from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, FamiliaColor, ColorProducto, Linea, Familia
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.control_peso import ControlPeso
@@ -63,25 +63,42 @@ def inicializar_bd():
         db.session.commit()
 
         # ---------------------------------------------------------
-        # 1.6 CATALOGO DE PRODUCTOS (Color, Pieza, Producto)
+        # 1.6 CATALOGO DE PRODUCTOS (Linea, Color, Pieza, Producto)
         # ---------------------------------------------------------
         
+        # Crear Líneas (REFACTORIZADO - entidad normalizada)
+        linea_industrial = Linea(codigo=1, nombre='INDUSTRIAL')
+        linea_hogar = Linea(codigo=2, nombre='HOGAR')
+        db.session.add_all([linea_industrial, linea_hogar])
+        db.session.flush()
+        
         # Familia y Colores de Producto
-        fam_solido = FamiliaColor(nombre="Solido")
+        # FamiliaColor ahora tiene código para ProductoTerminado
+        fam_solido = FamiliaColor(nombre="SOLIDO", codigo=1)
         db.session.add(fam_solido)
         db.session.flush()
 
         col_amarillo_prod = ColorProducto(nombre="Amarillo", codigo=1, familia_id=fam_solido.id)
         col_rojo_prod = ColorProducto(nombre="Rojo", codigo=2, familia_id=fam_solido.id)
-        db.session.add_all([col_amarillo_prod, col_rojo_prod])
+        col_azul_prod = ColorProducto(nombre="Azul", codigo=3, familia_id=fam_solido.id)
+        col_magenta_prod = ColorProducto(nombre="Magenta", codigo=4, familia_id=fam_solido.id)
+        col_verde_prod = ColorProducto(nombre="Verde", codigo=5, familia_id=fam_solido.id)
+        col_lila_prod = ColorProducto(nombre="Lila", codigo=6, familia_id=fam_solido.id)
+        
+        db.session.add_all([col_amarillo_prod, col_rojo_prod, col_azul_prod, col_magenta_prod, col_verde_prod, col_lila_prod])
+        db.session.flush()
+        
+        # Crear Familias (entidad normalizada - antes era campo string)
+        familia_baldes = Familia(codigo=10, nombre='BALDES')
+        db.session.add(familia_baldes)
         db.session.flush()
 
-        # Piezas
+        # Piezas (usando linea_id y familia_id FKs)
         pieza_balde = Pieza(
             sku="10101-BALDE",
             piezas="Cuerpo Balde 20L",
-            cod_linea=1, linea="Industrial",
-            familia="Baldes",
+            linea_id=linea_industrial.id,  # FK normalizada
+            familia_id=familia_baldes.id,   # FK normalizada
             cod_pieza=1,
             cod_col="01",
             tipo_color="Solido",
@@ -93,8 +110,8 @@ def inicializar_bd():
         pieza_asa = Pieza(
             sku="10102-ASA",
             piezas="Asa Balde 20L",
-            cod_linea=1, linea="Industrial",
-            familia="Baldes",
+            linea_id=linea_industrial.id,  # FK normalizada
+            familia_id=familia_baldes.id,   # FK normalizada
             cod_pieza=2,
             cod_col="01",
             tipo_color="Solido",
@@ -106,18 +123,20 @@ def inicializar_bd():
         db.session.add_all([pieza_balde, pieza_asa])
         db.session.flush()
 
-        # Producto Terminado
+        # Producto Terminado (usando linea_id y familia_id FKs)
         pt_balde_romano = ProductoTerminado(
             cod_sku_pt="PT-BALDE-ROMANO",
             producto="Balde Romano 20L Completo",
-            linea="Industrial", cod_linea_num=1,
-            familia="Baldes", cod_familia=10,
+            linea_id=linea_industrial.id,   # FK normalizada
+            familia_id=familia_baldes.id,   # FK normalizada
             cod_producto=100,
-            cod_color=1, familia_color="Solido",
-            color_id=col_amarillo_prod.id,
+            cod_familia_color=1,  # Código de FamiliaColor (antes cod_color)
+            familia_color="SOLIDO",
+            familia_color_id=fam_solido.id,  # FK a FamiliaColor
             um="UND",
             peso_g=650.0,
-            status="ACTIVO"
+            status="ACTIVO",
+            estado_revision="VERIFICADO"  # Datos de ejemplo ya verificados
         )
         db.session.add(pt_balde_romano)
         db.session.flush()
@@ -140,13 +159,13 @@ def inicializar_bd():
             molde="BALDE PLAYERO ROMANO",
             
             # --- PARAMETROS TÉCNICOS ---
-            peso_unitario_gr=87.0,
-            peso_inc_colada=176.0,
-            cavidades=2,
+            snapshot_peso_unitario_gr=650.0, # Peso real aprox Balde 20L
+            snapshot_peso_inc_colada=660.0,
+            snapshot_cavidades=1, # Balde grande suele ser 1 cavidad
             
             # --- TIEMPOS ---
-            tiempo_ciclo=30.0,
-            horas_turno=23.0,
+            snapshot_tiempo_ciclo=35.0,
+            snapshot_horas_turno=24.0,
             
             # --- ESTRATEGIA (Por Peso) ---
             tipo_estrategia="POR_PESO",
@@ -161,21 +180,30 @@ def inicializar_bd():
         # ---------------------------------------------------------
         
         # DATASET DE COLORES Y RECETAS
+        # Tupla: (Nombre Color, Pigmentos, Personas, Peso Asignado Kg)
         lotes_config = [
-            ("Amarillo", [(pig_amarillo, 30.0), (pig_dioxido, 5.0)], 1),
-            ("Azul",    [(pig_azul, 60.0), (pig_dioxido, 5.0)], 1),
-            ("Rojo",    [(pig_rojo, 40.0), (pig_dioxido, 5.0)], 1),
-            ("Magenta", [(pig_magenta, 40.0), (pig_dioxido, 5.0)], 1),
-            ("Verde",   [(pig_verde, 20.0), (pig_amarillo, 5.0), (pig_dioxido, 5.0)], 1),
-            ("Lila", [(pig_dioxido, 5.0), (pig_magenta, 40.0), (pig_azul, 42.0)], 1), 
+            ("Amarillo", [(pig_amarillo, 30.0), (pig_dioxido, 5.0)], 1, 175.0),
+            ("Azul",    [(pig_azul, 60.0), (pig_dioxido, 5.0)], 1, 175.0),
+            ("Rojo",    [(pig_rojo, 40.0), (pig_dioxido, 5.0)], 1, 175.0),
+            ("Magenta", [(pig_magenta, 40.0), (pig_dioxido, 5.0)], 1, 175.0),
+            ("Verde",   [(pig_verde, 20.0), (pig_amarillo, 5.0), (pig_dioxido, 5.0)], 1, 175.0),
+            ("Lila", [(pig_dioxido, 5.0), (pig_magenta, 40.0), (pig_azul, 42.0)], 1, 175.0), 
         ]
 
-        for nombre_color, lista_pigmentos, num_personas in lotes_config:
-            # Crear Lote
+        for nombre_color, lista_pigmentos, num_personas, peso_asignado in lotes_config:
+            # Buscar ID del color
+            color_obj = ColorProducto.query.filter_by(nombre=nombre_color).first()
+            if not color_obj:
+                print(f"⚠️ Color {nombre_color} no encontrado en catalogo, saltando...")
+                continue
+
+            # Crear Lote con ID
             lote = LoteColor(
                 numero_op=orden.numero_op,
-                color_nombre=nombre_color,
-                personas=num_personas
+                color_id=color_obj.id, # FK
+                personas=num_personas,
+                stock_kg_manual=peso_asignado, # Asignamos la parte de la meta a este lote
+                # producto_sku_output=... 
             )
             db.session.add(lote)
             db.session.flush() # Para ID
@@ -187,6 +215,10 @@ def inicializar_bd():
             # Receta Pigmentos (Dinámica)
             for pig_obj, dosis in lista_pigmentos:
                 db.session.add(SeColorea(lote_id=lote.id, colorante_id=pig_obj.id, gramos=dosis))
+        
+        # IMPORTANTE: Calcular métricas iniciales de la orden para poblar resumen_totales
+        orden.actualizar_metricas()
+        db.session.add(orden)
         
         db.session.commit()
 
@@ -212,8 +244,8 @@ def inicializar_bd():
             tiempo_enfriamiento=5.0,
             
             # Snapshots
-            snapshot_cavidades=orden.cavidades,
-            snapshot_peso_neto_gr=orden.peso_unitario_gr,
+            snapshot_cavidades=orden.snapshot_cavidades,
+            snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr,
             snapshot_peso_colada_gr=10.0,
             snapshot_peso_extra_gr=0.0
         )
@@ -290,9 +322,9 @@ def inicializar_bd():
         print("\n✅ ¡Base de Datos Inicializada con Éxito!")
         print("-" * 50)
         print(f"📄 Orden Generada: {orden.numero_op}")
-        print(f"   Producto: {orden.producto} ({orden.cavidades} cavidades)")
-        print(f"   Peso Tiro (inc. colada): {orden.peso_inc_colada} gr")
-        print(f"   T/C: {orden.tiempo_ciclo} seg")
+        print(f"   Producto: {orden.producto} ({orden.snapshot_cavidades} cavidades)")
+        print(f"   Peso Tiro (inc. colada): {orden.snapshot_peso_inc_colada} gr")
+        print(f"   T/C: {orden.snapshot_tiempo_ciclo} seg")
         print("-" * 50)
         print(f"📝 Registro Diario Generado: ID {reg_header.id}")
         print(f"   Total Coladas: {reg_header.total_coladas_calculada}")

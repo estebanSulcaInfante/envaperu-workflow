@@ -188,13 +188,14 @@ class OrdenProduccion(db.Model):
              fecha_fin = self.fecha_inicio + timedelta(days=dias)
         self.calculo_fecha_fin = fecha_fin
 
+
         # 7. FAMILIA COLOR (Cache desde Producto)
         self.calculo_familia_color = None
         if self.producto_ref:
-            # Opción A: sacar de relación ColorProducto -> Familia
+            # Opción A: sacar de relación FamiliaColor directa
+            if self.producto_ref.familia_color_rel:
+                self.calculo_familia_color = self.producto_ref.familia_color_rel.nombre
             # Opción B: sacar de columna legacy si no hay relación
-            if self.producto_ref.color_rel and self.producto_ref.color_rel.familia:
-                self.calculo_familia_color = self.producto_ref.color_rel.familia.nombre
             elif self.producto_ref.familia_color:
                 self.calculo_familia_color = self.producto_ref.familia_color
 

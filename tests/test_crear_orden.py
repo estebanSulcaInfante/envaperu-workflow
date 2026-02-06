@@ -16,6 +16,15 @@ def test_crear_orden_post(client, app): # Removed db argument
         db.session.commit()
         mp_id = mp.id
         col_id = col.id
+        
+        # Create ColorProducto for lookup
+        from app.models.producto import ColorProducto, FamiliaColor
+        fam = FamiliaColor(nombre="STD")
+        db.session.add(fam)
+        db.session.commit()
+        c_prod = ColorProducto(nombre="ROJO", codigo=10, familia=fam)
+        db.session.add(c_prod)
+        db.session.commit()
 
     payload = {
         "numero_op": "OP-API-TEST",
@@ -54,7 +63,8 @@ def test_crear_orden_post(client, app): # Removed db argument
     assert len(data['lotes']) == 1
     
     lote = data['lotes'][0]
-    assert lote['Color'] == "ROJO" # Keys updated in previous step
+    # assert lote['Color'] == "ROJO" # Now comes from logic, check if it works
+    assert lote['Color'] == "ROJO" # Should match created color
     assert lote['mano_obra']['personas'] == 3
     assert len(lote['materiales']) == 1
     assert lote['materiales'][0]['fraccion'] == 1.0

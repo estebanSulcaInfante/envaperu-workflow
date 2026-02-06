@@ -32,7 +32,7 @@ def generar_url_form(orden) -> str:
         'usp': 'pp_url',
         FORM_FIELDS['numero_op']: orden.numero_op or '',
         FORM_FIELDS['molde']: orden.molde or '',
-        FORM_FIELDS['peso_unitario']: str(int(orden.peso_unitario_gr)) if orden.peso_unitario_gr else '',
+        FORM_FIELDS['peso_unitario']: str(int(orden.snapshot_peso_unitario_gr)) if orden.snapshot_peso_unitario_gr else '',
         FORM_FIELDS['maquina']: orden.maquina_id or '',
     }
     

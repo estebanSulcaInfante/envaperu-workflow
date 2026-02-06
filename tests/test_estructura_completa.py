@@ -37,11 +37,11 @@ def test_estructura_completa_json(client, app):
             numero_op="OP-FULL-STRUCT",
             tipo_estrategia="POR_PESO",
             meta_total_kg=1000.0,
-            peso_unitario_gr=50.0,
-            peso_inc_colada=200.0, # 200g tiro
-            cavidades=4,
-            tiempo_ciclo=20.0,
-            horas_turno=24.0,
+            snapshot_peso_unitario_gr=50.0,
+            snapshot_peso_inc_colada=200.0, # 200g tiro
+            snapshot_cavidades=4,
+            snapshot_tiempo_ciclo=20.0,
+            snapshot_horas_turno=24.0,
             fecha_inicio=datetime.now(timezone.utc),
             maquina_id=maquina_test.id  # FK a Maquina
         )
@@ -49,9 +49,14 @@ def test_estructura_completa_json(client, app):
         db.session.commit()
 
         # 3. SETUP: LOTE (1 solo lote -> 1000kg)
+        # Necesitamos un ColorProducto real
+        c_prod_test = ColorProducto(nombre="AZUL TEST", codigo=99, familia_id=None)
+        db.session.add(c_prod_test)
+        db.session.commit()
+
         lote = LoteColor(
             numero_op=orden.numero_op,
-            color_nombre="AZUL TEST",
+            color_id=c_prod_test.id, # Usar ID
             personas=2 # 2 Operarios
         )
         db.session.add(lote)
@@ -124,7 +129,7 @@ def test_estructura_completa_json(client, app):
         # 7. VALIDACIÓN SKU Y FAMILIA COLOR (NUEVO REFACTOR)
         # ---------------------------------------------------------------------
         # A. Crear Entidades de Color
-        fam = FamiliaColor(nombre="TRANSPARENTE")
+        fam = FamiliaColor(nombre="TRANSPARENTE", codigo=50)  # Añadir codigo
         db.session.add(fam)
         db.session.commit()
         
@@ -132,18 +137,42 @@ def test_estructura_completa_json(client, app):
         db.session.add(col_prod)
         db.session.commit()
         
-        # B. Crear Producto con Color y verificar SKU
+        # B. Crear Producto con FamiliaColor (no ColorProducto) y verificar SKU
+        from app.models.producto import Linea, Familia
+        
+        # Get or create linea and familia
+        linea_test = Linea.query.filter_by(nombre='INDUSTRIAL').first()
+        if not linea_test:
+            linea_test = Linea(codigo=1, nombre='INDUSTRIAL')
+            db.session.add(linea_test)
+            db.session.flush()
+        
+        familia_test = Familia.query.filter_by(nombre='TEST').first()
+        if not familia_test:
+            familia_test = Familia(codigo=2, nombre='TEST')
+            db.session.add(familia_test)
+            db.session.flush()
+        
         pt = ProductoTerminado(
-            cod_linea_num=1,
-            cod_familia=2,
+            linea_id=linea_test.id,
+            familia_id=familia_test.id,
             cod_producto=3,
-            color_rel=col_prod, # Usando relacion
-            producto="BALDE ROJO TRANS"
+            familia_color_rel=fam,  # Usando relacion con FamiliaColor
+            familia_color="TRANSPARENTE",
+            cod_familia_color=50,
+            producto="BALDE ROJO TRANS",
+            estado_revision="IMPORTADO"  # Nuevo campo obligatorio
         )
+        
+        # Manually set backref relationships for SKU generation (before session)
+        pt.linea_rel = linea_test
+        pt.familia_rel = familia_test
+        
         # Generar SKU (deberia usar codigo 50)
         sku_gen = pt.generar_sku()
-        # Generar: 0 + 1 + 2 + 3 + 0 + 50 -> "0123050"
-        assert sku_gen == "0123050"
+        # Dynamic assertion: 0 + linea.codigo + familia.codigo + 3 + 0 + 50
+        expected_sku = f"0{linea_test.codigo}{familia_test.codigo}3050"
+        assert sku_gen == expected_sku, f"SKU mismatch. Expected {expected_sku}, got {sku_gen}"
         pt.cod_sku_pt = sku_gen
         db.session.add(pt)
         db.session.commit()
@@ -176,9 +205,9 @@ def test_estructura_completa_json(client, app):
             # horas_trabajadas=5.0, # Removed
             
             # Snapshots (Copiados de la Orden)
-            snapshot_cavidades=orden.cavidades, # 4
-            tiempo_ciclo_reportado=orden.tiempo_ciclo,
-            snapshot_peso_neto_gr=orden.peso_unitario_gr, # 50.0
+            snapshot_cavidades=orden.snapshot_cavidades, # 4
+            tiempo_ciclo_reportado=orden.snapshot_tiempo_ciclo,
+            snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr, # 50.0
             snapshot_peso_colada_gr=0.0,
             snapshot_peso_extra_gr=0.0
         )

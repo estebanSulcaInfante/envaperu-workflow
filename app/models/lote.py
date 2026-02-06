@@ -8,7 +8,16 @@ class LoteColor(db.Model):
     
     # Relación con el Padre
     numero_op = db.Column(db.String(20), db.ForeignKey('orden_produccion.numero_op'), nullable=False)
-    color_nombre = db.Column(db.String(50), nullable=False)
+    
+    # --- COLOR REAL (Refactor: FK a Tabla Colores) ---
+    color_id = db.Column(db.Integer, db.ForeignKey('color_producto.id'), nullable=True)
+    
+    # --- SKU SALIDA (Refactor: Link a Inventario) ---
+    producto_sku_output = db.Column(db.String(50), db.ForeignKey('producto_terminado.cod_sku_pt'), nullable=True)
+    
+    # Relaciones
+    color_rel = db.relationship('ColorProducto', backref='lotes')
+    producto_output = db.relationship('ProductoTerminado', foreign_keys=[producto_sku_output], backref='lotes_produccion')
 
     # --- INPUT MANUAL (Solo para estrategia STOCK) ---
     stock_kg_manual = db.Column(db.Float, nullable=True)
@@ -91,9 +100,9 @@ class LoteColor(db.Model):
         self.calculo_extra_kg = total_extra / n_colores
         
         # 3. COLADAS
-        if orden_padre.peso_inc_colada and orden_padre.peso_inc_colada > 0:
+        if orden_padre.snapshot_peso_inc_colada and orden_padre.snapshot_peso_inc_colada > 0:
             peso_total_maquina = peso_base + self.calculo_extra_kg
-            peso_neto_tiro = orden_padre.peso_unitario_gr * orden_padre.cavidades
+            peso_neto_tiro = orden_padre.snapshot_peso_unitario_gr * orden_padre.snapshot_cavidades
             
             if peso_neto_tiro > 0:
                 self.calculo_coladas = (peso_total_maquina * 1000) / peso_neto_tiro
@@ -105,7 +114,7 @@ class LoteColor(db.Model):
         # 4. HORAS HOMBRE
         # HH = (Dias * HorasTurno * Personas) / #Colores
         dias_orden = orden_padre.calculo_dias or 0.0
-        horas_turno = orden_padre.horas_turno or 24.0
+        horas_turno = orden_padre.snapshot_horas_turno or 24.0
         self.calculo_horas_hombre = (dias_orden * horas_turno * self.personas) / n_colores
 
         # --- CASCADE TO RECIPES ---
@@ -162,7 +171,7 @@ class LoteColor(db.Model):
         
         return {
             'id': self.id,
-            'Color': self.color_nombre,
+            'Color': self.color_rel.nombre if self.color_rel else "Sin Color",
             
             # --- VISTA POLIMÓRFICA (Frontend decide cuál pintar) ---
             'Por Cantidad (Kg)': vals['col_C'],  
