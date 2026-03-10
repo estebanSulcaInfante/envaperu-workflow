@@ -1,137 +1,77 @@
 import pytest
-from app.models.orden import OrdenProduccion
+from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
 from app.models.producto import ColorProducto
 from app.extensions import db
 
-def test_lote_polimorfismo_completo(client, app):
+
+def test_coladas_float_sin_redondeo(client, app):
     """
-    Verifica que el Lote active la columna correcta (C, D o E)
-    y calcule el valor base basándose estrictamente en la Estrategia de la Orden.
+    Verifica que calculo_coladas sea Float (sin redondeo).
+    El sistema reporta el valor exacto; la planta opera en golpes enteros.
     """
     with app.app_context():
-        # =================================================================
-        # ESCENARIO A: ESTRATEGIA "POR PESO" (Activa Columna D)
-        # =================================================================
-        orden_peso = OrdenProduccion(
-            numero_op="OP-TEST-PESO",
-            tipo_estrategia="POR_PESO",
-            meta_total_kg=600.0, # Input Global
-            snapshot_peso_unitario_gr=10.0
+        c = ColorProducto(nombre="FLOAT-TEST", codigo=50)
+        db.session.add(c)
+        db.session.flush()
+
+        # 1 cav × 87g → meta_kg = 100.0 → coladas = 100000/87 = 1149.425...
+        op = OrdenProduccion(numero_op="OP-FLOAT")
+        db.session.add(op)
+        db.session.flush()
+
+        db.session.add(SnapshotComposicionMolde(
+            orden_id=op.numero_op, cavidades=1, peso_unit_gr=87.0
+        ))
+        db.session.flush()
+
+        lote = LoteColor(numero_op=op.numero_op, color_id=c.id, meta_kg=100.0)
+        db.session.add(lote)
+        db.session.flush()
+
+        op.actualizar_metricas()
+        db.session.commit()
+
+        coladas_esperadas = 100_000.0 / 87.0
+        assert lote.calculo_coladas == pytest.approx(coladas_esperadas, rel=1e-5)
+        # No es entero
+        assert lote.calculo_coladas != round(lote.calculo_coladas)
+
+
+def test_meta_kg_directo_por_lote(client, app):
+    """
+    Cada lote tiene su propia meta_kg independiente.
+    La OP suma las metas de todos los lotes.
+    """
+    with app.app_context():
+        c1 = ColorProducto(nombre="L-META-1", codigo=51)
+        c2 = ColorProducto(nombre="L-META-2", codigo=52)
+        db.session.add_all([c1, c2])
+        db.session.flush()
+
+        op = OrdenProduccion(
+            numero_op="OP-META-LOTE",
+            snapshot_peso_colada_gr=5.0,
         )
-        db.session.add(orden_peso)
+        db.session.add(op)
+        db.session.flush()
+
+        db.session.add(SnapshotComposicionMolde(
+            orden_id=op.numero_op, cavidades=2, peso_unit_gr=100.0
+        ))
+        db.session.flush()
+
+        l1 = LoteColor(numero_op=op.numero_op, color_id=c1.id, meta_kg=200.0)
+        l2 = LoteColor(numero_op=op.numero_op, color_id=c2.id, meta_kg=350.0)
+        db.session.add_all([l1, l2])
+        db.session.flush()
+
+        op.actualizar_metricas()
         db.session.commit()
 
-        # Agregar colores para tests
-        c_rojo = ColorProducto(nombre="Rojo", codigo=1)
-        c_verde = ColorProducto(nombre="Verde", codigo=2)
-        c_azul = ColorProducto(nombre="Azul", codigo=3)
-        db.session.add_all([c_rojo, c_verde, c_azul])
-        db.session.commit()
-        
-        # Agregamos 3 Lotes (Colores) -> La meta se debe dividir entre 3
-        l1 = LoteColor(numero_op=orden_peso.numero_op, color_id=c_rojo.id)
-        l2 = LoteColor(numero_op=orden_peso.numero_op, color_id=c_verde.id)
-        l3 = LoteColor(numero_op=orden_peso.numero_op, color_id=c_azul.id)
-        db.session.add_all([l1, l2, l3])
-        db.session.commit()
-        
-        # Actualizar métricas
-        orden_peso.actualizar_metricas()
-        db.session.commit()
+        # Suma correcta
+        assert op.calculo_peso_produccion == pytest.approx(550.0)
 
-        # VALIDACIÓN LOTE 1
-        data = l1.to_dict()
-        
-        # 1. Verificar Semáforo de Columnas
-        assert data['Peso (Kg)'] is not None  # ACTIVO (Columna D)
-        assert data['Por Cantidad (Kg)'] is None      # INACTIVO (Columna C)
-        assert data['Stock (Kg)'] is None   # INACTIVO (Columna E)
-
-        # 2. Verificar Matemática (600 / 3 = 200)
-        assert data['Peso (Kg)'] == 200.0
-
-
-        # =================================================================
-        # ESCENARIO B: ESTRATEGIA "POR CANTIDAD" (Activa Columna C)
-        # =================================================================
-        orden_cant = OrdenProduccion(
-            numero_op="OP-TEST-CANT",
-            tipo_estrategia="POR_CANTIDAD",
-            meta_total_doc=100.0,  # Input Global: 100 Docenas
-            snapshot_peso_unitario_gr=50.0, # P.Unitario necesario para conversión
-        )
-        db.session.add(orden_cant)
-        db.session.commit()
-
-        # Agregar colores para tests
-        c_amarillo = ColorProducto(nombre="Amarillo", codigo=4)
-        c_negro = ColorProducto(nombre="Negro", codigo=5)
-        db.session.add_all([c_amarillo, c_negro])
-        db.session.commit()
-        
-        # Agregamos 2 Lotes -> Meta repartida entre 2
-        l_c1 = LoteColor(numero_op=orden_cant.numero_op, color_id=c_amarillo.id)
-        l_c2 = LoteColor(numero_op=orden_cant.numero_op, color_id=c_negro.id)
-        db.session.add_all([l_c1, l_c2])
-        db.session.commit()
-        
-        # Actualizar métricas
-        orden_cant.actualizar_metricas()
-        db.session.commit()
-
-        # VALIDACIÓN LOTE
-        data_c = l_c1.to_dict()
-
-        # 1. Verificar Semáforo
-        assert data_c['Por Cantidad (Kg)'] is not None # ACTIVO (Columna C)
-        assert data_c['Peso (Kg)'] is None     # INACTIVO
-        assert data_c['Stock (Kg)'] is None  # INACTIVO
-
-        # 2. Verificar Matemática
-        # Fórmula: (100 Doc * 12 * 50gr / 1000) = 60 Kg Totales
-        # Reparto: 60 Kg / 2 Colores = 30 Kg por color
-        assert data_c['Por Cantidad (Kg)'] == 30.0
-
-
-        # =================================================================
-        # ESCENARIO C: ESTRATEGIA "STOCK" (Activa Columna E)
-        # =================================================================
-        orden_stock = OrdenProduccion(
-            numero_op="OP-TEST-STOCK",
-            tipo_estrategia="STOCK",
-            # Sin metas globales
-        )
-        db.session.add(orden_stock)
-        db.session.commit()
-
-        # Agregar color para test
-        c_blanco = ColorProducto(nombre="Blanco", codigo=6)
-        db.session.add(c_blanco)
-        db.session.commit()
-        
-        # Input Manual en el Lote (Stock manual)
-        l_s1 = LoteColor(
-            numero_op=orden_stock.numero_op, 
-            color_id=c_blanco.id, 
-            stock_kg_manual=25.5 # Usuario escribió esto
-        )
-        db.session.add(l_s1)
-        db.session.commit()
-        
-        # Actualizar métricas
-        orden_stock.actualizar_metricas()
-        db.session.commit()
-
-        # VALIDACIÓN LOTE
-        data_s = l_s1.to_dict()
-
-        # 1. Verificar Semáforo
-        assert data_s['Stock (Kg)'] == 25.5 # ACTIVO (Columna E)
-        assert data_s['Por Cantidad (Kg)'] is None    # INACTIVO
-        assert data_s['Peso (Kg)'] is None    # INACTIVO
-        
-        # 2. Verificar que el cálculo de coladas use este valor base
-        # (Aunque sea manual, el sistema debe reconocerlo como el peso objetivo)
-        # Asumiendo Lote.peso_total_objetivo funciona:
-        assert l_s1.peso_total_objetivo == 25.5
+        # Coladas independientes: peso_neto_golpe = 2×100 = 200g
+        assert l1.calculo_coladas == pytest.approx(200_000.0 / 200.0)  # 1000
+        assert l2.calculo_coladas == pytest.approx(350_000.0 / 200.0)  # 1750

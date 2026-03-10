@@ -93,17 +93,13 @@ class RegistroDiarioProduccion(db.Model):
         if sum_pesos_control > 0:
             self.total_kg_real = sum_pesos_control
         else:
-            # Prioridad 2: Calculo por Coladas * Peso Tiro
-            # Peso Teórico (Kg) = (Coladas * (PesoNeto + PesoColada)) / 1000
-            p_neto = self.snapshot_peso_neto_gr or 0.0
+            # Prioridad 2: Cálculo por Coladas × Peso Tiro
+            # snapshot_peso_neto_gr = peso neto TOTAL del golpe (ya incluye todas cav)
+            # snapshot_peso_colada_gr = ramal
+            p_neto   = self.snapshot_peso_neto_gr   or 0.0
             p_colada = self.snapshot_peso_colada_gr or 0.0
-            
-            peso_tiro_gr = (p_neto * cavs) + p_colada
-            
-            # Fallback: Si el snapshot es 0, intentar sacar de la orden actual (si existe)
-            if peso_tiro_gr == 0 and self.orden:
-                 peso_tiro_gr = self.orden.snapshot_peso_inc_colada or 0.0
-                 
+            peso_tiro_gr = p_neto + p_colada
+
             self.total_kg_real = (self.total_coladas_calculada * peso_tiro_gr) / 1000.0
 
     def to_dict(self):

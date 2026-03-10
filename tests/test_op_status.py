@@ -43,8 +43,6 @@ def setup_test_data(app):
             test_op = OrdenProduccion(
                 numero_op="TEST-STATUS-001",
                 producto="Producto Test Status",
-                tipo_estrategia="POR_PESO",
-                meta_total_kg=100.0,
                 maquina_id=maquina.id,
                 activa=True
             )

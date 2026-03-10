@@ -174,10 +174,12 @@ class Pieza(db.Model):
     # Tipo de pieza: SIMPLE, KIT, COMPONENTE
     tipo = db.Column(db.String(20), default="SIMPLE")
     
-    # Relación 1:N con Molde (1 Molde → N Piezas, 1 Pieza → 1 Molde)
-    molde_id = db.Column(db.String(50), db.ForeignKey('molde.codigo'), nullable=True)
-    molde = db.relationship('Molde', backref=db.backref('piezas_producidas', lazy='dynamic'))
-    
+    # --- RELACIÓN CON FORMA DEL MOLDE (Option C) ---
+    # Vincula esta pieza (SKU coloreado) con su forma/cavidad en el molde
+    # Nullable: piezas legacy importadas del Excel pueden no tener esta relación aún
+    molde_pieza_id = db.Column(db.Integer, db.ForeignKey('molde_pieza.id'), nullable=True)
+    molde_pieza_rel = db.relationship('MoldePieza', backref='variantes', foreign_keys=[molde_pieza_id])
+
     cod_pieza = db.Column(db.Integer)
     piezas = db.Column(db.String(200)) # Nombre Pieza
     

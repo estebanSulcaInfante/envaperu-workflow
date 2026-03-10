@@ -34,11 +34,6 @@ def test_generar_excel_basico(client, app):
 
         orden = OrdenProduccion(
             numero_op="OP-EXCEL-TEST",
-            tipo_estrategia="POR_PESO",
-            meta_total_kg=100.0,
-            snapshot_peso_unitario_gr=50.0,
-            snapshot_peso_inc_colada=100.0,
-            snapshot_cavidades=2,
             snapshot_tiempo_ciclo=30.0,
             snapshot_horas_turno=24.0,
             producto="Producto Test",
@@ -89,11 +84,6 @@ def test_endpoint_excel_descarga(client, app):
             # Si no existe, crear una orden de prueba
             orden = OrdenProduccion(
                 numero_op="OP-1322",
-                tipo_estrategia="POR_PESO",
-                meta_total_kg=100.0,
-                snapshot_peso_unitario_gr=50.0,
-                snapshot_peso_inc_colada=100.0,
-                snapshot_cavidades=2,
                 producto="Test",
                 molde="Test Molde",
                 maquina_id="M1"

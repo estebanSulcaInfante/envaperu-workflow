@@ -98,7 +98,6 @@ def listar_piezas():
                 Pieza.piezas.ilike(search),
                 Pieza.color.ilike(search),
                 Pieza.mp.ilike(search),
-                Pieza.molde_id.ilike(search),
                 Pieza.tipo_extruccion.ilike(search)
             )
         )
@@ -118,8 +117,6 @@ def listar_piezas():
         'cod_familia': p.familia_rel.codigo if p.familia_rel else None,
         'familia_id': p.familia_id,
         'cod_pieza': p.cod_pieza,
-        'molde_id': p.molde_id,
-        'molde_nombre': p.molde.nombre if p.molde else None,
         'color': p.color,
         'cod_color': p.cod_color,
         'tipo_color': p.tipo_color,
@@ -151,8 +148,8 @@ def obtener_producto(cod_sku_pt):
     return jsonify({
         'cod_sku_pt': producto.cod_sku_pt,
         'producto': producto.producto,
-        'familia': producto.familia,
-        'linea': producto.linea,
+        'familia': producto.familia_rel.nombre if producto.familia_rel else None,
+        'linea': producto.linea_rel.nombre if producto.linea_rel else None,
         'peso_g': producto.peso_g,
         'precio_estimado': producto.precio_estimado,
         'precio_sin_igv': producto.precio_sin_igv,
@@ -181,8 +178,6 @@ def crear_producto():
         producto = ProductoTerminado(
             cod_sku_pt=data['cod_sku_pt'],
             producto=data['producto'],
-            familia=data.get('familia'),
-            linea=data.get('linea'),
             peso_g=data.get('peso_g'),
             precio_estimado=data.get('precio_estimado'),
             status=data.get('status', 'Activo'),
@@ -218,8 +213,6 @@ def actualizar_producto(cod_sku_pt):
     data = request.get_json()
     
     producto.producto = data.get('producto', producto.producto)
-    producto.familia = data.get('familia', producto.familia)
-    producto.linea = data.get('linea', producto.linea)
     producto.peso_g = data.get('peso_g', producto.peso_g)
     producto.precio_estimado = data.get('precio_estimado', producto.precio_estimado)
     producto.status = data.get('status', producto.status)
@@ -358,26 +351,26 @@ def crear_molde():
                 # Obtener o crear Linea y Familia por defecto
                 linea_default = Linea.query.filter_by(nombre='GENERAL').first()
                 if not linea_default:
-                    linea_default = Linea(codigo=99, nombre='GENERAL')
+                    max_cod = db.session.query(db.func.max(Linea.codigo)).scalar() or 0
+                    linea_default = Linea(codigo=max_cod + 1, nombre='GENERAL')
                     db.session.add(linea_default)
                     db.session.flush()
                 
                 familia_default = Familia.query.filter_by(nombre='COMPONENTES').first()
                 if not familia_default:
-                    familia_default = Familia(codigo=99, nombre='COMPONENTES')
+                    max_cod = db.session.query(db.func.max(Familia.codigo)).scalar() or 0
+                    familia_default = Familia(codigo=max_cod + 1, nombre='COMPONENTES')
                     db.session.add(familia_default)
                     db.session.flush()
-                
+
                 pieza = Pieza(
                     sku=pieza_sku,
                     piezas=f"{molde.nombre} (Std)",
                     linea_id=linea_default.id,
                     familia_id=familia_default.id,
-                    # Asignar peso/cavidad base a la pieza
                     peso=float(data.get('peso_unitario_gr')),
                     cavidad=int(data.get('cavidades')),
                     tipo='SIMPLE',
-                    molde_id=molde.codigo # Link directo
                 )
                 db.session.add(pieza)
             
@@ -452,7 +445,6 @@ def actualizar_molde(codigo):
                     peso=float(data['peso_unitario_gr']),
                     cavidad=int(data['cavidades']),
                     tipo='SIMPLE',
-                    molde_id=molde.codigo
                 )
                 db.session.add(pieza)
             
@@ -497,8 +489,8 @@ def obtener_pieza(sku):
         'tipo': pieza.tipo,
         'peso': pieza.peso,
         'cavidad': pieza.cavidad,
-        'linea': pieza.linea,
-        'familia': pieza.familia,
+        'linea': pieza.linea_rel.nombre if pieza.linea_rel else None,
+        'familia': pieza.familia_rel.nombre if pieza.familia_rel else None,
         'color': pieza.color,
         'componentes': [c.to_dict() for c in pieza.componentes] if pieza.tipo == 'KIT' else [],
         'moldes': [{'molde_id': mp.molde_id, 'cavidades': mp.cavidades, 'peso_unitario': mp.peso_unitario_gr} 
@@ -520,10 +512,7 @@ def crear_pieza():
             tipo=data.get('tipo', 'SIMPLE'),
             peso=data.get('peso'),
             cavidad=data.get('cavidad'),
-            linea=data.get('linea'),
-            familia=data.get('familia'),
             color=data.get('color'),
-            cod_linea=data.get('cod_linea'),
             cod_pieza=data.get('cod_pieza')
         )
         db.session.add(pieza)
@@ -558,8 +547,6 @@ def actualizar_pieza(sku):
     pieza.tipo = data.get('tipo', pieza.tipo)
     pieza.peso = data.get('peso', pieza.peso)
     pieza.cavidad = data.get('cavidad', pieza.cavidad)
-    pieza.linea = data.get('linea', pieza.linea)
-    pieza.familia = data.get('familia', pieza.familia)
     pieza.color = data.get('color', pieza.color)
     
     # Actualizar componentes si es KIT
@@ -599,28 +586,31 @@ def eliminar_pieza(sku):
 
 @catalogo_bp.route('/piezas-producibles', methods=['GET'])
 def obtener_piezas_producibles():
-    """Retorna solo piezas que tienen un molde asignado (producibles)"""
+    """Retorna solo piezas que tienen un molde asignado via MoldePieza (producibles)"""
+    from app.models.molde import MoldePieza as MP
     piezas = (
         Pieza.query
-        .filter(Pieza.molde_id.isnot(None))
+        .join(MP, MP.pieza_sku == Pieza.sku)
         .order_by(Pieza.piezas)
         .all()
     )
-    
+
     result = []
     for p in piezas:
+        mp_row = MP.query.filter_by(pieza_sku=p.sku).first()
+        molde_obj = db.session.get(Molde, mp_row.molde_id) if mp_row else None
         result.append({
             'sku': p.sku,
             'nombre': p.piezas,
             'tipo': p.tipo,
             'molde': {
-                'codigo': p.molde.codigo if p.molde else None,
-                'nombre': p.molde.nombre if p.molde else None,
-                'peso_tiro_gr': p.molde.peso_tiro_gr if p.molde else None,
-                'tiempo_ciclo_std': p.molde.tiempo_ciclo_std if p.molde else None
+                'codigo': molde_obj.codigo if molde_obj else None,
+                'nombre': molde_obj.nombre if molde_obj else None,
+                'peso_tiro_gr': molde_obj.peso_tiro_gr if molde_obj else None,
+                'tiempo_ciclo_std': molde_obj.tiempo_ciclo_std if molde_obj else None
             },
-            'cavidades': p.cavidad,
-            'peso_unitario_gr': p.peso
+            'cavidades': mp_row.cavidades if mp_row else p.cavidad,
+            'peso_unitario_gr': mp_row.peso_unitario_gr if mp_row else p.peso
         })
     
     return jsonify(result), 200
@@ -686,58 +676,69 @@ def crear_color():
 @catalogo_bp.route('/configurar-producto', methods=['POST'])
 def configurar_producto_cascada():
     """
-    Crea Molde + Pieza(s) + ProductoTerminado(s) en una sola transacción.
-    
+    Crea Molde + Formas (MoldePieza) + Piezas coloreadas (opcional) + Kit (opcional).
+
+    Las FORMAS (MoldePieza) definen las cavidades del molde — sin color.
+    Las PIEZAS coloreadas (SKUs de inventario) se crean opcionalmente
+    y apuntan a su forma vía molde_pieza_id.
+
     Payload:
     {
-        "molde": {
-            "codigo": "MOL-XXX",
-            "nombre": "Nombre Molde",
-            "peso_tiro_gr": 200,
-            "tiempo_ciclo_std": 30,
-            "usar_existente": false  // Si true, solo vincula molde existente
-        },
-        "piezas": [
-            {
-                "nombre": "Pieza 1",
-                "cavidades": 2,
-                "peso_unitario_gr": 85,
-                "sku_override": null  // Opcional, genera automáticamente si null
-            }
-        ],
-        "color_ids": [1, 2, 3],  // IDs de colores para generar productos
-        "generar_productos": true,  // Si crear ProductoTerminado por pieza+color
-        "linea": "JUGUETES",
-        "cod_linea": 2,
-        "familia": "PLAYEROS",
-        "cod_familia": 14
+        "molde": { "codigo", "nombre", "peso_tiro_gr", "tiempo_ciclo_std", "usar_existente" },
+        "piezas": [ { "nombre", "cavidades", "peso_unitario_gr" } ],
+        "kit": { "nombre", "sku_override" },
+        "color_ids": [1, 2, 3],       // opcional: colores de inyección
+        "linea": "JUGUETES", "cod_linea": 2,
+        "familia": "PLAYEROS", "cod_familia": 14
     }
     """
+    from app.models.producto import PiezaComponente
+    from app.models.molde import Molde, MoldePieza
+
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
-    
+
     resultado = {
         'molde_creado': None,
+        'formas_creadas': [],
         'piezas_creadas': [],
-        'productos_creados': [],
+        'kit_creado': None,
         'errores': []
     }
-    
+
     try:
-        # 1. CREAR O OBTENER MOLDE
+        # --- Resolver Linea y Familia ---
+        cod_linea = data.get('cod_linea')
+        cod_familia = data.get('cod_familia')
+        linea_obj = None
+        familia_obj = None
+
+        if cod_linea:
+            linea_obj = Linea.query.filter_by(codigo=cod_linea).first()
+        elif data.get('linea'):
+            linea_obj = Linea.query.filter(Linea.nombre.ilike(data.get('linea'))).first()
+
+        if cod_familia:
+            familia_obj = Familia.query.filter_by(codigo=cod_familia).first()
+        elif data.get('familia'):
+            familia_obj = Familia.query.filter(Familia.nombre.ilike(data.get('familia'))).first()
+
+        if not linea_obj or not familia_obj:
+            return jsonify({'error': 'Linea y Familia son requeridas'}), 400
+
+        # ── 1. CREAR O OBTENER MOLDE ──
         molde_data = data.get('molde', {})
         molde_codigo = molde_data.get('codigo')
-        
+
         if not molde_codigo:
             return jsonify({'error': 'Código de molde requerido'}), 400
-        
+
         if molde_data.get('usar_existente'):
             molde = db.session.get(Molde, molde_codigo)
             if not molde:
                 return jsonify({'error': f'Molde {molde_codigo} no encontrado'}), 404
         else:
-            # Verificar si ya existe
             molde = db.session.get(Molde, molde_codigo)
             if molde:
                 resultado['errores'].append(f'Molde {molde_codigo} ya existe, usando existente')
@@ -750,137 +751,135 @@ def configurar_producto_cascada():
                     activo=True
                 )
                 db.session.add(molde)
-                db.session.flush()  # Para obtener el codigo
+                db.session.flush()
                 resultado['molde_creado'] = molde.codigo
-        
-        # 2. CREAR PIEZAS
-        piezas_creadas = []
+
+        # ── 2. CREAR FORMAS (MoldePieza) — sin color, sin SKU ──
+        formas_creadas = []
         for idx, pieza_data in enumerate(data.get('piezas', [])):
-            nombre_pieza = pieza_data.get('nombre', f'Pieza {idx+1}')
+            nombre_forma = pieza_data.get('nombre', f'Pieza {idx+1}')
             cavidades = pieza_data.get('cavidades', 1)
             peso_unitario = pieza_data.get('peso_unitario_gr', 0)
-            
-            # Generar SKU de pieza
-            sku_pieza = pieza_data.get('sku_override')
-            if not sku_pieza:
-                base_sku = molde_codigo.replace('MOL-', '')
-                sku_pieza = f"{base_sku}-{idx+1:02d}" if len(data.get('piezas', [])) > 1 else f"{base_sku}-STD"
-            
-            # Crear pieza
-            pieza = db.session.get(Pieza, sku_pieza)
-            if pieza:
-                resultado['errores'].append(f'Pieza {sku_pieza} ya existe, usando existente')
-            else:
-                # Buscar Linea por nombre o código
-                linea_obj = None
-                linea_nombre = data.get('linea')
-                cod_linea = data.get('cod_linea')
-                if cod_linea:
-                    linea_obj = Linea.query.filter_by(codigo=cod_linea).first()
-                elif linea_nombre:
-                    linea_obj = Linea.query.filter(Linea.nombre.ilike(linea_nombre)).first()
-                
-                pieza = Pieza(
-                    sku=sku_pieza,
-                    piezas=nombre_pieza,
-                    peso=peso_unitario,
-                    cavidad=cavidades,
-                    tipo='SIMPLE',
-                    molde_id=molde.codigo,
-                    linea_id=linea_obj.id if linea_obj else None,  # FK normalizada
-                    familia=data.get('familia')
-                )
-                db.session.add(pieza)
-                resultado['piezas_creadas'].append(sku_pieza)
-            
-            piezas_creadas.append({
-                'pieza': pieza,
-                'sku': sku_pieza,
-                'cavidades': cavidades,
-                'peso_unitario': peso_unitario
-            })
-            
-            # Crear relación MoldePieza
-            mp_existente = MoldePieza.query.filter_by(
-                molde_id=molde.codigo, 
-                pieza_sku=sku_pieza
+
+            # Verificar si ya existe esta forma en el molde
+            forma_existente = MoldePieza.query.filter_by(
+                molde_id=molde.codigo, nombre=nombre_forma
             ).first()
-            if not mp_existente:
-                mp = MoldePieza(
+
+            if forma_existente:
+                resultado['errores'].append(f'Forma "{nombre_forma}" ya existe en molde, usando existente')
+                formas_creadas.append(forma_existente)
+            else:
+                forma = MoldePieza(
                     molde_id=molde.codigo,
-                    pieza_sku=sku_pieza,
+                    nombre=nombre_forma,
                     cavidades=cavidades,
                     peso_unitario_gr=peso_unitario
                 )
-                db.session.add(mp)
-        
-        # 3. CREAR PRODUCTOS TERMINADOS (por cada pieza × color)
-        if data.get('generar_productos', True):
-            color_ids = data.get('color_ids', [])
-            colores = ColorProducto.query.filter(ColorProducto.id.in_(color_ids)).all() if color_ids else []
-            
-        for pieza_info in piezas_creadas:
-                for color in colores:
-                    # Buscar Linea por código
-                    cod_linea = data.get('cod_linea', 0)
-                    linea_obj = Linea.query.filter_by(codigo=cod_linea).first()
-                    
-                    # Generar SKU del producto
-                    linea_code = linea_obj.codigo if linea_obj else cod_linea
-                    cod_familia = data.get('cod_familia', 0)
-                    cod_producto = hash(pieza_info['sku']) % 1000  # Simplificado
-                    sku_pt = f"0{linea_code}{cod_familia}{cod_producto:03d}0{color.codigo}"
-                    
-                    # Verificar si existe
-                    producto = db.session.get(ProductoTerminado, sku_pt)
-                    if producto:
-                        resultado['errores'].append(f'Producto {sku_pt} ya existe')
+                db.session.add(forma)
+                db.session.flush()  # Obtener forma.id
+                formas_creadas.append(forma)
+                resultado['formas_creadas'].append(nombre_forma)
+
+        # ── 3. CREAR PIEZAS COLOREADAS (opcional) ──
+        color_ids = data.get('color_ids', [])
+        colores = ColorProducto.query.filter(
+            ColorProducto.id.in_(color_ids)
+        ).all() if color_ids else []
+
+        if colores:
+            for color in colores:
+                for forma in formas_creadas:
+                    base_sku = molde_codigo.replace('MOL-', '')
+                    sku_pieza = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
+                    nombre_coloreado = f"{forma.nombre} {color.nombre}"
+
+                    pieza_existente = db.session.get(Pieza, sku_pieza)
+                    if pieza_existente:
+                        resultado['errores'].append(f'Pieza {sku_pieza} ya existe')
                         continue
-                    
-                    # Obtener la familia del color
-                    familia_color_rel = color.familia if hasattr(color, 'familia') else None
-                    familia_color_nombre = familia_color_rel.nombre if familia_color_rel else 'SOLIDO'
-                    familia_color_codigo = familia_color_rel.codigo if familia_color_rel else 1
-                    
-                    producto = ProductoTerminado(
-                        cod_sku_pt=sku_pt,
-                        linea_id=linea_obj.id if linea_obj else None,  # FK normalizada
-                        cod_familia=cod_familia,
-                        familia=data.get('familia'),
-                        cod_producto=cod_producto,
-                        producto=f"{pieza_info['pieza'].piezas} - {color.nombre}",
-                        cod_familia_color=familia_color_codigo,  # Antes: cod_color
-                        familia_color=familia_color_nombre,      # Nombre de la familia
-                        familia_color_id=familia_color_rel.id if familia_color_rel else None,  # FK
-                        peso_g=pieza_info['peso_unitario'],
-                        um='DOC'
+
+                    pieza = Pieza(
+                        sku=sku_pieza,
+                        piezas=nombre_coloreado,
+                        peso=forma.peso_unitario_gr,
+                        cavidad=forma.cavidades,
+                        tipo='SIMPLE',
+                        linea_id=linea_obj.id,
+                        familia_id=familia_obj.id,
+                        color_id=color.id,
+                        cod_color=color.codigo,
+                        color=color.nombre,
+                        molde_pieza_id=forma.id  # ← Vínculo con la forma
                     )
-                    db.session.add(producto)
-                    
-                    # Crear relación ProductoPieza
-                    pp = ProductoPieza(
-                        producto_terminado_id=sku_pt,
-                        pieza_sku=pieza_info['sku'],
-                        cantidad=1
-                    )
-                    db.session.add(pp)
-                    
-                    resultado['productos_creados'].append({
-                        'sku': sku_pt,
-                        'nombre': producto.producto,
-                        'color': color.nombre
-                    })
-        
+                    db.session.add(pieza)
+                    resultado['piezas_creadas'].append(sku_pieza)
+
+        db.session.flush()
+
+        # ── 4. CREAR KIT (opcional, si >1 forma y hay piezas coloreadas) ──
+        kit_data = data.get('kit')
+
+        if kit_data and len(formas_creadas) > 1 and colores:
+            kit_nombre_base = kit_data.get('nombre', f'{molde.nombre} Completo')
+            kit_sku_base = kit_data.get('sku_override')
+            if not kit_sku_base:
+                base_sku = molde_codigo.replace('MOL-', '')
+                kit_sku_base = f"{base_sku}-KIT"
+
+            for color in colores:
+                kit_sku = f"{kit_sku_base}-C{color.codigo}"
+                kit_nombre = f"{kit_nombre_base} {color.nombre}"
+
+                kit_pieza = db.session.get(Pieza, kit_sku)
+                if kit_pieza:
+                    resultado['errores'].append(f'Kit {kit_sku} ya existe')
+                    continue
+
+                peso_kit = sum(f.peso_unitario_gr for f in formas_creadas)
+                kit_pieza = Pieza(
+                    sku=kit_sku,
+                    piezas=kit_nombre,
+                    peso=peso_kit,
+                    cavidad=1,
+                    tipo='KIT',
+                    linea_id=linea_obj.id,
+                    familia_id=familia_obj.id,
+                    color_id=color.id,
+                    cod_color=color.codigo,
+                    color=color.nombre,
+                )
+                db.session.add(kit_pieza)
+                db.session.flush()
+
+                # PiezaComponente: buscar piezas de este color
+                for forma in formas_creadas:
+                    base_sku = molde_codigo.replace('MOL-', '')
+                    comp_sku = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
+                    comp = db.session.get(Pieza, comp_sku)
+                    if comp:
+                        db.session.add(PiezaComponente(
+                            kit_sku=kit_sku,
+                            componente_sku=comp.sku,
+                            cantidad=1
+                        ))
+
+                resultado['piezas_creadas'].append(kit_sku)
+
+            resultado['kit_creado'] = kit_sku_base
+
         db.session.commit()
-        
+
         return jsonify({
             'success': True,
             'resultado': resultado
         }), 201
-        
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e), 'resultado': resultado}), 400
+
+
 
 
 # ============================================================
@@ -1666,3 +1665,71 @@ def estadisticas_revision_piezas():
         'pendientes': stats['IMPORTADO'] + stats['EN_REVISION'],
         'por_linea_pendiente': [{'linea': linea or 'Sin Línea', 'cantidad': cant} for linea, cant in por_linea]
     })
+
+
+# ============================================================
+# RECETA COLOR NORMALIZADA — Prefill inteligente de pigmentos
+# ============================================================
+
+@catalogo_bp.route('/catalogo/receta-color', methods=['GET'])
+def obtener_receta_color():
+    """
+    Devuelve los pigmentos sugeridos para un color, basados en el
+    promedio ponderado acumulado de OPs anteriores.
+
+    Query params:
+        color_id    (int, requerido)
+        producto_sku (str, opcional) — busca receta específica primero
+        meta_kg     (float, opcional) — calcula gramos absolutos si se envía
+    """
+    from app.models.receta_color import RecetaColorNormalizada
+
+    color_id = request.args.get('color_id', type=int)
+    if not color_id:
+        return jsonify({'error': 'color_id requerido'}), 400
+
+    producto_sku = request.args.get('producto_sku') or None
+    meta_kg = request.args.get('meta_kg', type=float)
+
+    color = db.session.get(ColorProducto, color_id)
+    if not color:
+        return jsonify({'error': f'Color {color_id} no encontrado'}), 404
+
+    # Estrategia: buscar receta específica primero, luego genérica como fallback
+    if producto_sku:
+        especificas = RecetaColorNormalizada.query.filter_by(
+            color_id=color_id, producto_sku=producto_sku
+        ).all()
+        genericas = RecetaColorNormalizada.query.filter_by(
+            color_id=color_id, producto_sku=None
+        ).all()
+        con_especifica = {r.colorante_id for r in especificas}
+        recetas = especificas + [r for r in genericas if r.colorante_id not in con_especifica]
+        sku_usado = producto_sku if especificas else None
+    else:
+        recetas = RecetaColorNormalizada.query.filter_by(
+            color_id=color_id, producto_sku=None
+        ).all()
+        sku_usado = None
+
+    if not recetas:
+        return jsonify({
+            'color_id': color_id,
+            'color_nombre': color.nombre,
+            'producto_sku': sku_usado,
+            'tiene_receta': False,
+            'n_muestras_min': 0,
+            'pigmentos': []
+        }), 200
+
+    n_muestras_min = min(r.n_muestras for r in recetas)
+
+    return jsonify({
+        'color_id': color_id,
+        'color_nombre': color.nombre,
+        'producto_sku': sku_usado,
+        'tiene_receta': True,
+        'n_muestras_min': n_muestras_min,
+        'pigmentos': [r.to_dict(meta_kg=meta_kg) for r in recetas]
+    }), 200
+

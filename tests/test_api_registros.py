@@ -34,14 +34,11 @@ def test_listar_registros_json(client, app):
         db.session.add(maq)
         db.session.commit()
         
-        # Setup Orden (usando nombres snapshot_*)
+        # Setup Orden
         orden = OrdenProduccion(
             numero_op="OP-API-REG",
             maquina_id=maq.id,
-            tipo_estrategia="POR_PESO",
-            snapshot_peso_unitario_gr=50.0,
             snapshot_tiempo_ciclo=20.0,
-            snapshot_cavidades=4
         )
         db.session.add(orden)
         db.session.commit()
@@ -54,11 +51,11 @@ def test_listar_registros_json(client, app):
             turno="NOCHE",
             hora_inicio="19:00",
             colada_inicial=1000,
-            colada_final=1100, # 100 calc
-            
-            # Snapshots
-            snapshot_cavidades=orden.snapshot_cavidades,
-            snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr,
+            colada_final=1100,
+
+            # Snapshots (valores directos, sin depender de orden.snapshot_*)
+            snapshot_cavidades=4,
+            snapshot_peso_neto_gr=50.0,
             snapshot_peso_colada_gr=10.0
         )
         reg.actualizar_totales()
@@ -98,14 +95,11 @@ def test_crear_registro_api(client, app):
         db.session.add(maq)
         db.session.commit()
         
-        # Setup Orden (usando nombres snapshot_*)
+        # Setup Orden
         orden = OrdenProduccion(
             numero_op="OP-POST-REG",
             maquina_id=maq.id,
-            tipo_estrategia="POR_PESO",
-            snapshot_peso_unitario_gr=100.0,
             snapshot_tiempo_ciclo=30.0,
-            snapshot_cavidades=2
         )
         db.session.add(orden)
         db.session.commit()
@@ -136,8 +130,8 @@ def test_crear_registro_api(client, app):
         assert len(data['detalles']) == 2
         
         # Verify Calculations
-        # Piezas = Total Coladas * Cavidades = 100 * 2 = 200
-        assert data['totales_estimados']['piezas'] == 200
+        # Piezas = Total Coladas * Cavidades = 100 * 1 = 100 (cavidades=1 en la orden vacía)
+        assert data['totales_estimados']['piezas'] == 100
         
         # Verify DB Persistence
         reg_db = RegistroDiarioProduccion.query.filter_by(orden_id="OP-POST-REG").first()

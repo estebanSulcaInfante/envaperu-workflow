@@ -21,29 +21,22 @@ class Molde(db.Model):
     activo = db.Column(db.Boolean, default=True)
     notas = db.Column(db.Text, nullable=True)
     
-    # Relación 1:N con Pieza (backref 'piezas_producidas' definido en Pieza)
-    # Legacy: mantiene 'piezas' para compatibilidad con MoldePieza si existe
+    # Relación N:M con Pieza via tabla MoldePieza (única fuente de verdad)
     piezas = db.relationship('MoldePieza', backref='molde', lazy=True, cascade="all, delete-orphan")
-    
-    # --- Propiedades Calculadas usando relación 1:N ---
+
     @property
     def peso_neto_gr(self):
-        """Peso de todas las piezas sin colada"""
-        # Usar piezas_producidas (relación directa 1:N) si existe, sino MoldePieza
-        if hasattr(self, 'piezas_producidas') and self.piezas_producidas.count() > 0:
-            return sum((p.peso or 0) * (p.cavidad or 1) for p in self.piezas_producidas)
+        """Peso neto del golpe: suma de (cavidades × peso_unit) de todas las piezas."""
         return sum(mp.peso_unitario_gr * mp.cavidades for mp in self.piezas)
     
     @property
     def peso_colada_gr(self):
-        """Peso de la colada/desperdicio"""
+        """Peso del ramal/runner del golpe."""
         return self.peso_tiro_gr - self.peso_neto_gr
-    
+
     @property
     def cavidades_totales(self):
-        """Total de cavidades del molde"""
-        if hasattr(self, 'piezas_producidas') and self.piezas_producidas.count() > 0:
-            return sum((p.cavidad or 1) for p in self.piezas_producidas)
+        """Total de cavidades del golpe."""
         return sum(mp.cavidades for mp in self.piezas)
     
     @property
@@ -54,31 +47,20 @@ class Molde(db.Model):
         return 0.0
     
     def to_dict(self):
-        # Obtener lista de piezas (preferir relación directa)
-        if hasattr(self, 'piezas_producidas') and self.piezas_producidas.count() > 0:
-            piezas_list = [{
-                'pieza_sku': p.sku,
-                'pieza_nombre': p.piezas,
-                'cavidades': p.cavidad,
-                'peso_unitario_gr': p.peso
-            } for p in self.piezas_producidas]
-        else:
-            piezas_list = [mp.to_dict() for mp in self.piezas]
-        
         return {
-            'codigo': self.codigo,
-            'nombre': self.nombre,
-            'peso_tiro_gr': self.peso_tiro_gr,
+            'codigo':           self.codigo,
+            'nombre':           self.nombre,
+            'peso_tiro_gr':     self.peso_tiro_gr,
             'tiempo_ciclo_std': self.tiempo_ciclo_std,
-            'activo': self.activo,
-            'notas': self.notas,
+            'activo':           self.activo,
+            'notas':            self.notas,
             # Calculados
-            'peso_neto_gr': self.peso_neto_gr,
-            'peso_colada_gr': self.peso_colada_gr,
+            'peso_neto_gr':      self.peso_neto_gr,
+            'peso_colada_gr':    self.peso_colada_gr,
             'cavidades_totales': self.cavidades_totales,
-            'merma_pct': self.merma_pct,
-            # Piezas
-            'piezas': piezas_list
+            'merma_pct':         self.merma_pct,
+            # Piezas (única fuente: MoldePieza)
+            'piezas': [mp.to_dict() for mp in self.piezas]
         }
     
     def __repr__(self):
@@ -87,26 +69,39 @@ class Molde(db.Model):
 
 class MoldePieza(db.Model):
     """
-    Relación N:N entre Molde y Pieza con atributos.
-    Define cuántas cavidades de cada pieza tiene el molde.
+    Definición de forma/cavidad de un molde.
+    
+    Cada registro representa una FORMA (no un SKU coloreado).
+    Las Piezas coloreadas (SKUs de inventario) apuntan aquí
+    vía Pieza.molde_pieza_id.
+    
+    Ejemplo: Molde "Jarra Regadera" tiene 2 MoldePieza:
+      - id=1: "Tapa Regadera" (2 cav, 15g)
+      - id=2: "Base Regadera" (2 cav, 15g)
     """
     __tablename__ = 'molde_pieza'
     
     id = db.Column(db.Integer, primary_key=True)
     
     molde_id = db.Column(db.String(50), db.ForeignKey('molde.codigo'), nullable=False)
-    pieza_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku'), nullable=False)
     
-    # Atributos de la relación
+    # Nombre de la forma (ej. "Tapa Regadera")
+    nombre = db.Column(db.String(200), nullable=True)
+    
+    # Legacy: pieza_sku apunta a una pieza específica (nullable para formas puras)
+    # use_alter=True rompe la dependencia circular Pieza↔MoldePieza
+    pieza_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku', name='fk_moldepieza_pieza_sku', use_alter=True), nullable=True)
+    
+    # Atributos de la forma
     cavidades = db.Column(db.Integer, nullable=False, default=1)
     peso_unitario_gr = db.Column(db.Float, nullable=False)  # Peso de UNA pieza
     
-    # Relación a Pieza
-    pieza = db.relationship('Pieza', backref='molde_piezas')
+    # Relación legacy a Pieza (puede ser None para formas puras)
+    pieza = db.relationship('Pieza', backref='molde_piezas', foreign_keys=[pieza_sku])
     
-    # Constraint único
+    # Constraint: un molde no tiene dos formas con el mismo nombre
     __table_args__ = (
-        db.UniqueConstraint('molde_id', 'pieza_sku', name='uq_molde_pieza'),
+        db.UniqueConstraint('molde_id', 'nombre', name='uq_molde_pieza_nombre'),
     )
     
     @property
@@ -118,12 +113,15 @@ class MoldePieza(db.Model):
         return {
             'id': self.id,
             'molde_id': self.molde_id,
+            'nombre': self.nombre,
             'pieza_sku': self.pieza_sku,
-            'pieza_nombre': self.pieza.piezas if self.pieza else None,
+            'pieza_nombre': self.pieza.piezas if self.pieza else self.nombre,
             'cavidades': self.cavidades,
             'peso_unitario_gr': self.peso_unitario_gr,
-            'peso_total_gr': self.peso_total_gr
+            'peso_total_gr': self.peso_total_gr,
+            'variantes_count': len(self.variantes) if hasattr(self, 'variantes') else 0
         }
     
     def __repr__(self):
-        return f'<MoldePieza {self.molde_id}/{self.pieza_sku}: {self.cavidades} cav>'
+        label = self.nombre or self.pieza_sku or '?'
+        return f'<MoldePieza {self.molde_id}/{label}: {self.cavidades} cav>'

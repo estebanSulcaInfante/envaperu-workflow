@@ -35,11 +35,6 @@ def test_estructura_completa_json(client, app):
         # 2. SETUP: ORDEN (Por Peso)
         orden = OrdenProduccion(
             numero_op="OP-FULL-STRUCT",
-            tipo_estrategia="POR_PESO",
-            meta_total_kg=1000.0,
-            snapshot_peso_unitario_gr=50.0,
-            snapshot_peso_inc_colada=200.0, # 200g tiro
-            snapshot_cavidades=4,
             snapshot_tiempo_ciclo=20.0,
             snapshot_horas_turno=24.0,
             fecha_inicio=datetime.now(timezone.utc),
@@ -54,10 +49,19 @@ def test_estructura_completa_json(client, app):
         db.session.add(c_prod_test)
         db.session.commit()
 
+        from app.models.orden import SnapshotComposicionMolde
+
+        # 3. SETUP: SNAPSHOT del molde (1 cav × 200g, sin colada)
+        db.session.add(SnapshotComposicionMolde(
+            orden_id=orden.numero_op, cavidades=1, peso_unit_gr=200.0
+        ))
+        db.session.flush()
+
         lote = LoteColor(
             numero_op=orden.numero_op,
-            color_id=c_prod_test.id, # Usar ID
-            personas=2 # 2 Operarios
+            color_id=c_prod_test.id,
+            personas=2,
+            meta_kg=1000.0,   # <-- meta directa por lote
         )
         db.session.add(lote)
         db.session.commit()
@@ -78,51 +82,46 @@ def test_estructura_completa_json(client, app):
         orden.actualizar_metricas()
         db.session.commit() # Guardar cambios calculados
 
-        # 5. VALIDACIÓN DE PERSISTENCIA (Columnas directas)
-        # Re-fetch para asegurar que leemos de DB
+        # 5. VALIDACIÓN DE PERSISTENCIA (nuevo modelo)
         orden_db = OrdenProduccion.query.get("OP-FULL-STRUCT")
-        
-        # A. CÁLCULO DE PESOS
-        assert orden_db.calculo_peso_produccion == 1000.0
-        assert orden_db.calculo_merma_pct == 0.0
-        assert orden_db.calculo_extra_kg == 0.0
-        
-        # B. LOTE DATA (Columnas)
+
+        # A. PESO PRODUCCION = suma de meta_kg de lotes
+        assert orden_db.calculo_peso_produccion == pytest.approx(1000.0)
+        # Merma = 0 (sin colada en el snapshot)
+        assert orden_db.calculo_merma_pct == pytest.approx(0.0)
+
+        # B. Lote: coladas = meta_kg * 1000 / peso_neto_golpe = 1000000 / 200 = 5000
         lote_db = orden_db.lotes[0]
-        assert lote_db.calculo_col_d == 1000.0
-        assert lote_db.calculo_peso_base == 1000.0
-        
-        # C. MATERIALES (Columnas)
-        # PP: 60% de 1000 = 600kg
+        assert lote_db.meta_kg == pytest.approx(1000.0)
+        assert lote_db.calculo_coladas == pytest.approx(5000.0)
+        assert lote_db.calculo_kg_real == pytest.approx(1000.0)
+
+        # C. MATERIALES: fraccion * meta_kg * (1 + merma) = fraccion * 1000
         mats = lote_db.materias_primas
         pp = next(m for m in mats if m.materia.nombre == "POLIPROPILENO")
-        assert pp.calculo_peso_kg == 600.0
-        
+        assert pp.calculo_peso_kg == pytest.approx(600.0)   # 60% × 1000
+
         molido = next(m for m in mats if m.materia.nombre == "MOLIDO")
-        assert molido.calculo_peso_kg == 400.0
-        
-        # ---------------------------------------------------------------------
-        # 6. VALIDACIÓN LEGACY (El to_dict debe seguir funcionando igual)
-        # ---------------------------------------------------------------------
+        assert molido.calculo_peso_kg == pytest.approx(400.0)  # 40% × 1000
+
+        # D. to_dict
         data = orden_db.to_dict()
         lote_data = data['lotes'][0]
         resumen = data['resumen_totales']
 
-        assert resumen['Peso(Kg) PRODUCCION'] == 1000.0
-        assert lote_data['Peso (Kg)'] == 1000.0
-        
+        assert resumen['Peso(Kg) PRODUCCION'] == pytest.approx(1000.0)
+        assert lote_data['meta_kg'] == pytest.approx(1000.0)
+
         mats_dict = lote_data['materiales']
         pp_data = next(m for m in mats_dict if m['nombre'] == "POLIPROPILENO")
-        assert pp_data['peso_kg'] == 600.0
-        
+        assert pp_data['peso_kg'] == pytest.approx(600.0)
+
         mo = lote_data['mano_obra']
-        # HH Validation (mismos valores que antes)
-        # 100,000s / 3600 = 27.77h maq -> 1.157 dias -> * 48h (24*2p) = 55.55
-        horas_maq = 100000 / 3600
-        dias_maq = horas_maq / 24
+        # HH: tiempo=20s/ciclo, meta=1000kg, neto=200g/golpe → golpes=5000
+        # total_s=100000 → horas=27.77 → dias=1.157 → HH=1.157*24*2=55.55
+        horas_maq = (1000000 / 200 * 20) / 3600   # = 100000/3600
+        dias_maq  = horas_maq / 24
         hh_esperadas = dias_maq * 24 * 2
-        
-        
         assert mo['horas_hombre'] == pytest.approx(hh_esperadas, abs=0.01)
 
         # ---------------------------------------------------------------------
@@ -188,48 +187,27 @@ def test_estructura_completa_json(client, app):
         # Verificar en dict final
         final_dict = orden.to_dict()
         assert final_dict['resumen_totales']['Familia Color'] == "TRANSPARENTE"
-        # ---------------------------------------------------------------------
         # 8. VALIDAR REGISTRO DIARIO
-        # ---------------------------------------------------------------------
-        # Crear registro asociado a la orden y maquina
         registro = RegistroDiarioProduccion(
             orden_id=orden.numero_op,
             maquina_id=maquina_test.id,
             fecha=datetime.now(timezone.utc).date(),
             turno="DIA",
-            # maquinista="TEST OPERATOR", # Removed
-            # molde=orden.molde, # Removed
-            # pieza_color="TEST-PIEZA-COLOR", # Removed
             colada_inicial=0,
-            colada_final=100, # coladas=100
-            # horas_trabajadas=5.0, # Removed
-            
-            # Snapshots (Copiados de la Orden)
-            snapshot_cavidades=orden.snapshot_cavidades, # 4
-            tiempo_ciclo_reportado=orden.snapshot_tiempo_ciclo,
-            snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr, # 50.0
-            snapshot_peso_colada_gr=0.0,
-            snapshot_peso_extra_gr=0.0
+            colada_final=100,
+
+            # Snapshots (valores directos del nuevo modelo)
+            snapshot_cavidades   = orden_db.calculo_cavidades_totales,  # 1
+            tiempo_ciclo_reportado = orden.snapshot_tiempo_ciclo,
+            snapshot_peso_neto_gr  = orden_db.calculo_peso_neto_golpe,  # 200g
+            snapshot_peso_colada_gr= 0.0,
+            snapshot_peso_extra_gr = 0.0,
         )
-        
         registro.actualizar_totales()
         db.session.add(registro)
         db.session.commit()
-        
-        # Validar Cálculos
-        
-        # 1. Peso Aprox = (PesoUnit * Cavs * Coladas) / 1000
-        # (50 * 4 * 100) / 1000 = 20,000 / 1000 = 20.0 kg
+
+        # Peso = (200g * 1cav * 100 coladas) / 1000 = 20.0 kg
         assert registro.total_kg_real == pytest.approx(20.0)
-        
-        # 2. Cantidad Real = Coladas * Cavs
-        # 100 * 4 = 400
-        assert registro.total_piezas_buenas == 400
-        
-        # 3. Produccion Esperada 
-        # No existe campo "calculo_produccion_esperada_kg" en el modelo actual.
-        # Lo omitimos si no es parte del modelo actual.
-        
-        # Validar Relationships
-        assert len(orden.registros_diarios) == 1
-        # assert orden.registros_diarios[0].maquinista == "TEST OPERATOR" # Removed as field does not exist
+        # Piezas = 100 * 1 = 100
+        assert registro.total_piezas_buenas == 100

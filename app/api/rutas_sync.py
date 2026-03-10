@@ -70,19 +70,20 @@ def sync_pesajes():
                     errors.append({'local_id': p['local_id'], 'error': f"Orden {orden_id} no encontrada"})
                     continue
 
-                # Crear RDP on-the-fly
+                # Crear RDP on-the-fly con snapshots desde caché de la orden
                 rdp = RegistroDiarioProduccion(
                     orden_id=orden_id,
                     maquina_id=maq_id,
                     fecha=fecha_ot,
                     turno=turno,
-                    hora_inicio="00:00", # Placeholder
+                    hora_inicio="00:00",
                     colada_inicial=0,
                     colada_final=0,
-                    # Snapshots
-                    snapshot_cavidades=orden.snapshot_cavidades,
-                    snapshot_peso_neto_gr=orden.snapshot_peso_unitario_gr,
-                    tiempo_ciclo_reportado=orden.snapshot_tiempo_ciclo or 0.0
+                    # Snapshots del nuevo modelo (de campos cacheados)
+                    snapshot_cavidades      = orden.calculo_cavidades_totales or 1,
+                    snapshot_peso_neto_gr   = orden.calculo_peso_neto_golpe or 0.0,
+                    snapshot_peso_colada_gr = orden.snapshot_peso_colada_gr or 0.0,
+                    tiempo_ciclo_reportado  = orden.snapshot_tiempo_ciclo or 0.0,
                 )
                 db.session.add(rdp)
                 db.session.flush() # Para obtener ID

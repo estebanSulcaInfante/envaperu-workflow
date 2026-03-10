@@ -1,169 +1,205 @@
 # 📄 Informe de Definición de Estructura: Sistema de Producción (Completo y Normalizado)
 
-Este documento define la estructura de datos, lógica de negocio y contrato de interfaz (API) para la vista completa de Órdenes de Producción, basada en el archivo *OP1322-BALDE ROMANO.xlsm*.
+Este documento define la estructura de datos, lógica de negocio y contrato de interfaz (API) para la vista completa de Órdenes de Producción.
+
+> **Última actualización (refactoring):** Se eliminó el concepto de `tipo_orden` (estrategias Por Peso / Por Cantidad / Stock). Cada `LoteColor` ahora recibe un `meta_kg` directo como único input de producción. La snapshot del molde pasó de campos escalares a una tabla separada (`snapshot_composicion_molde`) que soporta moldes multi-pieza.
 
 ---
 
 ## 1. Entidad: Orden de Producción (Cabecera Global)
-Es la entidad padre (`OrdenProduccion`). Contiene la configuración técnica de la máquina, el molde y la estrategia de producción seleccionada.
+
+Es la entidad padre (`OrdenProduccion`). Contiene la configuración técnica de la máquina, el molde y los parámetros de producción.
 
 | Atributo / Campo | Origen de Dato | Descripción | Fórmula / Lógica |
 | :--- | :--- | :--- | :--- |
-| **Nº OrdenProduccion** | Input (Sistema) | Identificador único (ej. OP-1322). | - |
-| **Fecha Creación** | Automático | Fecha de registro en BD (Timestamp). | `NOW()` |
+| **Nº OrdenProduccion** | Input (Sistema) | Identificador único (ej. OP-1322). Primary Key tipo String. | - |
+| **Fecha Creación** | Automático | Fecha de registro en BD (Timestamp UTC). | `NOW()` |
 | **F. Inicio** | **Input (Usuario)** | Fecha planificada para el arranque de producción. | - |
-| **Producto** | Input (Usuario) | Nombre del producto a fabricar. | - |
-| **Molde** | Input (Usuario) | Código o nombre del molde. | - |
-| **Máquina** | Input (Usuario) | ID de la máquina asignada. | - |
-| **Tipo Máquina** | Input (Usuario) | Clasificación técnica (ej. Hidráulica 500T). | - |
-| **Tipo de Orden** | Input (Select) | Estrategia: *Por Peso, Por Cantidad, Stock*. | - |
+| **Producto (SKU)** | Input (Usuario) | FK a `ProductoTerminado`. Incluye campo `producto` como nombre en cache. | - |
+| **Molde (Código)** | Input (Usuario) | FK a `Molde`. Incluye campo `molde` como nombre en cache. | - |
+| **Máquina** | Input (Usuario) | FK a `Maquina`. | - |
 | **Activa** | Automático | Estado de la orden (abierta/cerrada). Default: `true`. Una OP cerrada no permite crear nuevos Registros Diarios. | `Boolean` |
-| **Snapshot T. Ciclo (seg)** | Input (Técnico) | Duración de un ciclo de inyección en segundos (Snapshot). | - |
-| **Snapshot P Unit (g)** | Input (Técnico) | Peso de una pieza limpia (Snapshot). | - |
-| **Snapshot Cavidades** | Input (Técnico) | Número de piezas por golpe (Snapshot). | - |
-| **Snapshot P Inc Cola (g)** | Input (Técnico) | Peso total del tiro (Piezas + Colada) (Snapshot). | - |
-| **Ciclos** | Input (Técnico) | Cantidad de ciclos teóricos (si aplica). | - |
-| **Snapshot Horas Turno** | Input (Técnico) | Horas laborales por día (ej. 23 o 24) (Snapshot). | - |
+| **Snapshot T. Ciclo (seg)** | Input (Técnico) | Duración de un ciclo de inyección en segundos. | - |
+| **Snapshot Horas Turno** | Input (Técnico) | Horas laborales por día (ej. 23 o 24). | - |
+| **Snapshot Peso Colada (g)** | Input (Técnico) | Peso del ramal/runner (gramos). No incluye piezas. | - |
+| **Ciclos** | Input (Técnico) | Cantidad de ciclos teóricos (opcional). | - |
 | **T/C (Tipo Cambio)** | Input (Finanzas) | Tipo de cambio USD/PEN al crear la orden (para costeo). | - |
 
----
-
-## 2. Entidad: Lote de Color (Detalle Polimórfico)
-Entidad hija (`LoteColor`). Su comportamiento es dinámico: las columnas de "Peso" o "Cantidad" se calculan o habilitan según la estrategia del padre.
-
-| Atributo Visual | Tipo | Descripción | Fórmula / Lógica |
-| :--- | :--- | :--- | :--- |
-| **Color** | Input | Nombre del color (ej. Amarillo). | - |
-| **Por Cantidad (Kg)** | Calculado | *Activo solo en "Por Cantidad".* Muestra la equivalencia en Kg de las docenas. | `(MetaDoc * 12 * P.Unit / 1000) / #Colores` |
-| **Peso (Kg)** | Calculado | *Activo solo en "Por Peso".* División equitativa de la meta global. | `MetaKg / #Colores` |
-| **Stock (Kg)** | **Input Manual** | *Activo solo en "Stock".* Único campo editable por lote. | `Input Usuario` |
-| **Extra (Kg)** | Calculado | Parte proporcional del desperdicio asignada a este color. | `TotalExtraOrden / #Colores` |
-| **TOTAL + EXTRA (Kg)** | Calculado | Peso final a entregar a máquina (Base + Extra). | `PesoBase + ExtraKg` |
+> **Eliminado:** El campo `tipo_orden` (estrategia Por Peso / Por Cantidad / Stock) fue removido en el refactoring. La única estrategia vigente es `meta_kg` directo por lote.
 
 ---
 
-## 3. Entidad: Tabla Auxiliar de Cálculos (Resumen Totales)
-Es una vista calculada (`resumen_totales`) que no se guarda en BD, sino que se procesa en tiempo real para mostrar los tiempos y materiales totales.
+## 2. Entidad: Snapshot de Composición del Molde (Nueva Tabla)
 
-| Atributo / Etiqueta | Descripción | Fórmula / Lógica (Python Style) |
+Tabla `snapshot_composicion_molde`. Congela la configuración de piezas del molde **al momento de crear la OP**. Reemplaza los anteriores campos escalares `snapshot_cavidades` y `snapshot_peso_neto_gr` de la cabecera.
+
+**Motivación:** Un molde puede producir distintos tipos de piezas simultáneamente (molde multi-pieza). Esta estructura permite registrar cada tipo de pieza con sus propias cavidades y peso unitario.
+
+| Atributo | Tipo | Descripción |
 | :--- | :--- | :--- |
-| **Peso(Kg) PRODUCCION** | Meta neta de producción (Base de cálculo). | `MetaKg` (si Peso), `Doc*12*PUnit/1000` (si Cant), `Sum(Lotes)` (si Stock) |
-| **Peso (Kg) Inc. Merma** | Producción + Merma Natural (sin reglas de cobro). | `Produccion * (1 + %Merma)` |
-| **% Merma** | Porcentaje de desperdicio real del tiro. | `(PesoTiro - (P.Unit * Cav)) / PesoTiro` |
-| **Merma Natural Kg** | Kilos físicos de desperdicio generados. | `PesoIncMerma - PesoProduccion` |
-| **Cantidad DOC** | Producción neta en Docenas (con decimales). | `MetaDoc` (si Cant) o `(Produccion * 1000) / P.Unit / 12` |
-| **Total DOC** | Producción neta en Docenas (redondeo visual). | `ROUND(Cantidad DOC, 0)` |
-| **% EXTRA** | Porcentaje cobrable al cliente (según reglas). | `IF(%Merma < 5%, %Merma, IF(%Merma <= 10%, %Merma/2, 0))` |
-| **EXTRA** | Kilos adicionales cobrables agregados a la orden. | `PesoProduccion * %Extra` |
-| **Peso REAL A ENTREGAR** | Total materia prima requerida (Prod + Extra). | `PesoProduccion + EXTRA` |
-| **Horas** | Tiempo estimado de inyección en horas. | `Dias * HorasTurno` |
-| **Días** | Tiempo estimado en días (según turno). | `(TotalGolpes * Ciclo) / 3600 / HorasTurno` |
-| **F. Fin** | Fecha estimada de finalización. | `WORKDAY(F.Inicio, Dias)` (Sumar días laborales) |
+| **id** | Auto (BD) | Primary Key. |
+| **orden_id** | FK | Referencia al `numero_op` de la Orden padre. |
+| **pieza_sku** | FK (nullable) | Referencia a `Pieza`. Nullable para override manual sin pieza en catálogo. |
+| **cavidades** | Input | Número de cavidades para este tipo de pieza en el golpe. |
+| **peso_unit_gr** | Input | Peso de una unidad de esta pieza (gramos). |
+| **peso_subtotal_gr** | Calculado | `cavidades × peso_unit_gr` |
+
+### Propiedades Derivadas (calculadas en `OrdenProduccion`)
+
+| Propiedad | Fórmula |
+| :--- | :--- |
+| **peso_neto_golpe_gr** | `SUM(snapshot.peso_subtotal_gr)` para todos los snapshots de la OP |
+| **peso_tiro_gr** | `peso_neto_golpe_gr + snapshot_peso_colada_gr` |
+| **cavidades_totales** | `SUM(snapshot.cavidades)` |
+| **es_multipieza** | `len(snapshot_composicion) > 1` |
 
 ---
 
-## 4. Entidad: Composición de Materiales (Lista Dinámica)
-Define la mezcla de materia prima para cada lote. Se modela como una lista de componentes, eliminando las columnas fijas (Virgen 1, 2...).
+## 3. Entidad: Lote de Color
+
+Entidad hija (`LoteColor`). Cada lote representa un color de producción. Recibe `meta_kg` como **único input** de producción, eliminando el polimorfismo por estrategia.
+
+| Atributo | Tipo | Descripción | Fórmula / Lógica |
+| :--- | :--- | :--- | :--- |
+| **Color** | Input (FK) | Referencia a `ColorProducto`. | - |
+| **Producto SKU Output** | Input (FK, nullable) | Referencia al SKU de `ProductoTerminado` que produce este lote. | - |
+| **meta_kg** | **Input directo** | Kilos objetivo para este color. Es el único input de producción del lote. | Usuario ingresa directamente |
+| **Personas** | Input | Operarios asignados a la mezcla. Default: 1. | - |
+| **calculo_coladas** | Calculado (persistido) | Golpes necesarios para cumplir la meta. Resultado exacto (Float, sin redondeo con ceil). | `(meta_kg × 1000) / peso_neto_golpe_gr` |
+| **calculo_kg_real** | Calculado (persistido) | Kg reales que produce la máquina exactamente. Refleja el resultado de las coladas exactas. | `calculo_coladas × peso_neto_golpe_gr / 1000` |
+| **calculo_horas_hombre** | Calculado (persistido) | Horas-Hombre proporcionales al tiempo total de la orden. | `(dias_orden × horas_turno × personas) / n_colores` |
+
+> **Nota sobre `calculo_coladas`:** Es Float exacto sin `math.ceil`. La máquina opera con golpes: el sistema muestra el número exacto de golpes necesarios. Si se requiere un entero para planificación física, se aplica ceil en la capa de presentación.
+
+> **Eliminado:** Los campos `Por Cantidad (Kg)`, `Peso (Kg)`, `Stock (Kg)` y `Extra (Kg)` fueron eliminados junto con el `tipo_orden`. La lógica polimórfica ya no existe.
+
+---
+
+## 4. Cálculos Cacheados en `OrdenProduccion`
+
+Todos los valores calculados se **persisten en BD** y se actualizan llamando a `actualizar_metricas()`. Este método también dispara en cascada a los `LoteColor` hijos.
+
+| Columna Persistida | Descripción | Fórmula |
+| :--- | :--- | :--- |
+| **calculo_peso_neto_golpe** | Peso neto total del golpe (piezas, sin colada). | `SUM(snap.cavidades × snap.peso_unit_gr)` |
+| **calculo_peso_tiro_gr** | Peso total del golpe (piezas + ramal). | `peso_neto_golpe + snapshot_peso_colada_gr` |
+| **calculo_cavidades_totales** | Total de cavidades del golpe. | `SUM(snap.cavidades)` |
+| **calculo_colores_activos** | Número de lotes activos en la OP. | `len(lotes)` |
+| **calculo_peso_produccion** | Meta neta total de producción. | `SUM(lote.meta_kg)` |
+| **calculo_merma_pct** | % de merma (solo colada/runner). | `(peso_tiro - peso_neto) / peso_tiro` |
+| **calculo_peso_inc_merma** | Producción incluyendo merma natural. | `calculo_peso_produccion × (1 + calculo_merma_pct)` |
+| **calculo_merma_natural_kg** | Kilos físicos de desperdicio (colada). | `calculo_peso_inc_merma - calculo_peso_produccion` |
+| **calculo_horas** | Tiempo estimado de inyección (horas). | `golpes × ciclo_seg / 3600` |
+| **calculo_dias** | Tiempo estimado en días. | `calculo_horas / snapshot_horas_turno` |
+| **calculo_fecha_fin** | Fecha estimada de finalización. | `fecha_inicio + timedelta(days=calculo_dias)` |
+| **calculo_familia_color** | Cache del nombre de familia de color del producto. | Desde `ProductoTerminado.familia_color_rel` |
+
+> **Nota sobre `calculo_merma_pct`:** La merma se calcula **únicamente** como el desperdicio físico del ramal/colada (runner), no como una merma de producción configurable. Es un dato objetivo del molde.
+
+---
+
+## 5. Entidad: Composición de Materiales (Lista Dinámica)
+
+Define la mezcla de materia prima para cada lote. Tabla `se_compone`.
 
 | Atributo | Origen | Descripción | Lógica |
 | :--- | :--- | :--- | :--- |
-| **Material** | Input (Select) | Nombre del material seleccionado de la BD. | - |
+| **Material** | Input (Select) | FK a `MateriaPrima`. | - |
 | **Tipo** | Automático | Clasificación (Virgen, Segunda) traída del Material. | - |
 | **Fracción** | Input (Manual) | Porcentaje de participación en la mezcla (0.0 a 1.0). | - |
-| **Peso (Kg)** | Calculado | Kilos de material requeridos para este lote. | `PesoTotalLote * Fracción` |
+| **calculo_peso_kg** | Calculado (persistido) | Kilos de material requeridos para este lote, incluyendo merma de colada. | `meta_kg × (1 + merma_pct) × fraccion` |
 
 > **Validación:** La suma de las fracciones de la lista `materiales` debe ser **1.0**.
 
 ---
 
-## 5. Entidad: Receta de Colorantes (Lista Dinámica)
-Define la lista de pigmentos necesarios para el color.
+## 6. Entidad: Receta de Colorantes (Lista Dinámica)
+
+Define la lista de pigmentos necesarios para el color. Tabla `se_colorea`.
 
 | Atributo | Origen | Descripción | Lógica |
 | :--- | :--- | :--- | :--- |
-| **Pigmento** | Input (Select) | Nombre del pigmento o masterbatch. | - |
-| **Dosis** | Input (Manual) | Cantidad a usar (Gramos por bolsa). | - |
-
-**Mano de Obra (Por Lote):**
-| Atributo | Origen | Descripción | Fórmula |
-| :--- | :--- | :--- | :--- |
-| **# Personas** | Input (Manual) | Operarios asignados a la mezcla. | - |
-| **HH** | Calculado | Horas Hombre requeridas. | `(TotalDias * HorasTurno * #Personas) / #Colores` |
+| **Pigmento** | Input (Select) | FK a `Colorante`. | - |
+| **Dosis (gramos)** | Input (Manual) | Gramos por bolsa (dosis). | - |
 
 ---
 
-## 6. Estructura JSON para Frontend (Referencia)
+## 7. Estructura JSON para Frontend (Referencia)
 
-Estructura de respuesta sugerida para el endpoint `GET /api/ordenes/<id>`. Incluye **todas** las secciones necesarias para renderizar la vista completa de Órdenes.
+Estructura de respuesta del endpoint `GET /api/ordenes/<id>` (método `to_dict()`).
 
 ```json
 {
-  "cabecera": {
-    "numero_op": "OP-1322",
-    "fecha_creacion": "2023-11-20T08:00:00",
-    "fecha_inicio": "2023-11-21T07:00:00",
-    "producto": "BALDE ROMANO",
-    "molde": "MOLDE-BALDE-01",
-    "maquina": "M1",
-    "tipo_maquina": "Hidráulica 500T",
-    "tipo_orden": "POR_PESO",
-    "tiempo_ciclo": 30.0,
-    "peso_unitario": 87.0,
-    "cavidades": 2,
-    "peso_tiro": 176.0,
-    "horas_turno": 23.0
+  "numero_op": "OP-1322",
+  "producto": "BALDE ROMANO",
+  "maquina": "M1",
+  "tipo_maquina": "Hidráulica 500T",
+  "fecha": "2023-11-20T08:00:00",
+  "fecha_inicio": "2023-11-21T07:00:00",
+  "molde": "MOLDE-BALDE-01",
+  "activa": true,
+
+  "snapshot_tecnico": {
+    "tiempo_ciclo_seg": 30.0,
+    "horas_turno": 23.0,
+    "peso_colada_gr": 2.0,
+    "es_multipieza": false,
+    "peso_neto_golpe_gr": 174.0,
+    "peso_tiro_gr": 176.0,
+    "cavidades_totales": 2,
+    "composicion": [
+      {
+        "pieza_sku": "PIE-001",
+        "pieza_nombre": "Balde Romano Cuerpo",
+        "cavidades": 2,
+        "peso_unit_gr": 87.0,
+        "peso_subtotal_gr": 174.0
+      }
+    ]
   },
-  
+
   "lotes": [
     {
-      "colores": "Amarillo",
-      
-      // --- SECCIÓN 1: POLIMORFISMO ---
-      "Por cantidad": null,
-      "Peso (Kg)": 175.0,
-      "Stock (Kg)": null,
-      "Extra (kg)": 1.99,
-      "TOTAL + EXTRA Kg": 176.99,
+      "id": 1,
+      "Color": "Amarillo",
+      "meta_kg": 175.0,
+      "kg_real": 174.993,
+      "coladas": 1006.8390,
 
-      // --- SECCIÓN 2: MATERIALES (LISTA DINÁMICA) ---
       "materiales": [
-        { "nombre": "PP Clarif", "tipo": "Virgen", "fraccion": 0.5, "peso_kg": 88.49 },
-        { "nombre": "Molido", "tipo": "Segunda", "fraccion": 0.5, "peso_kg": 88.50 }
+        { "nombre": "PP Clarif", "tipo": "Virgen", "fraccion": 0.5, "peso_kg": 89.0 },
+        { "nombre": "Molido",    "tipo": "Segunda", "fraccion": 0.5, "peso_kg": 89.0 }
       ],
-
-      // --- SECCIÓN 3: COLORANTES (LISTA DINÁMICA) ---
       "pigmentos": [
-         { "nombre": "Amarillo CH 1041", "dosis_gr": 30 },
-         { "nombre": "Dioxido Titanio", "dosis_gr": 5 }
+        { "nombre": "Amarillo CH 1041", "dosis_gr": 30 },
+        { "nombre": "Dioxido Titanio",  "dosis_gr": 5 }
       ],
-      
       "mano_obra": {
-         "personas": 1,
-         "horas_hombre": 18.3
+        "personas": 1,
+        "horas_hombre": 18.3
       }
     }
   ],
-  
-  "tabla_auxiliar": {
-    "F.Fin": "2023-11-23",
-    "Dias": 2.19,
-    "Horas": 50.28,
-    "Peso(Kg) PRODUCCION": 1050.00,
-    "Peso (Kg) Inc. Merma": 1061.93,
+
+  "resumen_totales": {
+    "Peso(Kg) PRODUCCION": 175.0,
+    "Peso (Kg) Inc. Merma": 177.0,
     "%Merma": 0.0114,
-    "Merma Natural Kg": 11.93,
-    "Cantidad DOC": 1005.75,
-    "% EXTRA": 0.0114,
-    "EXTRA": 11.93,
-    "Total DOC": 1006.0,
-    "Peso Kg REAL PARA ENTREGAR A MAQUINA": 1062.00
-  }
+    "Merma Natural Kg": 2.0,
+    "Horas": 13.24,
+    "Días": 0.58,
+    "F. Fin": "2023-11-21T23:27:00",
+    "Familia Color": "BALDE"
+  },
+
+  "avance_real_kg": 0.0,
+  "avance_real_coladas": 0
 }
 ```
 
 ---
 
-## 7. Entidad: Registro Diario de Producción (Hoja de Producción)
+## 8. Entidad: Registro Diario de Producción (Hoja de Producción)
 
 Representa la "Hoja de Producción" física que se llena por turno. Es hija de `OrdenProduccion` y contiene la producción real reportada por los maquinistas.
 
@@ -180,29 +216,29 @@ Representa la "Hoja de Producción" física que se llena por turno. Es hija de `
 | **Tiempo Ciclo Reportado** | Input (Manual) | T/C observado en el panel (segundos). | - |
 | **Tiempo Enfriamiento** | Input (Manual) | Tiempo de enfriamiento observado (seg). | - |
 
-### Snapshots (Captura al Crear)
+### Snapshots del Registro (Captura al Crear)
 
-Se copian de la `OrdenProduccion` al momento de crear el registro para mantener consistencia histórica.
+Se copian de la `OrdenProduccion` al momento de crear el registro para mantener consistencia histórica. A diferencia de la OP, el registro mantiene snapshots escalares (ya que un turno opera sobre el molde completo).
 
 | Atributo | Origen | Descripción |
 | :--- | :--- | :--- |
-| **snapshot_cavidades** | Orden | Número de cavidades al crear el registro. |
-| **snapshot_peso_neto_gr** | Orden | Peso unitario de pieza (gramos). |
+| **snapshot_cavidades** | Orden | Total de cavidades del golpe al crear el registro. |
+| **snapshot_peso_neto_gr** | Orden | Peso neto total del golpe (todas las piezas, gramos). |
 | **snapshot_peso_colada_gr** | Orden | Peso del ramal/colada (gramos). |
 
 ### Totalizadores (Calculados)
 
-| Atributo | Descripción | Fórmula |
-| :--- | :--- | :--- |
-| **Total Coladas** | Ciclos realizados en el turno. | `colada_final - colada_inicial` |
-| **Total Piezas** | Piezas buenas producidas. | `total_coladas * snapshot_cavidades` |
-| **Total Kg Real** | Peso teórico producido (antes de pesaje). | `(total_coladas * peso_tiro_gr) / 1000` |
+| Atributo | Descripción | Fórmula | Prioridad |
+| :--- | :--- | :--- | :--- |
+| **total_coladas_calculada** | Ciclos realizados en el turno. | `colada_final - colada_inicial` | Contadores > Suma detalles |
+| **total_piezas_buenas** | Piezas buenas producidas. | `total_coladas_calculada × snapshot_cavidades` | - |
+| **total_kg_real** | Kg reales del turno. | `SUM(ControlPeso.peso_real_kg)` | Pesajes reales > Cálculo coladas |
 
-> **Nota:** `peso_tiro_gr = (snapshot_peso_neto_gr * snapshot_cavidades) + snapshot_peso_colada_gr`
+> **Nota sobre `total_kg_real`:** Prioridad 1: suma de pesajes físicos (`ControlPeso`). Prioridad 2 (fallback): `total_coladas × (peso_neto_gr + peso_colada_gr) / 1000`.
 
 ---
 
-## 8. Entidad: Detalle Producción Hora (Tabla Interna)
+## 9. Entidad: Detalle Producción Hora (Tabla Interna)
 
 Cada `RegistroDiarioProduccion` tiene N filas de detalle, una por cada hora trabajada. Permite el seguimiento hora-a-hora.
 
@@ -213,12 +249,12 @@ Cada `RegistroDiarioProduccion` tiene N filas de detalle, una por cada hora trab
 | **Color** | Input | Color producido (puede cambiar por hora). |
 | **Coladas Realizadas** | Input | Cantidad de ciclos en esa hora. |
 | **Observación** | Input | Notas (parada, cambio de molde, etc.). |
-| **Cantidad Piezas** | Calculado | `coladas_realizadas * cavidades` |
-| **Kg Producidos** | Calculado | `(coladas_realizadas * peso_tiro_gr) / 1000` |
+| **Cantidad Piezas** | Calculado | `coladas_realizadas × cavidades` |
+| **Kg Producidos** | Calculado | `(coladas_realizadas × peso_tiro_gr) / 1000` |
 
 ---
 
-## 9. Entidad: Control de Peso (Doble Verificación)
+## 10. Entidad: Control de Peso (Doble Verificación)
 
 Sistema de pesaje individual de "bultos" para contrastar con la producción reportada. Sirve como doble verificación y control de calidad.
 
@@ -241,31 +277,53 @@ Sistema de pesaje individual de "bultos" para contrastar con la producción repo
 
 ---
 
-## 10. Estructura JSON: Registro Diario (Referencia)
+## 11. Estructura JSON: Registro Diario (Referencia)
 
-Estructura de respuesta sugerida para `GET /api/ordenes/<op>/registros`.
+Estructura de respuesta para `GET /api/ordenes/<op>/registros`.
 
 ```json
 {
-  "ID Registro": 1,
-  "FECHA": "2023-11-21",
-  "Turno": "DIURNO",
-  "Maquina": "INY-05",
-  "Hora Inicio": "07:00",
-  "Colada Ini": 1000,
-  "Colada Fin": 1500,
-  "Total Coladas (Calc)": 500,
-  "Total Piezas (Est)": 1000,
-  "Total Kg (Est)": 87.0,
+  "id": 1,
+  "fecha": "2023-11-21",
+  "turno": "DIURNO",
+  "maquina": "INY-05",
+  "orden": "OP-1322",
+  "contadores": {
+    "inicial": 1000,
+    "final": 1500,
+    "total": 500
+  },
+  "parametros": {
+    "ciclo": 30.0,
+    "enfriamiento": 5.0
+  },
+  "totales_estimados": {
+    "piezas": 1000,
+    "kg_total": 88.0
+  },
   "detalles": [
     {
-      "hora": "07:00 - 08:00",
+      "hora": "07:00",
       "maquinista": "Juan Perez",
       "color": "AMARILLO",
       "coladas": 50,
       "piezas": 100,
-      "kg": 8.7
+      "kg": 8.8
     }
   ]
 }
 ```
+
+---
+
+## 12. Resumen de Cambios del Refactoring
+
+| Aspecto | Antes | Después |
+| :--- | :--- | :--- |
+| **Estrategia de meta** | `tipo_orden`: Por Peso / Por Cantidad / Stock | Eliminado. `meta_kg` directo por lote |
+| **Input de LoteColor** | Campo polimórfico según `tipo_orden` | `meta_kg` único campo de input |
+| **Snapshot molde** | Campos escalares en `OrdenProduccion` (`snapshot_cavidades`, `snapshot_peso_neto_gr`) | Tabla `snapshot_composicion_molde` (soporta multi-pieza) |
+| **Cálculo coladas** | Con `math.ceil` (entero) | Float exacto sin redondeo |
+| **calculo_kg_real** | Aproximación por ceil | `coladas_float × peso_neto_golpe / 1000` (resultado exacto) |
+| **Merma** | Configurable / multiple fuentes | Solo merma física de colada (runner): `(tiro - neto) / tiro` |
+| **Campos eliminados** | `Extra (Kg)`, `TOTAL + EXTRA`, `%EXTRA`, `Peso(Kg) PRODUCCION` polimórfico | Todos eliminados |

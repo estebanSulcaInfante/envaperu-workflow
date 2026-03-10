@@ -10,3 +10,4 @@ from app.models.control_peso import ControlPeso
 from app.models.molde import Molde, MoldePieza
 from app.models.talonario import Talonario
 from app.models.historial_estado import HistorialEstadoOrden
+from app.models.receta_color import RecetaColorNormalizada

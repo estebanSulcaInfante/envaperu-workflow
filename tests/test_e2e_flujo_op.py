@@ -52,17 +52,18 @@ class TestFlujoOPCompleto:
         print("2. Creando OP en central...")
         response = requests.post(f'{CENTRAL_URL}/api/ordenes', json={
             'numero_op': op_numero,
+            'maquina_id': 1,
             'producto': 'BALDE ROMANO E2E',
-            'molde': 'BALDE PLAYERO',
-            'tipo_estrategia': 'POR_PESO',
-            'meta_total_kg': 500,
-            'snapshot_peso_unitario_gr': 87.0,
-            'snapshot_peso_inc_colada': 176.0,
-            'snapshot_cavidades': 2,
+            'molde_id': 'MOL-BPLAY-01',
             'snapshot_tiempo_ciclo': 30.0,
             'snapshot_horas_turno': 12.0,
+            'snapshot_peso_colada_gr': 89.0,
+            'snapshot_composicion': [
+                {'pieza_sku': 'TEST-001', 'cavidades': 2, 'peso_unit_gr': 87.0}
+            ],
             'lotes': [{
                 'color_nombre': 'AMARILLO',
+                'meta_kg': 500,
                 'personas': 1,
                 'materiales': [],
                 'pigmentos': []

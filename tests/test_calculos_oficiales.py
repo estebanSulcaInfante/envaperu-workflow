@@ -1,169 +1,157 @@
 import pytest
-from app.models.orden import OrdenProduccion
+from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
 from app.models.producto import ColorProducto
 from app.extensions import db
 
-def test_calculos_tabla_auxiliar_por_estrategia(client, app):
+
+def _mk_op(numero_op, snap_items, lotes_meta, **kwargs):
     """
-    TEST MAESTRO: LÓGICA DE NEGOCIO Y FÓRMULAS DEL EXCEL
-    ----------------------------------------------------------------
-    Objetivo: Validar que los cálculos de la tabla auxiliar (totales)
-    cambien dinámicamente según la estrategia, tal como el IF del Excel.
+    Helper: crea OrdenProduccion + SnapshotComposicionMolde + LoteColor.
+    snap_items: [{cavidades, peso_unit_gr}]
+    lotes_meta: [{color_id, meta_kg}] (pre-creados)
+    kwargs: campos extra de OrdenProduccion
     """
-    
+    op = OrdenProduccion(numero_op=numero_op, **kwargs)
+    db.session.add(op)
+    db.session.flush()
+
+    for item in snap_items:
+        db.session.add(SnapshotComposicionMolde(
+            orden_id     = numero_op,
+            cavidades    = item['cavidades'],
+            peso_unit_gr = item['peso_unit_gr'],
+        ))
+    db.session.flush()
+
+    for l in lotes_meta:
+        db.session.add(LoteColor(
+            numero_op = numero_op,
+            color_id  = l['color_id'],
+            meta_kg   = l['meta_kg'],
+        ))
+    db.session.flush()
+
+    op.actualizar_metricas()
+    db.session.commit()
+    return op
+
+
+def test_calculos_metricas_basicas(client, app):
+    """
+    Verifica los cálculos principales con meta_kg por lote.
+
+    Molde: 2 cav × 87g + 2g colada = 176g tiro
+    Merma = 2/176 ≈ 1.136%
+
+    Lote Rojo:  meta_kg = 174.0  → coladas = 174000/174 = 1000.0 exacto
+    Lote Azul:  meta_kg = 175.0  → coladas = 175000/174 ≈ 1005.747  (sin redondeo)
+    """
     with app.app_context():
-        # =================================================================
-        # CASO 1: ESTRATEGIA "POR PESO" (Ejemplo Balde Romano OP1322)
-        # =================================================================
-        # Lógica Excel: IF(Tipo="Por peso", D10*1000/D7/12, ...)
-        # El input principal son KILOS. Las DOCENAS se calculan.
-        
-        op_peso = OrdenProduccion(
-            numero_op="OP-PESO-CALC",
-            tipo_estrategia="POR_PESO",
-            meta_total_kg=1050.0,  # <-- INPUT USUARIO (D10)
-            
-            # Datos Técnicos (D7, E7, F7...)
-            snapshot_peso_unitario_gr=87.0, # D7
-            snapshot_cavidades=2,           # E7
-            snapshot_peso_inc_colada=176.0, # F7 (Tiro)
-            snapshot_tiempo_ciclo=30.0,
-            snapshot_horas_turno=23.0
+        c_rojo = ColorProducto(nombre="ROJO-CALC", codigo=20)
+        c_azul = ColorProducto(nombre="AZUL-CALC", codigo=21)
+        db.session.add_all([c_rojo, c_azul])
+        db.session.flush()
+
+        op = _mk_op(
+            "OP-CALC-META",
+            snap_items=[{"cavidades": 2, "peso_unit_gr": 87.0}],
+            lotes_meta=[
+                {"color_id": c_rojo.id, "meta_kg": 174.0},
+                {"color_id": c_azul.id, "meta_kg": 175.0},
+            ],
+            snapshot_peso_colada_gr = 2.0,
+            snapshot_tiempo_ciclo   = 30.0,
+            snapshot_horas_turno    = 23.0,
         )
-        db.session.add(op_peso)
-        db.session.commit()
-        
-        # Actualizar métricas calculadas
-        op_peso.actualizar_metricas()
-        db.session.commit()
-        
-        # Obtenemos los cálculos
-        data_peso = op_peso.to_dict()['resumen_totales']
-        
-        # --- VALIDACIÓN DE FÓRMULAS (ASSERTS) ---
-        
-        # 1. % Merma Real
-        # Fórm: (PesoTiro - (PesoUnit * Cav)) / PesoTiro
-        # Calc: (176 - (87 * 2)) / 176 = 2 / 176 = 0.01136...
-        merma_esperada = (176 - (87 * 2)) / 176
-        assert data_peso['%Merma'] == pytest.approx(merma_esperada, abs=0.0001)
-        
-        # 2. % EXTRA (Regla de Negocio)
-        # Como 1.13% < 5%, se cobra el 100% de la merma.
-        assert data_peso['% EXTRA'] == pytest.approx(merma_esperada, abs=0.0001)
 
-        # 3. EXTRA (Kg)
-        # Fórm: MetaKg * %Extra
-        # Calc: 1050 * 0.01136... = 11.93
-        extra_kg_esperado = 1050.0 * merma_esperada
-        assert data_peso['EXTRA'] == pytest.approx(extra_kg_esperado, abs=0.01)
-        
-        # 4. CANTIDAD DOC (La fórmula condicional H21)
-        # Al ser POR PESO -> Convertimos Kg a Docenas
-        # Fórm: (Kg * 1000) / P.Unit / 12
-        # Calc: 1,050,000 / 87 / 12 = 1005.747...
-        docenas_calc = (1050.0 * 1000) / 87.0 / 12
-        assert data_peso['Cantidad DOC'] == pytest.approx(docenas_calc, abs=0.01)
+        # --- Cabecera del golpe ---
+        assert op.calculo_peso_neto_golpe == pytest.approx(174.0)   # 2 × 87
+        assert op.calculo_peso_tiro_gr    == pytest.approx(176.0)   # 174 + 2
+
+        # --- Merma (solo colada) ---
+        merma_esperada = 2.0 / 176.0
+        assert op.calculo_merma_pct == pytest.approx(merma_esperada, abs=0.0001)
+
+        # --- Peso producción = suma de meta_kg ---
+        assert op.calculo_peso_produccion == pytest.approx(349.0)   # 174 + 175
+
+        # --- Coladas por lote (sin redondeo) ---
+        lote_rojo = op.lotes[0]
+        lote_azul = op.lotes[1]
+
+        assert lote_rojo.calculo_coladas == pytest.approx(1000.0, abs=0.001)
+        assert lote_rojo.calculo_kg_real == pytest.approx(174.0,  abs=0.001)
+
+        coladas_azul_esperadas = 175000.0 / 174.0
+        assert lote_azul.calculo_coladas == pytest.approx(coladas_azul_esperadas, rel=1e-4)
+        # kg_real > meta (fracción de golpe de sobrante)
+        assert lote_azul.calculo_kg_real >= lote_azul.meta_kg
 
 
-        # =================================================================
-        # CASO 2: ESTRATEGIA "POR CANTIDAD"
-        # =================================================================
-        # Lógica Excel: IF(Tipo="Por cantidad", C10, ...)
-        # El input principal son DOCENAS. Los Kilos base se calculan.
-        
-        op_cant = OrdenProduccion(
-            numero_op="OP-CANT-CALC",
-            tipo_estrategia="POR_CANTIDAD",
-            meta_total_doc=100.0,  # <-- INPUT USUARIO (C10)
-            
-            snapshot_peso_unitario_gr=45.0,
-            snapshot_cavidades=4,
-            snapshot_peso_inc_colada=200.0, # Tiro más grande => Más merma
-            snapshot_tiempo_ciclo=20.0
+def test_meta_kg_divisible_exacta(client, app):
+    """
+    Cuando meta_kg es exactamente divisible por peso_neto_golpe/1000,
+    calculo_kg_real == meta_kg (sin sobrante).
+    """
+    with app.app_context():
+        c = ColorProducto(nombre="EXACTO", codigo=30)
+        db.session.add(c)
+        db.session.flush()
+
+        # 1 cav × 100g + 0 colada → peso_neto = 100g
+        # meta_kg = 10.0 → coladas = 10000/100 = 100.0 exacta
+        op = _mk_op(
+            "OP-EXACTO",
+            snap_items=[{"cavidades": 1, "peso_unit_gr": 100.0}],
+            lotes_meta =[{"color_id": c.id, "meta_kg": 10.0}],
+            snapshot_peso_colada_gr=0.0,
         )
-        db.session.add(op_cant)
-        db.session.commit()
-        
-        # Actualizar métricas calculadas
-        op_cant.actualizar_metricas()
-        db.session.commit()
-        
-        data_cant = op_cant.to_dict()['resumen_totales']
-        
-        # --- VALIDACIÓN DE FÓRMULAS ---
-
-        # 1. Base de Cálculo (Kg Producción)
-        # Al ser POR CANTIDAD, necesitamos Kilos para la máquina.
-        # Fórm: (Docenas * 12 * P.Unit) / 1000
-        # Calc: (100 * 12 * 45) / 1000 = 54.0 Kg
-        kg_base_esperado = 54.0
-        assert data_cant['Peso(Kg) PRODUCCION'] == kg_base_esperado
-        
-        # 2. Cantidad DOC (Identidad)
-        # Al ser POR CANTIDAD -> Es el mismo valor del input (C10)
-        assert data_cant['Cantidad DOC'] == 100.0
-
-        # 3. % Merma
-        # (200 - (45*4)) / 200 = (200 - 180) / 200 = 20/200 = 0.10 (10%)
-        assert data_cant['%Merma'] == 0.10
-        
-        # 4. % EXTRA (Regla de Negocio)
-        # Como es 10% (está en rango 5-10%), se cobra la MITAD.
-        # Esperado: 5% (0.05)
-        assert data_cant['% EXTRA'] == 0.05
-        
-        # 5. EXTRA (Kg)
-        # 54 Kg * 5% = 2.7 Kg
-        assert data_cant['EXTRA'] == pytest.approx(2.7, abs=0.01)
+        lote = op.lotes[0]
+        assert lote.calculo_coladas == pytest.approx(100.0)
+        assert lote.calculo_kg_real == pytest.approx(10.0)
 
 
-        # =================================================================
-        # CASO 3: ESTRATEGIA "STOCK"
-        # =================================================================
-        # Lógica Excel: IF(Tipo="Completar Stock", SUM(E13:E18), ...)
-        # No hay meta global. El total es la SUMA de los inputs manuales.
-        
-        op_stock = OrdenProduccion(
-            numero_op="OP-STOCK-CALC",
-            tipo_estrategia="STOCK",
-            
-            snapshot_peso_unitario_gr=100.0,
-            snapshot_cavidades=1,
-            snapshot_peso_inc_colada=110.0
+def test_meta_kg_no_divisible(client, app):
+    """
+    Cuando meta_kg NO es divisible, coladas es float (sin ceil),
+    y calculo_kg_real == meta_kg (la expresión es idéntica).
+    """
+    with app.app_context():
+        c = ColorProducto(nombre="NODIV", codigo=31)
+        db.session.add(c)
+        db.session.flush()
+
+        # 1 cav × 30g → meta_kg = 1.0 → coladas = 1000/30 = 33.333...
+        op = _mk_op(
+            "OP-NODIV",
+            snap_items=[{"cavidades": 1, "peso_unit_gr": 30.0}],
+            lotes_meta =[{"color_id": c.id, "meta_kg": 1.0}],
+            snapshot_peso_colada_gr=0.0,
         )
-        db.session.add(op_stock)
-        db.session.commit()
-        
-        # Agregamos Lotes (Simulando input manual en columna E)
-        # Crear colores primero
-        c_a = ColorProducto(nombre="A", codigo=10)
-        c_b = ColorProducto(nombre="B", codigo=11)
-        db.session.add_all([c_a, c_b])
-        db.session.commit()
-        
-        l1 = LoteColor(numero_op=op_stock.numero_op, color_id=c_a.id, stock_kg_manual=50.0)
-        l2 = LoteColor(numero_op=op_stock.numero_op, color_id=c_b.id, stock_kg_manual=50.0)
-        db.session.add_all([l1, l2])
-        db.session.commit()
-        
-        # Actualizar métricas calculadas
-        op_stock.actualizar_metricas()
-        db.session.commit()
-        
-        data_stock = op_stock.to_dict()['resumen_totales']
-        
-        # --- VALIDACIÓN DE FÓRMULAS ---
-        
-        # 1. Base de Cálculo (Suma de Lotes)
-        # 50 + 50 = 100 Kg
-        kg_stock_total = 100.0
-        assert data_stock['Peso(Kg) PRODUCCION'] == kg_stock_total
-        
-        # 2. Cantidad DOC
-        # Al ser STOCK -> Convertimos la Suma de Kg a Docenas
-        # Fórm: (100 Kg * 1000) / P.Unit / 12
-        # Calc: 100,000 / 100 = 1000 un. / 12 = 83.33 docenas
-        docenas_stock = (100.0 * 1000) / 100.0 / 12
-        assert data_stock['Cantidad DOC'] == pytest.approx(docenas_stock, abs=0.01)
+        lote = op.lotes[0]
+        assert lote.calculo_coladas == pytest.approx(1000.0 / 30.0, rel=1e-5)
+        # kg_real recalculado desde coladas × peso → deberia ser igual a meta
+        assert lote.calculo_kg_real == pytest.approx(1.0, rel=1e-5)
+
+
+def test_peso_produccion_es_suma_de_meta_kg(client, app):
+    """La OP.calculo_peso_produccion debe ser exactamente la suma de meta_kg de sus lotes."""
+    with app.app_context():
+        c1 = ColorProducto(nombre="S1", codigo=40)
+        c2 = ColorProducto(nombre="S2", codigo=41)
+        c3 = ColorProducto(nombre="S3", codigo=42)
+        db.session.add_all([c1, c2, c3])
+        db.session.flush()
+
+        op = _mk_op(
+            "OP-SUMA",
+            snap_items=[{"cavidades": 4, "peso_unit_gr": 50.0}],
+            lotes_meta=[
+                {"color_id": c1.id, "meta_kg": 100.0},
+                {"color_id": c2.id, "meta_kg": 250.0},
+                {"color_id": c3.id, "meta_kg": 75.5},
+            ],
+            snapshot_peso_colada_gr=20.0,
+        )
+        assert op.calculo_peso_produccion == pytest.approx(425.5)

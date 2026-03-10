@@ -33,7 +33,6 @@ class TestHistorialEstadoModel:
         with app.app_context():
             orden = OrdenProduccion(
                 numero_op='OP-TEST-001',
-                tipo_estrategia='POR_PESO',
                 activa=True
             )
             db.session.add(orden)
@@ -57,7 +56,6 @@ class TestHistorialEstadoModel:
         with app.app_context():
             orden = OrdenProduccion(
                 numero_op='OP-TEST-002',
-                tipo_estrategia='POR_PESO',
                 activa=False
             )
             db.session.add(orden)
@@ -79,7 +77,6 @@ class TestHistorialEstadoModel:
         with app.app_context():
             orden = OrdenProduccion(
                 numero_op='OP-TEST-003',
-                tipo_estrategia='POR_PESO',
                 activa=True
             )
             db.session.add(orden)
@@ -98,7 +95,6 @@ class TestHistorialAPI:
         with app.app_context():
             orden = OrdenProduccion(
                 numero_op='OP-API-001',
-                tipo_estrategia='POR_PESO',
                 activa=True
             )
             db.session.add(orden)
@@ -122,7 +118,6 @@ class TestHistorialAPI:
         with app.app_context():
             orden = OrdenProduccion(
                 numero_op='OP-API-002',
-                tipo_estrategia='POR_PESO',
                 activa=True
             )
             db.session.add(orden)

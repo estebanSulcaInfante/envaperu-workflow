@@ -19,25 +19,23 @@ class SeCompone(db.Model):
 
     def actualizar_metricas(self, contexto_lote=None):
         """
-        Calcula kilos reales requeridos usando el peso total del lote.
+        Calcula kilos reales requeridos usando meta_kg del lote,
+        incluyendo la merma de colada de la orden padre.
         """
         lote_padre = contexto_lote or self.lote
         if not lote_padre:
             return
 
-        # Peso Total del Lote (Base + Extra)
-        peso_base_mas_extra = lote_padre.calculo_peso_base + lote_padre.calculo_extra_kg
-        
-        # Ajuste Discrepancia F28: Excel suma "Merma a Recuperar" al total de materiales
-        # Pero ojo: el lote NO tiene merma_pct directa, hay que sacarla del padre.
-        merma_pct = 0.0
-        # Intentamos obtener contexto del padre del lote si es posible, o usamos relaciones
-        orden = lote_padre.orden # Ojo: aqui podria ser lazy load si no vieine en contexto
-        if orden:
-             merma_pct = orden.calculo_merma_pct or 0.0
+        meta_kg = lote_padre.meta_kg or 0.0
 
-        peso_total = peso_base_mas_extra * (1 + merma_pct)
+        merma_pct = 0.0
+        orden = lote_padre.orden
+        if orden:
+            merma_pct = orden.calculo_merma_pct or 0.0
+
+        peso_total = meta_kg * (1 + merma_pct)
         self.calculo_peso_kg = peso_total * self.fraccion
+
     @property
     def peso_kg(self):
         return self.calculo_peso_kg or 0.0
