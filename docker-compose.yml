@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  backend:
+    image: esulca/envaperu-backend:latest
+    container_name: envaperu-api
+    restart: unless-stopped
+    ports:
+      - "80:5000"
+    env_file:
+      - .env
+    # Nota: No necesitamos el bloque 'db' aquí, ya que la base de datos
+    # se alojará externamente en Amazon RDS.

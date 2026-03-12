@@ -7,10 +7,9 @@ import os
 
 def setup_logging(app):
     """Configura logging estructurado para la aplicación"""
-    # Crear directorio de logs si no existe
+    # Crear directorio de logs si no existe (con exist_ok=True para evitar race conditions con Gunicorn)
     log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    os.makedirs(log_dir, exist_ok=True)
     
     # Configurar handler de archivo rotativo
     file_handler = RotatingFileHandler(
