@@ -692,18 +692,19 @@ def configurar_producto_cascada():
         "familia": "PLAYEROS", "cod_familia": 14
     }
     """
-    from app.models.producto import PiezaComponente
+    from app.models.producto import PiezaComponente, ProductoTerminado, ProductoPieza
     from app.models.molde import Molde, MoldePieza
 
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
 
-    resultado = {
+    response_data = {
         'molde_creado': None,
         'formas_creadas': [],
         'piezas_creadas': [],
         'kit_creado': None,
+        'producto_terminado': None,
         'errores': []
     }
 
@@ -852,6 +853,9 @@ def configurar_producto_cascada():
                 db.session.add(kit_pieza)
                 db.session.flush()
 
+                db.session.add(kit_pieza)
+                db.session.flush()
+
                 # PiezaComponente: buscar piezas de este color
                 for forma in formas_creadas:
                     base_sku = molde_codigo.replace('MOL-', '')
@@ -861,12 +865,95 @@ def configurar_producto_cascada():
                         db.session.add(PiezaComponente(
                             kit_sku=kit_sku,
                             componente_sku=comp.sku,
-                            cantidad=1
+                            cantidad=forma.cavidades
                         ))
 
                 resultado['piezas_creadas'].append(kit_sku)
 
             resultado['kit_creado'] = kit_sku_base
+
+        # ── 5. CREAR O VINCULAR PRODUCTO TERMINADO (BOM Comercial) ──
+        pt_data = data.get('producto_terminado')
+        if pt_data:
+            cod_sku_pt = pt_data.get('cod_sku_pt')
+            usar_existente = pt_data.get('usar_existente', False)
+            
+            producto = None
+            if usar_existente and cod_sku_pt:
+                producto = db.session.get(ProductoTerminado, cod_sku_pt)
+                if not producto:
+                    resultado['errores'].append(f'Producto Terminado {cod_sku_pt} no encontrado')
+            else:
+                # Crear nuevo PT
+                # Autogenerar SKU si no viene
+                if not cod_sku_pt:
+                    # Lógica simple de auto-sku para PT
+                    pt_base = pt_data.get('producto', 'PT').upper().replace(' ', '-')[:15]
+                    cod_sku_pt = f"PT-{pt_base}"
+                
+                # Verificar si ya existe por si acaso
+                producto = db.session.get(ProductoTerminado, cod_sku_pt)
+                if producto:
+                    resultado['errores'].append(f'Producto Terminado {cod_sku_pt} ya existe, actualizando BOM')
+                else:
+                    producto = ProductoTerminado(
+                        cod_sku_pt=cod_sku_pt,
+                        producto=pt_data.get('producto', f'Producto derivado de {molde.nombre}'),
+                        um=pt_data.get('um', 'Docena'),
+                        familia_color=pt_data.get('familia_color', 'SÓLIDO'),
+                        doc_x_paq=pt_data.get('doc_x_paq', 1.0),
+                        doc_x_bulto=pt_data.get('doc_x_bulto', 10.0),
+                        peso_g=pt_data.get('peso_g', 0.0),
+                        linea_id=linea_obj.id,
+                        familia_id=familia_obj.id,
+                        # Campos legacy/vacios requeridos por DB
+                        cod_producto=0,
+                        cod_familia_color=0,
+                        precio_estimado=0.0,
+                        precio_sin_igv=0.0
+                    )
+                    db.session.add(producto)
+                    db.session.flush()
+                    resultado['producto_terminado'] = cod_sku_pt
+
+            if producto:
+                # Actualizar el BOM (ProductoPieza) eliminando las anteriores si las hubiera
+                ProductoPieza.query.filter_by(producto_terminado_id=producto.cod_sku_pt).delete()
+                
+                # Regla de Negocio: Si hay Kit, el PT apunta al Kit (es un solo item comercial).
+                # Pero en este modelo de "Configuración Rápida", como las piezas Color dependen del Kit y las formas (STD) dependen del Molde, 
+                # y conversamos que el PT apuntará a las piezas STD:
+                
+                # Primero, necesitamos asegurarnos de que existan piezas "Base" o "STD" para cada forma,
+                # independientes del color.
+                for forma in formas_creadas:
+                    base_sku = molde_codigo.replace('MOL-', '')
+                    # Generamos una pieza STD por forma
+                    sku_std = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-STD"
+                    
+                    pieza_std = db.session.get(Pieza, sku_std)
+                    if not pieza_std:
+                        pieza_std = Pieza(
+                            sku=sku_std,
+                            piezas=f"{forma.nombre} (Genérico)",
+                            peso=forma.peso_unitario_gr,
+                            cavidad=forma.cavidades,
+                            tipo='SIMPLE',
+                            linea_id=linea_obj.id,
+                            familia_id=familia_obj.id,
+                            molde_pieza_id=forma.id
+                            # Sin color
+                        )
+                        db.session.add(pieza_std)
+                        db.session.flush()
+                        resultado['piezas_creadas'].append(sku_std)
+                    
+                    # Agregar al BOM del Producto
+                    db.session.add(ProductoPieza(
+                        producto_terminado_id=producto.cod_sku_pt,
+                        pieza_sku=pieza_std.sku,
+                        cantidad=forma.cavidades
+                    ))
 
         db.session.commit()
 

@@ -1,0 +1,134 @@
+{
+  "info": {
+    "name": "Kardex Enva API",
+    "description": "Endpoints para el manejo de inventario de magas y bultos mediante escaneo QR",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Entrada de Manga (INGRESO-PROD)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"codigo_qr\": \"1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;CER-ROM-STD;Cernidor Romano;DatoExtra1;DatoExtra2;DatoExtra3\",\n    \"tipo_operacion\": \"INGRESO-PROD\",\n    \"locacion_origen\": \"ZONA_PRODUCCION\",\n    \"locacion_destino\": \"ALMACEN_PRINCIPAL\",\n    \"operario_id\": \"daniel@test.com\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/kardex/movimientos",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "kardex",
+            "movimientos"
+          ]
+        }
+      }
+    },
+    {
+      "name": "2. Movimiento Interno (MOV-INTERNO)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"codigo_qr\": \"1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;CER-ROM-STD;Cernidor Romano;DatoExtra1;DatoExtra2;DatoExtra3\",\n    \"tipo_operacion\": \"MOV-INTERNO\",\n    \"locacion_origen\": \"ALMACEN_PRINCIPAL\",\n    \"locacion_destino\": \"ZONA_DESPACHO\",\n    \"operario_id\": \"daniel@test.com\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/kardex/movimientos",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "kardex",
+            "movimientos"
+          ]
+        }
+      }
+    },
+    {
+      "name": "3. Despacho o Salida (SAL-ARMAR)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"codigo_qr\": \"1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;CER-ROM-STD;Cernidor Romano;DatoExtra1;DatoExtra2;DatoExtra3\",\n    \"tipo_operacion\": \"SAL-ARMAR\",\n    \"locacion_origen\": \"ZONA_DESPACHO\",\n    \"locacion_destino\": \"\",\n    \"operario_id\": \"daniel@test.com\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/kardex/movimientos",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "kardex",
+            "movimientos"
+          ]
+        }
+      }
+    },
+    {
+      "name": "4. Consultar Inventario Actual",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/kardex/inventario",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "kardex",
+            "inventario"
+          ]
+        }
+      }
+    },
+    {
+      "name": "5. Historial y Estado de Manga específica",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/kardex/manga/1001",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "kardex",
+            "manga",
+            "1001"
+          ]
+        }
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://ec2-98-88-33-79.compute-1.amazonaws.com",
+      "type": "string"
+    }
+  ]
+}

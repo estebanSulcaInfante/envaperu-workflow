@@ -46,19 +46,21 @@ def create_app():
     # --- IMPORTAR MODELOS ---
     # Es crucial importar los modelos aquí para que SQLAlchemy los registre
     # antes de que cualquier blueprint intente usarlos.
-    from app.models import orden, lote, materiales, recetas, producto, registro, control_peso
+    from app.models import orden, lote, materiales, recetas, producto, registro, control_peso, kardex
 
     # --- REGISTRO DE RUTAS ---
     from app.api.rutas_produccion import produccion_bp
     from app.api.rutas_catalogo import catalogo_bp
     from app.api.rutas_talonarios import talonarios_bp
     from app.api.rutas_sync import sync_bp
+    from app.api.rutas_kardex import kardex_bp
     
     # Todo lo que esté en ese archivo empezará con /api
     app.register_blueprint(produccion_bp, url_prefix='/api')
     app.register_blueprint(catalogo_bp, url_prefix='/api')
     app.register_blueprint(talonarios_bp)
     app.register_blueprint(sync_bp, url_prefix='/api')
+    app.register_blueprint(kardex_bp, url_prefix='/api')
     
     # --- MANEJADORES DE ERROR GLOBALES ---
     @app.errorhandler(404)
