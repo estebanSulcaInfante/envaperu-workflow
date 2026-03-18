@@ -17,7 +17,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n    \"codigo_qr\": \"1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;CER-ROM-STD;Cernidor Romano;DatoExtra1;DatoExtra2;DatoExtra3\",\n    \"tipo_operacion\": \"INGRESO-PROD\",\n    \"locacion_origen\": \"ZONA_PRODUCCION\",\n    \"locacion_destino\": \"ALMACEN_PRINCIPAL\",\n    \"operario_id\": \"daniel@test.com\"\n}"
+          "raw": "{\n    \"codigo_qr\": \"1001,MOLDE_TEST,MAQ1,OP100,TURNO1,2026-03-13,1,USER,ROJO,2026-03-13/10:00:00,5.5,Cernidor Romano,DatoExtra1,DatoExtra2,DatoExtra3\",\n    \"tipo_operacion\": \"INGRESO-PROD\",\n    \"locacion_origen\": \"ZONA_PRODUCCION\",\n    \"locacion_destino\": \"ALMACEN_PRINCIPAL\",\n    \"operario_id\": \"daniel@test.com\"\n}"
         },
         "url": {
           "raw": "{{base_url}}/api/kardex/movimientos",
@@ -44,7 +44,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n    \"codigo_qr\": \"1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;CER-ROM-STD;Cernidor Romano;DatoExtra1;DatoExtra2;DatoExtra3\",\n    \"tipo_operacion\": \"MOV-INTERNO\",\n    \"locacion_origen\": \"ALMACEN_PRINCIPAL\",\n    \"locacion_destino\": \"ZONA_DESPACHO\",\n    \"operario_id\": \"daniel@test.com\"\n}"
+          "raw": "{\n    \"codigo_qr\": \"1001,MOLDE_TEST,MAQ1,OP100,TURNO1,2026-03-13,1,USER,ROJO,2026-03-13/10:00:00,5.5,Cernidor Romano,DatoExtra1,DatoExtra2,DatoExtra3\",\n    \"tipo_operacion\": \"MOV-INTERNO\",\n    \"locacion_origen\": \"ALMACEN_PRINCIPAL\",\n    \"locacion_destino\": \"ZONA_DESPACHO\",\n    \"operario_id\": \"daniel@test.com\"\n}"
         },
         "url": {
           "raw": "{{base_url}}/api/kardex/movimientos",
@@ -71,7 +71,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n    \"codigo_qr\": \"1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;CER-ROM-STD;Cernidor Romano;DatoExtra1;DatoExtra2;DatoExtra3\",\n    \"tipo_operacion\": \"SAL-ARMAR\",\n    \"locacion_origen\": \"ZONA_DESPACHO\",\n    \"locacion_destino\": \"\",\n    \"operario_id\": \"daniel@test.com\"\n}"
+          "raw": "{\n    \"codigo_qr\": \"1001,MOLDE_TEST,MAQ1,OP100,TURNO1,2026-03-13,1,USER,ROJO,2026-03-13/10:00:00,5.5,Cernidor Romano,DatoExtra1,DatoExtra2,DatoExtra3\",\n    \"tipo_operacion\": \"SAL-ARMAR\",\n    \"locacion_origen\": \"ZONA_DESPACHO\",\n    \"locacion_destino\": \"\",\n    \"operario_id\": \"daniel@test.com\"\n}"
         },
         "url": {
           "raw": "{{base_url}}/api/kardex/movimientos",

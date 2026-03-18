@@ -9,10 +9,10 @@ kardex_bp = Blueprint('kardex', __name__)
 def _parsear_pesaje_id_del_qr(codigo_qr: str) -> int | None:
     """
     Extrae el pesaje_id (primer campo) del string QR del sticker.
-    Formato: ID;MOLDE;MAQUINA;NRO_OP;TURNO;FECHA_OT;NRO_OT;OPERADOR;COLOR;FECHA_HORA;PESO_KG
+    Formato: ID,MOLDE,MAQUINA,NRO_OP,TURNO,FECHA_OT,NRO_OT,OPERADOR,COLOR,FECHA_HORA,PESO_KG
     """
     try:
-        parts = codigo_qr.split(';')
+        parts = codigo_qr.replace(';', ',').split(',')
         return int(parts[0])
     except (ValueError, IndexError):
         return None
@@ -21,20 +21,19 @@ def _parsear_pesaje_id_del_qr(codigo_qr: str) -> int | None:
 def _parsear_datos_qr(codigo_qr: str) -> dict:
     """
     Extrae datos descriptivos del QR para cachear en InventarioManga.
-    Formato: ID;MOLDE;MAQUINA;NRO_OP;TURNO;FECHA_OT;NRO_OT;OPERADOR;COLOR;FECHA_HORA;PESO_KG;PIEZA_SKU;PIEZA_NOMBRE;EXTRA1;EXTRA2;EXTRA3
+    Formato: ID,MOLDE,MAQUINA,NRO_OP,TURNO,FECHA_OT,NRO_OT,OPERADOR,COLOR,FECHA_HORA,PESO_KG,PIEZA_NOMBRE,EXTRA1,EXTRA2,EXTRA3
     """
-    parts = codigo_qr.split(';')
+    parts = codigo_qr.replace(';', ',').split(',')
     return {
         'pesaje_id': int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else None,
         'molde': parts[1] if len(parts) > 1 else None,
         'nro_op': parts[3] if len(parts) > 3 else None,
         'color': parts[8] if len(parts) > 8 else None,
         'peso_kg': float(parts[10]) if len(parts) > 10 and parts[10] else None,
-        'pieza_sku': parts[11] if len(parts) > 11 and parts[11] else None,
-        'pieza_nombre': parts[12] if len(parts) > 12 and parts[12] else None,
-        'extra1': parts[13] if len(parts) > 13 and parts[13] else None,
-        'extra2': parts[14] if len(parts) > 14 and parts[14] else None,
-        'extra3': parts[15] if len(parts) > 15 and parts[15] else None,
+        'pieza_nombre': parts[11] if len(parts) > 11 and parts[11] else None,
+        'extra1': parts[12] if len(parts) > 12 and parts[12] else None,
+        'extra2': parts[13] if len(parts) > 13 and parts[13] else None,
+        'extra3': parts[14] if len(parts) > 14 and parts[14] else None,
     }
 
 
@@ -46,11 +45,11 @@ def _clasificar_operacion(tipo: str) -> str:
     MOV-INTERNO, etc. → MOVIMIENTO
     """
     tipo_upper = tipo.upper()
-    if tipo_upper.startswith('INGRESO') or tipo_upper == 'ENTRADA':
+    if tipo_upper.startswith('INGRESO') or tipo_upper in ['ENTRADA', 'DEVOLUCION_NO_ARMADO']:
         return 'ENTRADA'
-    elif tipo_upper.startswith('SAL') or tipo_upper == 'SALIDA':
+    elif tipo_upper.startswith('SAL') or tipo_upper in ['SALIDA', 'ARMAR_PAQUETES', 'DONACIONES', 'MERMA_MOLINO', 'TRANSFORMACIONES']:
         return 'SALIDA'
-    elif tipo_upper.startswith('MOV') or tipo_upper == 'MOVIMIENTO':
+    elif tipo_upper.startswith('MOV') or tipo_upper in ['MOVIMIENTO', 'MOVIMIENTOS']:
         return 'MOVIMIENTO'
     return tipo_upper
 
@@ -86,6 +85,14 @@ def registrar_movimiento():
     operario_id = data.get('operario_id', '')
     metadatos = data.get('metadatos', '')
     timestamp_str = data.get('timestamp')
+    
+    import json
+    metadatos_dict = {}
+    if metadatos:
+        try:
+            metadatos_dict = json.loads(metadatos)
+        except Exception:
+            pass
 
     if not codigo_qr or not tipo_operacion_raw:
         return jsonify({'error': 'codigo_qr y tipo_operacion son requeridos'}), 400
@@ -107,32 +114,42 @@ def registrar_movimiento():
 
     try:
         if tipo_base == 'ENTRADA':
-            # ── ENTRADA: El bulto no debe existir ya en inventario ──
-            existente = InventarioManga.query.filter_by(pesaje_id=pesaje_id).first()
-            if existente:
-                return jsonify({
-                    'error': f'Este bulto (pesaje #{pesaje_id}) ya fue registrado en inventario',
-                    'estado_actual': existente.estado,
-                    'locacion': existente.locacion_actual
-                }), 409
-
-            manga = InventarioManga(
-                pesaje_id=pesaje_id,
-                nro_op=datos_qr.get('nro_op'),
-                molde=datos_qr.get('molde'),
-                color=datos_qr.get('color'),
-                peso_kg=datos_qr.get('peso_kg'),
-                pieza_sku=datos_qr.get('pieza_sku'),
-                pieza_nombre=datos_qr.get('pieza_nombre'),
-                extra1=datos_qr.get('extra1'),
-                extra2=datos_qr.get('extra2'),
-                extra3=datos_qr.get('extra3'),
-                locacion_actual=locacion_destino or locacion_origen,
-                estado='EN_INVENTARIO',
-                fecha_ingreso=ts,
-            )
-            db.session.add(manga)
-            db.session.flush()
+            if tipo_operacion_raw == 'INGRESO-PROD':
+                # ── 1A. INGRESO-PROD: El bulto no debe existir ya en inventario ──
+                existente = InventarioManga.query.filter_by(pesaje_id=pesaje_id).first()
+                if existente:
+                    return jsonify({
+                        'error': f'Este bulto (pesaje #{pesaje_id}) ya fue registrado en inventario',
+                        'estado_actual': existente.estado,
+                        'locacion': existente.locacion_actual
+                    }), 409
+    
+                manga = InventarioManga(
+                    pesaje_id=pesaje_id,
+                    nro_op=datos_qr.get('nro_op') or metadatos_dict.get('nro_op'),
+                    molde=datos_qr.get('molde') or metadatos_dict.get('molde'),
+                    color=datos_qr.get('color') or metadatos_dict.get('color'),
+                    peso_kg=datos_qr.get('peso_kg') or data.get('peso_kg') or metadatos_dict.get('peso_kg', 0.0),
+                    pieza_nombre=datos_qr.get('pieza_nombre') or data.get('pieza_nombre'),
+                    extra1=datos_qr.get('extra1') or data.get('extra1'),
+                    extra2=datos_qr.get('extra2') or data.get('extra2'),
+                    extra3=datos_qr.get('extra3') or data.get('extra3'),
+                    locacion_actual=locacion_destino or locacion_origen,
+                    estado='EN_INVENTARIO',
+                    fecha_ingreso=ts,
+                )
+                db.session.add(manga)
+                db.session.flush()
+                
+            elif tipo_operacion_raw in ['INGRESO-DEV', 'DEVOLUCION_NO_ARMADO']:
+                # ── 1B. INGRESO-DEV (Devolución): El bulto debe existir ──
+                manga = InventarioManga.query.filter_by(pesaje_id=pesaje_id).first()
+                if not manga:
+                    return jsonify({'error': f'Manga con pesaje #{pesaje_id} no encontrada para devolución'}), 404
+                
+                manga.estado = 'EN_INVENTARIO'
+                manga.locacion_actual = locacion_destino or locacion_origen
+                manga.fecha_despacho = None # Limpiar en caso tuviera fecha de salida previa
 
             mov = MovimientoKardex(
                 inventario_manga_id=manga.id,
@@ -153,20 +170,46 @@ def registrar_movimiento():
             }), 201
 
         elif tipo_base == 'SALIDA':
-            # ── SALIDA: El bulto debe existir y estar EN_INVENTARIO ──
+            # ── MÓDULO 2: SALIDAS ──
             manga = InventarioManga.query.filter_by(pesaje_id=pesaje_id).first()
             if not manga:
                 return jsonify({'error': f'Manga con pesaje #{pesaje_id} no encontrada en inventario'}), 404
 
-            if manga.estado == 'DESPACHADO':
+            if manga.estado in ['DESPACHADO', 'CONSUMIDO', 'MERMA', 'INACTIVO']:
                 return jsonify({
-                    'error': f'Este bulto ya fue despachado el {manga.fecha_despacho}',
+                    'error': f'Este bulto ya no está disponible (Estado: {manga.estado})',
                     'estado_actual': manga.estado
                 }), 409
 
-            manga.estado = 'DESPACHADO'
-            manga.fecha_despacho = ts
-            manga.locacion_actual = locacion_destino or 'DESPACHADO'
+            if tipo_operacion_raw in ['SAL-ARMAR', 'ARMAR_PAQUETES']:
+                # 2A. Salida a Armado
+                manga.estado = 'CONSUMIDO' # o EN_ARMADO según convención
+                manga.locacion_actual = locacion_destino or 'ZONA_ARMADO'
+            
+            elif tipo_operacion_raw == 'SAL-DESPACHO':
+                # 2B. Salida por Despacho al Cliente
+                manga.estado = 'DESPACHADO'
+                manga.fecha_despacho = ts
+                manga.locacion_actual = locacion_destino or 'CLIENTE_FINAL'
+                
+            elif tipo_operacion_raw in ['SAL-MERMA', 'MERMA_MOLINO']:
+                # 2C. Salida por Merma / Falla o Destrucción en Molino
+                manga.estado = 'MERMA'
+                manga.locacion_actual = locacion_destino or 'MOLINO_DESTRUCCION'
+                
+            elif tipo_operacion_raw == 'DONACIONES':
+                manga.estado = 'DESPACHADO'
+                manga.fecha_despacho = ts
+                manga.locacion_actual = locacion_destino or 'DONACION_EXTERNA'
+                
+            elif tipo_operacion_raw == 'TRANSFORMACIONES':
+                manga.estado = 'CONSUMIDO'
+                manga.locacion_actual = locacion_destino or 'ALMACEN_PARTES'
+                
+            else:
+                # Fallback genérico para otras salidas
+                manga.estado = 'DESPACHADO'
+                manga.locacion_actual = locacion_destino or 'AFUERA'
 
             mov = MovimientoKardex(
                 inventario_manga_id=manga.id,
@@ -187,21 +230,33 @@ def registrar_movimiento():
             }), 200
 
         elif tipo_base == 'MOVIMIENTO':
-            # ── MOVIMIENTO: El bulto debe existir y estar EN_INVENTARIO ──
+            # ── MÓDULO 3: MOVIMIENTOS INTERNOS (Flujo de 2 pasos vía TRANSITO) ──
             manga = InventarioManga.query.filter_by(pesaje_id=pesaje_id).first()
             if not manga:
                 return jsonify({'error': f'Manga con pesaje #{pesaje_id} no encontrada en inventario'}), 404
 
-            if manga.estado != 'EN_INVENTARIO':
+            if manga.estado not in ['EN_INVENTARIO', 'TRANSITO']:
                 return jsonify({
                     'error': f'No se puede mover: estado actual es {manga.estado}',
                     'estado_actual': manga.estado
                 }), 409
 
-            if locacion_origen == locacion_destino:
-                return jsonify({'error': 'Locación de origen y destino no pueden ser iguales'}), 400
-
-            manga.locacion_actual = locacion_destino
+            # Lógica de 2 pasos
+            if locacion_destino == 'TRANSITO':
+                # Paso 1: Iniciar Movimiento (Sale del origen)
+                manga.estado = 'TRANSITO'
+                manga.locacion_actual = 'TRANSITO'
+            elif locacion_origen == 'TRANSITO':
+                # Paso 2: Finalizar Movimiento (Llega al destino)
+                if manga.estado != 'TRANSITO':
+                    return jsonify({'error': 'El bulto debe estar en TRANSITO para ser recibido en destino.'}), 409
+                manga.estado = 'EN_INVENTARIO'
+                manga.locacion_actual = locacion_destino
+            else:
+                # Fallback: Movimiento atómico directo (origen -> destino en un solo escaneo)
+                if locacion_origen == locacion_destino:
+                    return jsonify({'error': 'Locación de origen y destino no pueden ser iguales'}), 400
+                manga.locacion_actual = locacion_destino
 
             mov = MovimientoKardex(
                 inventario_manga_id=manga.id,

@@ -7,12 +7,15 @@ from app.models.materiales import MateriaPrima, Colorante
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
-from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, FamiliaColor, ColorProducto, Linea, Familia
+from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, FamiliaColor, ColorProducto, Linea, Familia, PiezaComponente
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.control_peso import ControlPeso
 from app.models.talonario import Talonario
 from app.models.molde import Molde, MoldePieza
+from app.models.historial_estado import HistorialEstadoOrden
+from app.models.receta_color import RecetaColorNormalizada
+from app.models.kardex import InventarioManga, MovimientoKardex
 
 app = create_app()
 
