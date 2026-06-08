@@ -2,14 +2,14 @@
 
 ## 1. Entidad Pesaje — Módulo de Balanza (Desktop)
 
-Modelo definido en [pesaje.py](file:///d:/Users/esteb/repos/envaperu-workflow-scale-module-desktop/backend/app/models/pesaje.py). Almacenado en **SQLite local** (offline-first).
+Modelo definido en [pesaje.py](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/modulo-pesaje/backend/app/models/pesaje.py). Almacenado en **SQLite local** (offline-first).
 
 | Atributo | Tipo | Descripción |
 |:---|:---|:---|
-| [id](file:///d:/Users/esteb/repos/envaperu-workflow-frontend/envaperu-frontend/src/services/api.js#89-98) | Integer PK | Auto-incremental |
+| [id](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/frontend/src/services/api.js#89-98) | Integer PK | Auto-incremental |
 | `peso_kg` | Float | Peso real leído de la balanza |
 | `fecha_hora` | DateTime | Timestamp UTC del pesaje |
-| [molde](file:///d:/Users/esteb/repos/envaperu-workflow-scale-module-desktop/backend/app/routes/sync.py#65-123) | String(100) | Nombre del molde (del QR: "CERNIDOR ROMANO") |
+| [molde](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/modulo-pesaje/backend/app/routes/sync.py#65-123) | String(100) | Nombre del molde (del QR: "CERNIDOR ROMANO") |
 | `maquina` | String(50) | Máquina (del QR: "HT-250B") |
 | `nro_op` | String(20) | Número de Orden de Producción (del QR: "OP1354") |
 | `turno` | String(20) | Diurno / Nocturno |
@@ -23,13 +23,13 @@ Modelo definido en [pesaje.py](file:///d:/Users/esteb/repos/envaperu-workflow-sc
 | `observaciones` | Text | Notas libres |
 | `sticker_impreso` | Boolean | Si ya se imprimió el sticker físico |
 | `fecha_impresion` | DateTime | Cuándo se imprimió |
-| [sincronizado](file:///d:/Users/esteb/repos/envaperu-workflow-scale-module-desktop/backend/app/routes/pesajes.py#228-244) | Boolean | **Flag offline-first** — si ya se envió al central |
+| [sincronizado](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/modulo-pesaje/backend/app/routes/pesajes.py#228-244) | Boolean | **Flag offline-first** — si ya se envió al central |
 | `fecha_sincronizacion` | DateTime | Cuándo se sincronizó |
 | `qr_data_original` | String(500) | String crudo del QR escaneado |
 
 ### QR del Sticker impreso (output del pesaje)
 
-Método [generate_sticker_qr_data()](file:///d:/Users/esteb/repos/envaperu-workflow-scale-module-desktop/backend/app/models/pesaje.py#156-176) genera un string separado por `;`:
+Método [generate_sticker_qr_data()](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/modulo-pesaje/backend/app/models/pesaje.py#156-176) genera un string separado por `;`:
 
 ```
 ID;MOLDE;MAQUINA;NRO_OP;TURNO;FECHA_OT;NRO_OT;OPERADOR;COLOR;FECHA_HORA;PESO_KG;PIEZA_SKU;PIEZA_NOMBRE
@@ -42,11 +42,11 @@ ID;MOLDE;MAQUINA;NRO_OP;TURNO;FECHA_OT;NRO_OT;OPERADOR;COLOR;FECHA_HORA;PESO_KG;
 
 ## 2. Entidad ControlPeso — Backend Central
 
-Modelo en [control_peso.py](file:///d:/Users/esteb/repos/envaperu-workflow/app/models/control_peso.py). Es la versión **ligera** que llega al backend central de PostgreSQL.
+Modelo en [control_peso.py](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/backend/app/models/control_peso.py). Es la versión **ligera** que llega al backend central de PostgreSQL.
 
 | Atributo | Tipo | Descripción |
 |:---|:---|:---|
-| [id](file:///d:/Users/esteb/repos/envaperu-workflow-frontend/envaperu-frontend/src/services/api.js#89-98) | Integer PK | Auto-incremental |
+| [id](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/frontend/src/services/api.js#89-98) | Integer PK | Auto-incremental |
 | `registro_id` | FK → `registro_diario_produccion` | Liga al registro diario padre |
 | `peso_real_kg` | Float | Peso medido del bulto |
 | `color_nombre` | String(50) | Color (texto) |
@@ -90,8 +90,8 @@ flowchart LR
 
 | Cache | Modelo | Fuente | Propósito |
 |:---|:---|:---|:---|
-| **CorrelativoCache** | [correlativo_cache.py](file:///d:/Users/esteb/repos/envaperu-workflow-scale-module-desktop/backend/app/models/correlativo_cache.py) | Talonarios del central | Generar RDPs consecutivos sin internet |
-| **MoldePiezasCache** | [molde_cache.py](file:///d:/Users/esteb/repos/envaperu-workflow-scale-module-desktop/backend/app/models/molde_cache.py) | `/api/moldes/exportar` del central | Autocompletar piezas por molde sin internet |
+| **CorrelativoCache** | [correlativo_cache.py](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/modulo-pesaje/backend/app/models/correlativo_cache.py) | Talonarios del central | Generar RDPs consecutivos sin internet |
+| **MoldePiezasCache** | [molde_cache.py](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/modulo-pesaje/backend/app/models/molde_cache.py) | `/api/moldes/exportar` del central | Autocompletar piezas por molde sin internet |
 
 ---
 
@@ -111,7 +111,7 @@ flowchart TD
 
 ## 5. API Kardex — Endpoints Implementados
 
-Base URL: `POST /api/kardex/...` (Backend Central en [rutas_kardex.py](file:///d:/Users/esteb/repos/envaperu-workflow/app/api/rutas_kardex.py))
+Base URL: `POST /api/kardex/...` (Backend Central en [rutas_kardex.py](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/backend/app/api/rutas_kardex.py))
 
 > [!WARNING]
 > **Arquitectura Online-Only:** Todas las operaciones requieren conexión al backend. La app Android NO debe encolar transacciones localmente. Si no hay red, bloquear la operación y mostrar error al operario.
@@ -250,7 +250,7 @@ Lista todas las mangas en inventario con filtros y agrupación por locación.
 
 ## 6. Modelo de Datos del Kardex
 
-Tablas en PostgreSQL (Backend Central) — [kardex.py](file:///d:/Users/esteb/repos/envaperu-workflow/app/models/kardex.py):
+Tablas en PostgreSQL (Backend Central) — [kardex.py](file:///c:/Users/esteb/gitprojects/envaperu-workspace-2/backend/app/models/kardex.py):
 
 ```mermaid
 erDiagram
