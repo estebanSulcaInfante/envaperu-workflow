@@ -6,7 +6,7 @@ Incluye validación detallada y manejo robusto de errores.
 import pandas as pd
 from io import BytesIO, StringIO
 from app.extensions import db
-from app.models.producto import ProductoTerminado, Pieza, ColorProducto, FamiliaColor, ProductoPieza, Linea, Familia
+from app.models.producto import ProductoTerminado, PiezaColor, ColorProducto, FamiliaColor, ProductoPieza, Linea, Familia
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -120,11 +120,11 @@ class ImportService:
     # Columnas requeridas para ProductoTerminado
     COLUMNAS_REQUERIDAS_PRODUCTOS = ['COD SKU PT', 'Producto']
     
-    # Mapeo de columnas Excel -> Modelo Pieza
+    # Mapeo de columnas Excel -> Modelo PiezaColor
     # REFACTORIZADO: 'Cod Linea', 'Linea', 'FAMILIA' ya no se mapean - se usan para lookup de FK
     MAPEO_PIEZAS = {
         'SKU': 'sku',
-        'Cod Pieza': 'cod_pieza',
+        'Cod PiezaColor': 'cod_pieza',
         'PIEZAS': 'piezas',
         'Cod Col': 'cod_col',
         'Tipo Color': 'tipo_color',
@@ -138,7 +138,7 @@ class ImportService:
         'Color': 'color'
     }
     
-    # Columnas requeridas para Pieza
+    # Columnas requeridas para PiezaColor
     COLUMNAS_REQUERIDAS_PIEZAS = ['SKU', 'PIEZAS']
     
     def __init__(self):
@@ -874,7 +874,7 @@ class ImportService:
                         pieza_data['familia_id'] = primera_familia.id
                 
                 # UPSERT: Verificar si existe
-                existente = db.session.get(Pieza, sku)
+                existente = db.session.get(PiezaColor, sku)
                 if existente:
                     # Actualizar (Saltar PK)
                     for key, value in pieza_data.items():
@@ -884,7 +884,7 @@ class ImportService:
                     resultado['piezas_actualizadas'] += 1
                 else:
                     # Crear
-                    pieza = Pieza(**pieza_data)
+                    pieza = PiezaColor(**pieza_data)
                     db.session.add(pieza)
                     resultado['piezas_creadas'] += 1
                 

@@ -4,7 +4,7 @@ ACTUALIZADO: Usa linea_id y familia_id (FK normalizadas requeridas).
 """
 import pytest
 from datetime import datetime
-from app.models.producto import ProductoTerminado, FamiliaColor, Pieza, Linea, Familia
+from app.models.producto import ProductoTerminado, FamiliaColor, PiezaColor, Linea, Familia
 from app.extensions import db
 from tests.conftest import get_or_create_test_dependencies
 
@@ -281,16 +281,16 @@ class TestRevisionPiezas:
         with app.app_context():
             linea_id, familia_id = get_or_create_test_dependencies()
             
-            pieza = Pieza(
+            pieza = PiezaColor(
                 sku="TEST-PZ-001",
-                piezas="Pieza Test Revisión",
+                piezas="PiezaColor Test Revisión",
                 linea_id=linea_id,
                 familia_id=familia_id
             )
             db.session.add(pieza)
             db.session.commit()
             
-            pieza_db = Pieza.query.get("TEST-PZ-001")
+            pieza_db = PiezaColor.query.get("TEST-PZ-001")
             assert pieza_db.estado_revision == "IMPORTADO"
     
     def test_actualizar_estado_revision_pieza(self, app):
@@ -298,9 +298,9 @@ class TestRevisionPiezas:
         with app.app_context():
             linea_id, familia_id = get_or_create_test_dependencies()
             
-            pieza = Pieza(
+            pieza = PiezaColor(
                 sku="TEST-PZ-002",
-                piezas="Pieza Para Revisar",
+                piezas="PiezaColor Para Revisar",
                 linea_id=linea_id,
                 familia_id=familia_id,
                 estado_revision="IMPORTADO"
@@ -313,7 +313,7 @@ class TestRevisionPiezas:
             pieza.fecha_revision = datetime.now()
             db.session.commit()
             
-            pieza_db = Pieza.query.get("TEST-PZ-002")
+            pieza_db = PiezaColor.query.get("TEST-PZ-002")
             assert pieza_db.estado_revision == "VERIFICADO"
             assert pieza_db.notas_revision == "Peso verificado OK"
 
@@ -326,9 +326,9 @@ class TestRevisionPiezasAPI:
         with app.app_context():
             linea_id, familia_id = get_or_create_test_dependencies()
             
-            pieza = Pieza(
+            pieza = PiezaColor(
                 sku="API-PZ-001",
-                piezas="Pieza API Test",
+                piezas="PiezaColor API Test",
                 linea_id=linea_id,
                 familia_id=familia_id,
                 estado_revision="IMPORTADO"
@@ -349,7 +349,7 @@ class TestRevisionPiezasAPI:
         with app.app_context():
             linea_id, familia_id = get_or_create_test_dependencies()
             
-            pieza = Pieza(
+            pieza = PiezaColor(
                 sku="UPD-PZ-001",
                 piezas="Para Actualizar",
                 linea_id=linea_id,
@@ -374,9 +374,9 @@ class TestRevisionPiezasAPI:
             linea_id, familia_id = get_or_create_test_dependencies()
             
             db.session.add_all([
-                Pieza(sku="STAT-PZ-001", piezas="S1", linea_id=linea_id, 
+                PiezaColor(sku="STAT-PZ-001", piezas="S1", linea_id=linea_id, 
                      familia_id=familia_id, estado_revision="IMPORTADO"),
-                Pieza(sku="STAT-PZ-002", piezas="S2", linea_id=linea_id, 
+                PiezaColor(sku="STAT-PZ-002", piezas="S2", linea_id=linea_id, 
                      familia_id=familia_id, estado_revision="VERIFICADO"),
             ])
             db.session.commit()
@@ -395,11 +395,11 @@ class TestRevisionPiezasAPI:
             linea_id, familia_id = get_or_create_test_dependencies()
             
             db.session.add_all([
-                Pieza(sku="BULK-PZ-001", piezas="B1", linea_id=linea_id, 
+                PiezaColor(sku="BULK-PZ-001", piezas="B1", linea_id=linea_id, 
                      familia_id=familia_id, estado_revision="IMPORTADO"),
-                Pieza(sku="BULK-PZ-002", piezas="B2", linea_id=linea_id, 
+                PiezaColor(sku="BULK-PZ-002", piezas="B2", linea_id=linea_id, 
                      familia_id=familia_id, estado_revision="IMPORTADO"),
-                Pieza(sku="BULK-PZ-003", piezas="B3", linea_id=linea_id, 
+                PiezaColor(sku="BULK-PZ-003", piezas="B3", linea_id=linea_id, 
                      familia_id=familia_id, estado_revision="IMPORTADO"),
             ])
             db.session.commit()
@@ -414,9 +414,9 @@ class TestRevisionPiezasAPI:
         assert data['actualizados'] == 2
         
         with app.app_context():
-            b1 = Pieza.query.get('BULK-PZ-001')
-            b2 = Pieza.query.get('BULK-PZ-002')
-            b3 = Pieza.query.get('BULK-PZ-003')
+            b1 = PiezaColor.query.get('BULK-PZ-001')
+            b2 = PiezaColor.query.get('BULK-PZ-002')
+            b3 = PiezaColor.query.get('BULK-PZ-003')
             
             assert b1.estado_revision == 'VERIFICADO'
             assert b2.estado_revision == 'VERIFICADO'

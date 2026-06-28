@@ -33,7 +33,7 @@ with app.app_context():
 
     print("===== PRUEBA: ENTRADA (INGRESO-PROD) =====")
     payload_ingreso = {
-        "codigo_qr": "1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;SKU123;Pieza Test",
+        "codigo_qr": "1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;SKU123;PiezaColor Test",
         "tipo_operacion": "INGRESO-PROD",
         "locacion_origen": "ZONA_PRODUCCION",
         "locacion_destino": "ALMACEN_PRINCIPAL",
@@ -50,7 +50,7 @@ with app.app_context():
 
     print("\n===== PRUEBA: MOVIMIENTO (MOV-INTERNO) =====")
     payload_mov = {
-        "codigo_qr": "1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;SKU123;Pieza Test",
+        "codigo_qr": "1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;SKU123;PiezaColor Test",
         "tipo_operacion": "MOV-INTERNO",
         "locacion_origen": "ALMACEN_PRINCIPAL",
         "locacion_destino": "ZONA_DESPACHO",
@@ -62,7 +62,7 @@ with app.app_context():
 
     print("\n===== PRUEBA: SALIDA (SAL-ARMAR) =====")
     payload_salida = {
-        "codigo_qr": "1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;SKU123;Pieza Test",
+        "codigo_qr": "1001;MOLDE_TEST;MAQ1;OP100;TURNO1;2026-03-13;1;USER;ROJO;2026-03-13/10:00:00;5.5;SKU123;PiezaColor Test",
         "tipo_operacion": "SAL-ARMAR",
         "locacion_origen": "ZONA_DESPACHO",
         "locacion_destino": "",

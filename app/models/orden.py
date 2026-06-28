@@ -16,14 +16,14 @@ class SnapshotComposicionMolde(db.Model):
     id           = db.Column(db.Integer, primary_key=True, autoincrement=True)
     orden_id     = db.Column(db.String(20), db.ForeignKey('orden_produccion.numero_op'), nullable=False)
 
-    # FK a Pieza (nullable: permite override manual sin pieza registrada en catálogo)
-    pieza_sku    = db.Column(db.String(50), db.ForeignKey('pieza.sku'), nullable=True)
+    # FK a PiezaColor (nullable: permite override manual sin pieza registrada en catálogo)
+    pieza_sku    = db.Column(db.String(50), db.ForeignKey('pieza_color.sku'), nullable=True)
 
     cavidades    = db.Column(db.Integer,  nullable=False, default=1)
     peso_unit_gr = db.Column(db.Float,   nullable=False, default=0.0)
 
     # Relación de lectura para nombre de pieza
-    pieza = db.relationship('Pieza', backref='snapshots_op')
+    pieza = db.relationship('PiezaColor', backref='snapshots_op')
 
     @property
     def peso_subtotal_gr(self):

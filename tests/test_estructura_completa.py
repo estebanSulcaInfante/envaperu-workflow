@@ -4,7 +4,7 @@ from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
-from app.models.producto import ProductoTerminado, FamiliaColor, ColorProducto, Pieza
+from app.models.producto import ProductoTerminado, FamiliaColor, ColorProducto, PiezaColor
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion
 from app.extensions import db

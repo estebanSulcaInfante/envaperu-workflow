@@ -2,8 +2,8 @@ import pytest
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
 from app.models.materiales import MateriaPrima, Colorante
-from app.models.molde import Molde, MoldePieza
-from app.models.producto import Pieza, Linea, Familia
+from app.models.molde import Molde, Pieza
+from app.models.producto import PiezaColor, Linea, Familia
 from app.extensions import db
 
 
@@ -20,13 +20,13 @@ def _setup_molde(app):
         db.session.add(molde)
         db.session.flush()
 
-        pieza = Pieza(sku="PIEZA-TEST", cod_pieza=101, piezas="Pieza Test",
+        pieza = PiezaColor(sku="PIEZA-TEST", cod_pieza=101, piezas="PiezaColor Test",
                       tipo="SIMPLE", linea_id=linea.id, familia_id=familia.id,
                       cavidad=2, peso=10.0)
         db.session.add(pieza)
         db.session.flush()
 
-        mp_rel = MoldePieza(molde_id="MOL-TEST", pieza_sku="PIEZA-TEST", cavidades=2, peso_unitario_gr=10.0)
+        mp_rel = Pieza(molde_id="MOL-TEST", pieza_sku="PIEZA-TEST", cavidades=2, peso_unitario_gr=10.0)
         db.session.add(mp_rel)
         db.session.commit()
 
@@ -51,7 +51,7 @@ def test_crear_orden_manual_snapshot(client, app):
     payload = {
         "numero_op": "OP-MANUAL-SNAP",
         "maquina_id": 1,
-        "producto": "Pieza Simple",
+        "producto": "PiezaColor Simple",
         "snapshot_tiempo_ciclo": 10.0,
         "snapshot_horas_turno": 8.0,
         "snapshot_peso_colada_gr": 2.0,
@@ -110,7 +110,7 @@ def test_crear_orden_manual_snapshot(client, app):
 def test_crear_orden_auto_snapshot(client, app):
     """
     Crea una OP con auto_snapshot_molde:true.
-    Verifica que la composición se deriva desde MoldePieza del catálogo.
+    Verifica que la composición se deriva desde Pieza del catálogo.
     """
     _setup_molde(app)
 
@@ -142,7 +142,7 @@ def test_crear_orden_auto_snapshot(client, app):
 
     # Verificar que el catálogo ya no afecta el snapshot congelado
     with app.app_context():
-        mp_row = MoldePieza.query.filter_by(molde_id="MOL-TEST").first()
+        mp_row = Pieza.query.filter_by(molde_id="MOL-TEST").first()
         mp_row.peso_unitario_gr = 99.0  # Cambiamos el catálogo
         db.session.commit()
 

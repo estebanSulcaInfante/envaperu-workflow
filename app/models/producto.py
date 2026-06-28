@@ -11,14 +11,14 @@ class ProductoPieza(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     producto_terminado_id = db.Column(db.String(50), db.ForeignKey('producto_terminado.cod_sku_pt'), nullable=False)
-    pieza_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku'), nullable=False)
+    pieza_sku = db.Column(db.String(50), db.ForeignKey('pieza_color.sku'), nullable=False)
     
     # Cantidad de esta pieza en el producto (ej. 2 jarras en un pack)
     cantidad = db.Column(db.Integer, default=1)
     
     # Relaciones para acceso fácil
     producto_terminado = db.relationship('ProductoTerminado', backref='composicion_piezas')
-    pieza = db.relationship('Pieza', backref='en_productos')
+    pieza = db.relationship('PiezaColor', backref='en_productos')
     
     # Evitar duplicados
     __table_args__ = (db.UniqueConstraint('producto_terminado_id', 'pieza_sku', name='uq_producto_pieza'),)
@@ -158,8 +158,8 @@ class ProductoTerminado(db.Model):
             return None
 
 
-class Pieza(db.Model):
-    __tablename__ = 'pieza'
+class PiezaColor(db.Model):
+    __tablename__ = 'pieza_color'
 
     sku = db.Column(db.String(50), primary_key=True)
     
@@ -174,11 +174,16 @@ class Pieza(db.Model):
     # Tipo de pieza: SIMPLE, KIT, COMPONENTE
     tipo = db.Column(db.String(20), default="SIMPLE")
     
-    # --- RELACIÓN CON FORMA DEL MOLDE (Option C) ---
+    # --- RELACIÓN CON FORMA DEL MOLDE (Refactor) ---
     # Vincula esta pieza (SKU coloreado) con su forma/cavidad en el molde
     # Nullable: piezas legacy importadas del Excel pueden no tener esta relación aún
-    molde_pieza_id = db.Column(db.Integer, db.ForeignKey('molde_pieza.id'), nullable=True)
-    molde_pieza_rel = db.relationship('MoldePieza', backref='variantes', foreign_keys=[molde_pieza_id])
+    pieza_id = db.Column(db.Integer, db.ForeignKey('pieza.id'), nullable=True)
+    pieza_rel = db.relationship('Pieza', backref='variantes', foreign_keys=[pieza_id])
+    
+    # Restricción: No se puede repetir la misma forma y color
+    __table_args__ = (
+        db.UniqueConstraint('pieza_id', 'color_id', name='uq_pieza_color'),
+    )
 
     cod_pieza = db.Column(db.Integer)
     piezas = db.Column(db.String(200)) # Nombre Pieza
@@ -236,19 +241,19 @@ class Pieza(db.Model):
 class PiezaComponente(db.Model):
     """
     Relación auto-referencial para Kits.
-    Un Kit (Pieza) puede tener múltiples componentes (otras Piezas).
+    Un Kit (PiezaColor) puede tener múltiples componentes (otras PiezasColor).
     """
     __tablename__ = 'pieza_componente'
     
     id = db.Column(db.Integer, primary_key=True)
     
-    kit_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku'), nullable=False)
-    componente_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku'), nullable=False)
+    kit_sku = db.Column(db.String(50), db.ForeignKey('pieza_color.sku'), nullable=False)
+    componente_sku = db.Column(db.String(50), db.ForeignKey('pieza_color.sku'), nullable=False)
     cantidad = db.Column(db.Integer, default=1)
     
     # Relaciones
-    kit = db.relationship('Pieza', foreign_keys=[kit_sku], backref='componentes')
-    componente = db.relationship('Pieza', foreign_keys=[componente_sku])
+    kit = db.relationship('PiezaColor', foreign_keys=[kit_sku], backref='componentes')
+    componente = db.relationship('PiezaColor', foreign_keys=[componente_sku])
     
     # Constraint único
     __table_args__ = (

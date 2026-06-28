@@ -4,7 +4,7 @@ Incluye endpoints de listado y búsqueda.
 """
 from flask import Blueprint, jsonify, request
 from app.extensions import db
-from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, ColorProducto, Linea, Familia
+from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, ColorProducto, Linea, Familia
 from sqlalchemy import or_
 
 catalogo_bp = Blueprint('catalogo', __name__)
@@ -84,7 +84,7 @@ def listar_piezas():
     producto_id = request.args.get('producto_id', '').strip()
     limit = request.args.get('limit', 50, type=int)
     
-    query = Pieza.query
+    query = PiezaColor.query
     
     # Filtrar por producto via tabla intermedia
     if producto_id:
@@ -94,11 +94,11 @@ def listar_piezas():
         search = f"%{q}%"
         query = query.filter(
             or_(
-                Pieza.sku.ilike(search),
-                Pieza.piezas.ilike(search),
-                Pieza.color.ilike(search),
-                Pieza.mp.ilike(search),
-                Pieza.tipo_extruccion.ilike(search)
+                PiezaColor.sku.ilike(search),
+                PiezaColor.piezas.ilike(search),
+                PiezaColor.color.ilike(search),
+                PiezaColor.mp.ilike(search),
+                PiezaColor.tipo_extruccion.ilike(search)
             )
         )
     
@@ -178,8 +178,15 @@ def crear_producto():
         producto = ProductoTerminado(
             cod_sku_pt=data['cod_sku_pt'],
             producto=data['producto'],
+            cod_producto=data.get('cod_producto'),
+            linea_id=data.get('linea_id', 1),
+            familia_id=data.get('familia_id', 1),
+            familia_color_id=data.get('familia_color_id'),
             peso_g=data.get('peso_g'),
             precio_estimado=data.get('precio_estimado'),
+            precio_sin_igv=data.get('precio_sin_igv'),
+            doc_x_paq=data.get('doc_x_paq'),
+            doc_x_bulto=data.get('doc_x_bulto'),
             status=data.get('status', 'Activo'),
             codigo_barra=data.get('codigo_barra'),
             marca=data.get('marca'),
@@ -213,8 +220,15 @@ def actualizar_producto(cod_sku_pt):
     data = request.get_json()
     
     producto.producto = data.get('producto', producto.producto)
+    producto.cod_producto = data.get('cod_producto', producto.cod_producto)
+    producto.linea_id = data.get('linea_id', producto.linea_id)
+    producto.familia_id = data.get('familia_id', producto.familia_id)
+    producto.familia_color_id = data.get('familia_color_id', producto.familia_color_id)
     producto.peso_g = data.get('peso_g', producto.peso_g)
     producto.precio_estimado = data.get('precio_estimado', producto.precio_estimado)
+    producto.precio_sin_igv = data.get('precio_sin_igv', producto.precio_sin_igv)
+    producto.doc_x_paq = data.get('doc_x_paq', producto.doc_x_paq)
+    producto.doc_x_bulto = data.get('doc_x_bulto', producto.doc_x_bulto)
     producto.status = data.get('status', producto.status)
     producto.codigo_barra = data.get('codigo_barra', producto.codigo_barra)
     producto.marca = data.get('marca', producto.marca)
@@ -263,7 +277,7 @@ def listar_maquinas():
 # ============================================================
 # MOLDES CRUD
 # ============================================================
-from app.models.molde import Molde, MoldePieza
+from app.models.molde import Molde, Pieza
 from app.models.producto import PiezaComponente
 
 @catalogo_bp.route('/moldes/exportar', methods=['GET'])
@@ -275,7 +289,7 @@ def exportar_moldes():
     for m in moldes:
         piezas = []
         for mp in m.piezas:
-            pieza = db.session.get(Pieza, mp.pieza_sku)
+            pieza = db.session.get(PiezaColor, mp.pieza_sku)
             piezas.append({
                 'sku': mp.pieza_sku,
                 'nombre': pieza.piezas if pieza else mp.pieza_sku,
@@ -308,7 +322,7 @@ def obtener_molde(codigo):
     molde = db.session.get(Molde, codigo)
     if not molde:
         return jsonify({'error': 'Molde no encontrado'}), 404
-    return jsonify(molde.to_dict()), 200
+    return jsonify(molde.to_dict(include_variantes=True)), 200
 
 
 @catalogo_bp.route('/moldes', methods=['POST'])
@@ -332,7 +346,7 @@ def crear_molde():
         # Agregar piezas si se proveen
         if 'piezas' in data and len(data['piezas']) > 0:
             for pieza_data in data.get('piezas', []):
-                mp = MoldePieza(
+                mp = Pieza(
                     molde_id=molde.codigo,
                     pieza_sku=pieza_data['pieza_sku'],
                     cavidades=pieza_data['cavidades'],
@@ -346,7 +360,7 @@ def crear_molde():
             pieza_sku = f"{molde.codigo}-STD"
             
             # Verificar si existe, sino crear
-            pieza = db.session.get(Pieza, pieza_sku)
+            pieza = db.session.get(PiezaColor, pieza_sku)
             if not pieza:
                 # Obtener o crear Linea y Familia por defecto
                 linea_default = Linea.query.filter_by(nombre='GENERAL').first()
@@ -363,7 +377,7 @@ def crear_molde():
                     db.session.add(familia_default)
                     db.session.flush()
 
-                pieza = Pieza(
+                pieza = PiezaColor(
                     sku=pieza_sku,
                     piezas=f"{molde.nombre} (Std)",
                     linea_id=linea_default.id,
@@ -374,8 +388,8 @@ def crear_molde():
                 )
                 db.session.add(pieza)
             
-            # Crear relación Molde-Pieza
-            mp = MoldePieza(
+            # Crear relación Molde-PiezaColor
+            mp = Pieza(
                 molde_id=molde.codigo,
                 pieza_sku=pieza_sku,
                 cavidades=int(data.get('cavidades')),
@@ -408,9 +422,9 @@ def actualizar_molde(codigo):
     # Actualizar piezas si se proveen
     # Actualizar piezas si se proveen explicitamente
     if 'piezas' in data:
-        MoldePieza.query.filter_by(molde_id=codigo).delete()
+        Pieza.query.filter_by(molde_id=codigo).delete()
         for pieza_data in data['piezas']:
-            mp = MoldePieza(
+            mp = Pieza(
                 molde_id=codigo,
                 pieza_sku=pieza_data['pieza_sku'],
                 cavidades=pieza_data['cavidades'],
@@ -420,7 +434,7 @@ def actualizar_molde(codigo):
             
     # --- SIMPLE MODE: Actualizar primera pieza existente ---
     elif 'cavidades' in data and 'peso_unitario_gr' in data:
-        piezas_molde = MoldePieza.query.filter_by(molde_id=codigo).all()
+        piezas_molde = Pieza.query.filter_by(molde_id=codigo).all()
         
         if piezas_molde:
             # Update first piece
@@ -429,7 +443,7 @@ def actualizar_molde(codigo):
             mp.peso_unitario_gr = float(data['peso_unitario_gr'])
             
             # Tambien actualizar la pieza base para consistencia
-            pieza = db.session.get(Pieza, mp.pieza_sku)
+            pieza = db.session.get(PiezaColor, mp.pieza_sku)
             if pieza:
                 pieza.peso = mp.peso_unitario_gr
                 pieza.cavidad = mp.cavidades
@@ -437,9 +451,9 @@ def actualizar_molde(codigo):
         else:
             # No tiene piezas, CREAR la default (copy logic from create)
             pieza_sku = f"{molde.codigo}-STD"
-            pieza = db.session.get(Pieza, pieza_sku)
+            pieza = db.session.get(PiezaColor, pieza_sku)
             if not pieza:
-                pieza = Pieza(
+                pieza = PiezaColor(
                     sku=pieza_sku,
                     piezas=f"{molde.nombre} (Std)",
                     peso=float(data['peso_unitario_gr']),
@@ -448,7 +462,7 @@ def actualizar_molde(codigo):
                 )
                 db.session.add(pieza)
             
-            mp = MoldePieza(
+            mp = Pieza(
                 molde_id=molde.codigo,
                 pieza_sku=pieza_sku,
                 cavidades=int(data['cavidades']),
@@ -472,6 +486,108 @@ def eliminar_molde(codigo):
     return jsonify({'message': f'Molde {codigo} eliminado'}), 200
 
 
+@catalogo_bp.route('/moldes/<codigo>/formas', methods=['POST'])
+def crear_forma_molde(codigo):
+    """Crea una nueva forma física (cavidad) en el molde"""
+    molde = db.session.get(Molde, codigo)
+    if not molde:
+        return jsonify({'error': 'Molde no encontrado'}), 404
+        
+    data = request.get_json()
+    if not data or not data.get('nombre') or not data.get('cavidades') or not data.get('peso_unitario_gr'):
+        return jsonify({'error': 'Faltan campos (nombre, cavidades, peso_unitario_gr)'}), 400
+        
+    try:
+        # Validar unicidad (ya existe una forma con ese nombre en este molde)
+        if Pieza.query.filter_by(molde_id=codigo, nombre=data['nombre']).first():
+            return jsonify({'error': f"La forma '{data['nombre']}' ya existe en el molde"}), 409
+            
+        forma = Pieza(
+            molde_id=codigo,
+            nombre=data['nombre'],
+            cavidades=int(data['cavidades']),
+            peso_unitario_gr=float(data['peso_unitario_gr'])
+        )
+        db.session.add(forma)
+        db.session.commit()
+        return jsonify(forma.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
+@catalogo_bp.route('/formas/<int:forma_id>/colores', methods=['POST'])
+def crear_color_forma(forma_id):
+    """Crea una variante física SKU (PiezaColor) para la forma dada"""
+    forma = db.session.get(Pieza, forma_id)
+    if not forma:
+        return jsonify({'error': 'Forma no encontrada'}), 404
+        
+    data = request.get_json()
+    if not data or not data.get('color_id'):
+        return jsonify({'error': 'Debe proveer un color_id'}), 400
+        
+    color = db.session.get(ColorProducto, data['color_id'])
+    if not color:
+        return jsonify({'error': 'Color no encontrado'}), 404
+        
+    try:
+        molde_codigo = forma.molde_id
+        base_sku = molde_codigo.replace('MOL-', '')
+        sku_pieza = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
+        
+        if db.session.get(PiezaColor, sku_pieza):
+            return jsonify({'error': f'El SKU {sku_pieza} ya existe'}), 409
+            
+        nombre_coloreado = f"{forma.nombre} {color.nombre}"
+        
+        linea_id = None
+        familia_id = None
+        linea_default = Linea.query.filter_by(nombre='GENERAL').first()
+        familia_default = Familia.query.filter_by(nombre='COMPONENTES').first()
+        if linea_default: linea_id = linea_default.id
+        if familia_default: familia_id = familia_default.id
+             
+        pieza = PiezaColor(
+            sku=sku_pieza,
+            piezas=nombre_coloreado,
+            peso=forma.peso_unitario_gr,
+            cavidad=forma.cavidades,
+            tipo='SIMPLE',
+            linea_id=linea_id,
+            familia_id=familia_id,
+            color_id=color.id,
+            cod_color=color.codigo,
+            color=color.nombre,
+            pieza_id=forma.id
+        )
+        db.session.add(pieza)
+        db.session.commit()
+        return jsonify(pieza.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
+@catalogo_bp.route('/formas/<int:forma_id>', methods=['DELETE'])
+def eliminar_forma(forma_id):
+    """Elimina una forma física si no tiene SKUs (PiezaColor) asociados"""
+    forma = db.session.get(Pieza, forma_id)
+    if not forma:
+        return jsonify({'error': 'Forma no encontrada'}), 404
+        
+    if forma.variantes and len(forma.variantes) > 0:
+        return jsonify({'error': 'No se puede eliminar la Forma porque tiene SKUs de inventario asociados. Elimine los SKUs primero.'}), 400
+        
+    try:
+        db.session.delete(forma)
+        db.session.commit()
+        return jsonify({'message': f'Forma {forma_id} eliminada'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+
 # ============================================================
 # PIEZAS CON TIPO Y COMPONENTES
 # ============================================================
@@ -479,9 +595,9 @@ def eliminar_molde(codigo):
 @catalogo_bp.route('/piezas/<sku>', methods=['GET'])
 def obtener_pieza(sku):
     """Obtiene una pieza específica con componentes si es KIT"""
-    pieza = db.session.get(Pieza, sku)
+    pieza = db.session.get(PiezaColor, sku)
     if not pieza:
-        return jsonify({'error': 'Pieza no encontrada'}), 404
+        return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
     return jsonify({
         'sku': pieza.sku,
@@ -506,14 +622,22 @@ def crear_pieza():
         return jsonify({'error': 'Payload JSON requerido'}), 400
     
     try:
-        pieza = Pieza(
+        pieza = PiezaColor(
             sku=data['sku'],
             piezas=data['nombre'],
             tipo=data.get('tipo', 'SIMPLE'),
             peso=data.get('peso'),
             cavidad=data.get('cavidad'),
             color=data.get('color'),
-            cod_pieza=data.get('cod_pieza')
+            cod_pieza=data.get('cod_pieza'),
+            linea_id=data.get('linea_id', 1),
+            familia_id=data.get('familia_id', 1),
+            color_id=data.get('color_id'),
+            pieza_id=data.get('pieza_id'),
+            cod_extru=data.get('cod_extru'),
+            tipo_extruccion=data.get('tipo_extruccion'),
+            cod_mp=data.get('cod_mp'),
+            mp=data.get('mp')
         )
         db.session.add(pieza)
         
@@ -537,9 +661,9 @@ def crear_pieza():
 @catalogo_bp.route('/piezas/<sku>', methods=['PUT'])
 def actualizar_pieza(sku):
     """Actualiza una pieza existente"""
-    pieza = db.session.get(Pieza, sku)
+    pieza = db.session.get(PiezaColor, sku)
     if not pieza:
-        return jsonify({'error': 'Pieza no encontrada'}), 404
+        return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
     data = request.get_json()
     
@@ -548,6 +672,15 @@ def actualizar_pieza(sku):
     pieza.peso = data.get('peso', pieza.peso)
     pieza.cavidad = data.get('cavidad', pieza.cavidad)
     pieza.color = data.get('color', pieza.color)
+    pieza.cod_pieza = data.get('cod_pieza', pieza.cod_pieza)
+    pieza.linea_id = data.get('linea_id', pieza.linea_id)
+    pieza.familia_id = data.get('familia_id', pieza.familia_id)
+    pieza.color_id = data.get('color_id', pieza.color_id)
+    pieza.pieza_id = data.get('pieza_id', pieza.pieza_id)
+    pieza.cod_extru = data.get('cod_extru', pieza.cod_extru)
+    pieza.tipo_extruccion = data.get('tipo_extruccion', pieza.tipo_extruccion)
+    pieza.cod_mp = data.get('cod_mp', pieza.cod_mp)
+    pieza.mp = data.get('mp', pieza.mp)
     
     # Actualizar componentes si es KIT
     if data.get('componentes') is not None:
@@ -567,17 +700,17 @@ def actualizar_pieza(sku):
 @catalogo_bp.route('/piezas/<sku>', methods=['DELETE'])
 def eliminar_pieza(sku):
     """Elimina una pieza"""
-    pieza = db.session.get(Pieza, sku)
+    pieza = db.session.get(PiezaColor, sku)
     if not pieza:
-        return jsonify({'error': 'Pieza no encontrada'}), 404
+        return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
     # Verificar que no esté en uso
-    if MoldePieza.query.filter_by(pieza_sku=sku).first():
+    if Pieza.query.filter_by(pieza_sku=sku).first():
         return jsonify({'error': 'No se puede eliminar: pieza está asociada a un molde'}), 400
     
     db.session.delete(pieza)
     db.session.commit()
-    return jsonify({'message': f'Pieza {sku} eliminada'}), 200
+    return jsonify({'message': f'PiezaColor {sku} eliminada'}), 200
 
 
 # ============================================================
@@ -586,12 +719,12 @@ def eliminar_pieza(sku):
 
 @catalogo_bp.route('/piezas-producibles', methods=['GET'])
 def obtener_piezas_producibles():
-    """Retorna solo piezas que tienen un molde asignado via MoldePieza (producibles)"""
-    from app.models.molde import MoldePieza as MP
+    """Retorna solo piezas que tienen un molde asignado via Pieza (producibles)"""
+    from app.models.molde import Pieza as MP
     piezas = (
-        Pieza.query
-        .join(MP, MP.pieza_sku == Pieza.sku)
-        .order_by(Pieza.piezas)
+        PiezaColor.query
+        .join(MP, MP.pieza_sku == PiezaColor.sku)
+        .order_by(PiezaColor.piezas)
         .all()
     )
 
@@ -630,6 +763,26 @@ def listar_colores():
         'codigo': c.codigo
     } for c in colores])
 
+@catalogo_bp.route('/familias-color', methods=['GET'])
+def listar_familias_color():
+    from app.models.producto import FamiliaColor
+    familias_color = FamiliaColor.query.order_by(FamiliaColor.nombre).all()
+    return jsonify([{'id': fc.id, 'nombre': fc.nombre, 'codigo': fc.codigo} for fc in familias_color])
+
+
+@catalogo_bp.route('/formas', methods=['GET'])
+def listar_formas():
+    """Lista todas las formas (Pieza) de los moldes"""
+    from app.models.molde import Pieza, Molde
+    formas = Pieza.query.join(Molde).all()
+    return jsonify([{
+        'id': f.id,
+        'nombre': f.nombre,
+        'molde_codigo': f.molde.codigo,
+        'molde_nombre': f.molde.nombre,
+        'cavidades': f.cavidades,
+        'peso_unitario_gr': f.peso_unitario_gr
+    } for f in formas])
 
 @catalogo_bp.route('/colores', methods=['POST'])
 def crear_color():
@@ -676,9 +829,9 @@ def crear_color():
 @catalogo_bp.route('/configurar-producto', methods=['POST'])
 def configurar_producto_cascada():
     """
-    Crea Molde + Formas (MoldePieza) + Piezas coloreadas (opcional) + Kit (opcional).
+    Crea Molde + Formas (Pieza) + Piezas coloreadas (opcional) + Kit (opcional).
 
-    Las FORMAS (MoldePieza) definen las cavidades del molde — sin color.
+    Las FORMAS (Pieza) definen las cavidades del molde — sin color.
     Las PIEZAS coloreadas (SKUs de inventario) se crean opcionalmente
     y apuntan a su forma vía molde_pieza_id.
 
@@ -693,13 +846,13 @@ def configurar_producto_cascada():
     }
     """
     from app.models.producto import PiezaComponente, ProductoTerminado, ProductoPieza
-    from app.models.molde import Molde, MoldePieza
+    from app.models.molde import Molde, Pieza
 
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
 
-    response_data = {
+    resultado = {
         'molde_creado': None,
         'formas_creadas': [],
         'piezas_creadas': [],
@@ -710,18 +863,22 @@ def configurar_producto_cascada():
 
     try:
         # --- Resolver Linea y Familia ---
-        cod_linea = data.get('cod_linea')
-        cod_familia = data.get('cod_familia')
+        linea_id = data.get('linea_id')
+        familia_id = data.get('familia_id')
         linea_obj = None
         familia_obj = None
 
-        if cod_linea:
-            linea_obj = Linea.query.filter_by(codigo=cod_linea).first()
+        if linea_id:
+            linea_obj = Linea.query.get(linea_id)
+        elif data.get('cod_linea'):
+            linea_obj = Linea.query.filter_by(codigo=data.get('cod_linea')).first()
         elif data.get('linea'):
             linea_obj = Linea.query.filter(Linea.nombre.ilike(data.get('linea'))).first()
 
-        if cod_familia:
-            familia_obj = Familia.query.filter_by(codigo=cod_familia).first()
+        if familia_id:
+            familia_obj = Familia.query.get(familia_id)
+        elif data.get('cod_familia'):
+            familia_obj = Familia.query.filter_by(codigo=data.get('cod_familia')).first()
         elif data.get('familia'):
             familia_obj = Familia.query.filter(Familia.nombre.ilike(data.get('familia'))).first()
 
@@ -755,15 +912,25 @@ def configurar_producto_cascada():
                 db.session.flush()
                 resultado['molde_creado'] = molde.codigo
 
-        # ── 2. CREAR FORMAS (MoldePieza) — sin color, sin SKU ──
+        # ── 2. CREAR FORMAS (Pieza) — sin color, sin SKU ──
         formas_creadas = []
-        for idx, pieza_data in enumerate(data.get('piezas', [])):
-            nombre_forma = pieza_data.get('nombre', f'Pieza {idx+1}')
+        nombres_vistos = set()
+        
+        # Validar duplicados en payload para evitar colisión de SKUs
+        formas_payload = data.get('formas') or data.get('piezas', [])
+        for pieza_data in formas_payload:
+            nf = pieza_data.get('nombre', '')
+            if nf in nombres_vistos:
+                return jsonify({'error': f'Nombre de forma duplicado en request: {nf}', 'resultado': resultado}), 400
+            nombres_vistos.add(nf)
+
+        for idx, pieza_data in enumerate(formas_payload):
+            nombre_forma = pieza_data.get('nombre', f'Forma {idx+1}')
             cavidades = pieza_data.get('cavidades', 1)
             peso_unitario = pieza_data.get('peso_unitario_gr', 0)
 
             # Verificar si ya existe esta forma en el molde
-            forma_existente = MoldePieza.query.filter_by(
+            forma_existente = Pieza.query.filter_by(
                 molde_id=molde.codigo, nombre=nombre_forma
             ).first()
 
@@ -771,7 +938,7 @@ def configurar_producto_cascada():
                 resultado['errores'].append(f'Forma "{nombre_forma}" ya existe en molde, usando existente')
                 formas_creadas.append(forma_existente)
             else:
-                forma = MoldePieza(
+                forma = Pieza(
                     molde_id=molde.codigo,
                     nombre=nombre_forma,
                     cavidades=cavidades,
@@ -795,12 +962,12 @@ def configurar_producto_cascada():
                     sku_pieza = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
                     nombre_coloreado = f"{forma.nombre} {color.nombre}"
 
-                    pieza_existente = db.session.get(Pieza, sku_pieza)
+                    pieza_existente = db.session.get(PiezaColor, sku_pieza)
                     if pieza_existente:
-                        resultado['errores'].append(f'Pieza {sku_pieza} ya existe')
+                        resultado['errores'].append(f'PiezaColor {sku_pieza} ya existe')
                         continue
 
-                    pieza = Pieza(
+                    pieza = PiezaColor(
                         sku=sku_pieza,
                         piezas=nombre_coloreado,
                         peso=forma.peso_unitario_gr,
@@ -811,7 +978,7 @@ def configurar_producto_cascada():
                         color_id=color.id,
                         cod_color=color.codigo,
                         color=color.nombre,
-                        molde_pieza_id=forma.id  # ← Vínculo con la forma
+                        pieza_id=forma.id  # ← Vínculo con la forma
                     )
                     db.session.add(pieza)
                     resultado['piezas_creadas'].append(sku_pieza)
@@ -832,13 +999,13 @@ def configurar_producto_cascada():
                 kit_sku = f"{kit_sku_base}-C{color.codigo}"
                 kit_nombre = f"{kit_nombre_base} {color.nombre}"
 
-                kit_pieza = db.session.get(Pieza, kit_sku)
+                kit_pieza = db.session.get(PiezaColor, kit_sku)
                 if kit_pieza:
                     resultado['errores'].append(f'Kit {kit_sku} ya existe')
                     continue
 
                 peso_kit = sum(f.peso_unitario_gr for f in formas_creadas)
-                kit_pieza = Pieza(
+                kit_pieza = PiezaColor(
                     sku=kit_sku,
                     piezas=kit_nombre,
                     peso=peso_kit,
@@ -853,14 +1020,11 @@ def configurar_producto_cascada():
                 db.session.add(kit_pieza)
                 db.session.flush()
 
-                db.session.add(kit_pieza)
-                db.session.flush()
-
                 # PiezaComponente: buscar piezas de este color
                 for forma in formas_creadas:
                     base_sku = molde_codigo.replace('MOL-', '')
                     comp_sku = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
-                    comp = db.session.get(Pieza, comp_sku)
+                    comp = db.session.get(PiezaColor, comp_sku)
                     if comp:
                         db.session.add(PiezaComponente(
                             kit_sku=kit_sku,
@@ -931,9 +1095,9 @@ def configurar_producto_cascada():
                     # Generamos una pieza STD por forma
                     sku_std = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-STD"
                     
-                    pieza_std = db.session.get(Pieza, sku_std)
+                    pieza_std = db.session.get(PiezaColor, sku_std)
                     if not pieza_std:
-                        pieza_std = Pieza(
+                        pieza_std = PiezaColor(
                             sku=sku_std,
                             piezas=f"{forma.nombre} (Genérico)",
                             peso=forma.peso_unitario_gr,
@@ -941,7 +1105,7 @@ def configurar_producto_cascada():
                             tipo='SIMPLE',
                             linea_id=linea_obj.id,
                             familia_id=familia_obj.id,
-                            molde_pieza_id=forma.id
+                            pieza_id=forma.id
                             # Sin color
                         )
                         db.session.add(pieza_std)
@@ -998,7 +1162,7 @@ def validar_orden_prereq():
         return jsonify(result), 200
     
     # Buscar molde
-    from app.models.molde import Molde, MoldePieza
+    from app.models.molde import Molde, Pieza
     molde = Molde.query.filter_by(codigo=molde_id).first()
     
     if not molde:
@@ -1007,7 +1171,7 @@ def validar_orden_prereq():
         return jsonify(result), 200
     
     # Info del molde
-    piezas_rel = MoldePieza.query.filter_by(molde_id=molde.codigo).all()
+    piezas_rel = Pieza.query.filter_by(molde_id=molde.codigo).all()
     piezas_count = len(piezas_rel)
     
     result['molde'] = {
@@ -1041,21 +1205,20 @@ def validar_orden_prereq():
                 result['warnings'].append(f'⚠️ Color ID {color_id} no encontrado')
                 continue
             
-            # Buscar SKU: ProductoTerminado que tenga la familia_color Y alguna pieza del molde en su BOM
-            # NOTA: ProductoTerminado tiene familia_color, no color específico
-            # Debemos obtener la familia del ColorProducto para hacer match
-            color_familia_id = color.familia_id if color and hasattr(color, 'familia_id') else None
-            
+            # Buscar SKU: PiezaColor que tenga color_id igual y pertenezca a alguna forma del molde
             sku_encontrado = None
-            for mp in piezas_rel:
-                # Buscar productos que contengan esta pieza en su composición
-                producto_pieza = ProductoPieza.query.filter_by(pieza_sku=mp.pieza_sku).first()
-                if producto_pieza:
-                    # Verificar si el producto terminado tiene la misma familia de color
-                    prod = producto_pieza.producto_terminado
-                    if prod and prod.familia_color_id == color_familia_id:
-                        sku_encontrado = prod.cod_sku_pt
-                        break
+            forma_ids = [p.id for p in piezas_rel]
+            if forma_ids:
+                pieza_color = PiezaColor.query.filter(
+                    PiezaColor.color_id == color.id,
+                    PiezaColor.pieza_id.in_(forma_ids)
+                ).first()
+                
+                if pieza_color:
+                    # Encontrar el ProductoTerminado que contenga esta PiezaColor
+                    prod_pieza = ProductoPieza.query.filter_by(pieza_sku=pieza_color.sku).first()
+                    if prod_pieza and prod_pieza.producto_terminado:
+                        sku_encontrado = prod_pieza.producto_terminado.cod_sku_pt
             
             result['colores_info'].append({
                 'color_id': color_id,
@@ -1355,7 +1518,7 @@ def obtener_formatos_soportados():
         },
         'columnas_piezas': {
             'requeridas': ['SKU', 'PIEZAS'],
-            'opcionales': ['Cod Linea', 'Cod Pieza', 'Cavidad', 'Peso', 'Cod Color', 'Color', '...']
+            'opcionales': ['Cod Linea', 'Cod PiezaColor', 'Cavidad', 'Peso', 'Cod Color', 'Color', '...']
         }
     }), 200
 
@@ -1596,24 +1759,24 @@ def listar_piezas_revision():
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
     
-    query = Pieza.query
+    query = PiezaColor.query
     
     if estado in ['IMPORTADO', 'EN_REVISION', 'VERIFICADO']:
-        query = query.filter(Pieza.estado_revision == estado)
+        query = query.filter(PiezaColor.estado_revision == estado)
     
     if q:
         search = f"%{q}%"
         query = query.filter(
             or_(
-                Pieza.piezas.ilike(search),
-                Pieza.sku.ilike(search)
+                PiezaColor.piezas.ilike(search),
+                PiezaColor.sku.ilike(search)
             )
         )
     
-    # Nota: filtro por linea eliminado - Pieza.linea ya no existe
+    # Nota: filtro por linea eliminado - PiezaColor.linea ya no existe
     # Si se necesita filtrar por linea, usar join con Linea table
     
-    query = query.order_by(Pieza.fecha_importacion.desc().nullsfirst())
+    query = query.order_by(PiezaColor.fecha_importacion.desc().nullsfirst())
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
     
     piezas = [{
@@ -1648,9 +1811,9 @@ def actualizar_revision_pieza(sku):
     """Actualiza el estado de revisión de una pieza."""
     from datetime import datetime
     
-    pieza = Pieza.query.get(sku)
+    pieza = PiezaColor.query.get(sku)
     if not pieza:
-        return jsonify({'error': f'Pieza {sku} no encontrada'}), 404
+        return jsonify({'error': f'PiezaColor {sku} no encontrada'}), 404
     
     data = request.get_json()
     if not data:
@@ -1697,7 +1860,7 @@ def actualizar_revision_piezas_bulk():
     if nuevo_estado not in ['IMPORTADO', 'EN_REVISION', 'VERIFICADO']:
         return jsonify({'error': 'Estado no válido'}), 400
     
-    piezas = Pieza.query.filter(Pieza.sku.in_(skus)).all()
+    piezas = PiezaColor.query.filter(PiezaColor.sku.in_(skus)).all()
     
     actualizados = 0
     for p in piezas:
@@ -1722,9 +1885,9 @@ def estadisticas_revision_piezas():
     from sqlalchemy import func
     
     stats_query = db.session.query(
-        Pieza.estado_revision,
-        func.count(Pieza.sku)
-    ).group_by(Pieza.estado_revision).all()
+        PiezaColor.estado_revision,
+        func.count(PiezaColor.sku)
+    ).group_by(PiezaColor.estado_revision).all()
     
     stats = {'IMPORTADO': 0, 'EN_REVISION': 0, 'VERIFICADO': 0}
     total = 0
@@ -1735,14 +1898,14 @@ def estadisticas_revision_piezas():
     
     por_linea = db.session.query(
         Linea.nombre,
-        func.count(Pieza.sku)
-    ).join(Linea, Pieza.linea_id == Linea.id).filter(
+        func.count(PiezaColor.sku)
+    ).join(Linea, PiezaColor.linea_id == Linea.id).filter(
         or_(
-            Pieza.estado_revision == 'IMPORTADO',
-            Pieza.estado_revision.is_(None)
+            PiezaColor.estado_revision == 'IMPORTADO',
+            PiezaColor.estado_revision.is_(None)
         )
     ).group_by(Linea.nombre).order_by(
-        func.count(Pieza.sku).desc()
+        func.count(PiezaColor.sku).desc()
     ).limit(5).all()
     
     return jsonify({
@@ -1820,3 +1983,24 @@ def obtener_receta_color():
         'pigmentos': [r.to_dict(meta_kg=meta_kg) for r in recetas]
     }), 200
 
+@catalogo_bp.route('/catalogo/lineas', methods=['GET'])
+def listar_lineas():
+    """Retorna todas las líneas."""
+    lineas = Linea.query.all()
+    return jsonify([{
+        'id': l.id,
+        'codigo': l.codigo,
+        'nombre': l.nombre
+    } for l in lineas]), 200
+
+@catalogo_bp.route('/catalogo/familias', methods=['GET'])
+def listar_familias():
+    """Retorna familias filtrando opcionalmente por linea_id en frontend."""
+    # Nota: familia no tiene linea_id en DB (D2), el filtro por linea será a nivel front o lógicamente aquí si aplicara.
+    # Como D2 dictó que son independientes, enviamos todas las familias.
+    familias = Familia.query.all()
+    return jsonify([{
+        'id': f.id,
+        'codigo': f.codigo,
+        'nombre': f.nombre
+    } for f in familias]), 200

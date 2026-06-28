@@ -5,9 +5,9 @@ from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
-from app.models.producto import Pieza
+from app.models.producto import PiezaColor
 from app.models.producto import ProductoTerminado, ProductoPieza, ColorProducto
-from app.models.molde import Molde, MoldePieza
+from app.models.molde import Molde, Pieza
 from datetime import datetime, timezone
 from app.models.receta_color import RecetaColorNormalizada
 
@@ -22,7 +22,7 @@ produccion_bp = Blueprint('produccion', __name__)
 def _aprender_de_op(orden):
     """
     Side-effect post-commit de crear_orden:
-      A) Si la OP usó snapshot manual + molde_id existente → crear Molde/MoldePieza
+      A) Si la OP usó snapshot manual + molde_id existente → crear Molde/Pieza
          en catálogo SOLO SI NO EXISTEN. Nunca sobreescribe.
       B) Por cada lote con pigmentos → upsert en RecetaColorNormalizada
          usando promedio ponderado de gr/kg.
@@ -48,16 +48,16 @@ def _aprender_de_op(orden):
             db.session.add(nuevo_molde)
             db.session.flush()
 
-        # Crear MoldePieza solo para piezas que no existan aún
+        # Crear Pieza solo para piezas que no existan aún
         for snap in orden.snapshot_composicion:
             if not snap.pieza_sku:
                 continue
-            existe = MoldePieza.query.filter_by(
+            existe = Pieza.query.filter_by(
                 molde_id=molde_id,
                 pieza_sku=snap.pieza_sku
             ).first()
             if not existe:
-                db.session.add(MoldePieza(
+                db.session.add(Pieza(
                     molde_id=molde_id,
                     pieza_sku=snap.pieza_sku,
                     cavidades=snap.cavidades,
@@ -102,7 +102,7 @@ def crear_orden():
     """
     Crea una nueva Orden de Producción completa.
     Soporta dos modos para el snapshot de composición del molde:
-      A) auto_snapshot_molde: true  → deriva desde MoldePieza del catálogo
+      A) auto_snapshot_molde: true  → deriva desde Pieza del catálogo
       B) snapshot_composicion: [...]  → lista manual de piezas
     """
     data = request.get_json()
@@ -151,9 +151,9 @@ def crear_orden():
             if not molde_id:
                 return jsonify({'error': 'molde_id requerido para auto_snapshot_molde'}), 400
 
-            mp_rows = MoldePieza.query.filter_by(molde_id=molde_id).all()
+            mp_rows = Pieza.query.filter_by(molde_id=molde_id).all()
             if not mp_rows:
-                return jsonify({'error': f'Molde {molde_id} no tiene piezas en catálogo (MoldePieza)'}), 400
+                return jsonify({'error': f'Molde {molde_id} no tiene piezas en catálogo (Pieza)'}), 400
 
             for mp in mp_rows:
                 snap = SnapshotComposicionMolde(

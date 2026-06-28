@@ -21,8 +21,8 @@ class Molde(db.Model):
     activo = db.Column(db.Boolean, default=True)
     notas = db.Column(db.Text, nullable=True)
     
-    # Relación N:M con Pieza via tabla MoldePieza (única fuente de verdad)
-    piezas = db.relationship('MoldePieza', backref='molde', lazy=True, cascade="all, delete-orphan")
+    # Relación N:M con Pieza (forma pura)
+    piezas = db.relationship('Pieza', backref='molde', lazy=True, cascade="all, delete-orphan")
 
     @property
     def peso_neto_gr(self):
@@ -46,7 +46,7 @@ class Molde(db.Model):
             return (self.peso_tiro_gr - self.peso_neto_gr) / self.peso_tiro_gr
         return 0.0
     
-    def to_dict(self):
+    def to_dict(self, include_variantes=False):
         return {
             'codigo':           self.codigo,
             'nombre':           self.nombre,
@@ -60,44 +60,36 @@ class Molde(db.Model):
             'cavidades_totales': self.cavidades_totales,
             'merma_pct':         self.merma_pct,
             # Piezas (única fuente: MoldePieza)
-            'piezas': [mp.to_dict() for mp in self.piezas]
+            'formas': [mp.to_dict(include_variantes=include_variantes) for mp in self.piezas]
         }
     
     def __repr__(self):
         return f'<Molde {self.codigo}: {self.nombre}>'
 
 
-class MoldePieza(db.Model):
+class Pieza(db.Model):
     """
-    Definición de forma/cavidad de un molde.
+    Definición de forma pura (geometría) de un molde.
     
     Cada registro representa una FORMA (no un SKU coloreado).
-    Las Piezas coloreadas (SKUs de inventario) apuntan aquí
-    vía Pieza.molde_pieza_id.
-    
-    Ejemplo: Molde "Jarra Regadera" tiene 2 MoldePieza:
-      - id=1: "Tapa Regadera" (2 cav, 15g)
-      - id=2: "Base Regadera" (2 cav, 15g)
+    Las variantes coloreadas (SKUs de inventario) apuntan aquí.
     """
-    __tablename__ = 'molde_pieza'
+    __tablename__ = 'pieza'
     
     id = db.Column(db.Integer, primary_key=True)
     
     molde_id = db.Column(db.String(50), db.ForeignKey('molde.codigo'), nullable=False)
     
     # Nombre de la forma (ej. "Tapa Regadera")
-    nombre = db.Column(db.String(200), nullable=True)
+    nombre = db.Column(db.String(200), nullable=False)
     
-    # Legacy: pieza_sku apunta a una pieza específica (nullable para formas puras)
-    # use_alter=True rompe la dependencia circular Pieza↔MoldePieza
-    pieza_sku = db.Column(db.String(50), db.ForeignKey('pieza.sku', name='fk_moldepieza_pieza_sku', use_alter=True), nullable=True)
+    # Clasificación (migrado desde el SKU coloreado)
+    linea_id = db.Column(db.Integer, db.ForeignKey('linea.id'), nullable=True)
+    familia_id = db.Column(db.Integer, db.ForeignKey('familia.id'), nullable=True)
     
     # Atributos de la forma
     cavidades = db.Column(db.Integer, nullable=False, default=1)
     peso_unitario_gr = db.Column(db.Float, nullable=False)  # Peso de UNA pieza
-    
-    # Relación legacy a Pieza (puede ser None para formas puras)
-    pieza = db.relationship('Pieza', backref='molde_piezas', foreign_keys=[pieza_sku])
     
     # Constraint: un molde no tiene dos formas con el mismo nombre
     __table_args__ = (
@@ -109,19 +101,21 @@ class MoldePieza(db.Model):
         """Peso total de esta pieza en el molde (unitario × cavidades)"""
         return self.peso_unitario_gr * self.cavidades
     
-    def to_dict(self):
-        return {
+    def to_dict(self, include_variantes=False):
+        data = {
             'id': self.id,
             'molde_id': self.molde_id,
             'nombre': self.nombre,
-            'pieza_sku': self.pieza_sku,
-            'pieza_nombre': self.pieza.piezas if self.pieza else self.nombre,
+            'linea_id': self.linea_id,
+            'familia_id': self.familia_id,
             'cavidades': self.cavidades,
             'peso_unitario_gr': self.peso_unitario_gr,
             'peso_total_gr': self.peso_total_gr,
             'variantes_count': len(self.variantes) if hasattr(self, 'variantes') else 0
         }
+        if include_variantes and hasattr(self, 'variantes'):
+            data['variantes'] = [v.to_dict() for v in self.variantes]
+        return data
     
     def __repr__(self):
-        label = self.nombre or self.pieza_sku or '?'
-        return f'<MoldePieza {self.molde_id}/{label}: {self.cavidades} cav>'
+        return f'<Pieza {self.molde_id}/{self.nombre}: {self.cavidades} cav>'

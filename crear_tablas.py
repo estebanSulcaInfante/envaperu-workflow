@@ -7,12 +7,12 @@ from app.models.materiales import MateriaPrima, Colorante
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
-from app.models.producto import ProductoTerminado, Pieza, ProductoPieza, FamiliaColor, ColorProducto, Linea, Familia, PiezaComponente
+from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, FamiliaColor, ColorProducto, Linea, Familia, PiezaComponente
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.control_peso import ControlPeso
 from app.models.talonario import Talonario
-from app.models.molde import Molde, MoldePieza
+from app.models.molde import Molde, Pieza
 from app.models.historial_estado import HistorialEstadoOrden
 from app.models.receta_color import RecetaColorNormalizada
 from app.models.kardex import InventarioManga, MovimientoKardex
@@ -90,7 +90,7 @@ def inicializar_bd():
         db.session.add(familia_baldes)
         db.session.flush()
 
-        pieza_balde = Pieza(
+        pieza_balde = PiezaColor(
             sku="10101-BALDE", piezas="Cuerpo Balde 20L",
             linea_id=linea_industrial.id, familia_id=familia_baldes.id,
             cod_pieza=1, cod_col="01", tipo_color="Solido",
@@ -98,7 +98,7 @@ def inicializar_bd():
             cod_extru=1, tipo_extruccion="Inyeccion",
             cod_mp="MP01", mp="PP"
         )
-        pieza_asa = Pieza(
+        pieza_asa = PiezaColor(
             sku="10102-ASA", piezas="Asa Balde 20L",
             linea_id=linea_industrial.id, familia_id=familia_baldes.id,
             cod_pieza=2, cod_col="01", tipo_color="Solido",
@@ -143,7 +143,7 @@ def inicializar_bd():
         db.session.add(molde_balde)
         db.session.flush()
 
-        db.session.add(MoldePieza(
+        db.session.add(Pieza(
             molde_id=molde_balde.codigo,
             pieza_sku=pieza_balde.sku,
             cavidades=1,

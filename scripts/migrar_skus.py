@@ -7,7 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app import create_app
 from app.extensions import db
-from app.models.producto import ProductoTerminado, Pieza, ProductoPieza
+from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza
 
 def safe_float(val):
     if not val:
@@ -86,9 +86,9 @@ def migrar_piezas(ws):
         sku_pieza = str(row[0]).strip()
         
         # Crear o Actualizar
-        pieza = db.session.get(Pieza, sku_pieza)
+        pieza = db.session.get(PiezaColor, sku_pieza)
         if not pieza:
-            pieza = Pieza(sku=sku_pieza)
+            pieza = PiezaColor(sku=sku_pieza)
             
         pieza.cod_linea = row[1]
         pieza.linea = row[2]
@@ -123,7 +123,7 @@ _nombre_producto_map = {}
 
 def crear_relaciones_producto_pieza(mapa_nombres):
     """Crea registros en la tabla intermedia ProductoPieza."""
-    print("Creando relaciones Producto-Pieza...")
+    print("Creando relaciones Producto-PiezaColor...")
     count = 0
     
     # Cargar mapa de productos por nombre

@@ -1,13 +1,13 @@
 """
 Tests para el poblamiento dinámico de la BD al crear OPs:
   1. RecetaColorNormalizada: upsert y promedio ponderado acumulado
-  2. Molde on-the-fly: crea Molde+MoldePieza si no existen, no sobreescribe
+  2. Molde on-the-fly: crea Molde+Pieza si no existen, no sobreescribe
   3. Endpoint GET /api/catalogo/receta-color: prefill de pigmentos
 """
 import pytest
 from app.models.receta_color import RecetaColorNormalizada
-from app.models.molde import Molde, MoldePieza
-from app.models.producto import ColorProducto, FamiliaColor, Pieza, Linea, Familia
+from app.models.molde import Molde, Pieza
+from app.models.producto import ColorProducto, FamiliaColor, PiezaColor, Linea, Familia
 from app.models.materiales import Colorante
 from app.extensions import db
 
@@ -172,13 +172,13 @@ class TestMoldeOnTheFly:
             )
             db.session.add(molde_orig)
 
-            pieza_orig = Pieza(sku="PIEZA-ORIG", piezas="Pieza Original",
+            pieza_orig = PiezaColor(sku="PIEZA-ORIG", piezas="PiezaColor Original",
                                tipo="SIMPLE", linea_id=linea.id, familia_id=fam.id,
                                cavidad=2, peso=45.0)
             db.session.add(pieza_orig)
             db.session.flush()
 
-            mp_orig = MoldePieza(molde_id="MOL-ORIG-01", pieza_sku="PIEZA-ORIG",
+            mp_orig = Pieza(molde_id="MOL-ORIG-01", pieza_sku="PIEZA-ORIG",
                                  cavidades=2, peso_unitario_gr=45.0)
             db.session.add(mp_orig)
             db.session.commit()
@@ -201,7 +201,7 @@ class TestMoldeOnTheFly:
         assert resp.status_code == 201
 
         with app.app_context():
-            mp = MoldePieza.query.filter_by(molde_id="MOL-ORIG-01", pieza_sku="PIEZA-ORIG").first()
+            mp = Pieza.query.filter_by(molde_id="MOL-ORIG-01", pieza_sku="PIEZA-ORIG").first()
             # Debe mantenerse el valor original (45g), no el del snapshot (999g)
             assert mp.peso_unitario_gr == 45.0
 

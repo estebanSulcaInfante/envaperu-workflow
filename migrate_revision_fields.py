@@ -1,5 +1,5 @@
 """
-Migración: Agregar campos de revisión progresiva a ProductoTerminado Y Pieza
+Migración: Agregar campos de revisión progresiva a ProductoTerminado Y PiezaColor
 
 Campos nuevos en ambas tablas:
 - estado_revision: IMPORTADO, EN_REVISION, VERIFICADO
@@ -91,7 +91,7 @@ def migrate():
         # Migrar ProductoTerminado
         migrate_table('producto_terminado')
         
-        # Migrar Pieza
+        # Migrar PiezaColor
         migrate_table('pieza')
         
         # Estadísticas finales

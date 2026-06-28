@@ -5,7 +5,7 @@ Este script:
 1. Crea la tabla 'linea' si no existe
 2. Pobla con HOGAR (codigo=1) e INDUSTRIAL (codigo=2)
 3. Actualiza linea_id en ProductoTerminado basándose en el nombre de linea
-4. Actualiza linea_id en Pieza basándose en cod_linea
+4. Actualiza linea_id en PiezaColor basándose en cod_linea
 
 Uso:
     python migrate_linea.py
@@ -16,7 +16,7 @@ sys.path.insert(0, '.')
 from sqlalchemy import text, inspect
 from app import create_app
 from app.extensions import db
-from app.models.producto import Linea, ProductoTerminado, Pieza
+from app.models.producto import Linea, ProductoTerminado, PiezaColor
 
 def column_exists(table_name, column_name):
     """Check if a column exists in a table."""
@@ -114,14 +114,14 @@ def migrate():
         db.session.commit()
         print(f"   ✅ Actualizados {productos_actualizados} productos")
         
-        # 6. Actualizar linea_id en Pieza
+        # 6. Actualizar linea_id en PiezaColor
         print("\n6. Actualizando linea_id en pieza...")
         
         # Mapeo por código de linea
         lineas_map_codigo = {l.codigo: l for l in Linea.query.all()}
         
         piezas_actualizadas = 0
-        for pieza in Pieza.query.filter(Pieza.linea_id.is_(None)).all():
+        for pieza in PiezaColor.query.filter(PiezaColor.linea_id.is_(None)).all():
             if pieza.cod_linea and pieza.cod_linea in lineas_map_codigo:
                 pieza.linea_id = lineas_map_codigo[pieza.cod_linea].id
                 piezas_actualizadas += 1
@@ -140,7 +140,7 @@ def migrate():
         print("=" * 60)
         print(f"Líneas en tabla: {Linea.query.count()}")
         print(f"Productos con linea_id: {ProductoTerminado.query.filter(ProductoTerminado.linea_id.isnot(None)).count()}")
-        print(f"Piezas con linea_id: {Pieza.query.filter(Pieza.linea_id.isnot(None)).count()}")
+        print(f"Piezas con linea_id: {PiezaColor.query.filter(PiezaColor.linea_id.isnot(None)).count()}")
         print("\n✅ Migración completada exitosamente!")
 
 if __name__ == '__main__':

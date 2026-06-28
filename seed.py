@@ -17,9 +17,9 @@ from app import create_app
 from app.extensions import db
 from app.models.producto import (
     Linea, Familia, FamiliaColor, ColorProducto,
-    Pieza, PiezaComponente
+    PiezaColor, PiezaComponente
 )
-from app.models.molde import Molde, MoldePieza
+from app.models.molde import Molde, Pieza
 
 app = create_app()
 
@@ -96,7 +96,7 @@ with app.app_context():
     db.session.flush()
 
     # Forma única: Cuerpo Balde 20L
-    forma_cuerpo = MoldePieza(
+    forma_cuerpo = Pieza(
         molde_id=molde_balde.codigo,
         nombre='Cuerpo Balde 20L',
         cavidades=1,
@@ -105,8 +105,8 @@ with app.app_context():
     db.session.add(forma_cuerpo)
     db.session.flush()
 
-    # Pieza simple (sin color por ahora)
-    pieza_balde = Pieza(
+    # PiezaColor simple (sin color por ahora)
+    pieza_balde = PiezaColor(
         sku='10101-BALDE',
         piezas='Cuerpo Balde 20L',
         peso=600,
@@ -132,14 +132,14 @@ with app.app_context():
     db.session.flush()
 
     # Forma 1: Tapa Regadera
-    forma_tapa = MoldePieza(
+    forma_tapa = Pieza(
         molde_id=molde_jarra.codigo,
         nombre='Tapa Regadera',
         cavidades=2,
         peso_unitario_gr=15
     )
     # Forma 2: Base Regadera
-    forma_base = MoldePieza(
+    forma_base = Pieza(
         molde_id=molde_jarra.codigo,
         nombre='Base Regadera',
         cavidades=2,
@@ -153,7 +153,7 @@ with app.app_context():
 
     for color in colores_inyeccion:
         # Tapa coloreada
-        tapa = Pieza(
+        tapa = PiezaColor(
             sku=f'JARRA-REG-TAPA-C{color.codigo}',
             piezas=f'Tapa Regadera {color.nombre}',
             peso=forma_tapa.peso_unitario_gr,
@@ -167,7 +167,7 @@ with app.app_context():
             molde_pieza_id=forma_tapa.id
         )
         # Base coloreada
-        base = Pieza(
+        base = PiezaColor(
             sku=f'JARRA-REG-BASE-C{color.codigo}',
             piezas=f'Base Regadera {color.nombre}',
             peso=forma_base.peso_unitario_gr,
@@ -183,7 +183,7 @@ with app.app_context():
         db.session.add_all([tapa, base])
 
         # Kit por color
-        kit = Pieza(
+        kit = PiezaColor(
             sku=f'JARRA-REG-KIT-C{color.codigo}',
             piezas=f'Jarra Regadera Completa {color.nombre}',
             peso=forma_tapa.peso_unitario_gr + forma_base.peso_unitario_gr,
@@ -210,8 +210,8 @@ with app.app_context():
     print(f"✅ FamiliasColor: {FamiliaColor.query.count()}")
     print(f"✅ Colores: {ColorProducto.query.count()}")
     print(f"✅ Moldes: {Molde.query.count()}")
-    print(f"✅ Formas (MoldePieza): {MoldePieza.query.count()}")
-    print(f"✅ Piezas: {Pieza.query.count()}")
+    print(f"✅ Formas (Pieza): {Pieza.query.count()}")
+    print(f"✅ Piezas: {PiezaColor.query.count()}")
     print()
     for m in Molde.query.all():
         print(f"  {m.codigo}: {m.nombre} — {m.cavidades_totales} cavidades")

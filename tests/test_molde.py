@@ -4,8 +4,8 @@ Tests for Molde entity and related models
 import pytest
 from app import create_app
 from app.extensions import db
-from app.models.molde import Molde, MoldePieza
-from app.models.producto import Pieza, PiezaComponente, Linea, Familia
+from app.models.molde import Molde, Pieza
+from app.models.producto import PiezaColor, PiezaComponente, Linea, Familia
 
 
 @pytest.fixture
@@ -52,7 +52,7 @@ class TestMoldeHomogeneo:
             linea_id, familia_id = get_default_linea_familia(app)
             
             # Crear pieza
-            pieza = Pieza(
+            pieza = PiezaColor(
                 sku="BALDE-001",
                 piezas="Balde Romano",
                 tipo="SIMPLE",
@@ -75,7 +75,7 @@ class TestMoldeHomogeneo:
             db.session.commit()
             
             # Relacionar
-            mp = MoldePieza(
+            mp = Pieza(
                 molde_id="MOL-BALDE",
                 pieza_sku="BALDE-001",
                 cavidades=4,
@@ -100,12 +100,12 @@ class TestMoldeHeterogeneo:
             linea_id, familia_id = get_default_linea_familia(app)
             
             # Crear piezas componentes
-            tapa = Pieza(sku="REG-TAPA", piezas="Tapa Regadera", tipo="COMPONENTE", peso=25.0, linea_id=linea_id, familia_id=familia_id)
-            asa = Pieza(sku="REG-ASA", piezas="Asa Regadera", tipo="COMPONENTE", peso=40.0, linea_id=linea_id, familia_id=familia_id)
-            base = Pieza(sku="REG-BASE", piezas="Base Regadera", tipo="COMPONENTE", peso=120.0, linea_id=linea_id, familia_id=familia_id)
+            tapa = PiezaColor(sku="REG-TAPA", piezas="Tapa Regadera", tipo="COMPONENTE", peso=25.0, linea_id=linea_id, familia_id=familia_id)
+            asa = PiezaColor(sku="REG-ASA", piezas="Asa Regadera", tipo="COMPONENTE", peso=40.0, linea_id=linea_id, familia_id=familia_id)
+            base = PiezaColor(sku="REG-BASE", piezas="Base Regadera", tipo="COMPONENTE", peso=120.0, linea_id=linea_id, familia_id=familia_id)
             
             # Crear pieza kit
-            kit = Pieza(sku="REG-KIT", piezas="Kit Regadera", tipo="KIT", peso=185.0, linea_id=linea_id, familia_id=familia_id)
+            kit = PiezaColor(sku="REG-KIT", piezas="Kit Regadera", tipo="KIT", peso=185.0, linea_id=linea_id, familia_id=familia_id)
             
             db.session.add_all([tapa, asa, base, kit])
             db.session.commit()
@@ -127,7 +127,7 @@ class TestMoldeHeterogeneo:
             db.session.commit()
             
             # Relacionar molde con kit
-            mp = MoldePieza(
+            mp = Pieza(
                 molde_id="MOL-REGADERA",
                 pieza_sku="REG-KIT",
                 cavidades=1,
@@ -149,13 +149,13 @@ class TestPiezasProducibles:
     """Test para validación de piezas producibles"""
     
     def test_solo_piezas_en_molde_son_producibles(self, client, app):
-        """Solo piezas asociadas a un molde via MoldePieza son producibles"""
+        """Solo piezas asociadas a un molde via Pieza son producibles"""
         with app.app_context():
             linea_id, familia_id = get_default_linea_familia(app)
             
             # Crear pieza producible (con molde)
-            pieza_prod = Pieza(sku="PROD-001", piezas="Producible", tipo="SIMPLE", linea_id=linea_id, familia_id=familia_id)
-            pieza_no_prod = Pieza(sku="COMP-001", piezas="Componente", tipo="COMPONENTE", linea_id=linea_id, familia_id=familia_id)
+            pieza_prod = PiezaColor(sku="PROD-001", piezas="Producible", tipo="SIMPLE", linea_id=linea_id, familia_id=familia_id)
+            pieza_no_prod = PiezaColor(sku="COMP-001", piezas="Componente", tipo="COMPONENTE", linea_id=linea_id, familia_id=familia_id)
             
             db.session.add_all([pieza_prod, pieza_no_prod])
             db.session.commit()
@@ -165,7 +165,7 @@ class TestPiezasProducibles:
             db.session.add(molde)
             db.session.commit()
             
-            mp = MoldePieza(
+            mp = Pieza(
                 molde_id="MOL-TEST",
                 pieza_sku="PROD-001",
                 cavidades=2,
@@ -175,7 +175,7 @@ class TestPiezasProducibles:
             db.session.commit()
             
             # Query para piezas producibles
-            piezas_producibles = Pieza.query.join(MoldePieza).distinct().all()
+            piezas_producibles = PiezaColor.query.join(Pieza).distinct().all()
             skus_producibles = [p.sku for p in piezas_producibles]
             
             assert "PROD-001" in skus_producibles

@@ -114,7 +114,7 @@ class TestFlujoOPCompleto:
                 'operador': 'OPERADOR E2E',
                 'color': peso_data['color'],
                 'pieza_sku': 'TEST-001',
-                'pieza_nombre': 'Pieza Test'
+                'pieza_nombre': 'PiezaColor Test'
             })
             assert response.status_code == 201, f"Error registrando pesaje: {response.text}"
         

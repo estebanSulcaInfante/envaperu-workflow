@@ -1,5 +1,5 @@
 import pytest
-from app.models.molde import Molde, MoldePieza
+from app.models.molde import Molde, Pieza
 from app.models.producto import ProductoTerminado
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.maquina import Maquina
@@ -32,15 +32,15 @@ def mock_data(session):
     # Simple
     molde_balde = Molde(codigo="MLB01", nombre="Molde Balde Playero", peso_tiro_gr=150.0)
     prod_balde = ProductoTerminado(cod_sku_pt="PT-BLD", producto="Balde Romano", linea_id=linea.id, familia_id=familia.id)
-    pieza_balde = MoldePieza(pieza_sku="MZ-BLD", nombre="Pieza Balde", peso_unitario_gr=145.0, cavidades=1, molde_id="MLB01")
+    pieza_balde = Pieza(pieza_sku="MZ-BLD", nombre="PiezaColor Balde", peso_unitario_gr=145.0, cavidades=1, molde_id="MLB01")
     session.add_all([molde_balde, prod_balde, pieza_balde])
 
     # Complejo
     molde_jarra = Molde(codigo="MLJ01", nombre="Molde Jarra Regadera", peso_tiro_gr=150.0)
     prod_jarra = ProductoTerminado(cod_sku_pt="PT-JRG", producto="Jarra Regadera", linea_id=linea.id, familia_id=familia.id)
-    pieza_jarra_base = MoldePieza(pieza_sku="MZ-JBASE", nombre="Base Jarra", peso_unitario_gr=100.0, cavidades=1, molde_id="MLJ01")
-    pieza_jarra_tapa = MoldePieza(pieza_sku="MZ-JTAPA", nombre="Tapa Jarra", peso_unitario_gr=20.0, cavidades=1, molde_id="MLJ01")
-    pieza_jarra_roseta = MoldePieza(pieza_sku="MZ-JROS", nombre="Roseta", peso_unitario_gr=5.0, cavidades=2, molde_id="MLJ01")
+    pieza_jarra_base = Pieza(pieza_sku="MZ-JBASE", nombre="Base Jarra", peso_unitario_gr=100.0, cavidades=1, molde_id="MLJ01")
+    pieza_jarra_tapa = Pieza(pieza_sku="MZ-JTAPA", nombre="Tapa Jarra", peso_unitario_gr=20.0, cavidades=1, molde_id="MLJ01")
+    pieza_jarra_roseta = Pieza(pieza_sku="MZ-JROS", nombre="Roseta", peso_unitario_gr=5.0, cavidades=2, molde_id="MLJ01")
     session.add_all([molde_jarra, prod_jarra, pieza_jarra_base, pieza_jarra_tapa, pieza_jarra_roseta])
 
     session.commit()
@@ -61,7 +61,7 @@ def mock_data(session):
 def test_creacion_op_simple_un_molde_una_pieza(client, session, mock_data):
     """
     Escenario 1: Creación de OP para 'Balde Playero Romano'
-    1 Molde -> 1 Pieza
+    1 Molde -> 1 PiezaColor
     """
     # Preparar el payload enviando auto_snapshot_molde: true
     payload = {
@@ -99,7 +99,7 @@ def test_creacion_op_simple_un_molde_una_pieza(client, session, mock_data):
     assert len(op.snapshot_composicion) == 1
     snap = op.snapshot_composicion[0]
     
-    # El molde_balde mockeado tiene 1 pieza, revisar que el peso y cavidades sea de MoldePieza catalog
+    # El molde_balde mockeado tiene 1 pieza, revisar que el peso y cavidades sea de Pieza catalog
     assert snap.pieza_sku == mock_data['pieza_balde'].pieza_sku
     assert snap.cavidades == mock_data['molde_pieza_balde'].cavidades
     

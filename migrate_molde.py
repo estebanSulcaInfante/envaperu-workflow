@@ -1,6 +1,6 @@
 """
-Migración: Crear tablas para Molde, MoldePieza, PiezaComponente
-y agregar campos tipo a Pieza y molde_id a OrdenProduccion
+Migración: Crear tablas para Molde, Pieza, PiezaComponente
+y agregar campos tipo a PiezaColor y molde_id a OrdenProduccion
 """
 from app import create_app
 from app.extensions import db
