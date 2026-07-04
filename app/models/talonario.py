@@ -1,5 +1,5 @@
 """
-Modelo Talonario para gestión de correlativos RDP
+Modelo Talonario para gestión de correlativos de Orden de Trabajo (ex-RDP)
 """
 from datetime import datetime, timezone
 from app.extensions import db
@@ -7,7 +7,7 @@ from app.extensions import db
 
 class Talonario(db.Model):
     """
-    Representa un talonario de Registros Diarios de Producción.
+    Representa un talonario de Ordenes de Trabajo (ex Registros Diarios de Producción).
     Cada talonario tiene un rango de correlativos (desde-hasta).
     """
     __tablename__ = 'talonario'

@@ -292,7 +292,7 @@ def inicializar_bd():
         db.session.commit()
 
         # ---------------------------------------------------------
-        # 9. TALONARIOS RDP
+        # 9. TALONARIOS DE ORDEN DE TRABAJO (ex-RDP)
         # ---------------------------------------------------------
         db.session.add(Talonario(desde=30001, hasta=30500, descripcion="Lote Inicial 2026"))
         db.session.commit()

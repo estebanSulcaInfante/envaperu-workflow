@@ -12,7 +12,7 @@ sync_bp = Blueprint('sync', __name__)
 def sync_pesajes():
     """
     Recibe pesajes desde el Scale Module y los inserta como ControlPeso.
-    Si el RDP no existe, lo crea.
+    Si la Orden de Trabajo no existe, la crea.
     """
     data = request.get_json()
     if not data or 'pesajes' not in data:
@@ -27,7 +27,7 @@ def sync_pesajes():
     except Exception as e:
         return jsonify({'error': f'Error cargando maquinas: {str(e)}'}), 500
     
-    # Track impacted RDPs to recalculate once at end (optimization) or loop?
+    # Track impacted Ordenes de Trabajo to recalculate once at end (optimization) or loop?
     # Doing inside loop is safer for now.
     
     for p in data['pesajes']:
@@ -48,7 +48,7 @@ def sync_pesajes():
                 errors.append({'local_id': p['local_id'], 'error': f"Maquina {maq_nombre} no encontrada en Central"})
                 continue
                 
-            # 2. Buscar/Crear RDP
+            # 2. Buscar/Crear Orden de Trabajo
             # Scale envia fecha_ot en ISO string (YYYY-MM-DD)
             fecha_str = p.get('fecha_ot')
             fecha_ot = datetime.fromisoformat(fecha_str).date() if fecha_str else datetime.now().date()
@@ -56,22 +56,22 @@ def sync_pesajes():
             orden_id = p.get('nro_op')
             
             # Buscar existente
-            rdp = RegistroDiarioProduccion.query.filter_by(
+            orden_trabajo = RegistroDiarioProduccion.query.filter_by(
                 orden_id=orden_id,
                 maquina_id=maq_id,
                 fecha=fecha_ot,
                 turno=turno
             ).first()
             
-            if not rdp:
+            if not orden_trabajo:
                 # Buscar Orden para snapshots
                 orden = db.session.get(OrdenProduccion, orden_id)
                 if not orden:
                     errors.append({'local_id': p['local_id'], 'error': f"Orden {orden_id} no encontrada"})
                     continue
 
-                # Crear RDP on-the-fly con snapshots desde caché de la orden
-                rdp = RegistroDiarioProduccion(
+                # Crear Orden de Trabajo on-the-fly con snapshots desde caché de la orden
+                orden_trabajo = RegistroDiarioProduccion(
                     orden_id=orden_id,
                     maquina_id=maq_id,
                     fecha=fecha_ot,
@@ -85,7 +85,7 @@ def sync_pesajes():
                     snapshot_peso_colada_gr = orden.snapshot_peso_colada_gr or 0.0,
                     tiempo_ciclo_reportado  = orden.snapshot_tiempo_ciclo or 0.0,
                 )
-                db.session.add(rdp)
+                db.session.add(orden_trabajo)
                 db.session.flush() # Para obtener ID
             
             # 3. Insertar ControlPeso
@@ -94,7 +94,7 @@ def sync_pesajes():
             # Guardamos la data
             
             nuevo_peso = ControlPeso(
-                registro_id=rdp.id,
+                registro_id=orden_trabajo.id,
                 peso_real_kg=float(p.get('peso_kg', 0)),
                 color_nombre=p.get('color'),
                 # Parsear fecha_hora con info de timezone si viene
@@ -105,10 +105,10 @@ def sync_pesajes():
             db.session.flush()
             
             # Invalidar cache de la relacion para que se recargue con el nuevo item
-            db.session.expire(rdp, ['controles_peso'])
+            db.session.expire(orden_trabajo, ['controles_peso'])
             
-            # 4. Actualizar Totales del RDP
-            rdp.actualizar_totales()
+            # 4. Actualizar Totales de la Orden de Trabajo
+            orden_trabajo.actualizar_totales()
             
             synced_ids.append({'local_id': p['local_id']})
             

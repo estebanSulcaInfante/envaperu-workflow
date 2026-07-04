@@ -156,9 +156,11 @@ def crear_orden():
                 return jsonify({'error': f'Molde {molde_id} no tiene piezas en catálogo (Pieza)'}), 400
 
             for mp in mp_rows:
+                # Buscar un SKU representativo de esta pieza para guardarlo en el snapshot
+                pc = PiezaColor.query.filter_by(pieza_id=mp.id).first()
                 snap = SnapshotComposicionMolde(
                     orden_id     = nueva_orden.numero_op,
-                    pieza_sku    = mp.pieza_sku,
+                    pieza_sku    = pc.sku if pc else None,
                     cavidades    = mp.cavidades,
                     peso_unit_gr = mp.peso_unitario_gr,
                 )
@@ -617,7 +619,7 @@ def crear_registro(numero_op):
         
         # Procesar Detalles
         detalles_data = data.get('detalles', [])
-        peso_tiro = (cabecera.snapshot_peso_neto_gr * cabecera.snapshot_cavidades)
+        peso_tiro = cabecera.snapshot_peso_neto_gr + (cabecera.snapshot_peso_colada_gr or 0.0) + (cabecera.snapshot_peso_extra_gr or 0.0)
         
         for d in detalles_data:
             detalle = DetalleProduccionHora(

@@ -78,14 +78,15 @@ def test_sync_pesajes_logic(client, app):
         assert data['success'] == True, f"Failed: {data.get('message')}"
         assert len(data['synced']) == 2
         
-        # Assert DB
-        rdp = RegistroDiarioProduccion.query.first()
-        assert rdp is not None
-        assert rdp.orden_id == 'OP-TEST'
+        # Verificar que se creó la Orden de Trabajo
+        orden_trabajo = RegistroDiarioProduccion.query.first()
+        assert orden_trabajo is not None
+        assert orden_trabajo.orden_id == 'OP-TEST'
         
-        # EXACT CALCULATION Verification
-        # 10.5 + 20.0 = 30.5
-        assert abs(rdp.total_kg_real - 30.5) < 0.001, \
-            f"Registration Total Kg incorrect. Got {rdp.total_kg_real}, Expected 30.5"
+        # Verificar que se asociaron 2 pesajes
+        assert len(orden_trabajo.controles_peso) == 2
+        
+        assert abs(orden_trabajo.total_kg_real - 30.5) < 0.001, \
+            f"Registration Total Kg incorrect. Got {orden_trabajo.total_kg_real}, Expected 30.5"
             
         print("\n✅ Internal Sync Logic Verified: Totals matched exactly.")

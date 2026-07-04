@@ -1,5 +1,5 @@
 """
-API para gestión de Talonarios RDP
+API para gestión de Talonarios de Orden de Trabajo (ex-RDP)
 """
 from flask import Blueprint, request, jsonify
 from app.extensions import db
@@ -123,7 +123,7 @@ def obtener_siguiente():
 def consumir_correlativo():
     """
     Consume el siguiente correlativo disponible y lo retorna.
-    Usado cuando se crea un RDP.
+    Usado cuando se crea una Orden de Trabajo (RDP).
     """
     talonario = Talonario.query.filter(
         Talonario.activo == True,

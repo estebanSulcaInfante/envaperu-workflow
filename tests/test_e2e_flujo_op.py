@@ -7,7 +7,7 @@ el cierre con pesajes sincronizados.
 Flujo:
 1. Central: Crear talonario + OP
 2. Scale: Reponer cache de correlativos
-3. Scale: Simular QR scan de OP, crear RDP
+3. Scale: Simular QR scan de OP, crear Orden de Trabajo (ex-RDP)
 4. Scale: Registrar múltiples pesajes
 5. Scale: Sincronizar pesajes al central
 6. Central: Verificar pesajes recibidos
@@ -75,12 +75,13 @@ class TestFlujoOPCompleto:
         
         # 3. Reponer cache de correlativos en scale
         print("3. Reponiendo cache en scale...")
-        response = requests.post(f'{SCALE_URL}/api/rdp/cache/reponer')
-        assert response.status_code == 200, f"Error reponiendo cache: {response.text}"
+        response = requests.post(f'{SCALE_URL}/api/orden-trabajo/cache/reponer')
+        assert response.status_code == 200, "Error reponiendo cache correlativos en Scale"
+        print("   Cache correlativos scale reabastecido.")
         
-        # 4. Crear RDP (simula escaneo de QR de OP)
-        print("4. Generando RDP en scale...")
-        rdp_data = {
+        # 4. Crear Orden de Trabajo (simula escaneo de QR de OP)
+        print("4. Generando Orden de Trabajo en scale...")
+        orden_trabajo_data = {
             'nro_op': op_numero,
             'molde': 'BALDE PLAYERO',
             'maquina': 'INY-05',
@@ -88,11 +89,11 @@ class TestFlujoOPCompleto:
             'fecha_ot': date.today().isoformat(),
             'operador': 'OPERADOR E2E'
         }
-        response = requests.post(f'{SCALE_URL}/api/rdp/generar', json=rdp_data)
-        assert response.status_code == 200, f"Error generando RDP: {response.text}"
-        data_rdp = response.json()
-        correlativo_rdp = data_rdp['correlativo']
-        print(f"   RDP Generado: {correlativo_rdp}")
+        response = requests.post(f'{SCALE_URL}/api/orden-trabajo/generar', json=orden_trabajo_data)
+        assert response.status_code == 200, f"Error generando Orden de Trabajo: {response.text}"
+        data_orden_trabajo = response.json()
+        correlativo_orden_trabajo = data_orden_trabajo['correlativo']
+        print(f"   Orden de Trabajo Generada: {correlativo_orden_trabajo}")
         
         # 5. Registrar pesajes en scale
         print("5. Registrando pesajes...")
@@ -110,7 +111,7 @@ class TestFlujoOPCompleto:
                 'nro_op': op_numero,
                 'turno': 'DIURNO',
                 'fecha_orden_trabajo': date.today().isoformat(),
-                'nro_orden_trabajo': str(correlativo_rdp),
+                'nro_orden_trabajo': str(correlativo_orden_trabajo),
                 'operador': 'OPERADOR E2E',
                 'color': peso_data['color'],
                 'pieza_sku': 'TEST-001',
@@ -166,18 +167,18 @@ class TestFlujoOPCompleto:
 class TestFlujoOPOffline:
     """E2E Test del flujo offline del scale module"""
     
-    def test_generar_rdp_sin_conexion_central(self):
-        """Generar RDP usando cache local"""
+    def test_generar_orden_trabajo_sin_conexion_central(self):
+        """Generar Orden de Trabajo usando cache local"""
         # Verificar estado del cache primero
         try:
-            status = requests.get(f'{SCALE_URL}/api/rdp/cache/status').json()
-            if status.get('disponibles', 0) == 0:
-                pytest.skip("Cache vacío, no se puede probar offline")
-        except:
-            pytest.skip("No se pudo conectar al scale module")
+            status = requests.get(f'{SCALE_URL}/api/orden-trabajo/cache/status').json()
+            if status['disponibles'] == 0:
+                requests.post(f'{SCALE_URL}/api/orden-trabajo/cache/reponer')
+        except requests.exceptions.RequestException:
+            pass # Ignore connection errors in setup phase
         
-        # Simular generación
-        response = requests.post(f'{SCALE_URL}/api/rdp/generar', json={
+        # 2. Generar Orden de Trabajo (OP "INVENTADA-001" - asumiendo cache offline no valida FK OP)
+        response = requests.post(f'{SCALE_URL}/api/orden-trabajo/generar', json={
             'nro_op': 'OP-OFFLINE-TEST',
             'molde': 'MOLDE TEST',
             'maquina': 'INY-01',

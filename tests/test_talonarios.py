@@ -1,5 +1,4 @@
-"""
-Tests para Talonario RDP
+Tests para Talonario de Orden de Trabajo (ex-RDP)
 """
 import pytest
 from app import create_app

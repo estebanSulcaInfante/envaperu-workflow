@@ -723,25 +723,21 @@ def obtener_piezas_producibles():
     from app.models.molde import Pieza as MP
     piezas = (
         PiezaColor.query
-        .join(MP, MP.pieza_sku == PiezaColor.sku)
+        .join(MP, MP.id == PiezaColor.pieza_id)
         .order_by(PiezaColor.piezas)
         .all()
     )
 
     result = []
     for p in piezas:
-        mp_row = MP.query.filter_by(pieza_sku=p.sku).first()
-        molde_obj = db.session.get(Molde, mp_row.molde_id) if mp_row else None
+        mp_row = p.pieza_rel
+        molde_obj = mp_row.molde if mp_row else None
+        
         result.append({
             'sku': p.sku,
             'nombre': p.piezas,
             'tipo': p.tipo,
-            'molde': {
-                'codigo': molde_obj.codigo if molde_obj else None,
-                'nombre': molde_obj.nombre if molde_obj else None,
-                'peso_tiro_gr': molde_obj.peso_tiro_gr if molde_obj else None,
-                'tiempo_ciclo_std': molde_obj.tiempo_ciclo_std if molde_obj else None
-            },
+            'molde': molde_obj.to_dict(include_variantes=False) if molde_obj else None,
             'cavidades': mp_row.cavidades if mp_row else p.cavidad,
             'peso_unitario_gr': mp_row.peso_unitario_gr if mp_row else p.peso
         })
@@ -1228,9 +1224,7 @@ def validar_orden_prereq():
             })
             
             if not sku_encontrado:
-                result['warnings'].append(
-                    f'⚠️ No existe SKU para color "{color.nombre}" con las piezas de este molde'
-                )
+                pass # Legacy warning removed: Agile catalog allows dynamic color/sku generation
     
     # Si hay warnings, marcamos como válido pero con advertencias
     # Solo errors hacen invalid
