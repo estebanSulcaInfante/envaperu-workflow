@@ -28,10 +28,7 @@ class TestRevisionProductos:
                 producto="Producto Test Revisión",
                 linea_id=linea_id,
                 familia_id=familia_id,
-                familia_color_rel=fam,
-                familia_color="SOLIDO",
-                cod_familia_color=1
-            )
+                )
             db.session.add(pt)
             db.session.commit()
             
@@ -54,7 +51,6 @@ class TestRevisionProductos:
                 producto="Producto Para Revisar",
                 linea_id=linea_id,
                 familia_id=familia_id,
-                familia_color_rel=fam,
                 estado_revision="IMPORTADO"
             )
             db.session.add(pt)
@@ -86,16 +82,16 @@ class TestRevisionProductos:
             productos = [
                 ProductoTerminado(cod_sku_pt="PEND-001", producto="Pendiente 1", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="IMPORTADO"),
+                                 estado_revision="IMPORTADO"),
                 ProductoTerminado(cod_sku_pt="PEND-002", producto="Pendiente 2", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="IMPORTADO"),
+                                 estado_revision="IMPORTADO"),
                 ProductoTerminado(cod_sku_pt="REV-001", producto="En Revision", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="EN_REVISION"),
+                                 estado_revision="EN_REVISION"),
                 ProductoTerminado(cod_sku_pt="VER-001", producto="Verificado", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="VERIFICADO"),
+                                 estado_revision="VERIFICADO"),
             ]
             db.session.add_all(productos)
             db.session.commit()
@@ -127,7 +123,6 @@ class TestRevisionAPI:
                 producto="Producto API Test",
                 linea_id=linea_id,
                 familia_id=familia_id,
-                familia_color_rel=fam,
                 estado_revision="IMPORTADO"
             )
             db.session.add(pt)
@@ -153,10 +148,10 @@ class TestRevisionAPI:
             db.session.add_all([
                 ProductoTerminado(cod_sku_pt="FILT-001", producto="F1", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="IMPORTADO"),
+                                 estado_revision="IMPORTADO"),
                 ProductoTerminado(cod_sku_pt="FILT-002", producto="F2", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="VERIFICADO"),
+                                 estado_revision="VERIFICADO"),
             ])
             db.session.commit()
         
@@ -183,7 +178,6 @@ class TestRevisionAPI:
                 producto="Para Actualizar",
                 linea_id=linea_id,
                 familia_id=familia_id,
-                familia_color_rel=fam,
                 estado_revision="IMPORTADO"
             )
             db.session.add(pt)
@@ -211,10 +205,10 @@ class TestRevisionAPI:
             db.session.add_all([
                 ProductoTerminado(cod_sku_pt="STAT-001", producto="S1", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="IMPORTADO"),
+                                 estado_revision="IMPORTADO"),
                 ProductoTerminado(cod_sku_pt="STAT-002", producto="S2", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="VERIFICADO"),
+                                 estado_revision="VERIFICADO"),
             ])
             db.session.commit()
         
@@ -239,13 +233,13 @@ class TestRevisionAPI:
             db.session.add_all([
                 ProductoTerminado(cod_sku_pt="BULK-001", producto="B1", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="IMPORTADO"),
+                                 estado_revision="IMPORTADO"),
                 ProductoTerminado(cod_sku_pt="BULK-002", producto="B2", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="IMPORTADO"),
+                                 estado_revision="IMPORTADO"),
                 ProductoTerminado(cod_sku_pt="BULK-003", producto="B3", 
                                  linea_id=linea_id, familia_id=familia_id,
-                                 familia_color_rel=fam, estado_revision="IMPORTADO"),
+                                 estado_revision="IMPORTADO"),
             ])
             db.session.commit()
         

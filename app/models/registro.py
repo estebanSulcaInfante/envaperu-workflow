@@ -36,6 +36,10 @@ class RegistroDiarioProduccion(db.Model):
     snapshot_peso_colada_gr = db.Column(db.Float, default=0.0)    # Peso del ramal
     snapshot_peso_extra_gr = db.Column(db.Float, default=0.0)     # Otros pesos
     
+    # SNAPSHOTS DE MÁQUINA (Para conservar dato histórico si la máquina cambia)
+    maquina_codigo_snapshot = db.Column(db.String(20), nullable=True)
+    maquina_nombre_snapshot = db.Column(db.String(100), nullable=True)
+    
     # TOTALIZADORES (Calculados)
     total_coladas_calculada = db.Column(db.Integer, default=0)     # Final - Inicial
     total_piezas_buenas = db.Column(db.Integer, default=0)         # Suma de detalles o (Coladas * Cav)
@@ -107,7 +111,9 @@ class RegistroDiarioProduccion(db.Model):
             'id': self.id,
             'fecha': self.fecha.isoformat() if self.fecha else None,
             'turno': self.turno,
-            'maquina': self.maquina.nombre if self.maquina else None,
+            'maquina_id': self.maquina_id,
+            'maquina': self.maquina_nombre_snapshot or (self.maquina.nombre if self.maquina else None),
+            'maquina_codigo': self.maquina_codigo_snapshot or (self.maquina.codigo if self.maquina else None),
             'orden': self.orden_id,
             'contadores': {
                 'inicial': self.colada_inicial,
@@ -136,9 +142,16 @@ class DetalleProduccionHora(db.Model):
     registro_id = db.Column(db.Integer, db.ForeignKey('registro_diario_produccion.id'), nullable=False)
     
     hora = db.Column(db.String(10), nullable=False) # "07:00", "08:00"
-    maquinista = db.Column(db.String(100))
+    
+    # Nuevos campos normalizados
+    trabajador_id = db.Column(db.Integer, db.ForeignKey('trabajador.id'), nullable=True) # nullable temporalmente para historial
+    maquinista_snapshot = db.Column(db.String(100)) # Reemplaza a "maquinista", retiene el texto
+    
     color = db.Column(db.String(50))
     observacion = db.Column(db.String(255))
+    
+    # Relación
+    trabajador = db.relationship('Trabajador', backref='detalles_produccion', lazy=True)
     
     coladas_realizadas = db.Column(db.Integer, default=0) # Cantidad de ciclos en esta hora
     
@@ -154,7 +167,9 @@ class DetalleProduccionHora(db.Model):
         return {
             'id': self.id,
             'hora': self.hora,
-            'maquinista': self.maquinista,
+            'trabajador_id': self.trabajador_id,
+            'maquinista': self.maquinista_snapshot, # Mantenemos el key 'maquinista' para el frontend temporalmente
+            'trabajador_nombre': self.trabajador.nombre_completo if self.trabajador else self.maquinista_snapshot,
             'color': self.color,
             'observacion': self.observacion,
             'coladas': self.coladas_realizadas,

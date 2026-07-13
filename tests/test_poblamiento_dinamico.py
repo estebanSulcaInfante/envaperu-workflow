@@ -7,9 +7,34 @@ Tests para el poblamiento dinámico de la BD al crear OPs:
 import pytest
 from app.models.receta_color import RecetaColorNormalizada
 from app.models.molde import Molde, Pieza
-from app.models.producto import ColorProducto, FamiliaColor, PiezaColor, Linea, Familia
+from app.models.producto import ColorProduccion, ColorBase, FamiliaColor, FamiliaColor, PiezaColor, Linea, Familia
 from app.models.materiales import Colorante
 from app.extensions import db
+
+def _get_or_create_fam(nombre="SOLIDO", codigo=1):
+    from app.models.producto import FamiliaColor
+    fam = FamiliaColor.query.filter_by(nombre=nombre).first()
+    if not fam:
+        from app.extensions import db
+        fam = FamiliaColor(nombre=nombre, codigo=codigo)
+        db.session.add(fam)
+        db.session.flush()
+    return fam
+
+def _create_color_prod(nombre, codigo=None, familia_id=None):
+    from app.models.producto import ColorBase, ColorProduccion
+    from app.extensions import db
+    cb = ColorBase.query.filter_by(nombre=nombre).first()
+    if not cb:
+        cb = ColorBase(nombre=nombre)
+        db.session.add(cb)
+        db.session.flush()
+    fam_id = familia_id if familia_id else _get_or_create_fam().id
+    cp = ColorProduccion(color_base_id=cb.id, familia_color_id=fam_id, codigo_legacy=codigo)
+    db.session.add(cp)
+    db.session.flush()
+    return cp
+
 
 
 # ============================================================
@@ -23,9 +48,11 @@ def _make_color(app, nombre="AZUL", codigo=99):
             db.session.add(fam)
             db.session.flush()
         fam = FamiliaColor.query.first()
-        c = ColorProducto.query.filter_by(nombre=nombre).first()
+        from app.models.producto import ColorBase, ColorProduccion
+        cb = ColorBase.query.filter_by(nombre=nombre).first()
+        c = ColorProduccion.query.filter_by(color_base_id=cb.id).first() if cb else None
         if not c:
-            c = ColorProducto(nombre=nombre, codigo=codigo, familia_id=fam.id)
+            c = _create_color_prod(nombre=nombre, codigo=codigo, familia_id=fam.id)
             db.session.add(c)
             db.session.commit()
         return c.id
@@ -55,7 +82,7 @@ class TestRecetaColorNormalizada:
         with app.app_context():
             RecetaColorNormalizada.upsert(
                 session=db.session,
-                color_id=color_id,
+                color_produccion_id=color_id,
                 colorante_id=colo_id,
                 producto_sku=None,
                 gr_por_kg_nuevo=0.30,
@@ -63,7 +90,7 @@ class TestRecetaColorNormalizada:
             db.session.commit()
 
             receta = RecetaColorNormalizada.query.filter_by(
-                color_id=color_id, colorante_id=colo_id, producto_sku=None
+                color_produccion_id=color_id, colorante_id=colo_id, producto_sku=None
             ).first()
 
             assert receta is not None
@@ -85,7 +112,7 @@ class TestRecetaColorNormalizada:
             db.session.commit()
 
             receta = RecetaColorNormalizada.query.filter_by(
-                color_id=color_id, colorante_id=colo_id, producto_sku=None
+                color_produccion_id=color_id, colorante_id=colo_id, producto_sku=None
             ).first()
 
             assert receta.n_muestras == 2
@@ -102,9 +129,9 @@ class TestRecetaColorNormalizada:
             db.session.commit()
 
             generica   = RecetaColorNormalizada.query.filter_by(
-                color_id=color_id, colorante_id=colo_id, producto_sku=None).first()
+                color_produccion_id=color_id, colorante_id=colo_id, producto_sku=None).first()
             especifica = RecetaColorNormalizada.query.filter_by(
-                color_id=color_id, colorante_id=colo_id, producto_sku="SKU-PROVA").first()
+                color_produccion_id=color_id, colorante_id=colo_id, producto_sku="SKU-PROVA").first()
 
             assert generica.n_muestras == 1
             assert abs(generica.gr_por_kg - 0.10) < 1e-6
@@ -136,7 +163,7 @@ class TestMoldeOnTheFly:
             "snapshot_tiempo_ciclo": 20.0,
             "snapshot_horas_turno": 8.0,
             "snapshot_peso_colada_gr": 3.0,
-            # Manual snapshot con pieza_sku=None (molde genérico)
+            # Manual snapshot con nombre=None (molde genérico)
             "snapshot_composicion": [
                 {"pieza_sku": None, "cavidades": 4, "peso_unit_gr": 25.0}
             ],
@@ -171,6 +198,7 @@ class TestMoldeOnTheFly:
                 activo=True
             )
             db.session.add(molde_orig)
+            db.session.flush()
 
             pieza_orig = PiezaColor(sku="PIEZA-ORIG", piezas="PiezaColor Original",
                                tipo="SIMPLE", linea_id=linea.id, familia_id=fam.id,
@@ -178,8 +206,8 @@ class TestMoldeOnTheFly:
             db.session.add(pieza_orig)
             db.session.flush()
 
-            mp_orig = Pieza(molde_id="MOL-ORIG-01", pieza_sku="PIEZA-ORIG",
-                                 cavidades=2, peso_unitario_gr=45.0)
+            mp_orig = Pieza(molde_id=molde_orig.codigo, nombre="PIEZA-ORIG",
+                             cavidades=2, peso_unitario_gr=45.0)
             db.session.add(mp_orig)
             db.session.commit()
 
@@ -201,7 +229,7 @@ class TestMoldeOnTheFly:
         assert resp.status_code == 201
 
         with app.app_context():
-            mp = Pieza.query.filter_by(molde_id="MOL-ORIG-01", pieza_sku="PIEZA-ORIG").first()
+            mp = Pieza.query.filter_by(nombre="PIEZA-ORIG").first()
             # Debe mantenerse el valor original (45g), no el del snapshot (999g)
             assert mp.peso_unitario_gr == 45.0
 
@@ -216,7 +244,7 @@ class TestEndpointRecetaColor:
         """Color sin OPs previas → tiene_receta=False y lista vacía."""
         color_id = _make_color(app, "ROSA SIN RECETA", 77)
 
-        resp = client.get(f'/api/catalogo/receta-color?color_id={color_id}')
+        resp = client.get(f'/api/catalogo/receta-color?color_produccion_id={color_id}')
         assert resp.status_code == 200
         data = resp.get_json()
         assert data['tiene_receta'] is False
@@ -231,7 +259,7 @@ class TestEndpointRecetaColor:
             RecetaColorNormalizada.upsert(db.session, color_id, colo_id, None, 0.25)
             db.session.commit()
 
-        resp = client.get(f'/api/catalogo/receta-color?color_id={color_id}')
+        resp = client.get(f'/api/catalogo/receta-color?color_produccion_id={color_id}')
         assert resp.status_code == 200
         data = resp.get_json()
         assert data['tiene_receta'] is True
@@ -249,7 +277,7 @@ class TestEndpointRecetaColor:
             RecetaColorNormalizada.upsert(db.session, color_id, colo_id, None, 0.50)
             db.session.commit()
 
-        resp = client.get(f'/api/catalogo/receta-color?color_id={color_id}&meta_kg=200')
+        resp = client.get(f'/api/catalogo/receta-color?color_produccion_id={color_id}&meta_kg=200')
         assert resp.status_code == 200
         data = resp.get_json()
         pig = data['pigmentos'][0]

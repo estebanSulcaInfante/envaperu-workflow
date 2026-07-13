@@ -23,7 +23,7 @@ class RecetaColorNormalizada(db.Model):
     id            = db.Column(db.Integer, primary_key=True, autoincrement=True)
 
     # Claves de clasificación
-    color_id      = db.Column(db.Integer, db.ForeignKey('color_producto.id'), nullable=False)
+    color_produccion_id = db.Column(db.Integer, db.ForeignKey('color_produccion.id'), nullable=False)
     colorante_id  = db.Column(db.Integer, db.ForeignKey('colorante.id'), nullable=False)
     producto_sku  = db.Column(db.String(50), db.ForeignKey('producto_terminado.cod_sku_pt'), nullable=True)
 
@@ -38,13 +38,13 @@ class RecetaColorNormalizada(db.Model):
     )
 
     # Relaciones de lectura
-    color     = db.relationship('ColorProducto', backref='recetas_normalizadas')
+    color_produccion = db.relationship('ColorProduccion', backref='recetas_normalizadas')
     colorante = db.relationship('Colorante', backref='recetas_normalizadas')
     producto  = db.relationship('ProductoTerminado', backref='recetas_color')
 
     # Restricción única: una sola receta por combinación
     __table_args__ = (
-        db.UniqueConstraint('color_id', 'colorante_id', 'producto_sku',
+        db.UniqueConstraint('color_produccion_id', 'colorante_id', 'producto_sku',
                             name='uq_receta_color_normalizada'),
     )
 
@@ -67,21 +67,21 @@ class RecetaColorNormalizada(db.Model):
     # -----------------------------------------------------------------------
 
     @classmethod
-    def upsert(cls, session, color_id: int, colorante_id: int,
+    def upsert(cls, session, color_produccion_id: int, colorante_id: int,
                producto_sku: str | None, gr_por_kg_nuevo: float):
         """
         Busca o crea la receta y absorbe la nueva muestra.
         Retorna la instancia actualizada (no hace commit).
         """
         receta = session.query(cls).filter_by(
-            color_id=color_id,
+            color_produccion_id=color_produccion_id,
             colorante_id=colorante_id,
             producto_sku=producto_sku
         ).first()
 
         if receta is None:
             receta = cls(
-                color_id=color_id,
+                color_produccion_id=color_produccion_id,
                 colorante_id=colorante_id,
                 producto_sku=producto_sku,
                 gr_por_kg=gr_por_kg_nuevo,
@@ -109,6 +109,6 @@ class RecetaColorNormalizada(db.Model):
         return d
 
     def __repr__(self):
-        return (f'<RecetaColor color={self.color_id} '
+        return (f'<RecetaColor color_prod={self.color_produccion_id} '
                 f'colorante={self.colorante_id} '
                 f'gr_kg={self.gr_por_kg:.4f} n={self.n_muestras}>')

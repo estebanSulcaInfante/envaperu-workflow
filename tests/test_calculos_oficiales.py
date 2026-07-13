@@ -1,8 +1,33 @@
 import pytest
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
-from app.models.producto import ColorProducto
+from app.models.producto import ColorProduccion, ColorBase, FamiliaColor
 from app.extensions import db
+
+def _get_or_create_fam(nombre="SOLIDO", codigo=1):
+    from app.models.producto import FamiliaColor
+    fam = FamiliaColor.query.filter_by(nombre=nombre).first()
+    if not fam:
+        from app.extensions import db
+        fam = FamiliaColor(nombre=nombre, codigo=codigo)
+        db.session.add(fam)
+        db.session.flush()
+    return fam
+
+def _create_color_prod(nombre, codigo=None, familia_id=None):
+    from app.models.producto import ColorBase, ColorProduccion
+    from app.extensions import db
+    cb = ColorBase.query.filter_by(nombre=nombre).first()
+    if not cb:
+        cb = ColorBase(nombre=nombre)
+        db.session.add(cb)
+        db.session.flush()
+    fam_id = familia_id if familia_id else _get_or_create_fam().id
+    cp = ColorProduccion(color_base_id=cb.id, familia_color_id=fam_id, codigo_legacy=codigo)
+    db.session.add(cp)
+    db.session.flush()
+    return cp
+
 
 
 def _mk_op(numero_op, snap_items, lotes_meta, **kwargs):
@@ -27,7 +52,7 @@ def _mk_op(numero_op, snap_items, lotes_meta, **kwargs):
     for l in lotes_meta:
         db.session.add(LoteColor(
             numero_op = numero_op,
-            color_id  = l['color_id'],
+            color_produccion_id = l['color_produccion_id'],
             meta_kg   = l['meta_kg'],
         ))
     db.session.flush()
@@ -48,8 +73,8 @@ def test_calculos_metricas_basicas(client, app):
     Lote Azul:  meta_kg = 175.0  → coladas = 175000/174 ≈ 1005.747  (sin redondeo)
     """
     with app.app_context():
-        c_rojo = ColorProducto(nombre="ROJO-CALC", codigo=20)
-        c_azul = ColorProducto(nombre="AZUL-CALC", codigo=21)
+        c_rojo = _create_color_prod(nombre="ROJO-CALC", codigo=20)
+        c_azul = _create_color_prod(nombre="AZUL-CALC", codigo=21)
         db.session.add_all([c_rojo, c_azul])
         db.session.flush()
 
@@ -57,8 +82,8 @@ def test_calculos_metricas_basicas(client, app):
             "OP-CALC-META",
             snap_items=[{"cavidades": 2, "peso_unit_gr": 87.0}],
             lotes_meta=[
-                {"color_id": c_rojo.id, "meta_kg": 174.0},
-                {"color_id": c_azul.id, "meta_kg": 175.0},
+                {"color_produccion_id": c_rojo.id, "meta_kg": 174.0},
+                {"color_produccion_id": c_azul.id, "meta_kg": 175.0},
             ],
             snapshot_peso_colada_gr = 2.0,
             snapshot_tiempo_ciclo   = 30.0,
@@ -95,7 +120,7 @@ def test_meta_kg_divisible_exacta(client, app):
     calculo_kg_real == meta_kg (sin sobrante).
     """
     with app.app_context():
-        c = ColorProducto(nombre="EXACTO", codigo=30)
+        c = _create_color_prod(nombre="EXACTO", codigo=30)
         db.session.add(c)
         db.session.flush()
 
@@ -104,7 +129,7 @@ def test_meta_kg_divisible_exacta(client, app):
         op = _mk_op(
             "OP-EXACTO",
             snap_items=[{"cavidades": 1, "peso_unit_gr": 100.0}],
-            lotes_meta =[{"color_id": c.id, "meta_kg": 10.0}],
+            lotes_meta =[{"color_produccion_id": c.id, "meta_kg": 10.0}],
             snapshot_peso_colada_gr=0.0,
         )
         lote = op.lotes[0]
@@ -118,7 +143,7 @@ def test_meta_kg_no_divisible(client, app):
     y calculo_kg_real == meta_kg (la expresión es idéntica).
     """
     with app.app_context():
-        c = ColorProducto(nombre="NODIV", codigo=31)
+        c = _create_color_prod(nombre="NODIV", codigo=31)
         db.session.add(c)
         db.session.flush()
 
@@ -126,7 +151,7 @@ def test_meta_kg_no_divisible(client, app):
         op = _mk_op(
             "OP-NODIV",
             snap_items=[{"cavidades": 1, "peso_unit_gr": 30.0}],
-            lotes_meta =[{"color_id": c.id, "meta_kg": 1.0}],
+            lotes_meta =[{"color_produccion_id": c.id, "meta_kg": 1.0}],
             snapshot_peso_colada_gr=0.0,
         )
         lote = op.lotes[0]
@@ -138,9 +163,9 @@ def test_meta_kg_no_divisible(client, app):
 def test_peso_produccion_es_suma_de_meta_kg(client, app):
     """La OP.calculo_peso_produccion debe ser exactamente la suma de meta_kg de sus lotes."""
     with app.app_context():
-        c1 = ColorProducto(nombre="S1", codigo=40)
-        c2 = ColorProducto(nombre="S2", codigo=41)
-        c3 = ColorProducto(nombre="S3", codigo=42)
+        c1 = _create_color_prod(nombre="S1", codigo=40)
+        c2 = _create_color_prod(nombre="S2", codigo=41)
+        c3 = _create_color_prod(nombre="S3", codigo=42)
         db.session.add_all([c1, c2, c3])
         db.session.flush()
 
@@ -148,9 +173,9 @@ def test_peso_produccion_es_suma_de_meta_kg(client, app):
             "OP-SUMA",
             snap_items=[{"cavidades": 4, "peso_unit_gr": 50.0}],
             lotes_meta=[
-                {"color_id": c1.id, "meta_kg": 100.0},
-                {"color_id": c2.id, "meta_kg": 250.0},
-                {"color_id": c3.id, "meta_kg": 75.5},
+                {"color_produccion_id": c1.id, "meta_kg": 100.0},
+                {"color_produccion_id": c2.id, "meta_kg": 250.0},
+                {"color_produccion_id": c3.id, "meta_kg": 75.5},
             ],
             snapshot_peso_colada_gr=20.0,
         )

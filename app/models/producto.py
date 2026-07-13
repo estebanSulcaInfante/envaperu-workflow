@@ -65,17 +65,40 @@ class Familia(db.Model):
     def __repr__(self):
         return f'<Familia {self.codigo}: {self.nombre}>'
 
-class ColorProducto(db.Model):
-    __tablename__ = 'color_producto'
+class ColorBase(db.Model):
+    """El pigmento puro, independiente de la familia comercial."""
+    __tablename__ = 'color_base'
     id = db.Column(db.Integer, primary_key=True)
-    nombre = db.Column(db.String(50), nullable=False) # e.g. "Rojo", "Azul"
-    codigo = db.Column(db.Integer, nullable=False)    # e.g. 5
-    familia_id = db.Column(db.Integer, db.ForeignKey('familia_color.id'), nullable=True)
+    nombre = db.Column(db.String(50), nullable=False, unique=True) # e.g. "ROJO", "AZUL"
     
-    familia = db.relationship('FamiliaColor', backref='colores')
+    def __repr__(self):
+        return f'<ColorBase {self.nombre}>'
+
+class ColorProduccion(db.Model):
+    """La combinación operativa de un pigmento en un acabado."""
+    __tablename__ = 'color_produccion'
+    id = db.Column(db.Integer, primary_key=True)
+    
+    color_base_id = db.Column(db.Integer, db.ForeignKey('color_base.id'), nullable=False)
+    color_base_rel = db.relationship('ColorBase', backref='colores_produccion')
+    
+    familia_color_id = db.Column(db.Integer, db.ForeignKey('familia_color.id'), nullable=False)
+    familia_color_rel = db.relationship('FamiliaColor', backref='colores_produccion')
+    
+    codigo_legacy = db.Column(db.Integer, nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('color_base_id', 'familia_color_id', name='uix_color_base_familia'),
+    )
 
     def __repr__(self):
-        return f'{self.nombre} ({self.codigo})'
+        base_name = self.color_base_rel.nombre if self.color_base_rel else f"Base{self.color_base_id}"
+        fam_name = self.familia_color_rel.nombre if self.familia_color_rel else f"Fam{self.familia_color_id}"
+        return f'{base_name} {fam_name}'
+
+    @property
+    def nombre(self):
+        return str(self)
 
 
 class ProductoTerminado(db.Model):
@@ -99,15 +122,6 @@ class ProductoTerminado(db.Model):
     cod_producto = db.Column(db.Integer)
     producto = db.Column(db.String(200))
     cod_sku_pt = db.Column(db.String(50), primary_key=True)
-    
-    # --- FAMILIA DE COLOR (Refactorizado) ---
-    # cod_color en el CSV de productos es realmente el código de FAMILIA
-    cod_familia_color = db.Column(db.Integer)  # Renombrado para claridad (antes cod_color)
-    familia_color = db.Column(db.String(50))   # Nombre: SOLIDO, CARAMELO, etc.
-    
-    # Relación con FamiliaColor (opcional - para normalización)
-    familia_color_id = db.Column(db.Integer, db.ForeignKey('familia_color.id'), nullable=True)
-    familia_color_rel = db.relationship('FamiliaColor', backref='productos')
 
     um = db.Column(db.String(20))
     doc_x_paq = db.Column(db.Integer)
@@ -136,24 +150,13 @@ class ProductoTerminado(db.Model):
 
     def generar_sku(self):
         """
-        Genera el SKU basado en componentes:
-        0 + LINEA + FAMILIA + PRODUCTO + 0 + COD_FAMILIA_COLOR
+        Genera el SKU basado en componentes.
+        El SKU original era importado, la autogeneración ya no usa familia de color.
         """
         try:
-            # Usar código de linea desde relación normalizada
             linea_code = self.linea_rel.codigo if self.linea_rel else 0
-            
-            # Usar código de familia desde relación normalizada
             familia_code = self.familia_rel.codigo if self.familia_rel else 0
-            
-            # Usar código de familia de color
-            fc_code = self.cod_familia_color
-            if self.familia_color_rel:
-                fc_code = self.familia_color_rel.codigo
-            
-            if fc_code is None: fc_code = 0
-            
-            return f"0{linea_code}{familia_code}{self.cod_producto}0{fc_code}"
+            return f"0{linea_code}{familia_code}{self.cod_producto}"
         except:
             return None
 
@@ -180,20 +183,17 @@ class PiezaColor(db.Model):
     pieza_id = db.Column(db.Integer, db.ForeignKey('pieza.id'), nullable=True)
     pieza_rel = db.relationship('Pieza', backref='variantes', foreign_keys=[pieza_id])
     
-    # Restricción: No se puede repetir la misma forma y color
+    # Restricción: No se puede repetir la misma forma y color de producción
     __table_args__ = (
-        db.UniqueConstraint('pieza_id', 'color_id', name='uq_pieza_color'),
+        db.UniqueConstraint('pieza_id', 'color_produccion_id', name='uq_pieza_color'),
     )
 
     cod_pieza = db.Column(db.Integer)
     piezas = db.Column(db.String(200)) # Nombre Pieza
     
-    # --- RELACION COLOR (Refactor) ---
-    color_id = db.Column(db.Integer, db.ForeignKey('color_producto.id'), nullable=True)
-    color_rel = db.relationship('ColorProducto', backref='piezas')
-    
-    cod_col = db.Column(db.String(10)) # Legacy string code?
-    tipo_color = db.Column(db.String(50))
+    # --- RELACION COLOR PRODUCCION (Refactor) ---
+    color_produccion_id = db.Column(db.Integer, db.ForeignKey('color_produccion.id'), nullable=True)
+    color_produccion_rel = db.relationship('ColorProduccion', backref='piezas_color')
     
     cavidad = db.Column(db.Integer)
     peso = db.Column(db.Float)
@@ -201,9 +201,6 @@ class PiezaColor(db.Model):
     tipo_extruccion = db.Column(db.String(50))
     cod_mp = db.Column(db.String(50))
     mp = db.Column(db.String(100))
-    
-    cod_color = db.Column(db.Integer) # Legacy integer code?
-    color = db.Column(db.String(50)) # Legacy name
     
     # --- CAMPOS DE REVISIÓN PROGRESIVA ---
     estado_revision = db.Column(db.String(20), default='IMPORTADO')  # IMPORTADO, EN_REVISION, VERIFICADO
@@ -223,17 +220,11 @@ class PiezaColor(db.Model):
         LINEA + PIEZA + COD_COL(Str) + EXTRU + COD_COLOR(Int)
         """
         try:
-            # Usar código de linea desde relación normalizada
             linea_code = self.linea_rel.codigo if self.linea_rel else 0
-            
-            # Priorizar relacional para color
-            c_int = self.cod_color
-            if self.color_rel:
-                c_int = self.color_rel.codigo
-                
+            c_int = self.color_produccion_rel.codigo_legacy if self.color_produccion_rel else 0
             if c_int is None: c_int = 0
             
-            return f"{linea_code}{self.cod_pieza}{self.cod_col}{self.cod_extru}{c_int}"
+            return f"{linea_code}{self.cod_pieza}{self.cod_extru}{c_int}"
         except:
             return None
 

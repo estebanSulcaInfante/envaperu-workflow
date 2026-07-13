@@ -10,7 +10,7 @@ from datetime import datetime
 import os
 
 # Ruta a la plantilla Excel
-TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'templates', 'excel', 'OrdenProduccion', 'Book1.xlsx')
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'templates', 'excel', 'OrdenProduccion', 'Book2.xlsx')
 
 
 def generar_op_excel(orden) -> BytesIO:
@@ -39,18 +39,31 @@ def generar_op_excel(orden) -> BytesIO:
     ws['G4'] = orden.maquina_id or ''
     ws['C5'] = resumen.get('Cantidad DOC', 0)
     ws['B7'] = orden.molde or ''
-    ws['C8'] = resumen.get('Días', 0)
-    ws['G8'] = orden.snapshot_peso_unitario_gr or 0
-    ws['C9'] = orden.snapshot_horas_turno or 24
-    ws['G9'] = orden.snapshot_peso_inc_colada or 0
-    ws['C10'] = orden.snapshot_cavidades or 1
-    ws['G10'] = resumen.get('%Merma', 0)
+    
+    # === COMPOSICION DEL MOLDE (Filas 8-11, nuevas) ===
+    # Llenar hasta 4 piezas
+    composicion = orden.snapshot_composicion
+    for i, snap in enumerate(composicion[:4]):
+        row = 8 + i
+        ws[f'B{row}'] = snap.pieza.piezas if snap.pieza else f'Pieza {i+1}'
+        ws[f'C{row}'] = snap.cavidades
+        ws[f'D{row}'] = snap.peso_unit_gr
+        ws[f'E{row}'] = snap.peso_subtotal_gr
+    
+    # === PARAMETROS TECNICOS (Filas 12-16, desplazadas) ===
+    ws['C12'] = resumen.get('Días', 0)
+    ws['G12'] = orden.calculo_peso_neto_golpe or 0
+    ws['C13'] = orden.snapshot_horas_turno or 24
+    ws['G13'] = orden.snapshot_peso_colada_gr or 0   # Peso Colada
+    ws['C14'] = orden.calculo_cavidades_totales or 1
+    ws['G14'] = orden.calculo_peso_tiro_gr or 0      # Peso Tiro
     
     # Coladas por hora: 3600 / tiempo_ciclo
     coladas_hora = 0
     if orden.snapshot_tiempo_ciclo and orden.snapshot_tiempo_ciclo > 0:
         coladas_hora = 3600 / orden.snapshot_tiempo_ciclo
-    ws['C11'] = coladas_hora
+    ws['C15'] = coladas_hora
+    ws['G15'] = resumen.get('%Merma', 0)             # Merma
     
     # Rango de fechas
     fecha_inicio = orden.fecha_inicio.strftime('%d/%m') if orden.fecha_inicio else ''
@@ -58,14 +71,14 @@ def generar_op_excel(orden) -> BytesIO:
     if fecha_fin_str:
         try:
             fecha_fin = datetime.fromisoformat(fecha_fin_str)
-            ws['G11'] = f"{fecha_inicio} a {fecha_fin.strftime('%d/%m')}"
+            ws['G16'] = f"{fecha_inicio} a {fecha_fin.strftime('%d/%m')}"
         except:
-            ws['G11'] = fecha_inicio
+            ws['G16'] = fecha_inicio
     else:
-        ws['G11'] = fecha_inicio
+        ws['G16'] = fecha_inicio
     
     # =========================================================================
-    # 2. TABLA DE COLORES / PRODUCCIÓN (Filas 14-21)
+    # 2. TABLA DE COLORES / PRODUCCIÓN (Filas 18-25, desplazadas +4)
     # =========================================================================
     lotes = orden.lotes[:6]  # Máximo 6 colores
     
@@ -75,11 +88,11 @@ def generar_op_excel(orden) -> BytesIO:
     total_coladas = 0
     
     for i, lote in enumerate(lotes):
-        row = 15 + i  # Filas 15-20
+        row = 19 + i  # Filas 19-24
         lote_data = lote.to_dict()
         
         # Nombre del color
-        ws[f'B{row}'] = lote.color_rel.nombre if lote.color_rel else 'Sin Color'
+        ws[f'B{row}'] = lote_data.get('Color', 'Sin Color')
         
         # Peso producción por color (peso base + extra)
         peso_lote = lote_data.get('TOTAL + EXTRA (Kg)', 0)
@@ -97,13 +110,13 @@ def generar_op_excel(orden) -> BytesIO:
         ws[f'G{row}'] = coladas
         total_coladas += coladas
     
-    # Fila de totales (21)
-    ws['C21'] = total_peso
-    ws['E21'] = total_merma
-    ws['G21'] = total_coladas
+    # Fila de totales (25)
+    ws['C25'] = total_peso
+    ws['E25'] = total_merma
+    ws['G25'] = total_coladas
     
     # =========================================================================
-    # 3. MATERIA PRIMA TOTALES (Filas 23-28)
+    # 3. MATERIA PRIMA TOTALES (Filas 27-32, desplazadas +4)
     # =========================================================================
     # Acumular materiales por tipo
     materiales_totales = {'VIRGEN': 0, 'VIRGEN_2': 0, 'MOLIDO': 0}
@@ -117,23 +130,24 @@ def generar_op_excel(orden) -> BytesIO:
             if not materiales_nombres.get(tipo) and mat.materia:
                 materiales_nombres[tipo] = mat.materia.nombre
     
-    ws['D25'] = materiales_nombres.get('VIRGEN', '')
-    ws['F25'] = materiales_totales.get('VIRGEN', 0)
-    ws['D26'] = materiales_nombres.get('VIRGEN_2', '')
-    ws['F26'] = materiales_totales.get('VIRGEN_2', 0)
-    ws['D27'] = materiales_nombres.get('MOLIDO', '')
-    ws['F27'] = materiales_totales.get('MOLIDO', 0)
+    ws['D29'] = materiales_nombres.get('VIRGEN', '')
+    ws['F29'] = materiales_totales.get('VIRGEN', 0)
+    ws['D30'] = materiales_nombres.get('VIRGEN_2', '')
+    ws['F30'] = materiales_totales.get('VIRGEN_2', 0)
+    ws['D31'] = materiales_nombres.get('MOLIDO', '')
+    ws['F31'] = materiales_totales.get('MOLIDO', 0)
     
     total_material = sum(materiales_totales.values())
-    ws['F28'] = total_material
+    ws['F32'] = total_material
     
     # =========================================================================
-    # 4. MATERIA PRIMA POR COLOR (Filas 30-38)
+    # 4. MATERIA PRIMA POR COLOR (Filas 34-42, desplazadas +4)
     # =========================================================================
     for i, lote in enumerate(lotes):
-        row = 32 + i  # Filas 32-37
+        row = 36 + i  # Filas 36-41
         
-        ws[f'B{row}'] = lote.color_rel.nombre if lote.color_rel else 'Sin Color'
+        lote_data = lote.to_dict()
+        ws[f'B{row}'] = lote_data.get('Color', 'Sin Color')
         
         # Procesar materiales del lote
         materiales_lote = {'VIRGEN': None, 'VIRGEN_2': None, 'MOLIDO': None}
@@ -164,24 +178,24 @@ def generar_op_excel(orden) -> BytesIO:
             ws[f'G{row}'] = materiales_lote['MOLIDO']['nombre']
             ws[f'H{row}'] = materiales_lote['MOLIDO']['peso']
     
-    # Totales materiales por color (fila 38)
-    ws['D38'] = materiales_totales.get('VIRGEN', 0)
-    ws['F38'] = materiales_totales.get('VIRGEN_2', 0)
-    ws['H38'] = materiales_totales.get('MOLIDO', 0)
+    # Totales materiales por color (fila 42)
+    ws['D42'] = materiales_totales.get('VIRGEN', 0)
+    ws['F42'] = materiales_totales.get('VIRGEN_2', 0)
+    ws['H42'] = materiales_totales.get('MOLIDO', 0)
     
     # =========================================================================
-    # 5. COLORANTES (Filas 40-56)
+    # 5. COLORANTES (Filas 44-60, desplazadas +4)
     # =========================================================================
-    # Grupo 1: Colores 0-2 (filas 41-48)
+    # Grupo 1: Colores 0-2 (filas 45-52)
     if len(lotes) >= 1:
-        _llenar_colorantes_grupo(ws, lotes[0:3], start_header_row=41, start_data_row=42)
+        _llenar_colorantes_grupo(ws, lotes[0:3], start_header_row=45, start_data_row=46)
     
-    # Grupo 2: Colores 3-5 (filas 49-56)
+    # Grupo 2: Colores 3-5 (filas 53-60)
     if len(lotes) >= 4:
-        _llenar_colorantes_grupo(ws, lotes[3:6], start_header_row=49, start_data_row=50)
+        _llenar_colorantes_grupo(ws, lotes[3:6], start_header_row=53, start_data_row=54)
     
     # =========================================================================
-    # 6. QR CODE (Celda C61 - bajado 8 casillas desde C53)
+    # 6. QR CODE (Celda C65 - bajado 4 casillas desde C61)
     # =========================================================================
     from app.services.qr_service import generar_qr_imagen
     
@@ -190,11 +204,32 @@ def generar_op_excel(orden) -> BytesIO:
         qr_img = XLImage(qr_buffer)
         qr_img.width = 200
         qr_img.height = 200
-        ws.add_image(qr_img, 'C61')
+        ws.add_image(qr_img, 'C65')
     except Exception as e:
         # Si falla el QR, continuamos sin él
         print(f"Error generando QR: {e}")
     
+    # =========================================================================
+    # 7. CONFIGURAR ZONA DE IMPRESIÓN Y SALTOS DE PÁGINA
+    # =========================================================================
+    from openpyxl.worksheet.pagebreak import Break
+    
+    # Limpiar saltos viejos y forzar ajuste al ancho
+    ws.row_breaks = openpyxl.worksheet.pagebreak.RowBreak()
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.page_margins.left = 0.25
+    ws.page_margins.right = 0.25
+    ws.page_margins.top = 0.5
+    ws.page_margins.bottom = 0.5
+
+    # Insertar salto de página justo antes de colorantes (Fila 44)
+    # openpyxl inserta el salto *después* de la fila id, así que usamos id=43
+    ws.row_breaks.append(Break(id=43))
+    
+    # Definir area de impresión hasta el final del QR (Fila 75 aprox)
+    ws.print_area = 'A1:H75'
+
     # =========================================================================
     # GUARDAR A BUFFER
     # =========================================================================
@@ -225,7 +260,7 @@ def _llenar_colorantes_grupo(ws, lotes_grupo, start_header_row, start_data_row):
         col_nombre, col_gramos = columnas[idx]
         
         # Header: Nombre del color
-        ws[f'{col_nombre}{start_header_row}'] = lote.color_rel.nombre if lote.color_rel else 'Sin Color'
+        ws[f'{col_nombre}{start_header_row}'] = lote.color_produccion_rel.nombre if lote.color_produccion_rel else 'Sin Color'
         ws[f'{col_gramos}{start_header_row}'] = 'Gr.'
         
         # Colorantes (hasta 7 filas)

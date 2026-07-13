@@ -7,7 +7,7 @@ from app.models.materiales import MateriaPrima, Colorante
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
-from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, FamiliaColor, ColorProducto, Linea, Familia, PiezaComponente
+from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, FamiliaColor, ColorProduccion, ColorBase, Linea, Familia, PiezaComponente
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.control_peso import ControlPeso

@@ -47,7 +47,6 @@ def test_generar_excel_basico(client, app):
         # Agregar un lote
         lote = LoteColor(
             numero_op=orden.numero_op,
-            color_nombre="Rojo",
             personas=1
         )
         db.session.add(lote)

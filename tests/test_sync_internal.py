@@ -26,7 +26,7 @@ def client(app):
 def test_sync_pesajes_logic(client, app):
     with app.app_context():
         # Setup: Maquina
-        maq = Maquina(nombre="INY-05", tipo="INYECTOR")
+        maq = Maquina(codigo="INY-05", nombre="INY-05", tipo_maquina_id=1, tipo="INYECTOR")
         db.session.add(maq)
         
         # Setup: Orden

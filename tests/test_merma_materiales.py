@@ -3,8 +3,33 @@ from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone
 from app.models.materiales import MateriaPrima
-from app.models.producto import ColorProducto
+from app.models.producto import ColorProduccion, ColorBase, FamiliaColor
 from app.extensions import db
+
+def _get_or_create_fam(nombre="SOLIDO", codigo=1):
+    from app.models.producto import FamiliaColor
+    fam = FamiliaColor.query.filter_by(nombre=nombre).first()
+    if not fam:
+        from app.extensions import db
+        fam = FamiliaColor(nombre=nombre, codigo=codigo)
+        db.session.add(fam)
+        db.session.flush()
+    return fam
+
+def _create_color_prod(nombre, codigo=None, familia_id=None):
+    from app.models.producto import ColorBase, ColorProduccion
+    from app.extensions import db
+    cb = ColorBase.query.filter_by(nombre=nombre).first()
+    if not cb:
+        cb = ColorBase(nombre=nombre)
+        db.session.add(cb)
+        db.session.flush()
+    fam_id = familia_id if familia_id else _get_or_create_fam().id
+    cp = ColorProduccion(color_base_id=cb.id, familia_color_id=fam_id, codigo_legacy=codigo)
+    db.session.add(cp)
+    db.session.flush()
+    return cp
+
 
 
 def test_calculo_materiales_con_merma(client, app):
@@ -39,11 +64,11 @@ def test_calculo_materiales_con_merma(client, app):
         ))
         db.session.flush()
 
-        c_test = ColorProducto(nombre="A-MERMA", codigo=1)
+        c_test = _create_color_prod(nombre="A-MERMA", codigo=1)
         db.session.add(c_test)
         db.session.flush()
 
-        lote = LoteColor(numero_op=orden.numero_op, color_id=c_test.id, meta_kg=1000.0)
+        lote = LoteColor(numero_op=orden.numero_op, color_produccion_id=c_test.id, meta_kg=1000.0)
         db.session.add(lote)
         db.session.flush()
 

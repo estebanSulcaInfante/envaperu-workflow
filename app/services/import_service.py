@@ -6,7 +6,7 @@ Incluye validación detallada y manejo robusto de errores.
 import pandas as pd
 from io import BytesIO, StringIO
 from app.extensions import db
-from app.models.producto import ProductoTerminado, PiezaColor, ColorProducto, FamiliaColor, ProductoPieza, Linea, Familia
+from app.models.producto import ProductoTerminado, PiezaColor, ColorProduccion, ColorBase, FamiliaColor, ProductoPieza, Linea, Familia
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -133,9 +133,7 @@ class ImportService:
         'Cod Extru': 'cod_extru',
         'Tipo Extruccion': 'tipo_extruccion',
         'Cod MP': 'cod_mp',
-        'MP': 'mp',
-        'Cod Color': 'cod_color',
-        'Color': 'color'
+        'MP': 'mp'
     }
     
     # Columnas requeridas para PiezaColor
@@ -769,17 +767,20 @@ class ImportService:
             'warnings': []
         }
         
-        # Crear colores primero
-        colores_existentes = {c.codigo: c for c in ColorProducto.query.all()}
+        # Crear colores base primero
+        colores_existentes = {c.id: c for c in ColorBase.query.all()}
         if crear_colores:
             for _, row in df.iterrows():
-                cod_color = self._obtener_valor_int(row, 'Cod Color')
-                if cod_color and cod_color not in colores_existentes:
-                    nombre = self._obtener_valor_str(row, 'Color') or f"COLOR_{cod_color}"
-                    nuevo = ColorProducto(codigo=cod_color, nombre=nombre.upper())
-                    db.session.add(nuevo)
-                    colores_existentes[cod_color] = nuevo
-                    resultado['colores_creados'] += 1
+                nombre = self._obtener_valor_str(row, 'Color')
+                if nombre:
+                    nombre = nombre.upper()
+                    base = ColorBase.query.filter_by(nombre=nombre).first()
+                    if not base:
+                        base = ColorBase(nombre=nombre)
+                        db.session.add(base)
+                        db.session.flush()
+                        colores_existentes[base.id] = base
+                        resultado['colores_creados'] += 1
             db.session.flush()
         
         # Crear/buscar Lineas (UPSERT)

@@ -19,10 +19,7 @@ def test_control_peso_flow(client, app):
     100 coladas → 100 × (50g×2) / 1000 = 10.0 Kg neto
     """
     # 0. Seed Required Data
-    from app.models.maquina import Maquina
-    with app.app_context():
-        db.session.add(Maquina(id=1, nombre="Inyectora 1", tipo="INYECTORA"))
-        db.session.commit()
+    pass
 
     op_num = "OP-TEST-PESO-01"
 

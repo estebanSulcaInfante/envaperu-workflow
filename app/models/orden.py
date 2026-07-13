@@ -53,6 +53,8 @@ class OrdenProduccion(db.Model):
 
     # --- CABECERA ---
     maquina_id  = db.Column(db.Integer, db.ForeignKey('maquina.id'), nullable=True)
+    maquina_codigo_snapshot = db.Column(db.String(20), nullable=True)
+    maquina_nombre_snapshot = db.Column(db.String(100), nullable=True)
 
     # --- PRODUCTO ---
     producto_sku = db.Column(db.String(50), db.ForeignKey('producto_terminado.cod_sku_pt'), nullable=True)
@@ -197,13 +199,11 @@ class OrdenProduccion(db.Model):
             fecha_fin = self.fecha_inicio + timedelta(days=dias)
         self.calculo_fecha_fin = fecha_fin
 
-        # 5. FAMILIA COLOR (cache desde Producto)
+        # 5. FAMILIA COLOR (cache desde el primer Lote)
         self.calculo_familia_color = None
-        if self.producto_ref:
-            if self.producto_ref.familia_color_rel:
-                self.calculo_familia_color = self.producto_ref.familia_color_rel.nombre
-            elif self.producto_ref.familia_color:
-                self.calculo_familia_color = self.producto_ref.familia_color
+        if self.lotes and self.lotes[0].color_produccion_rel:
+            if self.lotes[0].color_produccion_rel.familia_color_rel:
+                self.calculo_familia_color = self.lotes[0].color_produccion_rel.familia_color_rel.nombre
 
         # CASCADE a Lotes
         for lote in self.lotes:

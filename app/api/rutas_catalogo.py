@@ -4,7 +4,7 @@ Incluye endpoints de listado y búsqueda.
 """
 from flask import Blueprint, jsonify, request
 from app.extensions import db
-from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, ColorProducto, Linea, Familia
+from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, ColorProduccion, ColorBase, Linea, Familia, FamiliaColor
 from sqlalchemy import or_
 
 catalogo_bp = Blueprint('catalogo', __name__)
@@ -49,8 +49,6 @@ def listar_productos():
         'cod_familia': p.familia_rel.codigo if p.familia_rel else None,
         'familia_id': p.familia_id,
         'cod_producto': p.cod_producto,
-        'familia_color': p.familia_color,
-        'cod_familia_color': p.cod_familia_color,
         'um': p.um,
         'doc_x_paq': p.doc_x_paq,
         'doc_x_bulto': p.doc_x_bulto,
@@ -72,9 +70,41 @@ def listar_productos():
 
 
 @catalogo_bp.route('/piezas', methods=['GET'])
-def listar_piezas():
+def listar_piezas_abstractas():
     """
-    Lista Piezas con búsqueda opcional.
+    Lista Piezas (formas abstractas sin color) con búsqueda opcional.
+    """
+    from app.models.molde import Pieza
+    q = request.args.get('q', '').strip()
+    limit = request.args.get('limit', 50, type=int)
+    
+    query = Pieza.query
+    
+    if q:
+        search = f"%{q}%"
+        query = query.filter(
+            or_(
+                Pieza.nombre.ilike(search),
+                Pieza.molde_id.ilike(search)
+            )
+        )
+    
+    piezas = query.limit(limit).all()
+    
+    return jsonify([{
+        'id': p.id,
+        'nombre': p.nombre,
+        'molde_id': p.molde_id,
+        'cavidades': p.cavidades,
+        'peso_unitario_gr': p.peso_unitario_gr,
+        'num_variantes': len(p.variantes_color) if hasattr(p, 'variantes_color') else 0
+    } for p in piezas])
+
+
+@catalogo_bp.route('/piezas-color', methods=['GET'])
+def listar_piezas_color():
+    """
+    Lista Piezas Físicas (SKUs con color) con búsqueda opcional.
     Query params:
         - q: término de búsqueda (busca en múltiples campos)
         - producto_id: filtrar por producto terminado (SKU PT)
@@ -96,7 +126,6 @@ def listar_piezas():
             or_(
                 PiezaColor.sku.ilike(search),
                 PiezaColor.piezas.ilike(search),
-                PiezaColor.color.ilike(search),
                 PiezaColor.mp.ilike(search),
                 PiezaColor.tipo_extruccion.ilike(search)
             )
@@ -108,19 +137,16 @@ def listar_piezas():
         'sku': p.sku,
         'piezas': p.piezas,
         'tipo': p.tipo,
-        # Usar datos normalizados de Linea (campos legacy eliminados)
         'linea': p.linea_rel.nombre if p.linea_rel else None,
         'cod_linea': p.linea_rel.codigo if p.linea_rel else None,
         'linea_id': p.linea_id,
-        # Usar datos normalizados de Familia (campos legacy eliminados)
         'familia': p.familia_rel.nombre if p.familia_rel else None,
         'cod_familia': p.familia_rel.codigo if p.familia_rel else None,
         'familia_id': p.familia_id,
         'cod_pieza': p.cod_pieza,
-        'color': p.color,
-        'cod_color': p.cod_color,
-        'tipo_color': p.tipo_color,
-        'cod_col': p.cod_col,
+        'color': p.color_produccion_rel.nombre if p.color_produccion_rel else None,
+        'color_produccion_id': p.color_produccion_id,
+        'pieza_id': p.pieza_id,
         'cavidad': p.cavidad,
         'peso': p.peso,
         'tipo_extruccion': p.tipo_extruccion,
@@ -160,7 +186,7 @@ def obtener_producto(cod_sku_pt):
         'piezas': [{
             'sku': cp.pieza.sku,
             'nombre': cp.pieza.piezas,
-            'color': cp.pieza.color,
+            'color': cp.pieza.color_produccion_rel.nombre if cp.pieza.color_produccion_rel else None,
             'peso': cp.pieza.peso,
             'cantidad': cp.cantidad
         } for cp in producto.composicion_piezas]
@@ -181,7 +207,6 @@ def crear_producto():
             cod_producto=data.get('cod_producto'),
             linea_id=data.get('linea_id', 1),
             familia_id=data.get('familia_id', 1),
-            familia_color_id=data.get('familia_color_id'),
             peso_g=data.get('peso_g'),
             precio_estimado=data.get('precio_estimado'),
             precio_sin_igv=data.get('precio_sin_igv'),
@@ -223,7 +248,6 @@ def actualizar_producto(cod_sku_pt):
     producto.cod_producto = data.get('cod_producto', producto.cod_producto)
     producto.linea_id = data.get('linea_id', producto.linea_id)
     producto.familia_id = data.get('familia_id', producto.familia_id)
-    producto.familia_color_id = data.get('familia_color_id', producto.familia_color_id)
     producto.peso_g = data.get('peso_g', producto.peso_g)
     producto.precio_estimado = data.get('precio_estimado', producto.precio_estimado)
     producto.precio_sin_igv = data.get('precio_sin_igv', producto.precio_sin_igv)
@@ -348,7 +372,7 @@ def crear_molde():
             for pieza_data in data.get('piezas', []):
                 mp = Pieza(
                     molde_id=molde.codigo,
-                    pieza_sku=pieza_data['pieza_sku'],
+                    nombre=pieza_data.get('nombre', pieza_data.get('pieza_sku', 'Forma Genérica')),
                     cavidades=pieza_data['cavidades'],
                     peso_unitario_gr=pieza_data['peso_unitario_gr']
                 )
@@ -391,7 +415,7 @@ def crear_molde():
             # Crear relación Molde-PiezaColor
             mp = Pieza(
                 molde_id=molde.codigo,
-                pieza_sku=pieza_sku,
+                nombre=pieza_sku,  # Usamos el SKU como nombre de la forma por ahora
                 cavidades=int(data.get('cavidades')),
                 peso_unitario_gr=float(data.get('peso_unitario_gr'))
             )
@@ -426,7 +450,7 @@ def actualizar_molde(codigo):
         for pieza_data in data['piezas']:
             mp = Pieza(
                 molde_id=codigo,
-                pieza_sku=pieza_data['pieza_sku'],
+                nombre=pieza_data.get('nombre', pieza_data.get('pieza_sku', 'Forma Genérica')),
                 cavidades=pieza_data['cavidades'],
                 peso_unitario_gr=pieza_data['peso_unitario_gr']
             )
@@ -443,7 +467,7 @@ def actualizar_molde(codigo):
             mp.peso_unitario_gr = float(data['peso_unitario_gr'])
             
             # Tambien actualizar la pieza base para consistencia
-            pieza = db.session.get(PiezaColor, mp.pieza_sku)
+            pieza = db.session.get(PiezaColor, mp.nombre)
             if pieza:
                 pieza.peso = mp.peso_unitario_gr
                 pieza.cavidad = mp.cavidades
@@ -527,7 +551,7 @@ def crear_color_forma(forma_id):
     if not data or not data.get('color_id'):
         return jsonify({'error': 'Debe proveer un color_id'}), 400
         
-    color = db.session.get(ColorProducto, data['color_id'])
+    color = db.session.get(ColorProduccion, data['color_id'])
     if not color:
         return jsonify({'error': 'Color no encontrado'}), 404
         
@@ -556,9 +580,7 @@ def crear_color_forma(forma_id):
             tipo='SIMPLE',
             linea_id=linea_id,
             familia_id=familia_id,
-            color_id=color.id,
-            cod_color=color.codigo,
-            color=color.nombre,
+            color_produccion_id=color.id,
             pieza_id=forma.id
         )
         db.session.add(pieza)
@@ -607,7 +629,7 @@ def obtener_pieza(sku):
         'cavidad': pieza.cavidad,
         'linea': pieza.linea_rel.nombre if pieza.linea_rel else None,
         'familia': pieza.familia_rel.nombre if pieza.familia_rel else None,
-        'color': pieza.color,
+        'color': pieza.color_produccion_rel.nombre if pieza.color_produccion_rel else None,
         'componentes': [c.to_dict() for c in pieza.componentes] if pieza.tipo == 'KIT' else [],
         'moldes': [{'molde_id': mp.molde_id, 'cavidades': mp.cavidades, 'peso_unitario': mp.peso_unitario_gr} 
                    for mp in pieza.molde_piezas] if hasattr(pieza, 'molde_piezas') else []
@@ -628,11 +650,10 @@ def crear_pieza():
             tipo=data.get('tipo', 'SIMPLE'),
             peso=data.get('peso'),
             cavidad=data.get('cavidad'),
-            color=data.get('color'),
+            color_produccion_id=data.get('color_produccion_id'),
             cod_pieza=data.get('cod_pieza'),
             linea_id=data.get('linea_id', 1),
             familia_id=data.get('familia_id', 1),
-            color_id=data.get('color_id'),
             pieza_id=data.get('pieza_id'),
             cod_extru=data.get('cod_extru'),
             tipo_extruccion=data.get('tipo_extruccion'),
@@ -671,11 +692,10 @@ def actualizar_pieza(sku):
     pieza.tipo = data.get('tipo', pieza.tipo)
     pieza.peso = data.get('peso', pieza.peso)
     pieza.cavidad = data.get('cavidad', pieza.cavidad)
-    pieza.color = data.get('color', pieza.color)
+    pieza.color_produccion_id = data.get('color_produccion_id', pieza.color_produccion_id)
     pieza.cod_pieza = data.get('cod_pieza', pieza.cod_pieza)
     pieza.linea_id = data.get('linea_id', pieza.linea_id)
     pieza.familia_id = data.get('familia_id', pieza.familia_id)
-    pieza.color_id = data.get('color_id', pieza.color_id)
     pieza.pieza_id = data.get('pieza_id', pieza.pieza_id)
     pieza.cod_extru = data.get('cod_extru', pieza.cod_extru)
     pieza.tipo_extruccion = data.get('tipo_extruccion', pieza.tipo_extruccion)
@@ -751,13 +771,14 @@ def obtener_piezas_producibles():
 
 @catalogo_bp.route('/colores', methods=['GET'])
 def listar_colores():
-    """Lista todos los colores disponibles"""
-    colores = ColorProducto.query.order_by(ColorProducto.nombre).all()
+    """Lista todos los colores de producción disponibles"""
+    colores = ColorProduccion.query.all()
+    # Para el frontend devolvemos el ID del ColorProduccion pero con el nombre combinado (ej. ROJO SOLIDO)
     return jsonify([{
         'id': c.id,
-        'nombre': c.nombre,
-        'codigo': c.codigo
-    } for c in colores])
+        'nombre': str(c),
+        'codigo': c.codigo_legacy or c.id
+    } for c in sorted(colores, key=lambda x: str(x))])
 
 @catalogo_bp.route('/familias-color', methods=['GET'])
 def listar_familias_color():
@@ -782,38 +803,56 @@ def listar_formas():
 
 @catalogo_bp.route('/colores', methods=['POST'])
 def crear_color():
-    """Crea un nuevo color (para create-on-the-fly)"""
+    """Crea un nuevo color base (para create-on-the-fly) - NOTA: El front debe enviar ahora ColorProduccion, este endpoint podría quedar obsoleto o requerir familia_color_id"""
     data = request.get_json()
     nombre = data.get('nombre', '').strip().upper()
+    familia_color_id = data.get('familia_color_id')
     
     if not nombre:
-        return jsonify({'error': 'Nombre requerido'}), 400
+        return jsonify({'error': 'Nombre de color base requerido'}), 400
+        
+    if not familia_color_id:
+        # Fallback para mantener compatibilidad con frontends antiguos (OrdenForm.jsx)
+        fam_default = FamiliaColor.query.filter(db.func.upper(FamiliaColor.nombre) == 'SOLIDO').first()
+        if not fam_default:
+            fam_default = FamiliaColor(nombre='SOLIDO', codigo=1)
+            db.session.add(fam_default)
+            db.session.flush()
+        familia_color_id = fam_default.id
     
-    # Verificar si ya existe (case-insensitive)
-    existente = ColorProducto.query.filter(
-        db.func.upper(ColorProducto.nombre) == nombre
+    # 1. Buscar o crear ColorBase
+    base_existente = ColorBase.query.filter(
+        db.func.upper(ColorBase.nombre) == nombre
     ).first()
-    if existente:
+    
+    if not base_existente:
+        base_existente = ColorBase(nombre=nombre)
+        db.session.add(base_existente)
+        db.session.flush()
+        
+    # 2. Buscar o crear ColorProduccion
+    prod_existente = ColorProduccion.query.filter_by(
+        color_base_id=base_existente.id,
+        familia_color_id=familia_color_id
+    ).first()
+    
+    if prod_existente:
         return jsonify({
-            'id': existente.id,
-            'nombre': existente.nombre,
-            'codigo': existente.codigo,
+            'id': prod_existente.id,
+            'nombre': str(prod_existente),
+            'codigo': prod_existente.codigo_legacy or prod_existente.id,
             'existed': True
         }), 200
-    
-    # Auto-generar código: obtener el máximo actual y sumar 1
-    max_codigo = db.session.query(db.func.max(ColorProducto.codigo)).scalar() or 0
-    nuevo_codigo = max_codigo + 1
-    
-    # Crear nuevo color
-    nuevo = ColorProducto(nombre=nombre, codigo=nuevo_codigo)
+        
+    # Crear nuevo ColorProduccion
+    nuevo = ColorProduccion(color_base_id=base_existente.id, familia_color_id=familia_color_id)
     db.session.add(nuevo)
     db.session.commit()
     
     return jsonify({
         'id': nuevo.id,
-        'nombre': nuevo.nombre,
-        'codigo': nuevo.codigo,
+        'nombre': str(nuevo),
+        'codigo': nuevo.codigo_legacy or nuevo.id,
         'existed': False
     }), 201
 
@@ -947,8 +986,8 @@ def configurar_producto_cascada():
 
         # ── 3. CREAR PIEZAS COLOREADAS (opcional) ──
         color_ids = data.get('color_ids', [])
-        colores = ColorProducto.query.filter(
-            ColorProducto.id.in_(color_ids)
+        colores = ColorProduccion.query.filter(
+            ColorProduccion.id.in_(color_ids)
         ).all() if color_ids else []
 
         if colores:
@@ -1190,23 +1229,23 @@ def validar_orden_prereq():
             color_ids = []
         
         for color_id in color_ids:
-            color = ColorProducto.query.get(color_id)
-            if not color:
+            color_prod = ColorProduccion.query.get(color_id)
+            if not color_prod:
                 result['colores_info'].append({
                     'color_id': color_id,
                     'color_nombre': '(desconocido)',
                     'sku_encontrado': None,
                     'sku_exists': False
                 })
-                result['warnings'].append(f'⚠️ Color ID {color_id} no encontrado')
+                result['warnings'].append(f'⚠️ Color Produccion ID {color_id} no encontrado')
                 continue
             
-            # Buscar SKU: PiezaColor que tenga color_id igual y pertenezca a alguna forma del molde
+            # Buscar SKU: PiezaColor que tenga color_produccion_id igual y pertenezca a alguna forma del molde
             sku_encontrado = None
             forma_ids = [p.id for p in piezas_rel]
             if forma_ids:
                 pieza_color = PiezaColor.query.filter(
-                    PiezaColor.color_id == color.id,
+                    PiezaColor.color_produccion_id == color_prod.id,
                     PiezaColor.pieza_id.in_(forma_ids)
                 ).first()
                 
@@ -1218,7 +1257,7 @@ def validar_orden_prereq():
             
             result['colores_info'].append({
                 'color_id': color_id,
-                'color_nombre': color.nombre,
+                'color_nombre': str(color_prod),
                 'sku_encontrado': sku_encontrado,
                 'sku_exists': sku_encontrado is not None
             })
@@ -1400,10 +1439,10 @@ def detectar_colores():
     Analiza un archivo Excel/CSV y detecta colores/familias únicos para revisión.
     
     Para PRODUCTOS: Detecta FamiliaColor (SOLIDO, CARAMELO, TRANSPARENTE, etc.)
-    Para PIEZAS: Detecta ColorProducto (Rojo, Azul, Verde, etc.)
+    Para PIEZAS: Detecta ColorBase (Rojo, Azul, Verde, etc.)
     """
     from app.services.import_service import ImportService
-    from app.models.producto import FamiliaColor, ColorProducto
+    from app.models.producto import FamiliaColor, ColorBase
     
     if 'file' not in request.files:
         return jsonify({'error': 'No se envió archivo'}), 400
@@ -1451,8 +1490,8 @@ def detectar_colores():
         label = 'familias'
         
     else:
-        # Para Piezas: Verificar contra ColorProducto (por CÓDIGO)
-        colores_existentes = {c.codigo: c.nombre for c in ColorProducto.query.all()}
+        # Para Piezas: Verificar contra ColorBase (por CÓDIGO u NOMBRE)
+        colores_existentes = {c.id: c.nombre for c in ColorBase.query.all()}
         colores_archivo = {}
         
         for _, row in df.iterrows():
@@ -1573,7 +1612,6 @@ def listar_productos_revision():
         'producto': p.producto,
         'familia': p.familia_rel.nombre if p.familia_rel else None,
         'linea': p.linea_rel.nombre if p.linea_rel else None,
-        'familia_color': p.familia_color,
         'peso_g': p.peso_g,
         'precio_estimado': p.precio_estimado,
         'estado_revision': p.estado_revision or 'IMPORTADO',
@@ -1778,7 +1816,7 @@ def listar_piezas_revision():
         'piezas': p.piezas,
         'familia': p.familia_rel.nombre if p.familia_rel else None,
         'linea': p.linea_rel.nombre if p.linea_rel else None,
-        'color': p.color,
+        'color': p.color_produccion_rel.nombre if p.color_produccion_rel else None,
         'peso': p.peso,
         'cavidad': p.cavidad,
         'estado_revision': p.estado_revision or 'IMPORTADO',
@@ -1928,37 +1966,37 @@ def obtener_receta_color():
     """
     from app.models.receta_color import RecetaColorNormalizada
 
-    color_id = request.args.get('color_id', type=int)
-    if not color_id:
-        return jsonify({'error': 'color_id requerido'}), 400
+    color_produccion_id = request.args.get('color_produccion_id', type=int)
+    if not color_produccion_id:
+        return jsonify({'error': 'color_produccion_id requerido'}), 400
 
     producto_sku = request.args.get('producto_sku') or None
     meta_kg = request.args.get('meta_kg', type=float)
 
-    color = db.session.get(ColorProducto, color_id)
+    color = db.session.get(ColorProduccion, color_produccion_id)
     if not color:
-        return jsonify({'error': f'Color {color_id} no encontrado'}), 404
+        return jsonify({'error': f'ColorProduccion {color_produccion_id} no encontrado'}), 404
 
     # Estrategia: buscar receta específica primero, luego genérica como fallback
     if producto_sku:
         especificas = RecetaColorNormalizada.query.filter_by(
-            color_id=color_id, producto_sku=producto_sku
+            color_produccion_id=color_produccion_id, producto_sku=producto_sku
         ).all()
         genericas = RecetaColorNormalizada.query.filter_by(
-            color_id=color_id, producto_sku=None
+            color_produccion_id=color_produccion_id, producto_sku=None
         ).all()
         con_especifica = {r.colorante_id for r in especificas}
         recetas = especificas + [r for r in genericas if r.colorante_id not in con_especifica]
         sku_usado = producto_sku if especificas else None
     else:
         recetas = RecetaColorNormalizada.query.filter_by(
-            color_id=color_id, producto_sku=None
+            color_produccion_id=color_produccion_id, producto_sku=None
         ).all()
         sku_usado = None
 
     if not recetas:
         return jsonify({
-            'color_id': color_id,
+            'color_produccion_id': color_produccion_id,
             'color_nombre': color.nombre,
             'producto_sku': sku_usado,
             'tiene_receta': False,
@@ -1969,7 +2007,7 @@ def obtener_receta_color():
     n_muestras_min = min(r.n_muestras for r in recetas)
 
     return jsonify({
-        'color_id': color_id,
+        'color_produccion_id': color_produccion_id,
         'color_nombre': color.nombre,
         'producto_sku': sku_usado,
         'tiene_receta': True,

@@ -6,10 +6,11 @@ from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.producto import PiezaColor
-from app.models.producto import ProductoTerminado, ProductoPieza, ColorProducto
+from app.models.producto import ProductoTerminado, ProductoPieza, ColorProduccion, ColorBase
 from app.models.molde import Molde, Pieza
 from datetime import datetime, timezone
 from app.models.receta_color import RecetaColorNormalizada
+from app.models.maquina import Maquina, TipoMaquina
 
 # Definimos el "Blueprint" (un grupo de rutas)
 produccion_bp = Blueprint('produccion', __name__)
@@ -54,12 +55,12 @@ def _aprender_de_op(orden):
                 continue
             existe = Pieza.query.filter_by(
                 molde_id=molde_id,
-                pieza_sku=snap.pieza_sku
+                nombre=snap.pieza_sku
             ).first()
             if not existe:
                 db.session.add(Pieza(
                     molde_id=molde_id,
-                    pieza_sku=snap.pieza_sku,
+                    nombre=snap.pieza_sku,
                     cavidades=snap.cavidades,
                     peso_unitario_gr=snap.peso_unit_gr,
                 ))
@@ -67,7 +68,7 @@ def _aprender_de_op(orden):
     # ---- B. Upsert de RecetaColorNormalizada --------------------------------
     for lote in orden.lotes:
         meta_kg = lote.meta_kg or 0.0
-        if meta_kg <= 0 or not lote.color_id:
+        if meta_kg <= 0 or not lote.color_produccion_id:
             continue
 
         for colorea in lote.colorantes:
@@ -80,7 +81,7 @@ def _aprender_de_op(orden):
             # Receta específica (con producto)
             RecetaColorNormalizada.upsert(
                 session=db.session,
-                color_id=lote.color_id,
+                color_produccion_id=lote.color_produccion_id,
                 colorante_id=colorea.colorante_id,
                 producto_sku=lote.producto_sku_output,
                 gr_por_kg_nuevo=gr_por_kg,
@@ -90,7 +91,7 @@ def _aprender_de_op(orden):
             if lote.producto_sku_output:
                 RecetaColorNormalizada.upsert(
                     session=db.session,
-                    color_id=lote.color_id,
+                    color_produccion_id=lote.color_produccion_id,
                     colorante_id=colorea.colorante_id,
                     producto_sku=None,
                     gr_por_kg_nuevo=gr_por_kg,
@@ -121,12 +122,17 @@ def crear_orden():
         return jsonify({'error': 'Se requiere auto_snapshot_molde:true o snapshot_composicion[]'}), 400
 
     try:
+        # Obtener datos de la maquina para snapshot
+        maquina = db.session.get(Maquina, data.get('maquina_id')) if data.get('maquina_id') else None
+        
         # ----------------------------------------------------------------
         # 1. Cabecera de la Orden
         # ----------------------------------------------------------------
         nueva_orden = OrdenProduccion(
             numero_op               = data.get('numero_op'),
             maquina_id              = data.get('maquina_id'),
+            maquina_codigo_snapshot = maquina.codigo if maquina else None,
+            maquina_nombre_snapshot = maquina.nombre if maquina else None,
             producto                = data.get('producto'),
             producto_sku            = data.get('producto_sku'),
             molde                   = data.get('molde'),
@@ -185,48 +191,31 @@ def crear_orden():
         # ----------------------------------------------------------------
         for l_data in data.get('lotes', []):
             # Resolver color
-            color_id = l_data.get('color_id')
-            c_nombre = l_data.get('color_nombre')
-            if not color_id and c_nombre:
-                color_obj = ColorProducto.query.filter(ColorProducto.nombre.ilike(c_nombre)).first()
-                if color_obj:
-                    color_id = color_obj.id
-                else:
-                    try:
-                        max_codigo = db.session.query(db.func.max(ColorProducto.codigo)).scalar() or 0
-                        nuevo_color = ColorProducto(nombre=c_nombre.upper(), codigo=max_codigo + 1)
-                        db.session.add(nuevo_color)
-                        db.session.flush()
-                        color_id = nuevo_color.id
-                    except Exception as e:
-                        print(f"Error creando color on-the-fly: {e}")
-                        continue
-
+            color_produccion_id = l_data.get('color_id') # Asumimos que el front ahora envía color_produccion_id
+            
             # SKU output (usa el de la orden o auto-discover)
             computed_sku = nueva_orden.producto_sku
-            if not computed_sku and nueva_orden.molde_id and color_id:
-                color_sel = ColorProducto.query.get(color_id)
-                familia_color_id = color_sel.familia_id if color_sel else None
-                if familia_color_id:
-                    piezas_molde = [
-                        s.pieza_sku for s in nueva_orden.snapshot_composicion if s.pieza_sku
-                    ]
-                    if piezas_molde:
-                        match_prod = (
-                            db.session.query(ProductoTerminado)
-                            .join(ProductoPieza, ProductoPieza.producto_terminado_id == ProductoTerminado.cod_sku_pt)
-                            .filter(
-                                ProductoPieza.pieza_sku.in_(piezas_molde),
-                                ProductoTerminado.familia_color_id == familia_color_id,
-                            )
-                            .first()
+            if not computed_sku and nueva_orden.molde_id and color_produccion_id:
+                piezas_molde = [
+                    s.pieza_sku for s in nueva_orden.snapshot_composicion if s.pieza_sku
+                ]
+                if piezas_molde:
+                    match_prod = (
+                        db.session.query(ProductoTerminado)
+                        .join(ProductoPieza, ProductoPieza.producto_terminado_id == ProductoTerminado.cod_sku_pt)
+                        .join(PiezaColor, PiezaColor.sku == ProductoPieza.pieza_sku)
+                        .filter(
+                            ProductoPieza.pieza_sku.in_(piezas_molde),
+                            PiezaColor.color_produccion_id == color_produccion_id,
                         )
-                        if match_prod:
-                            computed_sku = match_prod.cod_sku_pt
+                        .first()
+                    )
+                    if match_prod:
+                        computed_sku = match_prod.cod_sku_pt
 
             nuevo_lote = LoteColor(
                 numero_op           = nueva_orden.numero_op,
-                color_id            = color_id,
+                color_produccion_id = color_produccion_id,
                 producto_sku_output  = computed_sku,
                 personas            = l_data.get('personas', 1),
                 meta_kg             = l_data.get('meta_kg', 0.0),
@@ -592,10 +581,15 @@ def crear_registro(numero_op):
         if 'maquina_id' not in data or 'fecha' not in data:
              return jsonify({'error': 'Faltan campos obligatorios (maquina_id, fecha)'}), 400
 
+        from app.models.maquina import Maquina
+        maquina = db.session.get(Maquina, data.get('maquina_id'))
+
         # Crear Cabecera
         cabecera = RegistroDiarioProduccion(
             orden_id              = orden.numero_op,
-            maquina_id            = data.get('maquina_id'),
+            maquina_id            = maquina.id if maquina else data.get('maquina_id'),
+            maquina_codigo_snapshot = maquina.codigo if maquina else None,
+            maquina_nombre_snapshot = maquina.nombre if maquina else None,
             fecha                 = datetime.fromisoformat(data.get('fecha')).date(),
             turno                 = data.get('turno'),
             hora_inicio           = data.get('hora_inicio'),
@@ -622,10 +616,15 @@ def crear_registro(numero_op):
         peso_tiro = cabecera.snapshot_peso_neto_gr + (cabecera.snapshot_peso_colada_gr or 0.0) + (cabecera.snapshot_peso_extra_gr or 0.0)
         
         for d in detalles_data:
+            # Soportar legacy (maquinista) o nuevo (trabajador_id)
+            trabajador_id = d.get('trabajador_id')
+            maquinista_snap = d.get('maquinista_snapshot') or d.get('maquinista')
+
             detalle = DetalleProduccionHora(
                 registro_id=cabecera.id,
                 hora=d.get('hora'),
-                maquinista=d.get('maquinista'),
+                trabajador_id=trabajador_id,
+                maquinista_snapshot=maquinista_snap,
                 color=d.get('color'),
                 observacion=d.get('observacion'),
                 coladas_realizadas=d.get('coladas', 0)

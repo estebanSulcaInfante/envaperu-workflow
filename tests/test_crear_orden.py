@@ -6,6 +6,31 @@ from app.models.molde import Molde, Pieza
 from app.models.producto import PiezaColor, Linea, Familia
 from app.extensions import db
 
+def _get_or_create_fam(nombre="SOLIDO", codigo=1):
+    from app.models.producto import FamiliaColor
+    fam = FamiliaColor.query.filter_by(nombre=nombre).first()
+    if not fam:
+        from app.extensions import db
+        fam = FamiliaColor(nombre=nombre, codigo=codigo)
+        db.session.add(fam)
+        db.session.flush()
+    return fam
+
+def _create_color_prod(nombre, codigo=None, familia_id=None):
+    from app.models.producto import ColorBase, ColorProduccion
+    from app.extensions import db
+    cb = ColorBase.query.filter_by(nombre=nombre).first()
+    if not cb:
+        cb = ColorBase(nombre=nombre)
+        db.session.add(cb)
+        db.session.flush()
+    fam_id = familia_id if familia_id else _get_or_create_fam().id
+    cp = ColorProduccion(color_base_id=cb.id, familia_color_id=fam_id, codigo_legacy=codigo)
+    db.session.add(cp)
+    db.session.flush()
+    return cp
+
+
 
 def _setup_molde(app):
     """Helper: crea un molde simple con 1 pieza, 2 cavidades.
@@ -20,14 +45,14 @@ def _setup_molde(app):
         db.session.add(molde)
         db.session.flush()
 
-        pieza = PiezaColor(sku="PIEZA-TEST", cod_pieza=101, piezas="PiezaColor Test",
-                      tipo="SIMPLE", linea_id=linea.id, familia_id=familia.id,
-                      cavidad=2, peso=10.0)
-        db.session.add(pieza)
+        mp_rel = Pieza(molde_id=molde.codigo, nombre="PIEZA-TEST", cavidades=2, peso_unitario_gr=10.0)
+        db.session.add(mp_rel)
         db.session.flush()
 
-        mp_rel = Pieza(molde_id="MOL-TEST", pieza_sku="PIEZA-TEST", cavidades=2, peso_unitario_gr=10.0)
-        db.session.add(mp_rel)
+        pieza = PiezaColor(sku="PIEZA-TEST", cod_pieza=101, piezas="PiezaColor Test",
+                      tipo="SIMPLE", linea_id=linea.id, familia_id=familia.id,
+                      cavidad=2, peso=10.0, pieza_id=mp_rel.id)
+        db.session.add(pieza)
         db.session.commit()
 
 
@@ -40,13 +65,14 @@ def test_crear_orden_manual_snapshot(client, app):
         mp = MateriaPrima(nombre="TEST MP", tipo="VIRGEN")
         col = Colorante(nombre="TEST COL")
         db.session.add_all([mp, col])
-        from app.models.producto import ColorProducto, FamiliaColor
+        from app.models.producto import ColorProduccion, ColorBase, FamiliaColor, FamiliaColor
         fam = FamiliaColor(nombre="STD")
         db.session.add(fam)
         db.session.flush()
-        c_prod = ColorProducto(nombre="ROJO", codigo=10, familia_id=fam.id)
+        c_prod = _create_color_prod(nombre="ROJO", codigo=10, familia_id=fam.id)
         db.session.add(c_prod)
         db.session.commit()
+        c_prod_id = c_prod.id
 
     payload = {
         "numero_op": "OP-MANUAL-SNAP",
@@ -63,7 +89,7 @@ def test_crear_orden_manual_snapshot(client, app):
 
         "lotes": [
             {
-                "color_nombre": "ROJO",
+                "color_id": c_prod_id,
                 "meta_kg": 100.0,
                 "personas": 3,
                 "materiales": [{"nombre": "TEST MP", "tipo": "VIRGEN", "fraccion": 1.0}],
@@ -82,7 +108,7 @@ def test_crear_orden_manual_snapshot(client, app):
     assert len(data['lotes']) == 1
 
     lote = data['lotes'][0]
-    assert lote['Color'] == "ROJO"
+    assert lote['Color'] == "ROJO STD"
     assert lote['mano_obra']['personas'] == 3
     assert len(lote['materiales']) == 1
     assert lote['materiales'][0]['fraccion'] == 1.0
@@ -142,7 +168,7 @@ def test_crear_orden_auto_snapshot(client, app):
 
     # Verificar que el catálogo ya no afecta el snapshot congelado
     with app.app_context():
-        mp_row = Pieza.query.filter_by(molde_id="MOL-TEST").first()
+        mp_row = Pieza.query.filter_by().first()
         mp_row.peso_unitario_gr = 99.0  # Cambiamos el catálogo
         db.session.commit()
 

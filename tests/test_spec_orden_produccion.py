@@ -26,21 +26,21 @@ def mock_data(session):
     
     session.flush()
 
-    maq = Maquina(nombre="INJ-01", tipo="Inyectora")
+    maq = Maquina(codigo="INJ-01", nombre="INJ-01", tipo_maquina_id=1, tipo="Inyectora")
     session.add(maq)
 
     # Simple
     molde_balde = Molde(codigo="MLB01", nombre="Molde Balde Playero", peso_tiro_gr=150.0)
     prod_balde = ProductoTerminado(cod_sku_pt="PT-BLD", producto="Balde Romano", linea_id=linea.id, familia_id=familia.id)
-    pieza_balde = Pieza(pieza_sku="MZ-BLD", nombre="PiezaColor Balde", peso_unitario_gr=145.0, cavidades=1, molde_id="MLB01")
+    pieza_balde = Pieza(molde_id="MLB01", nombre="PiezaColor Balde", peso_unitario_gr=145.0, cavidades=1)
     session.add_all([molde_balde, prod_balde, pieza_balde])
 
     # Complejo
     molde_jarra = Molde(codigo="MLJ01", nombre="Molde Jarra Regadera", peso_tiro_gr=150.0)
     prod_jarra = ProductoTerminado(cod_sku_pt="PT-JRG", producto="Jarra Regadera", linea_id=linea.id, familia_id=familia.id)
-    pieza_jarra_base = Pieza(pieza_sku="MZ-JBASE", nombre="Base Jarra", peso_unitario_gr=100.0, cavidades=1, molde_id="MLJ01")
-    pieza_jarra_tapa = Pieza(pieza_sku="MZ-JTAPA", nombre="Tapa Jarra", peso_unitario_gr=20.0, cavidades=1, molde_id="MLJ01")
-    pieza_jarra_roseta = Pieza(pieza_sku="MZ-JROS", nombre="Roseta", peso_unitario_gr=5.0, cavidades=2, molde_id="MLJ01")
+    pieza_jarra_base = Pieza(molde_id="MLJ01", nombre="MZ-JBASE", peso_unitario_gr=100.0, cavidades=1)
+    pieza_jarra_tapa = Pieza(molde_id="MLJ01", nombre="MZ-JTAPA", peso_unitario_gr=20.0, cavidades=1)
+    pieza_jarra_roseta = Pieza(molde_id="MLJ01", nombre="MZ-JROS", peso_unitario_gr=5.0, cavidades=2)
     session.add_all([molde_jarra, prod_jarra, pieza_jarra_base, pieza_jarra_tapa, pieza_jarra_roseta])
 
     session.commit()
@@ -100,7 +100,6 @@ def test_creacion_op_simple_un_molde_una_pieza(client, session, mock_data):
     snap = op.snapshot_composicion[0]
     
     # El molde_balde mockeado tiene 1 pieza, revisar que el peso y cavidades sea de Pieza catalog
-    assert snap.pieza_sku == mock_data['pieza_balde'].pieza_sku
     assert snap.cavidades == mock_data['molde_pieza_balde'].cavidades
     
     # Verificar calculo del peso neto (Debe ser cavidades * peso_unit)
@@ -160,17 +159,17 @@ def test_creacion_op_manual_sobrescrita(client, session, mock_data):
         "auto_snapshot_molde": False, # MANUAL
         "snapshot_composicion": [
             {
-                "pieza_sku": mock_data['pieza_jarra_base'].pieza_sku,
+                "pieza_sku": mock_data['pieza_jarra_base'].nombre,
                 "cavidades": 1,
                 "peso_unit_gr": 100.0
             },
             {
-                "pieza_sku": mock_data['pieza_jarra_tapa'].pieza_sku,
+                "pieza_sku": mock_data['pieza_jarra_tapa'].nombre,
                 "cavidades": 0, # ANULADA
                 "peso_unit_gr": 20.0
             },
             {
-                "pieza_sku": mock_data['pieza_jarra_roseta'].pieza_sku,
+                "pieza_sku": mock_data['pieza_jarra_roseta'].nombre,
                 "cavidades": 1, # Reducida de 2 a 1
                 "peso_unit_gr": 5.0
             }

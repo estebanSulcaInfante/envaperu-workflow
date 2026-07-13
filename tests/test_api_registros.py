@@ -30,7 +30,7 @@ def test_listar_registros_json(client, app):
     """
     with app.app_context():
         # Setup Maquina
-        maq = Maquina(nombre="MAQ-API-REG", tipo="INYECCION")
+        maq = Maquina(codigo="MAQ-API-REG", nombre="MAQ-API-REG", tipo_maquina_id=1, tipo="INYECCION")
         db.session.add(maq)
         db.session.commit()
         
@@ -66,7 +66,7 @@ def test_listar_registros_json(client, app):
         det = DetalleProduccionHora(
             registro_id=reg.id,
             hora="19:00",
-            maquinista="TESTER",
+            trabajador_id=1, maquinista_snapshot="TESTER",
             coladas_realizadas=100
         )
         det.calcular_metricas(reg.snapshot_cavidades, (reg.snapshot_peso_neto_gr * reg.snapshot_cavidades))
@@ -91,7 +91,7 @@ def test_crear_registro_api(client, app):
     """
     with app.app_context():
         # Setup Maquina
-        maq = Maquina(nombre="MAQ-POST", tipo="INYECCION")
+        maq = Maquina(codigo="MAQ-POST", nombre="MAQ-POST", tipo_maquina_id=1, tipo="INYECCION")
         db.session.add(maq)
         db.session.commit()
         

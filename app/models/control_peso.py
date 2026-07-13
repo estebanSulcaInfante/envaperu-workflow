@@ -19,7 +19,7 @@ class ControlPeso(db.Model):
     # Color: Puede ser un ID si se linkea estricto, o un string si es flexible
     # Por ahora permitiremos ambos conceptos o string como fallback
     color_nombre = db.Column(db.String(50), nullable=True) 
-    color_id = db.Column(db.Integer, db.ForeignKey('color_producto.id'), nullable=True)
+    color_id = db.Column(db.Integer, db.ForeignKey('color_produccion.id'), nullable=True)
     
     # Auditoría
     hora_registro = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))

@@ -10,13 +10,13 @@ class LoteColor(db.Model):
     numero_op = db.Column(db.String(20), db.ForeignKey('orden_produccion.numero_op'), nullable=False)
 
     # --- COLOR REAL ---
-    color_id = db.Column(db.Integer, db.ForeignKey('color_producto.id'), nullable=True)
+    color_produccion_id = db.Column(db.Integer, db.ForeignKey('color_produccion.id'), nullable=True)
 
     # --- SKU SALIDA ---
     producto_sku_output = db.Column(db.String(50), db.ForeignKey('producto_terminado.cod_sku_pt'), nullable=True)
 
     # Relaciones
-    color_rel      = db.relationship('ColorProducto', backref='lotes')
+    color_produccion_rel = db.relationship('ColorProduccion', backref='lotes')
     producto_output = db.relationship('ProductoTerminado', foreign_keys=[producto_sku_output], backref='lotes_produccion')
 
     # --- META (input directo por lote) ---
@@ -88,7 +88,7 @@ class LoteColor(db.Model):
     def to_dict(self):
         return {
             'id':     self.id,
-            'Color':  self.color_rel.nombre if self.color_rel else "Sin Color",
+            'Color':  str(self.color_produccion_rel) if self.color_produccion_rel else "Sin Color",
 
             # Meta y resultado
             'meta_kg':       self.meta_kg,

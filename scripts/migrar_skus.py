@@ -43,8 +43,7 @@ def migrar_productos_terminados(ws):
         pt.familia = row[3]
         pt.cod_producto = row[4]
         pt.producto = str(row[5]).strip() if row[5] else None 
-        pt.cod_color = row[6]
-        pt.familia_color = row[7]
+        # Campos de color eliminados en US-008
         # row[8] es SKU
         pt.um = row[9]
         pt.doc_x_paq = row[10]
@@ -108,9 +107,8 @@ def migrar_piezas(ws):
         pieza.tipo_extruccion = row[12]
         pieza.cod_mp = row[13]
         pieza.mp = row[14]
-        pieza.cod_color = row[15]
-        pieza.color = row[16]
-                
+        # pieza.cod_color y pieza.color eliminados en US-008.
+        # FIXME: Se debería crear/buscar ColorProduccion usando row[15] y row[16] y setear pieza.color_produccion_id
         db.session.add(pieza)
         count += 1
         

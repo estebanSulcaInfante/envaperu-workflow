@@ -33,7 +33,7 @@ def setup_test_data(app):
         # Create a machine
         maquina = Maquina.query.first()
         if not maquina:
-            maquina = Maquina(nombre="Test Machine", tipo="INYECCION")
+            maquina = Maquina(codigo="Test Machine", nombre="Test Machine", tipo_maquina_id=1, tipo="INYECCION")
             db.session.add(maquina)
             db.session.commit()
         

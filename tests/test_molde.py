@@ -76,8 +76,8 @@ class TestMoldeHomogeneo:
             
             # Relacionar
             mp = Pieza(
-                molde_id="MOL-BALDE",
-                pieza_sku="BALDE-001",
+                molde_id=molde.codigo,
+                nombre="BALDE-001",
                 cavidades=4,
                 peso_unitario_gr=87.0
             )
@@ -128,8 +128,8 @@ class TestMoldeHeterogeneo:
             
             # Relacionar molde con kit
             mp = Pieza(
-                molde_id="MOL-REGADERA",
-                pieza_sku="REG-KIT",
+                molde_id=molde.codigo,
+                nombre="REG-KIT",
                 cavidades=1,
                 peso_unitario_gr=185.0
             )
@@ -166,12 +166,15 @@ class TestPiezasProducibles:
             db.session.commit()
             
             mp = Pieza(
-                molde_id="MOL-TEST",
-                pieza_sku="PROD-001",
+                molde_id=molde.codigo,
+                nombre="PROD-001",
                 cavidades=2,
                 peso_unitario_gr=45.0
             )
             db.session.add(mp)
+            db.session.commit()
+            
+            pieza_prod.pieza_id = mp.id
             db.session.commit()
             
             # Query para piezas producibles

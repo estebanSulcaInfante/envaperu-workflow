@@ -17,11 +17,31 @@ def app():
     with app.app_context():
         db.create_all()
         
-        # Create default Linea and Familia for tests that need them
         from app.models.producto import Linea, Familia
         default_linea = Linea(codigo=1, nombre='INDUSTRIAL')
         default_familia = Familia(codigo=1, nombre='TEST')
         db.session.add_all([default_linea, default_familia])
+        
+        # TS-009 Dependencies
+        from app.models.maquina import TipoMaquina, Maquina
+        from app.models.trabajador import RolOperativo, Trabajador
+        
+        tipo_maq = TipoMaquina(codigo="INYECCION", nombre="INYECCION", proceso="PRODUCCION")
+        db.session.add(tipo_maq)
+        db.session.flush()
+        
+        maq = Maquina(codigo="MQ-01", nombre="Maquina 1", tipo_maquina_id=tipo_maq.id, estado="OPERATIVA", activo=True)
+        db.session.add(maq)
+        
+        rol_maq = RolOperativo(codigo="MAQUINISTA", nombre="MAQUINISTA")
+        db.session.add(rol_maq)
+        db.session.flush()
+        
+        trab = Trabajador(codigo="TRB-01", nombres="Juan", apellidos="Perez", nombre_corto="Juan P.", activo=True)
+        trab.roles.append(rol_maq)
+        db.session.add(trab)
+        db.session.flush()
+
         db.session.commit()
         
         yield app

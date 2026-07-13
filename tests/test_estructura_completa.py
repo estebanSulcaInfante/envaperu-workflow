@@ -4,10 +4,35 @@ from app.models.orden import OrdenProduccion
 from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
-from app.models.producto import ProductoTerminado, FamiliaColor, ColorProducto, PiezaColor
+from app.models.producto import ProductoTerminado, FamiliaColor, ColorProduccion, ColorBase, PiezaColor
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion
 from app.extensions import db
+
+def _get_or_create_fam(nombre="SOLIDO", codigo=1):
+    from app.models.producto import FamiliaColor
+    fam = FamiliaColor.query.filter_by(nombre=nombre).first()
+    if not fam:
+        from app.extensions import db
+        fam = FamiliaColor(nombre=nombre, codigo=codigo)
+        db.session.add(fam)
+        db.session.flush()
+    return fam
+
+def _create_color_prod(nombre, codigo=None, familia_id=None):
+    from app.models.producto import ColorBase, ColorProduccion
+    from app.extensions import db
+    cb = ColorBase.query.filter_by(nombre=nombre).first()
+    if not cb:
+        cb = ColorBase(nombre=nombre)
+        db.session.add(cb)
+        db.session.flush()
+    fam_id = familia_id if familia_id else _get_or_create_fam().id
+    cp = ColorProduccion(color_base_id=cb.id, familia_color_id=fam_id, codigo_legacy=codigo)
+    db.session.add(cp)
+    db.session.flush()
+    return cp
+
 
 def test_estructura_completa_json(client, app):
     """
@@ -28,7 +53,7 @@ def test_estructura_completa_json(client, app):
         db.session.commit()
 
         # 1.5 SETUP: MAQUINA
-        maquina_test = Maquina(nombre="MAQ-TEST", tipo="TEST 100T")
+        maquina_test = Maquina(codigo="MAQ-TEST", nombre="MAQ-TEST", tipo_maquina_id=1, tipo="TEST 100T")
         db.session.add(maquina_test)
         db.session.commit()
 
@@ -45,7 +70,7 @@ def test_estructura_completa_json(client, app):
 
         # 3. SETUP: LOTE (1 solo lote -> 1000kg)
         # Necesitamos un ColorProducto real
-        c_prod_test = ColorProducto(nombre="AZUL TEST", codigo=99, familia_id=None)
+        c_prod_test = _create_color_prod(nombre="AZUL TEST", codigo=99, familia_id=None)
         db.session.add(c_prod_test)
         db.session.commit()
 
@@ -59,7 +84,7 @@ def test_estructura_completa_json(client, app):
 
         lote = LoteColor(
             numero_op=orden.numero_op,
-            color_id=c_prod_test.id,
+            color_produccion_id=c_prod_test.id,
             personas=2,
             meta_kg=1000.0,   # <-- meta directa por lote
         )
@@ -132,7 +157,7 @@ def test_estructura_completa_json(client, app):
         db.session.add(fam)
         db.session.commit()
         
-        col_prod = ColorProducto(nombre="ROJO", codigo=50, familia=fam)
+        col_prod = _create_color_prod(nombre="ROJO", codigo=50, familia_id=fam.id)
         db.session.add(col_prod)
         db.session.commit()
         
@@ -156,10 +181,6 @@ def test_estructura_completa_json(client, app):
             linea_id=linea_test.id,
             familia_id=familia_test.id,
             cod_producto=3,
-            familia_color_rel=fam,  # Usando relacion con FamiliaColor
-            familia_color="TRANSPARENTE",
-            cod_familia_color=50,
-            producto="BALDE ROJO TRANS",
             estado_revision="IMPORTADO"  # Nuevo campo obligatorio
         )
         
@@ -167,18 +188,19 @@ def test_estructura_completa_json(client, app):
         pt.linea_rel = linea_test
         pt.familia_rel = familia_test
         
-        # Generar SKU (deberia usar codigo 50)
+        # Generar SKU
         sku_gen = pt.generar_sku()
-        # Dynamic assertion: 0 + linea.codigo + familia.codigo + 3 + 0 + 50
-        expected_sku = f"0{linea_test.codigo}{familia_test.codigo}3050"
+        # Dynamic assertion: 0 + linea.codigo + familia.codigo + cod_producto
+        expected_sku = f"0{linea_test.codigo}{familia_test.codigo}3"
         assert sku_gen == expected_sku, f"SKU mismatch. Expected {expected_sku}, got {sku_gen}"
         pt.cod_sku_pt = sku_gen
         db.session.add(pt)
         db.session.commit()
         
-        # C. Vincular Orden a Producto y Actualizar
+        # C. Vincular Orden a Producto, Lote a Color, y Actualizar
         orden.producto_sku = pt.cod_sku_pt
-        orden.actualizar_metricas() # Debe jalar la familia
+        lote.color_produccion_id = col_prod.id
+        orden.actualizar_metricas() # Debe jalar la familia del lote
         db.session.commit()
         
         # D. Verificar Cache

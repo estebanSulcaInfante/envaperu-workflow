@@ -65,7 +65,7 @@ def test_simple_molde_flow(client, app):
         assert abs(molde.merma_pct - 0.2) < 0.001  # (100-80)/100
 
         # PiezaColor.molde_id ya NO existe — la pieza ahora se vincula solo por Pieza
-        pieza = db.session.get(PiezaColor, mp.pieza_sku)
+        pieza = db.session.get(PiezaColor, mp.nombre)
         assert pieza is not None
         assert not hasattr(pieza, 'molde_id') or pieza.molde_id is None  # campo eliminado
 
