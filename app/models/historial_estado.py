@@ -27,7 +27,17 @@ class HistorialEstadoOrden(db.Model):
     motivo = db.Column(db.String(200), nullable=True)   # Razón del cambio
     
     # Relación
-    orden = db.relationship('OrdenProduccion', backref=db.backref('historial_estados', lazy=True, order_by='HistorialEstadoOrden.fecha.desc()'))
+    orden = db.relationship(
+        'OrdenProduccion',
+        backref=db.backref(
+            'historial_estados',
+            lazy=True,
+            order_by=lambda: (
+                HistorialEstadoOrden.fecha.desc(),
+                HistorialEstadoOrden.id.desc(),
+            ),
+        ),
+    )
     
     @property
     def accion(self):

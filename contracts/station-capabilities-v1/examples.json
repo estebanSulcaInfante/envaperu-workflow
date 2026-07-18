@@ -1,0 +1,21 @@
+{
+  "response": {
+    "api_version": "integration-v1",
+    "server_time_utc": "2026-07-17T15:00:00Z",
+    "minimum_station_version": "1.1.0",
+    "supported_contracts": {
+      "heartbeat": ["station-heartbeat-v1"],
+      "catalog": ["station-catalog-v1"],
+      "weight_event": [
+        "sync-pesajes-legacy-v1",
+        "station-production-progress-v1"
+      ]
+    },
+    "features": {
+      "monitoring": true,
+      "catalog_snapshot": false,
+      "legacy_weight_ingest_enabled": false,
+      "remote_hardware_commands": false
+    }
+  }
+}

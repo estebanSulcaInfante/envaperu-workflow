@@ -8,6 +8,7 @@ Flask==3.1.2
 flask-cors==6.0.2
 Flask-Migrate==4.1.0
 Flask-SQLAlchemy==3.1.1
+jsonschema==4.26.0
 greenlet==3.3.0
 gunicorn==21.2.0
 idna==3.11

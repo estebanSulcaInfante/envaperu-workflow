@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.envaperu.local/station/heartbeat/v1/contract.schema.json",
+  "title": "EnvaPeru station heartbeat v1",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "heartbeat_id",
+        "boot_id",
+        "sequence",
+        "generated_at_utc",
+        "app_version",
+        "mode",
+        "uptime_seconds",
+        "components",
+        "communication",
+        "context",
+        "last_capture",
+        "local_summary"
+      ],
+      "properties": {
+        "contract_version": {"const": "station-heartbeat-v1"},
+        "heartbeat_id": {"type": "string", "format": "uuid"},
+        "boot_id": {"type": "string", "format": "uuid"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "generated_at_utc": {"type": "string", "format": "date-time"},
+        "app_version": {"type": "string", "minLength": 1, "maxLength": 50},
+        "mode": {
+          "enum": ["STANDALONE_OFFLINE", "MONITORED_LEGACY", "CONNECTED_NORMALIZED"]
+        },
+        "uptime_seconds": {"type": "integer", "minimum": 0},
+        "components": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["process", "database", "scale", "printer", "catalog"],
+          "properties": {
+            "process": {"enum": ["STARTING", "READY", "STOPPING", "STOPPED", "ERROR"]},
+            "database": {"enum": ["READY", "UNAVAILABLE", "ERROR"]},
+            "scale": {"enum": ["CONNECTED_LISTENING", "CONNECTED_IDLE", "DISCONNECTED", "RECONNECTING", "ERROR"]},
+            "printer": {"enum": ["AVAILABLE", "UNAVAILABLE", "NO_VERIFICADO", "ERROR"]},
+            "catalog": {"enum": ["CURRENT", "STALE", "LEGACY_CACHE", "UNAVAILABLE"]}
+          }
+        },
+        "communication": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "last_central_ack_utc",
+            "state",
+            "legacy_unsynced_count",
+            "oldest_legacy_unsynced_at_utc",
+            "last_error_code"
+          ],
+          "properties": {
+            "last_central_ack_utc": {"type": ["string", "null"], "format": "date-time"},
+            "state": {
+              "enum": [
+                "CENTRAL_NOT_PROVISIONED",
+                "ONLINE",
+                "CENTRAL_UNREACHABLE",
+                "AUTH_ERROR",
+                "CENTRAL_INCOMPATIBLE",
+                "CONTRACT_CONFLICT",
+                "PAYLOAD_REJECTED",
+                "RATE_LIMITED",
+                "CENTRAL_ERROR",
+                "TLS_ERROR"
+              ]
+            },
+            "legacy_unsynced_count": {"type": "integer", "minimum": 0},
+            "oldest_legacy_unsynced_at_utc": {"type": ["string", "null"], "format": "date-time"},
+            "last_error_code": {"type": ["string", "null"], "maxLength": 100}
+          }
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "ot", "machine_code", "shift"],
+          "properties": {
+            "op": {"type": ["string", "null"]},
+            "ot": {"type": ["string", "null"]},
+            "machine_code": {"type": ["string", "null"]},
+            "shift": {"type": ["string", "null"]}
+          }
+        },
+        "last_capture": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["capture_id", "captured_at_utc", "weight_kg", "print_state"],
+              "properties": {
+                "capture_id": {"type": ["string", "null"], "format": "uuid"},
+                "captured_at_utc": {"type": "string", "format": "date-time"},
+                "weight_kg": {"type": "string", "pattern": "^-?[0-9]+\\.[0-9]{3}$"},
+                "print_state": {"enum": ["PRINTED", "PENDING", "FAILED"]}
+              }
+            }
+          ]
+        },
+        "local_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "timezone", "window_start", "window_end", "bags", "weight_kg"],
+          "properties": {
+            "source": {"const": "LOCAL_REPORTED_LEGACY"},
+            "timezone": {"const": "America/Lima"},
+            "window_start": {"type": "string", "format": "date-time"},
+            "window_end": {"type": "string", "format": "date-time"},
+            "bags": {"type": "integer", "minimum": 0},
+            "weight_kg": {"type": "string", "pattern": "^-?[0-9]+\\.[0-9]{3}$"}
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accepted", "station_id", "heartbeat_id", "received_at_utc", "next_heartbeat_seconds"],
+      "properties": {
+        "accepted": {"const": true},
+        "station_id": {"type": "string", "format": "uuid"},
+        "heartbeat_id": {"type": "string", "format": "uuid"},
+        "received_at_utc": {"type": "string", "format": "date-time"},
+        "next_heartbeat_seconds": {"type": "integer", "minimum": 5, "maximum": 3600}
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "request": {
+    "pesajes": [
+      {
+        "local_id": 1,
+        "peso_kg": 12.5,
+        "fecha_hora": "2026-07-13T10:30:00-05:00",
+        "nro_op": "OP-CONTRACT-001",
+        "turno": "DIURNO",
+        "fecha_ot": "2026-07-13",
+        "nro_ot": "30001",
+        "maquina": "MAQUINA 1",
+        "molde": "MOLDE CONTRACT",
+        "color": "ROJO",
+        "operador": "OPERADOR CONTRACT",
+        "pieza_sku": "PZ-CONTRACT-ROJO",
+        "pieza_nombre": "PIEZA CONTRACT ROJO",
+        "qr_data": "QR-CONTRACT-001"
+      }
+    ]
+  },
+  "response": {
+    "success": true,
+    "message": "Procesados 1 pesajes",
+    "synced": [
+      {"local_id": 1}
+    ],
+    "errors": []
+  }
+}

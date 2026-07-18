@@ -1,6 +1,8 @@
 """
 Tests para HistorialEstadoOrden - tracking de cambios de estado en órdenes.
 """
+from datetime import datetime, timezone
+
 import pytest
 from app import create_app
 from app.extensions import db
@@ -127,6 +129,11 @@ class TestHistorialAPI:
             registrar_cambio_estado(orden, False, 'user1', 'Cierre 1')
             registrar_cambio_estado(orden, True, 'user2', 'Reapertura')
             registrar_cambio_estado(orden, False, 'user1', 'Cierre final')
+
+            # La base puede asignar el mismo timestamp a eventos consecutivos.
+            same_timestamp = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+            HistorialEstadoOrden.query.update({'fecha': same_timestamp})
+            db.session.commit()
         
         response = client.get('/api/ordenes/OP-API-002/historial')
         

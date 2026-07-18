@@ -20,6 +20,8 @@ import requests
 from datetime import date
 import time
 
+pytestmark = pytest.mark.e2e
+
 # URLs de los servidores
 CENTRAL_URL = 'http://127.0.0.1:5000'
 SCALE_URL = 'http://127.0.0.1:5050'

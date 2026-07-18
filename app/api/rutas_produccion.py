@@ -355,7 +355,10 @@ def obtener_historial_orden(numero_op):
     
     historial = HistorialEstadoOrden.query.filter_by(
         numero_op=numero_op
-    ).order_by(HistorialEstadoOrden.fecha.desc()).all()
+    ).order_by(
+        HistorialEstadoOrden.fecha.desc(),
+        HistorialEstadoOrden.id.desc(),
+    ).all()
     
     return jsonify({
         'numero_op': numero_op,

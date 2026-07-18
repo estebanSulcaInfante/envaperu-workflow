@@ -1,0 +1,48 @@
+{
+  "request": {
+    "contract_version": "station-production-progress-v1",
+    "report_id": "e6c3a99f-4b98-5b8e-bdd1-3990f0ee22dd",
+    "generated_at_utc": "2026-07-17T15:02:00Z",
+    "timezone": "America/Lima",
+    "window_start_date": "2026-06-17",
+    "window_end_date": "2026-07-17",
+    "source": "LOCAL_REPORTED_LEGACY",
+    "rows": [
+      {
+        "operational_date": "2026-07-17",
+        "op": "OP-1401",
+        "ot": "OT-0041",
+        "mold": "TAPA 38 MM",
+        "color": "ROJO SOLIDO",
+        "machine_code": "HT-250B",
+        "shift": "DIURNO",
+        "bags": 2,
+        "weight_kg": "50.250",
+        "first_capture_at_utc": "2026-07-17T13:10:00Z",
+        "last_capture_at_utc": "2026-07-17T14:05:00Z"
+      },
+      {
+        "operational_date": "2026-07-17",
+        "op": "OP-1402",
+        "ot": "OT-0042",
+        "mold": "BOTELLA 1 L",
+        "color": "NATURAL",
+        "machine_code": "SOP-01",
+        "shift": "DIURNO",
+        "bags": 1,
+        "weight_kg": "24.900",
+        "first_capture_at_utc": "2026-07-17T15:02:00Z",
+        "last_capture_at_utc": "2026-07-17T15:02:00Z"
+      }
+    ]
+  },
+  "response": {
+    "accepted": true,
+    "station_id": "7f99acdd-63e6-4385-bc16-b904d5d8d5ee",
+    "report_id": "e6c3a99f-4b98-5b8e-bdd1-3990f0ee22dd",
+    "received_at_utc": "2026-07-17T15:02:03Z",
+    "rows_applied": 2,
+    "window_start_date": "2026-06-17",
+    "window_end_date": "2026-07-17"
+  }
+}

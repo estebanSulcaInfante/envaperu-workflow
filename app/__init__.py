@@ -4,6 +4,7 @@ from app.extensions import db, cors
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+from sqlalchemy import text
 
 def setup_logging(app):
     """Configura logging estructurado para la aplicación"""
@@ -46,7 +47,7 @@ def create_app():
     # --- IMPORTAR MODELOS ---
     # Es crucial importar los modelos aquí para que SQLAlchemy los registre
     # antes de que cualquier blueprint intente usarlos.
-    from app.models import orden, lote, materiales, recetas, producto, registro, control_peso, kardex, trabajador, maquina
+    from app.models import orden, lote, materiales, recetas, producto, registro, control_peso, kardex, trabajador, maquina, estacion_pesaje
 
     # --- REGISTRO DE RUTAS ---
     from app.api.rutas_produccion import produccion_bp
@@ -56,6 +57,10 @@ def create_app():
     from app.api.rutas_kardex import kardex_bp
     from app.api.rutas_trabajadores import rutas_trabajadores
     from app.api.rutas_maquinas import rutas_maquinas
+    from app.api.rutas_estaciones_pesaje import (
+        integration_station_bp,
+        monitoring_station_bp,
+    )
     
     # Todo lo que esté en ese archivo empezará con /api
     app.register_blueprint(produccion_bp, url_prefix='/api')
@@ -65,6 +70,29 @@ def create_app():
     app.register_blueprint(talonarios_bp)
     app.register_blueprint(sync_bp, url_prefix='/api')
     app.register_blueprint(kardex_bp, url_prefix='/api')
+    app.register_blueprint(
+        integration_station_bp,
+        url_prefix='/api/integration/v1',
+    )
+    app.register_blueprint(
+        monitoring_station_bp,
+        url_prefix='/api/monitoring/v1',
+    )
+
+    from app.cli import register_station_commands
+
+    register_station_commands(app)
+
+    @app.get('/api/health')
+    def health_check():
+        try:
+            db.session.execute(text('SELECT 1'))
+        except Exception:
+            db.session.rollback()
+            app.logger.exception('Database health check failed')
+            return jsonify({'status': 'degraded', 'database': 'unavailable'}), 503
+
+        return jsonify({'status': 'ok', 'database': 'available'})
     
     # --- MANEJADORES DE ERROR GLOBALES ---
     @app.errorhandler(404)

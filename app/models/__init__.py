@@ -12,3 +12,11 @@ from app.models.talonario import Talonario
 from app.models.historial_estado import HistorialEstadoOrden
 from app.models.receta_color import RecetaColorNormalizada
 from app.models.trabajador import Trabajador, RolOperativo
+from app.models.estacion_pesaje import (
+    EstacionPesaje,
+    EstacionEstadoActual,
+    EstacionHeartbeatRecepcion,
+    EstacionEstadoHistorial,
+    EstacionReporteAvanceRecepcion,
+    EstacionAvanceProduccion,
+)

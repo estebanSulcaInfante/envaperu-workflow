@@ -1,0 +1,16 @@
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: envaperu_test
+      POSTGRES_USER: envaperu_test
+      POSTGRES_PASSWORD: envaperu_test
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U envaperu_test -d envaperu_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    tmpfs:
+      - /var/lib/postgresql/data

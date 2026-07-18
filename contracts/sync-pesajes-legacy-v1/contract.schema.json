@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.envaperu.local/sync/pesajes/legacy-v1/contract.schema.json",
+  "title": "EnvaPeru sync pesajes legacy-v1",
+  "description": "Characterization of the existing central-weighing contract. It is not the idempotent target contract for US-010.",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pesajes"],
+      "properties": {
+        "pesajes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "local_id",
+              "peso_kg",
+              "fecha_hora",
+              "nro_op",
+              "turno",
+              "fecha_ot",
+              "nro_ot",
+              "maquina",
+              "molde",
+              "color",
+              "operador",
+              "pieza_sku",
+              "pieza_nombre",
+              "qr_data"
+            ],
+            "properties": {
+              "local_id": {"type": "integer", "minimum": 1},
+              "peso_kg": {"type": "number"},
+              "fecha_hora": {"type": ["string", "null"], "format": "date-time"},
+              "nro_op": {"type": ["string", "null"]},
+              "turno": {"type": ["string", "null"]},
+              "fecha_ot": {"type": ["string", "null"], "format": "date"},
+              "nro_ot": {"type": ["string", "null"]},
+              "maquina": {"type": ["string", "null"]},
+              "molde": {"type": ["string", "null"]},
+              "color": {"type": ["string", "null"]},
+              "operador": {"type": ["string", "null"]},
+              "pieza_sku": {"type": ["string", "null"]},
+              "pieza_nombre": {"type": ["string", "null"]},
+              "qr_data": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["success", "message", "synced", "errors"],
+      "properties": {
+        "success": {"type": "boolean"},
+        "message": {"type": "string"},
+        "synced": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["local_id"],
+            "properties": {
+              "local_id": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["local_id", "error"],
+            "properties": {
+              "local_id": {"type": ["integer", "null"]},
+              "error": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

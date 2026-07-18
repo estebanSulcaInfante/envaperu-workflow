@@ -1,0 +1,53 @@
+{
+  "request": {
+    "contract_version": "station-heartbeat-v1",
+    "heartbeat_id": "1e1ca03d-f03a-49ff-8726-a8fbd94554c9",
+    "boot_id": "e8ee06ac-7284-4426-96fe-ec7be2100b65",
+    "sequence": 48,
+    "generated_at_utc": "2026-07-17T14:59:58Z",
+    "app_version": "1.1.0-pilot",
+    "mode": "MONITORED_LEGACY",
+    "uptime_seconds": 1432,
+    "components": {
+      "process": "READY",
+      "database": "READY",
+      "scale": "CONNECTED_LISTENING",
+      "printer": "AVAILABLE",
+      "catalog": "LEGACY_CACHE"
+    },
+    "communication": {
+      "last_central_ack_utc": "2026-07-17T14:59:29Z",
+      "state": "ONLINE",
+      "legacy_unsynced_count": 3,
+      "oldest_legacy_unsynced_at_utc": "2026-07-17T14:31:00Z",
+      "last_error_code": null
+    },
+    "context": {
+      "op": "OP-2026-0041",
+      "ot": "001238",
+      "machine_code": "INY-05",
+      "shift": "DIURNO"
+    },
+    "last_capture": {
+      "capture_id": "f59bfd7e-7cc5-4103-b038-e8bfe6c7d726",
+      "captured_at_utc": "2026-07-17T14:58:42Z",
+      "weight_kg": "25.000",
+      "print_state": "PRINTED"
+    },
+    "local_summary": {
+      "source": "LOCAL_REPORTED_LEGACY",
+      "timezone": "America/Lima",
+      "window_start": "2026-07-17T00:00:00-05:00",
+      "window_end": "2026-07-17T09:59:58-05:00",
+      "bags": 19,
+      "weight_kg": "475.000"
+    }
+  },
+  "response": {
+    "accepted": true,
+    "station_id": "6d560049-9809-431d-b09f-a6658c7f08cd",
+    "heartbeat_id": "1e1ca03d-f03a-49ff-8726-a8fbd94554c9",
+    "received_at_utc": "2026-07-17T15:00:00Z",
+    "next_heartbeat_seconds": 30
+  }
+}

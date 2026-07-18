@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.envaperu.local/station/capabilities/v1/contract.schema.json",
+  "title": "EnvaPeru station capabilities v1",
+  "$defs": {
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version",
+        "server_time_utc",
+        "minimum_station_version",
+        "supported_contracts",
+        "features"
+      ],
+      "properties": {
+        "api_version": {"const": "integration-v1"},
+        "server_time_utc": {"type": "string", "format": "date-time"},
+        "minimum_station_version": {"type": "string", "minLength": 1},
+        "supported_contracts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["heartbeat", "catalog", "weight_event"],
+          "properties": {
+            "heartbeat": {
+              "type": "array",
+              "contains": {"const": "station-heartbeat-v1"}
+            },
+            "catalog": {"type": "array", "items": {"type": "string"}},
+            "weight_event": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "features": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "monitoring",
+            "catalog_snapshot",
+            "legacy_weight_ingest_enabled",
+            "remote_hardware_commands"
+          ],
+          "properties": {
+            "monitoring": {"type": "boolean"},
+            "catalog_snapshot": {"type": "boolean"},
+            "legacy_weight_ingest_enabled": {"type": "boolean"},
+            "remote_hardware_commands": {"type": "boolean"}
+          }
+        }
+      }
+    }
+  }
+}
