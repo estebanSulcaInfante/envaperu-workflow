@@ -68,12 +68,13 @@ def main():
         db.create_all()
         after = set(inspect(db.engine).get_table_names())
         station, station_created = provision_bootstrap_station()
+        station_code = station.codigo if station is not None else None
 
     created = sorted(after - before)
     print(f"Render database ready: {len(after)} tables, {len(created)} created.")
-    if station is not None:
+    if station_code is not None:
         action = "created" if station_created else "already_registered"
-        print(f"Bootstrap station {action}: {station.codigo}")
+        print(f"Bootstrap station {action}: {station_code}")
 
 
 if __name__ == '__main__':
