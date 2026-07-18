@@ -146,6 +146,41 @@ def test_snapshot_replay_separates_orders_and_never_creates_inventory(
     assert op_1402["target_status"] == "OP_NOT_FOUND"
 
 
+def test_dashboard_reports_calendar_month_metrics_without_changing_daily_cut(
+    client,
+    app,
+    progress_station,
+):
+    payload = _load_example()
+    earlier = copy.deepcopy(payload["rows"][0])
+    earlier.update(
+        operational_date="2026-07-02",
+        bags=1,
+        weight_kg="25.000",
+        first_capture_at_utc="2026-07-02T13:10:00Z",
+        last_capture_at_utc="2026-07-02T13:20:00Z",
+    )
+    payload["rows"].append(earlier)
+
+    assert _put(client, progress_station, payload).status_code == 200
+
+    body = client.get(
+        "/api/monitoring/v1/production-progress?date=2026-07-17"
+    ).get_json()
+
+    assert body["summary"]["weight_kg"] == "75.150"
+    assert body["monthly_summary"] == {
+        "average_daily_weight_kg": "50.075",
+        "bags": 4,
+        "month": "2026-07",
+        "period_end": "2026-07-31",
+        "period_start": "2026-07-01",
+        "production_days": 2,
+        "production_orders": 2,
+        "weight_kg": "100.150",
+    }
+
+
 def test_new_snapshot_replaces_window_and_conflicting_replay_is_rejected(
     client,
     app,
@@ -210,6 +245,7 @@ def test_detailed_history_suppresses_stale_snapshot_after_all_rows_are_voided(
         "/api/monitoring/v1/production-progress?date=2026-07-17"
     ).get_json()
     assert detailed["summary"]["weight_kg"] == "25.125"
+    assert detailed["monthly_summary"]["weight_kg"] == "25.125"
 
     with app.app_context():
         EstacionPesajeLegacy.query.update({"is_deleted": True})
@@ -224,6 +260,8 @@ def test_detailed_history_suppresses_stale_snapshot_after_all_rows_are_voided(
         "stations_reporting": 0,
         "weight_kg": "0.000",
     }
+    assert empty["monthly_summary"]["weight_kg"] == "0.000"
+    assert empty["monthly_summary"]["production_days"] == 0
 
 
 @pytest.mark.parametrize(

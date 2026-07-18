@@ -2,7 +2,7 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
@@ -347,6 +347,103 @@ def _station_status(station, now):
     )
 
 
+def _month_bounds(operational_date):
+    period_start = operational_date.replace(day=1)
+    next_month = (
+        date(period_start.year + 1, 1, 1)
+        if period_start.month == 12
+        else date(period_start.year, period_start.month + 1, 1)
+    )
+    return period_start, next_month - timedelta(days=1)
+
+
+def _monthly_progress_summary(
+    operational_date,
+    *,
+    op=None,
+    machine_code=None,
+    shift=None,
+):
+    period_start, period_end = _month_bounds(operational_date)
+    detailed_station_dates = set(
+        db.session.query(
+            EstacionPesajeLegacy.station_id,
+            EstacionPesajeLegacy.operational_date,
+        )
+        .filter(EstacionPesajeLegacy.operational_date.between(period_start, period_end))
+        .distinct()
+        .all()
+    )
+
+    capture_query = EstacionPesajeLegacy.query.filter(
+        EstacionPesajeLegacy.operational_date.between(period_start, period_end),
+        EstacionPesajeLegacy.is_deleted.is_(False),
+    )
+    if op:
+        capture_query = capture_query.filter(
+            EstacionPesajeLegacy.op_normalized == _dimension(op)
+        )
+    if machine_code:
+        capture_query = capture_query.filter(
+            EstacionPesajeLegacy.machine_normalized == _dimension(machine_code)
+        )
+    if shift:
+        capture_query = capture_query.filter(
+            EstacionPesajeLegacy.shift_normalized == _dimension(shift)
+        )
+    captures = capture_query.all()
+
+    aggregate_query = EstacionAvanceProduccion.query.filter(
+        EstacionAvanceProduccion.operational_date.between(period_start, period_end)
+    )
+    if op:
+        aggregate_query = aggregate_query.filter(
+            EstacionAvanceProduccion.op == _dimension(op)
+        )
+    if machine_code:
+        aggregate_query = aggregate_query.filter(
+            EstacionAvanceProduccion.machine_code == _dimension(machine_code)
+        )
+    if shift:
+        aggregate_query = aggregate_query.filter(
+            EstacionAvanceProduccion.shift == _dimension(shift)
+        )
+    aggregate_rows = [
+        row
+        for row in aggregate_query.all()
+        if (row.station_id, row.operational_date) not in detailed_station_dates
+    ]
+
+    total_weight = sum(
+        (Decimal(row.weight_kg) for row in captures),
+        Decimal("0"),
+    ) + sum(
+        (Decimal(row.weight_kg) for row in aggregate_rows),
+        Decimal("0"),
+    )
+    production_days = {row.operational_date for row in captures} | {
+        row.operational_date for row in aggregate_rows
+    }
+    production_orders = {
+        row.op_normalized for row in captures if row.op_normalized
+    } | {row.op for row in aggregate_rows if row.op}
+    daily_average = (
+        total_weight / len(production_days)
+        if production_days
+        else Decimal("0")
+    )
+    return {
+        "month": period_start.strftime("%Y-%m"),
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "bags": len(captures) + sum(row.bags for row in aggregate_rows),
+        "weight_kg": _format_kg(total_weight),
+        "production_orders": len(production_orders),
+        "production_days": len(production_days),
+        "average_daily_weight_kg": _format_kg(daily_average),
+    }
+
+
 def production_progress_dashboard(
     operational_date,
     *,
@@ -611,6 +708,12 @@ def production_progress_dashboard(
         "source": SOURCE,
         "operational_date": operational_date.isoformat(),
         "generated_at_utc": _iso(latest_report),
+        "monthly_summary": _monthly_progress_summary(
+            operational_date,
+            op=op,
+            machine_code=machine_code,
+            shift=shift,
+        ),
         "summary": {
             "bags": sum(item["bags"] for item in items),
             "weight_kg": _format_kg(total_weight),
