@@ -20,3 +20,10 @@ from app.models.estacion_pesaje import (
     EstacionReporteAvanceRecepcion,
     EstacionAvanceProduccion,
 )
+from app.models.legacy_pesaje import (
+    EstacionCierreOpLegacy,
+    EstacionImportacionPesajeLegacy,
+    EstacionImportacionPesajeLegacyChunk,
+    EstacionImportacionPesajeLegacyFila,
+    EstacionPesajeLegacy,
+)

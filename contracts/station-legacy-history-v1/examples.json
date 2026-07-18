@@ -1,0 +1,67 @@
+{
+  "request": {
+    "contract_version": "station-legacy-history-v1",
+    "import_id": "7dc10871-5611-4b79-a179-cfb68b24fe24",
+    "manifest": {
+      "source_sha256": "7939f1d68c8b361f5495498769d0056cc3da3b4e0864ab03cc78a45d580f62c6",
+      "source_size_bytes": 2060288,
+      "source_schema_version": 5,
+      "source_total_rows": 2,
+      "source_active_rows": 1,
+      "source_deleted_rows": 1,
+      "source_first_capture_local": "2026-07-17 08:00:00",
+      "source_last_capture_local": "2026-07-17 09:00:00"
+    },
+    "chunk_index": 0,
+    "total_chunks": 1,
+    "rows": [
+      {
+        "legacy_id": 1001,
+        "weight_kg": "25.125",
+        "captured_at_local": "2026-07-17 08:00:00",
+        "deleted_at_local": null,
+        "op": "OP-0213",
+        "ot": "026021",
+        "mold": "EMBUDO N1",
+        "color": "blanco ",
+        "machine_code": "HT-160B",
+        "shift": "DIA",
+        "operator": null,
+        "raw": {}
+      },
+      {
+        "legacy_id": 1002,
+        "weight_kg": "30.000",
+        "captured_at_local": "2026-07-17 09:00:00",
+        "deleted_at_local": "2026-07-17 10:00:00",
+        "op": "OP-213",
+        "ot": "025639",
+        "mold": "FLORERO AMERICANO",
+        "color": "NARAMJA",
+        "machine_code": "SOPLADORA-2B",
+        "shift": null,
+        "operator": null,
+        "raw": {}
+      }
+    ],
+    "closures": [
+      {
+        "op": "OP-0069",
+        "mold": "ESCURRIDOR PORTAVAJILLA",
+        "reason": "culmino produccion",
+        "closed_at_local": "2026-06-29 21:00:35"
+      }
+    ]
+  },
+  "response": {
+    "accepted": true,
+    "station_id": "7f99acdd-63e6-4385-bc16-b904d5d8d5ee",
+    "import_id": "7dc10871-5611-4b79-a179-cfb68b24fe24",
+    "chunk_index": 0,
+    "chunks_received": 1,
+    "total_chunks": 1,
+    "status": "COMPLETE",
+    "received_at_utc": "2026-07-18T18:00:00+00:00"
+  }
+}
+

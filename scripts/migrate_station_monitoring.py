@@ -18,6 +18,13 @@ from app.models.estacion_pesaje import (  # noqa: F401
     EstacionPesaje,
     EstacionReporteAvanceRecepcion,
 )
+from app.models.legacy_pesaje import (  # noqa: F401
+    EstacionCierreOpLegacy,
+    EstacionImportacionPesajeLegacy,
+    EstacionImportacionPesajeLegacyChunk,
+    EstacionImportacionPesajeLegacyFila,
+    EstacionPesajeLegacy,
+)
 
 
 STATION_MONITORING_TABLES = (
@@ -27,6 +34,11 @@ STATION_MONITORING_TABLES = (
     "estacion_estado_historial",
     "estacion_reporte_avance_recepcion",
     "estacion_avance_produccion",
+    "estacion_importacion_pesaje_legacy",
+    "estacion_importacion_pesaje_legacy_chunk",
+    "estacion_pesaje_legacy",
+    "estacion_importacion_pesaje_legacy_fila",
+    "estacion_cierre_op_legacy",
 )
 
 
