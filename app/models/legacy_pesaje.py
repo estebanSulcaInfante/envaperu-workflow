@@ -180,3 +180,48 @@ class EstacionCierreOpLegacy(db.Model):
     reason_raw = db.Column(db.String(500), nullable=True)
     closed_at_local = db.Column(db.String(40), nullable=False)
     closed_at_utc = db.Column(db.DateTime(timezone=True), nullable=False)
+
+
+class EstacionDeltaPesajeLegacy(db.Model):
+    __tablename__ = "estacion_delta_pesaje_legacy"
+
+    batch_id = db.Column(db.String(36), primary_key=True)
+    station_id = db.Column(
+        db.String(36),
+        db.ForeignKey("estacion_pesaje.station_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    payload_hash = db.Column(db.String(64), nullable=False)
+    rows_received = db.Column(db.Integer, nullable=False)
+    rows_created = db.Column(db.Integer, nullable=False)
+    high_watermark = db.Column(db.Integer, nullable=False)
+    received_at_utc = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class EstacionComandoPiloto(db.Model):
+    __tablename__ = "estacion_comando_piloto"
+
+    command_id = db.Column(db.String(36), primary_key=True)
+    station_id = db.Column(
+        db.String(36),
+        db.ForeignKey("estacion_pesaje.station_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    action = db.Column(db.String(30), nullable=False, index=True)
+    legacy_pesaje_id = db.Column(db.Integer, nullable=True)
+    op_raw = db.Column(db.String(50), nullable=True)
+    requested_by = db.Column(db.String(120), nullable=False)
+    reason = db.Column(db.String(500), nullable=False)
+    payload_hash = db.Column(db.String(64), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="PENDING", index=True)
+    requested_at_utc = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    delivered_at_utc = db.Column(db.DateTime(timezone=True), nullable=True)
+    applied_at_utc = db.Column(db.DateTime(timezone=True), nullable=True)
+    error_code = db.Column(db.String(100), nullable=True)
+    result_json = db.Column(db.Text, nullable=True)

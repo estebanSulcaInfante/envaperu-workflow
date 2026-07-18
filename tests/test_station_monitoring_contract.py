@@ -29,6 +29,7 @@ pytestmark = pytest.mark.contract
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 CAPABILITIES_DIR = WORKSPACE_ROOT / "contracts" / "station-capabilities-v1"
 HEARTBEAT_DIR = WORKSPACE_ROOT / "contracts" / "station-heartbeat-v1"
+CONTINUITY_DIR = WORKSPACE_ROOT / "contracts" / "station-legacy-continuity-v1"
 STATION_TOKEN = "central-monitoring-test-token-with-high-entropy-0001"
 
 
@@ -51,6 +52,7 @@ def test_provider_contract_copies_match_workspace_canonical():
         "station-capabilities-v1",
         "station-heartbeat-v1",
         "station-production-progress-v1",
+        "station-legacy-continuity-v1",
     ):
         for filename in ("contract.schema.json", "examples.json"):
             canonical = WORKSPACE_ROOT / "contracts" / contract / filename
@@ -69,6 +71,22 @@ def test_station_monitoring_schema_migration_is_scoped_and_idempotent():
     assert first_created == list(STATION_MONITORING_TABLES)
     assert second_created == []
     assert set(inspect(engine).get_table_names()) == set(STATION_MONITORING_TABLES)
+
+
+def test_legacy_continuity_examples_match_contract():
+    examples = _load_json(CONTINUITY_DIR / "examples.json")
+    schema = _load_json(CONTINUITY_DIR / "contract.schema.json")
+    for definition in (
+        "syncState",
+        "deltaRequest",
+        "deltaResponse",
+        "commandList",
+        "commandAckRequest",
+    ):
+        Draft202012Validator(
+            {**schema, "$ref": f"#/$defs/{definition}"},
+            format_checker=FormatChecker(),
+        ).validate(examples[definition])
 
 
 def _auth_headers(token=STATION_TOKEN):
@@ -145,6 +163,7 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "legacy_weight_ingest_enabled": False,
         "monitoring": True,
         "remote_hardware_commands": False,
+        "pilot_data_commands": True,
     }
 
 

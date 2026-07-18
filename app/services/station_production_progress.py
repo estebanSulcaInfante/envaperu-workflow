@@ -15,8 +15,10 @@ from sqlalchemy.exc import IntegrityError
 from app.extensions import db
 from app.models.estacion_pesaje import (
     EstacionAvanceProduccion,
+    EstacionPesaje,
     EstacionReporteAvanceRecepcion,
 )
+from app.models.legacy_pesaje import EstacionPesajeLegacy
 from app.models.orden import OrdenProduccion
 from app.services.station_monitoring import classify_communication
 
@@ -365,14 +367,108 @@ def production_progress_dashboard(
         )
     if shift:
         query = query.filter(EstacionAvanceProduccion.shift == _dimension(shift))
-    rows = query.order_by(
+    aggregate_rows = query.order_by(
         EstacionAvanceProduccion.op,
         EstacionAvanceProduccion.ot,
         EstacionAvanceProduccion.machine_code,
         EstacionAvanceProduccion.shift,
     ).all()
 
-    op_keys = sorted({row.op for row in rows if row.op})
+    detailed_station_ids = {
+        station_id
+        for (station_id,) in db.session.query(EstacionPesajeLegacy.station_id)
+        .filter(EstacionPesajeLegacy.operational_date == operational_date)
+        .distinct()
+        .all()
+    }
+    capture_query = EstacionPesajeLegacy.query.filter_by(
+        operational_date=operational_date,
+        is_deleted=False,
+    )
+    if op:
+        capture_query = capture_query.filter(
+            EstacionPesajeLegacy.op_normalized == _dimension(op)
+        )
+    if machine_code:
+        capture_query = capture_query.filter(
+            EstacionPesajeLegacy.machine_normalized == _dimension(machine_code)
+        )
+    if shift:
+        capture_query = capture_query.filter(
+            EstacionPesajeLegacy.shift_normalized == _dimension(shift)
+        )
+    captures = capture_query.all()
+    aggregate_rows = [
+        row for row in aggregate_rows if row.station_id not in detailed_station_ids
+    ]
+
+    observations = [
+        {
+            "station_id": row.station_id,
+            "op": row.op,
+            "ot": row.ot,
+            "mold": row.mold,
+            "color": row.color,
+            "machine_code": row.machine_code,
+            "shift": row.shift,
+            "bags": row.bags,
+            "weight_kg": Decimal(row.weight_kg),
+            "first_capture_at_utc": _utc(row.first_capture_at_utc),
+            "last_capture_at_utc": _utc(row.last_capture_at_utc),
+            "received_at_utc": _utc(row.report_received_at_utc),
+        }
+        for row in aggregate_rows
+    ]
+    detailed_groups = defaultdict(
+        lambda: {
+            "bags": 0,
+            "weight_kg": Decimal("0"),
+            "first_capture_at_utc": None,
+            "last_capture_at_utc": None,
+            "received_at_utc": None,
+        }
+    )
+    for capture in captures:
+        key = (
+            capture.station_id,
+            capture.op_normalized,
+            capture.ot_normalized,
+            capture.mold_normalized,
+            capture.color_normalized,
+            capture.machine_normalized,
+            capture.shift_normalized,
+        )
+        bucket = detailed_groups[key]
+        bucket["bags"] += 1
+        bucket["weight_kg"] += Decimal(capture.weight_kg)
+        bucket["first_capture_at_utc"] = min(
+            filter(None, (bucket["first_capture_at_utc"], _utc(capture.captured_at_utc))),
+            default=None,
+        )
+        bucket["last_capture_at_utc"] = max(
+            filter(None, (bucket["last_capture_at_utc"], _utc(capture.captured_at_utc))),
+            default=None,
+        )
+        bucket["received_at_utc"] = max(
+            filter(None, (bucket["received_at_utc"], _utc(capture.imported_at_utc))),
+            default=None,
+        )
+    for key, bucket in detailed_groups.items():
+        station_id, item_op, ot, mold, color, machine, item_shift = key
+        observations.append(
+            {
+                "station_id": station_id,
+                "op": item_op,
+                "ot": ot,
+                "mold": mold,
+                "color": color,
+                "machine_code": machine,
+                "shift": item_shift,
+                **bucket,
+            }
+        )
+
+    op_keys = sorted({row["op"] for row in observations if row["op"]})
     orders = {}
     if op_keys:
         for order in OrdenProduccion.query.filter(
@@ -392,15 +488,23 @@ def production_progress_dashboard(
     )
     reporting_stations = set()
     latest_report = None
-    for row in rows:
-        key = row.op or "__UNASSIGNED__"
+    stations_by_id = {
+        station.station_id: station
+        for station in EstacionPesaje.query.filter(
+            EstacionPesaje.station_id.in_(
+                sorted({row["station_id"] for row in observations})
+            )
+        ).all()
+    } if observations else {}
+    for row in observations:
+        key = row["op"] or "__UNASSIGNED__"
         group = grouped[key]
-        group["bags"] += row.bags
-        group["weight_kg"] += Decimal(row.weight_kg)
-        group["station_ids"].add(row.station_id)
-        reporting_stations.add(row.station_id)
+        group["bags"] += row["bags"]
+        group["weight_kg"] += row["weight_kg"]
+        group["station_ids"].add(row["station_id"])
+        reporting_stations.add(row["station_id"])
         group["last_capture_at_utc"] = max(
-            filter(None, (group["last_capture_at_utc"], _utc(row.last_capture_at_utc))),
+            filter(None, (group["last_capture_at_utc"], row["last_capture_at_utc"])),
             default=None,
         )
         group["last_report_received_at_utc"] = max(
@@ -408,28 +512,28 @@ def production_progress_dashboard(
                 None,
                 (
                     group["last_report_received_at_utc"],
-                    _utc(row.report_received_at_utc),
+                    row["received_at_utc"],
                 ),
             ),
             default=None,
         )
         latest_report = max(
-            filter(None, (latest_report, _utc(row.report_received_at_utc))),
+            filter(None, (latest_report, row["received_at_utc"])),
             default=None,
         )
         group["details"].append(
             {
-                "station_id": row.station_id,
-                "station_code": row.estacion.codigo,
-                "ot": row.ot,
-                "mold": row.mold,
-                "color": row.color,
-                "machine_code": row.machine_code,
-                "shift": row.shift,
-                "bags": row.bags,
-                "weight_kg": _format_kg(row.weight_kg),
-                "first_capture_at_utc": _iso(row.first_capture_at_utc),
-                "last_capture_at_utc": _iso(row.last_capture_at_utc),
+                "station_id": row["station_id"],
+                "station_code": stations_by_id[row["station_id"]].codigo,
+                "ot": row["ot"],
+                "mold": row["mold"],
+                "color": row["color"],
+                "machine_code": row["machine_code"],
+                "shift": row["shift"],
+                "bags": row["bags"],
+                "weight_kg": _format_kg(row["weight_kg"]),
+                "first_capture_at_utc": _iso(row["first_capture_at_utc"]),
+                "last_capture_at_utc": _iso(row["last_capture_at_utc"]),
             }
         )
 
@@ -466,7 +570,7 @@ def production_progress_dashboard(
 
         stations = []
         for station_id in sorted(group["station_ids"]):
-            station = next(row.estacion for row in rows if row.station_id == station_id)
+            station = stations_by_id[station_id]
             stations.append(
                 {
                     "station_id": station_id,

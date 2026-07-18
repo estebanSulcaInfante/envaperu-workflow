@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.envaperu.local/station/legacy-continuity/v1/contract.schema.json",
+  "title": "EnvaPeru station legacy continuity v1",
+  "$defs": {
+    "nullableText": {
+      "type": ["string", "null"],
+      "maxLength": 300
+    },
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "legacy_id", "weight_kg", "captured_at_local", "deleted_at_local",
+        "op", "ot", "mold", "color", "machine_code", "shift", "operator", "raw"
+      ],
+      "properties": {
+        "legacy_id": {"type": "integer", "minimum": 1},
+        "weight_kg": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]{1,3})?$"},
+        "captured_at_local": {"type": "string", "minLength": 10, "maxLength": 40},
+        "deleted_at_local": {"$ref": "#/$defs/nullableText"},
+        "op": {"$ref": "#/$defs/nullableText"},
+        "ot": {"$ref": "#/$defs/nullableText"},
+        "mold": {"$ref": "#/$defs/nullableText"},
+        "color": {"$ref": "#/$defs/nullableText"},
+        "machine_code": {"$ref": "#/$defs/nullableText"},
+        "shift": {"$ref": "#/$defs/nullableText"},
+        "operator": {"$ref": "#/$defs/nullableText"},
+        "raw": {"type": "object"}
+      }
+    },
+    "closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "mold", "reason", "closed_at_local"],
+      "properties": {
+        "op": {"type": "string", "minLength": 1, "maxLength": 50},
+        "mold": {"$ref": "#/$defs/nullableText"},
+        "reason": {"type": ["string", "null"], "maxLength": 500},
+        "closed_at_local": {"type": "string", "minLength": 10, "maxLength": 40}
+      }
+    },
+    "syncState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["station_id", "initial_import_id", "high_watermark", "contract_version"],
+      "properties": {
+        "station_id": {"type": "string", "format": "uuid"},
+        "initial_import_id": {"type": "string", "format": "uuid"},
+        "high_watermark": {"type": "integer", "minimum": 0},
+        "contract_version": {"const": "station-legacy-continuity-v1"}
+      }
+    },
+    "deltaRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "batch_id", "rows", "closures"],
+      "properties": {
+        "contract_version": {"const": "station-legacy-continuity-v1"},
+        "batch_id": {"type": "string", "format": "uuid"},
+        "rows": {"type": "array", "maxItems": 500, "items": {"$ref": "#/$defs/row"}},
+        "closures": {"type": "array", "maxItems": 500, "items": {"$ref": "#/$defs/closure"}}
+      }
+    },
+    "deltaResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted", "station_id", "batch_id", "rows_received", "rows_created",
+        "high_watermark", "received_at_utc"
+      ],
+      "properties": {
+        "accepted": {"const": true},
+        "station_id": {"type": "string", "format": "uuid"},
+        "batch_id": {"type": "string", "format": "uuid"},
+        "rows_received": {"type": "integer", "minimum": 0},
+        "rows_created": {"type": "integer", "minimum": 0},
+        "high_watermark": {"type": "integer", "minimum": 0},
+        "received_at_utc": {"type": "string", "format": "date-time"}
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_id", "station_id", "action", "legacy_pesaje_id", "op",
+        "requested_by", "reason", "status", "requested_at_utc", "delivered_at_utc",
+        "applied_at_utc", "error_code"
+      ],
+      "properties": {
+        "command_id": {"type": "string", "format": "uuid"},
+        "station_id": {"type": "string", "format": "uuid"},
+        "action": {"enum": ["VOID_CAPTURE", "CLOSE_OP", "REOPEN_OP"]},
+        "legacy_pesaje_id": {"type": ["integer", "null"], "minimum": 1},
+        "op": {"type": ["string", "null"], "maxLength": 50},
+        "requested_by": {"type": "string", "minLength": 1, "maxLength": 120},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+        "status": {"enum": ["PENDING", "DELIVERED", "APPLIED", "FAILED"]},
+        "requested_at_utc": {"type": "string", "format": "date-time"},
+        "delivered_at_utc": {"type": ["string", "null"], "format": "date-time"},
+        "applied_at_utc": {"type": ["string", "null"], "format": "date-time"},
+        "error_code": {"type": ["string", "null"], "maxLength": 100}
+      }
+    },
+    "commandList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["items"],
+      "properties": {
+        "items": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/command"}}
+      }
+    },
+    "commandAckRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "result"],
+      "properties": {
+        "status": {"enum": ["APPLIED", "FAILED"]},
+        "error_code": {"type": ["string", "null"], "maxLength": 100},
+        "result": {"type": "object"}
+      }
+    }
+  }
+}

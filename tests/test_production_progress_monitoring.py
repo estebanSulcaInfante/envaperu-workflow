@@ -15,6 +15,7 @@ from app.models.estacion_pesaje import (
     EstacionReporteAvanceRecepcion,
 )
 from app.models.orden import OrdenProduccion
+from app.models.legacy_pesaje import EstacionPesajeLegacy
 from app.services.station_auth import hash_station_token
 
 
@@ -22,6 +23,7 @@ pytestmark = pytest.mark.contract
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = WORKSPACE_ROOT / "contracts" / "station-production-progress-v1"
+LEGACY_HISTORY_DIR = WORKSPACE_ROOT / "contracts" / "station-legacy-history-v1"
 STATION_TOKEN = "production-progress-test-token-with-high-entropy-0001"
 
 
@@ -178,6 +180,50 @@ def test_new_snapshot_replaces_window_and_conflicting_replay_is_rejected(
         assert str(rows[0].weight_kg) == "25.125"
         assert EstacionReporteAvanceRecepcion.query.count() == 2
         assert ControlPeso.query.count() == 0
+
+
+def test_detailed_history_suppresses_stale_snapshot_after_all_rows_are_voided(
+    client,
+    app,
+    progress_station,
+):
+    assert _put(client, progress_station, _load_example()).status_code == 200
+    history = json.loads(
+        (LEGACY_HISTORY_DIR / "examples.json").read_text(encoding="utf-8")
+    )["request"]
+    history["import_id"] = str(uuid.uuid4())
+    history["manifest"]["source_sha256"] = uuid.uuid4().hex * 2
+    imported = client.put(
+        (
+            f"/api/integration/v1/stations/{progress_station}/legacy-history/"
+            f"imports/{history['import_id']}/chunks/0"
+        ),
+        headers={
+            **_headers({"report_id": str(uuid.uuid4())}),
+            "Idempotency-Key": f"{history['import_id']}:0",
+        },
+        json=history,
+    )
+    assert imported.status_code == 200
+
+    detailed = client.get(
+        "/api/monitoring/v1/production-progress?date=2026-07-17"
+    ).get_json()
+    assert detailed["summary"]["weight_kg"] == "25.125"
+
+    with app.app_context():
+        EstacionPesajeLegacy.query.update({"is_deleted": True})
+        db.session.commit()
+
+    empty = client.get(
+        "/api/monitoring/v1/production-progress?date=2026-07-17"
+    ).get_json()
+    assert empty["summary"] == {
+        "bags": 0,
+        "production_orders": 0,
+        "stations_reporting": 0,
+        "weight_kg": "0.000",
+    }
 
 
 @pytest.mark.parametrize(

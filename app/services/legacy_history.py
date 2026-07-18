@@ -13,6 +13,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from app.extensions import db
 from app.models.legacy_pesaje import (
+    EstacionComandoPiloto,
     EstacionCierreOpLegacy,
     EstacionImportacionPesajeLegacy,
     EstacionImportacionPesajeLegacyChunk,
@@ -431,27 +432,15 @@ def _latest_complete_imports():
 
 def _current_snapshot_captures():
     imports = _latest_complete_imports()
-    import_ids = [record.import_id for record in imports.values()]
-    if not import_ids:
+    station_ids = list(imports)
+    if not station_ids:
         return imports, []
-    links = EstacionImportacionPesajeLegacyFila.query.filter(
-        EstacionImportacionPesajeLegacyFila.import_id.in_(import_ids)
+    captures = EstacionPesajeLegacy.query.filter(
+        EstacionPesajeLegacy.station_id.in_(station_ids)
     ).all()
-    by_import = defaultdict(list)
-    capture_ids = []
-    for link in links:
-        by_import[link.import_id].append(link.capture_id)
-        capture_ids.append(link.capture_id)
-    captures_by_id = {
-        item.id: item
-        for item in EstacionPesajeLegacy.query.filter(
-            EstacionPesajeLegacy.id.in_(capture_ids)
-        ).all()
-    }
-    captures = []
-    for import_id, ids in by_import.items():
-        captures.extend((import_id, captures_by_id[item_id]) for item_id in ids)
-    return imports, captures
+    return imports, [
+        (imports[capture.station_id].import_id, capture) for capture in captures
+    ]
 
 
 def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
@@ -466,6 +455,14 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
     )
     closure_map = {
         (item.import_id, item.station_id, item.op_raw): item for item in closures
+    }
+    pending_commands = EstacionComandoPiloto.query.filter(
+        EstacionComandoPiloto.status.in_(("PENDING", "DELIVERED"))
+    ).all()
+    pending_by_order = {
+        (item.station_id, item.op_raw): item
+        for item in pending_commands
+        if item.action in {"CLOSE_OP", "REOPEN_OP"}
     }
     central_orders = {
         item.numero_op: item
@@ -520,14 +517,17 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
         import_id, station_id, op_raw = key
         central = central_orders.get(op_raw)
         closure = closure_map.get((import_id, station_id, op_raw))
-        if central is not None:
-            visible_status = "ACTIVA_CENTRAL" if central.activa else "CERRADA_CENTRAL"
+        pending = pending_by_order.get((station_id, op_raw))
+        if pending is not None:
+            visible_status = (
+                "CIERRE_PENDIENTE"
+                if pending.action == "CLOSE_OP"
+                else "REAPERTURA_PENDIENTE"
+            )
         elif closure is not None:
             visible_status = "CERRADA_LEGACY"
-        elif group["resolution_status"] == "PENDIENTE_MAPEO":
-            visible_status = "PENDIENTE_MAPEO"
         else:
-            visible_status = "SIN_CIERRE_LEGACY"
+            visible_status = "ABIERTA_PILOTO"
         items.append(
             {
                 **{
@@ -544,6 +544,12 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
                     }
                 },
                 "status": visible_status,
+                "mapping_status": group["resolution_status"],
+                "central_status": (
+                    ("ACTIVA_CENTRAL" if central.activa else "CERRADA_CENTRAL")
+                    if central is not None
+                    else None
+                ),
                 "active_weight_kg": _format_kg(group["active_weight_kg"]),
                 "first_capture_at_utc": _iso(group["first_capture_at_utc"]),
                 "last_capture_at_utc": _iso(group["last_capture_at_utc"]),
@@ -559,6 +565,15 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
                     else None
                 ),
                 "source": SOURCE,
+                "pending_command": (
+                    {
+                        "command_id": pending.command_id,
+                        "action": pending.action,
+                        "status": pending.status,
+                    }
+                    if pending is not None
+                    else None
+                ),
             }
         )
 
@@ -571,7 +586,10 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
             or any(query_normalized in value for value in item["molds"])
         ]
     if status:
-        items = [item for item in items if item["status"] == status]
+        if status == "PENDIENTE_MAPEO":
+            items = [item for item in items if item["mapping_status"] == status]
+        else:
+            items = [item for item in items if item["status"] == status]
     items.sort(
         key=lambda item: (item["last_capture_at_utc"] or "", item["op_raw"]),
         reverse=True,
@@ -598,7 +616,7 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
                 for item in items
             ),
             "pending_mapping_orders": sum(
-                item["status"] == "PENDIENTE_MAPEO" for item in items
+                item["mapping_status"] == "PENDIENTE_MAPEO" for item in items
             ),
         },
         "source": SOURCE,
@@ -622,6 +640,14 @@ def legacy_production_order_detail(station_id, op_raw, *, page=1, per_page=100):
     captures.sort(key=lambda item: (item.captured_at_utc, item.legacy_pesaje_id), reverse=True)
     start = (page - 1) * per_page
     selected = captures[start : start + per_page]
+    pending_voids = {
+        item.legacy_pesaje_id: item
+        for item in EstacionComandoPiloto.query.filter(
+            EstacionComandoPiloto.station_id == station_id,
+            EstacionComandoPiloto.action == "VOID_CAPTURE",
+            EstacionComandoPiloto.status.in_(("PENDING", "DELIVERED")),
+        ).all()
+    }
     return {
         "station_id": station_id,
         "op_raw": op_raw,
@@ -646,6 +672,14 @@ def legacy_production_order_detail(station_id, op_raw, *, page=1, per_page=100):
                 "machine_code": item.machine_raw,
                 "shift": item.shift_raw,
                 "operator": item.operator_raw,
+                "pending_command": (
+                    {
+                        "command_id": pending_voids[item.legacy_pesaje_id].command_id,
+                        "status": pending_voids[item.legacy_pesaje_id].status,
+                    }
+                    if item.legacy_pesaje_id in pending_voids
+                    else None
+                ),
             }
             for item in selected
         ],

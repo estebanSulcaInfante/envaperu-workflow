@@ -11,6 +11,7 @@ from app.extensions import db
 from app.models.control_peso import ControlPeso
 from app.models.estacion_pesaje import EstacionPesaje
 from app.models.legacy_pesaje import (
+    EstacionComandoPiloto,
     EstacionCierreOpLegacy,
     EstacionImportacionPesajeLegacy,
     EstacionImportacionPesajeLegacyChunk,
@@ -199,8 +200,9 @@ def test_order_index_separates_pending_closed_and_deleted_totals(
     by_op = {item["op_raw"]: item for item in body["items"]}
     assert by_op["OP-0069"]["status"] == "CERRADA_LEGACY"
     assert by_op["OP-0069"]["active_weight_kg"] == "10.000"
-    assert by_op["OP-0213"]["status"] == "SIN_CIERRE_LEGACY"
-    assert by_op["OP-213"]["status"] == "PENDIENTE_MAPEO"
+    assert by_op["OP-0213"]["status"] == "ABIERTA_PILOTO"
+    assert by_op["OP-213"]["status"] == "ABIERTA_PILOTO"
+    assert by_op["OP-213"]["mapping_status"] == "PENDIENTE_MAPEO"
     assert by_op["OP-213"]["active_bags"] == 0
     assert by_op["OP-213"]["deleted_bags"] == 1
 
@@ -215,3 +217,170 @@ def test_order_index_separates_pending_closed_and_deleted_totals(
     )
     assert detail.status_code == 200
     assert detail.get_json()["captures"][0]["is_deleted"] is True
+
+
+def _station_headers(idempotency_key=None):
+    headers = {
+        "Authorization": f"Bearer {STATION_TOKEN}",
+        "X-Station-Version": "1.1.0-pilot",
+        "X-Correlation-Id": str(uuid.uuid4()),
+    }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    return headers
+
+
+def test_continuity_delta_extends_same_history_and_progress_read_model(
+    client,
+    app,
+    history_station,
+):
+    initial = _examples()["request"]
+    assert _put(client, history_station, initial).status_code == 200
+    batch_id = str(uuid.uuid4())
+    payload = {
+        "contract_version": "station-legacy-continuity-v1",
+        "batch_id": batch_id,
+        "rows": [
+            {
+                "legacy_id": 1003,
+                "weight_kg": "12.500",
+                "captured_at_local": "2026-07-18 08:00:00",
+                "deleted_at_local": None,
+                "op": "OP-0213",
+                "ot": "026021",
+                "mold": "EMBUDO N1",
+                "color": "BLANCO",
+                "machine_code": "HT-160B",
+                "shift": "DIA",
+                "operator": "OPERADOR PILOTO",
+                "raw": {"id": 1003},
+            }
+        ],
+        "closures": [],
+    }
+    url = (
+        f"/api/integration/v1/stations/{history_station}/legacy-history/"
+        f"deltas/{batch_id}"
+    )
+    first = client.put(url, headers=_station_headers(batch_id), json=payload)
+    replay = client.put(url, headers=_station_headers(batch_id), json=payload)
+    assert first.status_code == 200
+    assert replay.get_json() == first.get_json()
+    assert first.get_json()["rows_created"] == 1
+
+    orders = client.get("/api/monitoring/v1/legacy-production-orders").get_json()
+    op = next(item for item in orders["items"] if item["op_raw"] == "OP-0213")
+    assert op["active_bags"] == 2
+    assert op["active_weight_kg"] == "37.625"
+
+    progress = client.get(
+        "/api/monitoring/v1/production-progress?date=2026-07-18"
+    ).get_json()
+    assert progress["summary"]["bags"] == 1
+    assert progress["summary"]["weight_kg"] == "12.500"
+    assert ControlPeso.query.count() == 0
+
+
+def test_pilot_commands_void_close_and_reopen_with_station_ack(
+    client,
+    app,
+    history_station,
+):
+    initial = _examples()["request"]
+    assert _put(client, history_station, initial).status_code == 200
+
+    def create(action, **target):
+        command_id = str(uuid.uuid4())
+        response = client.post(
+            "/api/monitoring/v1/pilot-commands",
+            json={
+                "command_id": command_id,
+                "station_id": history_station,
+                "action": action,
+                "requested_by": "Gerencia",
+                "reason": "Validacion del piloto",
+                **target,
+            },
+        )
+        assert response.status_code == 202
+        return command_id
+
+    already_open = client.post(
+        "/api/monitoring/v1/pilot-commands",
+        json={
+            "command_id": str(uuid.uuid4()),
+            "station_id": history_station,
+            "action": "REOPEN_OP",
+            "op": "OP-0213",
+            "requested_by": "Gerencia",
+            "reason": "Prueba de estado",
+        },
+    )
+    assert already_open.status_code == 409
+    assert already_open.get_json()["code"] == "ORDER_ALREADY_OPEN"
+
+    void_id = create("VOID_CAPTURE", legacy_pesaje_id=1001)
+    close_id = create("CLOSE_OP", op="OP-0213")
+    conflicting_lifecycle = client.post(
+        "/api/monitoring/v1/pilot-commands",
+        json={
+            "command_id": str(uuid.uuid4()),
+            "station_id": history_station,
+            "action": "REOPEN_OP",
+            "op": "OP-0213",
+            "requested_by": "Gerencia",
+            "reason": "No debe adelantarse al cierre pendiente",
+        },
+    )
+    assert conflicting_lifecycle.status_code == 409
+    assert conflicting_lifecycle.get_json()["code"] == "COMMAND_ALREADY_PENDING"
+    commands = client.get(
+        f"/api/integration/v1/stations/{history_station}/pilot-commands",
+        headers=_station_headers(),
+    ).get_json()["items"]
+    assert {item["command_id"] for item in commands} == {void_id, close_id}
+
+    void_ack = client.post(
+        f"/api/integration/v1/stations/{history_station}/pilot-commands/{void_id}/ack",
+        headers=_station_headers(),
+        json={
+            "status": "APPLIED",
+            "result": {"deleted_at_local": "2026-07-18 09:00:00"},
+        },
+    )
+    assert void_ack.status_code == 200
+    close_ack = client.post(
+        f"/api/integration/v1/stations/{history_station}/pilot-commands/{close_id}/ack",
+        headers=_station_headers(),
+        json={
+            "status": "APPLIED",
+            "result": {
+                "closed_at_local": "2026-07-18 09:01:00",
+                "mold": "EMBUDO N1",
+            },
+        },
+    )
+    assert close_ack.status_code == 200
+
+    detail = client.get(
+        "/api/monitoring/v1/legacy-production-orders/detail",
+        query_string={"station_id": history_station, "op": "OP-0213"},
+    ).get_json()
+    assert detail["captures"][0]["is_deleted"] is True
+    orders = client.get("/api/monitoring/v1/legacy-production-orders").get_json()
+    op = next(item for item in orders["items"] if item["op_raw"] == "OP-0213")
+    assert op["status"] == "CERRADA_LEGACY"
+
+    reopen_id = create("REOPEN_OP", op="OP-0213")
+    assert client.post(
+        f"/api/integration/v1/stations/{history_station}/pilot-commands/{reopen_id}/ack",
+        headers=_station_headers(),
+        json={"status": "APPLIED", "result": {}},
+    ).status_code == 200
+    orders = client.get("/api/monitoring/v1/legacy-production-orders").get_json()
+    op = next(item for item in orders["items"] if item["op_raw"] == "OP-0213")
+    assert op["status"] == "ABIERTA_PILOTO"
+    with app.app_context():
+        assert EstacionComandoPiloto.query.filter_by(status="APPLIED").count() == 3
+        assert ControlPeso.query.count() == 0

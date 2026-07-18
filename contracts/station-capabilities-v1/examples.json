@@ -8,14 +8,17 @@
       "catalog": ["station-catalog-v1"],
       "weight_event": [
         "sync-pesajes-legacy-v1",
-        "station-production-progress-v1"
+        "station-production-progress-v1",
+        "station-legacy-history-v1",
+        "station-legacy-continuity-v1"
       ]
     },
     "features": {
       "monitoring": true,
       "catalog_snapshot": false,
       "legacy_weight_ingest_enabled": false,
-      "remote_hardware_commands": false
+      "remote_hardware_commands": false,
+      "pilot_data_commands": true
     }
   }
 }

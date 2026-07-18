@@ -25,6 +25,14 @@ from app.services.legacy_history import (
     legacy_production_orders,
     process_legacy_history_chunk,
 )
+from app.services.legacy_continuity import (
+    LegacyContinuityError,
+    acknowledge_command,
+    create_pilot_command,
+    history_sync_state,
+    pending_commands,
+    process_history_delta,
+)
 
 
 integration_station_bp = Blueprint("integration_station", __name__)
@@ -53,6 +61,7 @@ def capabilities():
                     "sync-pesajes-legacy-v1",
                     "station-production-progress-v1",
                     "station-legacy-history-v1",
+                    "station-legacy-continuity-v1",
                 ],
             },
             "features": {
@@ -62,6 +71,7 @@ def capabilities():
                 ),
                 "legacy_weight_ingest_enabled": False,
                 "remote_hardware_commands": False,
+                "pilot_data_commands": True,
             },
         }
     )
@@ -205,6 +215,88 @@ def legacy_history_chunk(station_id, import_id, chunk_index):
     return jsonify(ack)
 
 
+def _continuity_error(exc):
+    db.session.rollback()
+    return jsonify({"code": exc.code, "message": exc.message}), exc.status
+
+
+def _station_matches(station_id):
+    if g.authenticated_station.station_id == station_id:
+        return True, None
+    return False, (
+        jsonify(
+            {
+                "code": "STATION_ID_MISMATCH",
+                "message": "El token no pertenece al station_id solicitado",
+            }
+        ),
+        403,
+    )
+
+
+@integration_station_bp.get("/stations/<station_id>/legacy-history/sync-state")
+@require_station_auth
+def legacy_history_sync_state(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(history_sync_state(station_id))
+    except LegacyContinuityError as exc:
+        return _continuity_error(exc)
+
+
+@integration_station_bp.put(
+    "/stations/<station_id>/legacy-history/deltas/<batch_id>"
+)
+@require_station_auth
+def legacy_history_delta(station_id, batch_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(
+            process_history_delta(
+                g.authenticated_station,
+                request.get_json(silent=True),
+                batch_id,
+                request.headers.get("Idempotency-Key"),
+            )
+        )
+    except LegacyContinuityError as exc:
+        return _continuity_error(exc)
+
+
+@integration_station_bp.get("/stations/<station_id>/pilot-commands")
+@require_station_auth
+def station_pilot_commands(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    limit = min(max(request.args.get("limit", 20, type=int), 1), 100)
+    return jsonify({"items": pending_commands(station_id, limit=limit)})
+
+
+@integration_station_bp.post(
+    "/stations/<station_id>/pilot-commands/<command_id>/ack"
+)
+@require_station_auth
+def station_pilot_command_ack(station_id, command_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(
+            acknowledge_command(
+                station_id,
+                command_id,
+                request.get_json(silent=True),
+            )
+        )
+    except LegacyContinuityError as exc:
+        return _continuity_error(exc)
+
+
 def _monitor_item(station):
     return station_monitor_dict(
         station,
@@ -332,3 +424,22 @@ def get_legacy_production_order_detail():
             404,
         )
     return jsonify(detail)
+
+
+@monitoring_station_bp.post("/pilot-commands")
+def post_pilot_command():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"code": "JSON_REQUIRED", "message": "JSON requerido"}), 415
+    station_id = payload.get("station_id")
+    if db.session.get(EstacionPesaje, station_id) is None:
+        return (
+            jsonify({"code": "STATION_NOT_FOUND", "message": "Estacion no encontrada"}),
+            404,
+        )
+    try:
+        return jsonify(
+            create_pilot_command(station_id, payload.get("action"), payload)
+        ), 202
+    except LegacyContinuityError as exc:
+        return _continuity_error(exc)

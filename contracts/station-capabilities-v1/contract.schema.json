@@ -37,13 +37,15 @@
             "monitoring",
             "catalog_snapshot",
             "legacy_weight_ingest_enabled",
-            "remote_hardware_commands"
+            "remote_hardware_commands",
+            "pilot_data_commands"
           ],
           "properties": {
             "monitoring": {"type": "boolean"},
             "catalog_snapshot": {"type": "boolean"},
             "legacy_weight_ingest_enabled": {"type": "boolean"},
-            "remote_hardware_commands": {"type": "boolean"}
+            "remote_hardware_commands": {"type": "boolean"},
+            "pilot_data_commands": {"type": "boolean"}
           }
         }
       }

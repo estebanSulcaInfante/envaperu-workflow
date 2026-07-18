@@ -21,7 +21,9 @@ from app.models.estacion_pesaje import (
     EstacionAvanceProduccion,
 )
 from app.models.legacy_pesaje import (
+    EstacionComandoPiloto,
     EstacionCierreOpLegacy,
+    EstacionDeltaPesajeLegacy,
     EstacionImportacionPesajeLegacy,
     EstacionImportacionPesajeLegacyChunk,
     EstacionImportacionPesajeLegacyFila,

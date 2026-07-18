@@ -19,7 +19,9 @@ from app.models.estacion_pesaje import (  # noqa: F401
     EstacionReporteAvanceRecepcion,
 )
 from app.models.legacy_pesaje import (  # noqa: F401
+    EstacionComandoPiloto,
     EstacionCierreOpLegacy,
+    EstacionDeltaPesajeLegacy,
     EstacionImportacionPesajeLegacy,
     EstacionImportacionPesajeLegacyChunk,
     EstacionImportacionPesajeLegacyFila,
@@ -39,6 +41,8 @@ STATION_MONITORING_TABLES = (
     "estacion_pesaje_legacy",
     "estacion_importacion_pesaje_legacy_fila",
     "estacion_cierre_op_legacy",
+    "estacion_delta_pesaje_legacy",
+    "estacion_comando_piloto",
 )
 
 

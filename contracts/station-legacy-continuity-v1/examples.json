@@ -1,0 +1,63 @@
+{
+  "syncState": {
+    "station_id": "6e4a5f65-67b7-413d-a780-1c9a2669e50f",
+    "initial_import_id": "e73e0de4-a456-5e87-a073-21ab05b7addc",
+    "high_watermark": 11699,
+    "contract_version": "station-legacy-continuity-v1"
+  },
+  "deltaRequest": {
+    "contract_version": "station-legacy-continuity-v1",
+    "batch_id": "7d311d5e-d195-5c52-97b7-7818318a7277",
+    "rows": [
+      {
+        "legacy_id": 11700,
+        "weight_kg": "25.000",
+        "captured_at_local": "2026-07-18 16:30:00-05:00",
+        "deleted_at_local": null,
+        "op": "OP-0213",
+        "ot": "025639",
+        "mold": "EMBUDO N1",
+        "color": "ROJO",
+        "machine_code": "HT-160B",
+        "shift": "DIA",
+        "operator": "OPERADOR 1",
+        "raw": {"capture_id": "capture-11700"}
+      }
+    ],
+    "closures": []
+  },
+  "deltaResponse": {
+    "accepted": true,
+    "station_id": "6e4a5f65-67b7-413d-a780-1c9a2669e50f",
+    "batch_id": "7d311d5e-d195-5c52-97b7-7818318a7277",
+    "rows_received": 1,
+    "rows_created": 1,
+    "high_watermark": 11700,
+    "received_at_utc": "2026-07-18T21:30:02Z"
+  },
+  "commandList": {
+    "items": [
+      {
+        "command_id": "55bde435-c062-46b7-bc22-ce4bed1aa594",
+        "station_id": "6e4a5f65-67b7-413d-a780-1c9a2669e50f",
+        "action": "CLOSE_OP",
+        "legacy_pesaje_id": null,
+        "op": "OP-0213",
+        "requested_by": "Jefe de planta",
+        "reason": "Produccion completada",
+        "status": "DELIVERED",
+        "requested_at_utc": "2026-07-18T21:31:00Z",
+        "delivered_at_utc": "2026-07-18T21:31:10Z",
+        "applied_at_utc": null,
+        "error_code": null
+      }
+    ]
+  },
+  "commandAckRequest": {
+    "status": "APPLIED",
+    "result": {
+      "closed_at_local": "2026-07-18 16:31:11-05:00",
+      "mold": "EMBUDO N1"
+    }
+  }
+}
