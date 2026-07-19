@@ -8,6 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from flask import current_app
 from jsonschema import Draft202012Validator, FormatChecker
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -311,20 +312,27 @@ def process_production_progress(
         EstacionAvanceProduccion.operational_date >= window_start,
         EstacionAvanceProduccion.operational_date <= window_end,
     ).delete(synchronize_session=False)
-    db.session.add(receipt)
-    for row in rows:
-        db.session.add(
-            EstacionAvanceProduccion(
-                station_id=station.station_id,
-                report_id=payload_id,
-                report_received_at_utc=received_at,
-                **row,
-            )
-        )
-
     try:
+        db.session.add(receipt)
+        # No ORM relationship links the receipt to its rows. Flush the parent
+        # explicitly so PostgreSQL can enforce the report_id foreign key.
+        db.session.flush()
+        for row in rows:
+            db.session.add(
+                EstacionAvanceProduccion(
+                    station_id=station.station_id,
+                    report_id=payload_id,
+                    report_received_at_utc=received_at,
+                    **row,
+                )
+            )
         db.session.commit()
     except IntegrityError:
+        current_app.logger.exception(
+            "No se pudo persistir el reporte de avance %s de la estacion %s",
+            payload_id,
+            station.station_id,
+        )
         db.session.rollback()
         concurrent = EstacionReporteAvanceRecepcion.query.filter_by(
             report_id=payload_id

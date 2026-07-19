@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
+from sqlalchemy import text
 
 from app.extensions import db
 from app.models.control_peso import ControlPeso
@@ -144,6 +145,24 @@ def test_snapshot_replay_separates_orders_and_never_creates_inventory(
     assert op_1402["target_kg"] is None
     assert op_1402["progress_percent"] is None
     assert op_1402["target_status"] == "OP_NOT_FOUND"
+
+
+def test_progress_persists_parent_before_rows_with_foreign_keys_enabled(
+    client,
+    app,
+    progress_station,
+):
+    with app.app_context():
+        db.session.execute(text("PRAGMA foreign_keys = ON"))
+        assert db.session.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
+
+    response = _put(client, progress_station, _load_example())
+
+    assert response.status_code == 200
+    assert response.get_json()["rows_applied"] == 2
+    with app.app_context():
+        assert EstacionReporteAvanceRecepcion.query.count() == 1
+        assert EstacionAvanceProduccion.query.count() == 2
 
 
 def test_dashboard_reports_calendar_month_metrics_without_changing_daily_cut(
