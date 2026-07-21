@@ -603,6 +603,10 @@ def production_progress_dashboard(
                 lambda: {
                     "bags": 0,
                     "weight_kg": Decimal("0"),
+                    "station_ids": set(),
+                    "ots": set(),
+                    "molds": set(),
+                    "machine_codes": set(),
                     "shifts": set(),
                     "operational_dates": set(),
                     "first_capture_at_utc": None,
@@ -649,16 +653,17 @@ def production_progress_dashboard(
             filter(None, (latest_report, row["received_at_utc"])),
             default=None,
         )
-        detail_key = (
-            row["station_id"],
-            row["color"],
-            row["ot"],
-            row["mold"],
-            row["machine_code"],
-        )
+        detail_key = row["color"] or "__NO_COLOR__"
         detail = group["details"][detail_key]
         detail["bags"] += row["bags"]
         detail["weight_kg"] += row["weight_kg"]
+        detail["station_ids"].add(row["station_id"])
+        if row["ot"]:
+            detail["ots"].add(row["ot"])
+        if row["mold"]:
+            detail["molds"].add(row["mold"])
+        if row["machine_code"]:
+            detail["machine_codes"].add(row["machine_code"])
         if row["shift"]:
             detail["shifts"].add(row["shift"])
         detail["operational_dates"].update(row["operational_dates"])
@@ -726,19 +731,35 @@ def production_progress_dashboard(
         details = []
         detail_entries = sorted(
             group["details"].items(),
-            key=lambda entry: tuple(value or "" for value in entry[0][1:]),
+            key=lambda entry: entry[0],
         )
-        for detail_key, detail in detail_entries:
-            station_id, color, ot, mold, detail_machine = detail_key
+        for color_key, detail in detail_entries:
+            color = None if color_key == "__NO_COLOR__" else color_key
+            station_ids = sorted(detail["station_ids"])
+            station_codes = sorted(
+                stations_by_id[station_id].codigo for station_id in station_ids
+            )
+            ots = sorted(detail["ots"])
+            molds = sorted(detail["molds"])
+            machine_codes = sorted(detail["machine_codes"])
             shifts = sorted(detail["shifts"])
             details.append(
                 {
-                    "station_id": station_id,
-                    "station_code": stations_by_id[station_id].codigo,
+                    "station_id": station_ids[0] if len(station_ids) == 1 else None,
+                    "station_code": (
+                        station_codes[0] if len(station_codes) == 1 else None
+                    ),
+                    "station_ids": station_ids,
+                    "station_codes": station_codes,
                     "color": color,
-                    "ot": ot,
-                    "mold": mold,
-                    "machine_code": detail_machine,
+                    "ot": ots[0] if len(ots) == 1 else None,
+                    "ots": ots,
+                    "mold": molds[0] if len(molds) == 1 else None,
+                    "molds": molds,
+                    "machine_code": (
+                        machine_codes[0] if len(machine_codes) == 1 else None
+                    ),
+                    "machine_codes": machine_codes,
                     "shift": shifts[0] if len(shifts) == 1 else None,
                     "shifts": shifts,
                     "operational_dates": sorted(

@@ -208,6 +208,7 @@ def test_month_dashboard_groups_color_and_exposes_all_shifts(
     earlier = copy.deepcopy(payload["rows"][0])
     earlier.update(
         operational_date="2026-07-02",
+        ot="OT-0040",
         bags=1,
         weight_kg="25.000",
         first_capture_at_utc="2026-07-02T13:10:00Z",
@@ -250,6 +251,10 @@ def test_month_dashboard_groups_color_and_exposes_all_shifts(
     assert detail["color"] == "ROJO SOLIDO"
     assert detail["bags"] == 4
     assert detail["weight_kg"] == "85.250"
+    assert detail["ot"] is None
+    assert detail["ots"] == ["OT-0040", "OT-0041"]
+    assert detail["molds"] == ["TAPA 38 MM"]
+    assert detail["machine_codes"] == ["HT-250B"]
     assert detail["shift"] is None
     assert detail["shifts"] == ["DIURNO", "NOCTURNO"]
     assert detail["operational_dates"] == ["2026-07-02", "2026-07-17"]
