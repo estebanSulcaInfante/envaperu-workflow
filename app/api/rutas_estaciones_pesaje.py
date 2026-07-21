@@ -335,19 +335,38 @@ def get_weighing_station(station_id):
 
 @monitoring_station_bp.get("/production-progress")
 def get_production_progress():
+    raw_period = (request.args.get("period") or "day").strip().lower()
     raw_date = request.args.get("date")
-    try:
-        operational_date = (
-            date.fromisoformat(raw_date)
-            if raw_date
-            else datetime.now(ZoneInfo("America/Lima")).date()
-        )
-    except ValueError:
+    raw_month = request.args.get("month")
+    if raw_period not in {"day", "month"}:
         return (
             jsonify(
                 {
-                    "code": "INVALID_DATE",
-                    "message": "date debe usar el formato AAAA-MM-DD",
+                    "code": "INVALID_PERIOD",
+                    "message": "period debe ser day o month",
+                }
+            ),
+            422,
+        )
+    try:
+        today = datetime.now(ZoneInfo("America/Lima")).date()
+        if raw_period == "month":
+            month = raw_month or today.strftime("%Y-%m")
+            if len(month) != 7:
+                raise ValueError
+            operational_date = date.fromisoformat(f"{month}-01")
+            if operational_date.strftime("%Y-%m") != month:
+                raise ValueError
+        else:
+            operational_date = date.fromisoformat(raw_date) if raw_date else today
+    except ValueError:
+        field = "month" if raw_period == "month" else "date"
+        expected = "AAAA-MM" if raw_period == "month" else "AAAA-MM-DD"
+        return (
+            jsonify(
+                {
+                    "code": f"INVALID_{field.upper()}",
+                    "message": f"{field} debe usar el formato {expected}",
                 }
             ),
             422,
@@ -355,6 +374,7 @@ def get_production_progress():
     return jsonify(
         production_progress_dashboard(
             operational_date,
+            period=raw_period.upper(),
             op=request.args.get("op"),
             machine_code=request.args.get("machine_code"),
             shift=request.args.get("shift"),

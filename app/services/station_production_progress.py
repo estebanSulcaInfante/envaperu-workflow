@@ -455,14 +455,21 @@ def _monthly_progress_summary(
 def production_progress_dashboard(
     operational_date,
     *,
+    period="DAY",
     op=None,
     machine_code=None,
     shift=None,
     now=None,
 ):
     now = _utc(now or _utc_now())
-    query = EstacionAvanceProduccion.query.filter_by(
-        operational_date=operational_date
+    period = period.upper()
+    period_start, period_end = (
+        _month_bounds(operational_date)
+        if period == "MONTH"
+        else (operational_date, operational_date)
+    )
+    query = EstacionAvanceProduccion.query.filter(
+        EstacionAvanceProduccion.operational_date.between(period_start, period_end)
     )
     if op:
         query = query.filter(EstacionAvanceProduccion.op == _dimension(op))
@@ -479,16 +486,18 @@ def production_progress_dashboard(
         EstacionAvanceProduccion.shift,
     ).all()
 
-    detailed_station_ids = {
-        station_id
-        for (station_id,) in db.session.query(EstacionPesajeLegacy.station_id)
-        .filter(EstacionPesajeLegacy.operational_date == operational_date)
+    detailed_station_dates = set(
+        db.session.query(
+            EstacionPesajeLegacy.station_id,
+            EstacionPesajeLegacy.operational_date,
+        )
+        .filter(EstacionPesajeLegacy.operational_date.between(period_start, period_end))
         .distinct()
         .all()
-    }
-    capture_query = EstacionPesajeLegacy.query.filter_by(
-        operational_date=operational_date,
-        is_deleted=False,
+    )
+    capture_query = EstacionPesajeLegacy.query.filter(
+        EstacionPesajeLegacy.operational_date.between(period_start, period_end),
+        EstacionPesajeLegacy.is_deleted.is_(False),
     )
     if op:
         capture_query = capture_query.filter(
@@ -504,12 +513,15 @@ def production_progress_dashboard(
         )
     captures = capture_query.all()
     aggregate_rows = [
-        row for row in aggregate_rows if row.station_id not in detailed_station_ids
+        row
+        for row in aggregate_rows
+        if (row.station_id, row.operational_date) not in detailed_station_dates
     ]
 
     observations = [
         {
             "station_id": row.station_id,
+            "operational_dates": {row.operational_date},
             "op": row.op,
             "ot": row.ot,
             "mold": row.mold,
@@ -528,6 +540,7 @@ def production_progress_dashboard(
         lambda: {
             "bags": 0,
             "weight_kg": Decimal("0"),
+            "operational_dates": set(),
             "first_capture_at_utc": None,
             "last_capture_at_utc": None,
             "received_at_utc": None,
@@ -546,6 +559,7 @@ def production_progress_dashboard(
         bucket = detailed_groups[key]
         bucket["bags"] += 1
         bucket["weight_kg"] += Decimal(capture.weight_kg)
+        bucket["operational_dates"].add(capture.operational_date)
         bucket["first_capture_at_utc"] = min(
             filter(None, (bucket["first_capture_at_utc"], _utc(capture.captured_at_utc))),
             default=None,
@@ -585,7 +599,16 @@ def production_progress_dashboard(
         lambda: {
             "bags": 0,
             "weight_kg": Decimal("0"),
-            "details": [],
+            "details": defaultdict(
+                lambda: {
+                    "bags": 0,
+                    "weight_kg": Decimal("0"),
+                    "shifts": set(),
+                    "operational_dates": set(),
+                    "first_capture_at_utc": None,
+                    "last_capture_at_utc": None,
+                }
+            ),
             "station_ids": set(),
             "last_capture_at_utc": None,
             "last_report_received_at_utc": None,
@@ -626,20 +649,32 @@ def production_progress_dashboard(
             filter(None, (latest_report, row["received_at_utc"])),
             default=None,
         )
-        group["details"].append(
-            {
-                "station_id": row["station_id"],
-                "station_code": stations_by_id[row["station_id"]].codigo,
-                "ot": row["ot"],
-                "mold": row["mold"],
-                "color": row["color"],
-                "machine_code": row["machine_code"],
-                "shift": row["shift"],
-                "bags": row["bags"],
-                "weight_kg": _format_kg(row["weight_kg"]),
-                "first_capture_at_utc": _iso(row["first_capture_at_utc"]),
-                "last_capture_at_utc": _iso(row["last_capture_at_utc"]),
-            }
+        detail_key = (
+            row["station_id"],
+            row["color"],
+            row["ot"],
+            row["mold"],
+            row["machine_code"],
+        )
+        detail = group["details"][detail_key]
+        detail["bags"] += row["bags"]
+        detail["weight_kg"] += row["weight_kg"]
+        if row["shift"]:
+            detail["shifts"].add(row["shift"])
+        detail["operational_dates"].update(row["operational_dates"])
+        detail["first_capture_at_utc"] = min(
+            filter(
+                None,
+                (detail["first_capture_at_utc"], row["first_capture_at_utc"]),
+            ),
+            default=None,
+        )
+        detail["last_capture_at_utc"] = max(
+            filter(
+                None,
+                (detail["last_capture_at_utc"], row["last_capture_at_utc"]),
+            ),
+            default=None,
         )
 
     status_rank = {
@@ -688,6 +723,35 @@ def production_progress_dashboard(
             (entry["communication_status"] for entry in stations),
             key=lambda status: status_rank[status],
         )
+        details = []
+        detail_entries = sorted(
+            group["details"].items(),
+            key=lambda entry: tuple(value or "" for value in entry[0][1:]),
+        )
+        for detail_key, detail in detail_entries:
+            station_id, color, ot, mold, detail_machine = detail_key
+            shifts = sorted(detail["shifts"])
+            details.append(
+                {
+                    "station_id": station_id,
+                    "station_code": stations_by_id[station_id].codigo,
+                    "color": color,
+                    "ot": ot,
+                    "mold": mold,
+                    "machine_code": detail_machine,
+                    "shift": shifts[0] if len(shifts) == 1 else None,
+                    "shifts": shifts,
+                    "operational_dates": sorted(
+                        value.isoformat() for value in detail["operational_dates"]
+                    ),
+                    "bags": detail["bags"],
+                    "weight_kg": _format_kg(detail["weight_kg"]),
+                    "first_capture_at_utc": _iso(
+                        detail["first_capture_at_utc"]
+                    ),
+                    "last_capture_at_utc": _iso(detail["last_capture_at_utc"]),
+                }
+            )
         items.append(
             {
                 "op": item_op,
@@ -703,7 +767,10 @@ def production_progress_dashboard(
                     group["last_report_received_at_utc"]
                 ),
                 "stations": stations,
-                "details": group["details"],
+                "colors": sorted(
+                    {detail["color"] for detail in details if detail["color"]}
+                ),
+                "details": details,
             }
         )
 
@@ -714,7 +781,14 @@ def production_progress_dashboard(
     )
     return {
         "source": SOURCE,
-        "operational_date": operational_date.isoformat(),
+        "operational_date": (
+            operational_date.isoformat() if period == "DAY" else None
+        ),
+        "period": {
+            "type": period,
+            "start_date": period_start.isoformat(),
+            "end_date": period_end.isoformat(),
+        },
         "generated_at_utc": _iso(latest_report),
         "monthly_summary": _monthly_progress_summary(
             operational_date,

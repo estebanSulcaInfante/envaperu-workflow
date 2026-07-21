@@ -200,6 +200,70 @@ def test_dashboard_reports_calendar_month_metrics_without_changing_daily_cut(
     }
 
 
+def test_month_dashboard_groups_color_and_exposes_all_shifts(
+    client,
+    progress_station,
+):
+    payload = _load_example()
+    earlier = copy.deepcopy(payload["rows"][0])
+    earlier.update(
+        operational_date="2026-07-02",
+        bags=1,
+        weight_kg="25.000",
+        first_capture_at_utc="2026-07-02T13:10:00Z",
+        last_capture_at_utc="2026-07-02T13:20:00Z",
+    )
+    night = copy.deepcopy(payload["rows"][0])
+    night.update(
+        shift="NOCTURNO",
+        bags=1,
+        weight_kg="10.000",
+        first_capture_at_utc="2026-07-17T14:20:00Z",
+        last_capture_at_utc="2026-07-17T14:30:00Z",
+    )
+    payload["rows"].extend([earlier, night])
+
+    assert _put(client, progress_station, payload).status_code == 200
+
+    response = client.get(
+        "/api/monitoring/v1/production-progress?period=month&month=2026-07"
+    )
+    assert response.status_code == 200
+    body = response.get_json()
+
+    assert body["operational_date"] is None
+    assert body["period"] == {
+        "type": "MONTH",
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-31",
+    }
+    assert body["summary"] == {
+        "bags": 5,
+        "production_orders": 2,
+        "stations_reporting": 1,
+        "weight_kg": "110.150",
+    }
+    op_1401 = next(item for item in body["items"] if item["op"] == "OP-1401")
+    assert op_1401["colors"] == ["ROJO SOLIDO"]
+    assert len(op_1401["details"]) == 1
+    detail = op_1401["details"][0]
+    assert detail["color"] == "ROJO SOLIDO"
+    assert detail["bags"] == 4
+    assert detail["weight_kg"] == "85.250"
+    assert detail["shift"] is None
+    assert detail["shifts"] == ["DIURNO", "NOCTURNO"]
+    assert detail["operational_dates"] == ["2026-07-02", "2026-07-17"]
+
+
+def test_month_dashboard_rejects_an_invalid_month(client):
+    response = client.get(
+        "/api/monitoring/v1/production-progress?period=month&month=2026-13"
+    )
+
+    assert response.status_code == 422
+    assert response.get_json()["code"] == "INVALID_MONTH"
+
+
 def test_new_snapshot_replaces_window_and_conflicting_replay_is_rejected(
     client,
     app,
