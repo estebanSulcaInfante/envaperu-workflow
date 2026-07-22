@@ -7,6 +7,10 @@ from app.models.lote import LoteColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
 from app.services.excel_service import generar_op_excel
+from app.services.scm_material_service import (
+    create_colorante_with_scm,
+    create_materia_prima_with_scm,
+)
 from app.extensions import db
 from datetime import datetime, timezone
 
@@ -21,15 +25,21 @@ def check_dependencies():
         pytest.skip("skipping Excel/QR tests because qrcode module is missing", allow_module_level=True)
 
 
-def test_generar_excel_basico(client, app):
+def test_generar_excel_basico(client, app, scm_config):
     """
     Verifica que el servicio de generación de Excel funcione correctamente.
     """
     with app.app_context():
         # Setup: Crear orden con datos mínimos
-        mp = MateriaPrima(nombre="PP Test", tipo="VIRGEN")
-        pig = Colorante(nombre="Azul Test")
-        db.session.add_all([mp, pig])
+        mp = create_materia_prima_with_scm(
+            session=db.session,
+            nombre="PP Test",
+            tipo="VIRGEN",
+        )
+        pig = create_colorante_with_scm(
+            session=db.session,
+            nombre="Azul Test",
+        )
         db.session.commit()
 
         orden = OrdenProduccion(

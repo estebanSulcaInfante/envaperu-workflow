@@ -12,10 +12,15 @@ from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
 from app.models.control_peso import ControlPeso
 from app.models.talonario import Talonario
-from app.models.molde import Molde, Pieza
+from app.models.molde import Molde, MoldePieza, Pieza
 from app.models.historial_estado import HistorialEstadoOrden
 from app.models.receta_color import RecetaColorNormalizada
 from app.models.kardex import InventarioManga, MovimientoKardex
+from app.services.scm_configuration import ensure_initial_scm_configuration
+from app.services.scm_material_service import (
+    create_colorante_with_scm,
+    create_materia_prima_with_scm,
+)
 
 app = create_app()
 
@@ -36,22 +41,37 @@ def inicializar_bd():
             return
 
         print("🌱 Insertando datos semilla (Seed Data)...")
+        ensure_initial_scm_configuration()
 
         # ---------------------------------------------------------
         # 1. CATALOGO DE MATERIALES
         # ---------------------------------------------------------
-        mp_pp_clarif = MateriaPrima(nombre="PP Clarif", tipo="VIRGEN")
-        mp_segunda   = MateriaPrima(nombre="Segunda",   tipo="MOLIDO")
+        mp_pp_clarif = create_materia_prima_with_scm(
+            session=db.session, nombre="PP Clarif", tipo="VIRGEN"
+        )
+        mp_segunda = create_materia_prima_with_scm(
+            session=db.session, nombre="Segunda", tipo="MOLIDO"
+        )
 
-        pig_amarillo = Colorante(nombre="Amarillo CH 1041")
-        pig_azul     = Colorante(nombre="Azul Ultra")
-        pig_rojo     = Colorante(nombre="Rojo R120")
-        pig_magenta  = Colorante(nombre="Magenta 21")
-        pig_verde    = Colorante(nombre="Verde 7041")
-        pig_dioxido  = Colorante(nombre="Dioxido Titanio")
+        pig_amarillo = create_colorante_with_scm(
+            session=db.session, nombre="Amarillo CH 1041"
+        )
+        pig_azul = create_colorante_with_scm(
+            session=db.session, nombre="Azul Ultra"
+        )
+        pig_rojo = create_colorante_with_scm(
+            session=db.session, nombre="Rojo R120"
+        )
+        pig_magenta = create_colorante_with_scm(
+            session=db.session, nombre="Magenta 21"
+        )
+        pig_verde = create_colorante_with_scm(
+            session=db.session, nombre="Verde 7041"
+        )
+        pig_dioxido = create_colorante_with_scm(
+            session=db.session, nombre="Dioxido Titanio"
+        )
 
-        db.session.add_all([mp_pp_clarif, mp_segunda,
-                            pig_amarillo, pig_azul, pig_rojo, pig_magenta, pig_verde, pig_dioxido])
         db.session.commit()
 
         # ---------------------------------------------------------
@@ -90,13 +110,31 @@ def inicializar_bd():
         db.session.add(familia_baldes)
         db.session.flush()
 
+        pieza_maestra_balde = Pieza(
+            codigo="PZ-BALDE-20L",
+            nombre="Cuerpo Balde 20L",
+            linea_id=linea_industrial.id,
+            familia_id=familia_baldes.id,
+            peso_nominal_gr=600.0,
+        )
+        pieza_maestra_asa = Pieza(
+            codigo="PZ-ASA-BALDE-20L",
+            nombre="Asa Balde 20L",
+            linea_id=linea_industrial.id,
+            familia_id=familia_baldes.id,
+            peso_nominal_gr=50.0,
+        )
+        db.session.add_all([pieza_maestra_balde, pieza_maestra_asa])
+        db.session.flush()
+
         pieza_balde = PiezaColor(
             sku="10101-BALDE", piezas="Cuerpo Balde 20L",
             linea_id=linea_industrial.id, familia_id=familia_baldes.id,
             cod_pieza=1, cod_col="01", tipo_color="Solido",
             cavidad=1, peso=600.0,
             cod_extru=1, tipo_extruccion="Inyeccion",
-            cod_mp="MP01", mp="PP"
+            cod_mp="MP01", mp="PP",
+            pieza_id=pieza_maestra_balde.id,
         )
         pieza_asa = PiezaColor(
             sku="10102-ASA", piezas="Asa Balde 20L",
@@ -104,7 +142,8 @@ def inicializar_bd():
             cod_pieza=2, cod_col="01", tipo_color="Solido",
             cavidad=2, peso=50.0,
             cod_extru=1, tipo_extruccion="Inyeccion",
-            cod_mp="MP02", mp="HDPE"
+            cod_mp="MP02", mp="HDPE",
+            pieza_id=pieza_maestra_asa.id,
         )
         db.session.add_all([pieza_balde, pieza_asa])
         db.session.flush()
@@ -143,9 +182,9 @@ def inicializar_bd():
         db.session.add(molde_balde)
         db.session.flush()
 
-        db.session.add(Pieza(
+        db.session.add(MoldePieza(
             molde_id=molde_balde.codigo,
-            pieza_sku=pieza_balde.sku,
+            pieza_id=pieza_maestra_balde.id,
             cavidades=1,
             peso_unitario_gr=600.0
         ))
@@ -176,7 +215,9 @@ def inicializar_bd():
         # Snapshot de composición (congelado al crear)
         db.session.add(SnapshotComposicionMolde(
             orden_id     = orden.numero_op,
-            pieza_sku    = pieza_balde.sku,
+            pieza_id     = pieza_maestra_balde.id,
+            pieza_codigo_snapshot = pieza_maestra_balde.codigo,
+            pieza_nombre_snapshot = pieza_maestra_balde.nombre,
             cavidades    = 1,
             peso_unit_gr = 600.0,
         ))

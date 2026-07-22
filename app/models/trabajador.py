@@ -1,4 +1,5 @@
 from app.extensions import db
+from app.models.scm_catalogos import scm_rol_capacidad
 
 # Tabla intermedia N:M para relacionar trabajadores con múltiples roles
 trabajador_rol = db.Table('trabajador_rol',
@@ -17,13 +18,24 @@ class RolOperativo(db.Model):
     codigo = db.Column(db.String(20), unique=True, nullable=False)
     nombre = db.Column(db.String(100), nullable=False)
     activo = db.Column(db.Boolean, default=True)
+    capacidades = db.relationship(
+        'ScmCapacidad',
+        secondary=scm_rol_capacidad,
+        back_populates='roles',
+        lazy='selectin',
+    )
 
     def to_dict(self):
         return {
             'id': self.id,
             'codigo': self.codigo,
             'nombre': self.nombre,
-            'activo': self.activo
+            'activo': self.activo,
+            'capacidades': [
+                capacidad.codigo
+                for capacidad in self.capacidades
+                if capacidad.activo
+            ],
         }
 
 class Trabajador(db.Model):
@@ -49,6 +61,22 @@ class Trabajador(db.Model):
     def nombre_completo(self):
         return f"{self.nombres} {self.apellidos}".strip()
 
+    @property
+    def capacidades_efectivas(self):
+        if not self.activo:
+            return set()
+
+        return {
+            capacidad.codigo
+            for rol in self.roles
+            if rol.activo
+            for capacidad in rol.capacidades
+            if capacidad.activo
+        }
+
+    def tiene_capacidad(self, codigo):
+        return codigo in self.capacidades_efectivas
+
     def to_dict(self):
         return {
             'id': self.id,
@@ -59,5 +87,6 @@ class Trabajador(db.Model):
             'nombre_completo': self.nombre_completo,
             'activo': self.activo,
             'observaciones': self.observaciones,
-            'roles': [rol.to_dict() for rol in self.roles]
+            'roles': [rol.to_dict() for rol in self.roles],
+            'capacidades_efectivas': sorted(self.capacidades_efectivas),
         }

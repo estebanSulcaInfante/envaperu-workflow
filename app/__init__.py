@@ -1,6 +1,6 @@
 from flask import Flask, jsonify
 from app.config import Config
-from app.extensions import db, cors
+from app.extensions import db, cors, migrate
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -39,6 +39,7 @@ def create_app():
     app.config.from_object(Config)
 
     db.init_app(app)
+    migrate.init_app(app, db, compare_type=True)
     cors.init_app(app) # Importante para que el Frontend pueda llamar al Backend
     
     # Configurar logging
@@ -47,7 +48,7 @@ def create_app():
     # --- IMPORTAR MODELOS ---
     # Es crucial importar los modelos aquí para que SQLAlchemy los registre
     # antes de que cualquier blueprint intente usarlos.
-    from app.models import orden, lote, materiales, recetas, producto, registro, control_peso, kardex, trabajador, maquina, estacion_pesaje, legacy_pesaje
+    from app.models import correlativo_catalogo, orden, lote, materiales, recetas, producto, registro, control_peso, kardex, scm_catalogos, scm_recepcion, trabajador, maquina, estacion_pesaje, legacy_pesaje
 
     # --- REGISTRO DE RUTAS ---
     from app.api.rutas_produccion import produccion_bp
@@ -57,6 +58,7 @@ def create_app():
     from app.api.rutas_kardex import kardex_bp
     from app.api.rutas_trabajadores import rutas_trabajadores
     from app.api.rutas_maquinas import rutas_maquinas
+    from app.api.rutas_scm import scm_bp
     from app.api.rutas_estaciones_pesaje import (
         integration_station_bp,
         monitoring_station_bp,
@@ -67,6 +69,7 @@ def create_app():
     app.register_blueprint(catalogo_bp, url_prefix='/api')
     app.register_blueprint(rutas_trabajadores)
     app.register_blueprint(rutas_maquinas)
+    app.register_blueprint(scm_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(talonarios_bp)
     app.register_blueprint(sync_bp, url_prefix='/api')
     app.register_blueprint(kardex_bp, url_prefix='/api')
@@ -79,9 +82,10 @@ def create_app():
         url_prefix='/api/monitoring/v1',
     )
 
-    from app.cli import register_station_commands
+    from app.cli import register_scm_commands, register_station_commands
 
     register_station_commands(app)
+    register_scm_commands(app)
 
     @app.get('/api/health')
     def health_check():

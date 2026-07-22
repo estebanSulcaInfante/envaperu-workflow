@@ -1,19 +1,55 @@
 from flask import Blueprint, jsonify, request
 from app.extensions import db
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
-from app.models.lote import LoteColor
+from app.models.lote import LoteColor, LoteSalidaPiezaColor
 from app.models.recetas import SeCompone, SeColorea
 from app.models.materiales import MateriaPrima, Colorante
+from app.models.scm_catalogos import ScmMaterial
 from app.models.registro import RegistroDiarioProduccion, DetalleProduccionHora
-from app.models.producto import PiezaColor
-from app.models.producto import ProductoTerminado, ProductoPieza, ColorProduccion, ColorBase
-from app.models.molde import Molde, Pieza
+from app.models.producto import ProductoTerminado, ProductoPieza, ColorProduccion, ColorBase, PiezaColor
+from app.models.receta_color import RecetaColorMaestra
 from datetime import datetime, timezone
+from decimal import Decimal
+from sqlalchemy.exc import IntegrityError
 from app.models.receta_color import RecetaColorNormalizada
 from app.models.maquina import Maquina, TipoMaquina
+from app.services.scm_material_service import (
+    create_colorante_with_scm,
+    create_materia_prima_with_scm,
+    ensure_colorante_identity,
+    ensure_materia_prima_identity,
+)
+from app.services.order_integrity_service import (
+    OrderIntegrityError,
+    validate_order_creation,
+)
 
 # Definimos el "Blueprint" (un grupo de rutas)
 produccion_bp = Blueprint('produccion', __name__)
+
+
+def _validated_recipe_snapshot(raw_recipe, *, color_id, producto_sku):
+    if raw_recipe in (None, {}):
+        return None
+    if not isinstance(raw_recipe, dict):
+        raise ValueError('receta_aplicada debe ser un objeto')
+    try:
+        recipe_id = int(raw_recipe.get('id'))
+        revision = int(raw_recipe.get('revision'))
+    except (TypeError, ValueError) as exc:
+        raise ValueError('receta_aplicada requiere id y revision válidos') from exc
+    recipe = db.session.get(RecetaColorMaestra, recipe_id)
+    if recipe is None:
+        raise ValueError('La receta aplicada ya no existe')
+    if recipe.estado != 'APROBADA':
+        raise ValueError('La receta aplicada ya no está aprobada')
+    if recipe.revision != revision:
+        raise ValueError('La revisión de receta aplicada ya no coincide')
+    if recipe.color_produccion_id != color_id:
+        raise ValueError('La receta aplicada no corresponde al color del lote')
+    if recipe.producto_sku is not None and recipe.producto_sku != producto_sku:
+        raise ValueError('La receta aplicada no corresponde al producto de la OP')
+    return recipe
 
 
 # ---------------------------------------------------------------------------
@@ -23,49 +59,16 @@ produccion_bp = Blueprint('produccion', __name__)
 def _aprender_de_op(orden):
     """
     Side-effect post-commit de crear_orden:
-      A) Si la OP usó snapshot manual + molde_id existente → crear Molde/Pieza
-         en catálogo SOLO SI NO EXISTEN. Nunca sobreescribe.
-      B) Por cada lote con pigmentos → upsert en RecetaColorNormalizada
+      Por cada lote con pigmentos → upsert en RecetaColorNormalizada
          usando promedio ponderado de gr/kg.
+
+    Los snapshots ya no crean Molde, Pieza ni MoldePieza. Esas identidades se
+    validan antes de la OP; una importación legacy no reconciliada conserva
+    evidencia en ``pieza_sku_legacy`` hasta que exista una decisión humana.
     Debe llamarse dentro de una transacción activa.
     """
 
-    # ---- A. Upsert de Molde desde snapshot manual -------------------------
-    molde_id = orden.molde_id
-    if molde_id:
-        molde_existente = db.session.get(Molde, molde_id)
-        if not molde_existente:
-            # Calcular peso_tiro_gr desde los snaps (neto + colada)
-            peso_tiro = orden.calculo_peso_tiro_gr or 0.0
-            tiempo_ciclo = orden.snapshot_tiempo_ciclo or 30.0
-            nuevo_molde = Molde(
-                codigo=molde_id,
-                nombre=orden.molde or molde_id,
-                peso_tiro_gr=peso_tiro,
-                tiempo_ciclo_std=tiempo_ciclo,
-                activo=True,
-                notas='Auto-creado desde OP ' + orden.numero_op
-            )
-            db.session.add(nuevo_molde)
-            db.session.flush()
-
-        # Crear Pieza solo para piezas que no existan aún
-        for snap in orden.snapshot_composicion:
-            if not snap.pieza_sku:
-                continue
-            existe = Pieza.query.filter_by(
-                molde_id=molde_id,
-                nombre=snap.pieza_sku
-            ).first()
-            if not existe:
-                db.session.add(Pieza(
-                    molde_id=molde_id,
-                    nombre=snap.pieza_sku,
-                    cavidades=snap.cavidades,
-                    peso_unitario_gr=snap.peso_unit_gr,
-                ))
-
-    # ---- B. Upsert de RecetaColorNormalizada --------------------------------
+    # ---- Upsert de RecetaColorNormalizada ----------------------------------
     for lote in orden.lotes:
         meta_kg = lote.meta_kg or 0.0
         if meta_kg <= 0 or not lote.color_produccion_id:
@@ -110,36 +113,29 @@ def crear_orden():
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
 
-    if not data.get('numero_op'):
-        return jsonify({'error': 'Número de OP requerido'}), 400
-    if not data.get('maquina_id'):
-        return jsonify({'error': 'Máquina requerida'}), 400
-
-    # Debe haber composición (auto o manual)
-    auto_snapshot = data.get('auto_snapshot_molde', False)
-    composicion_manual = data.get('snapshot_composicion', [])
-    if not auto_snapshot and not composicion_manual:
-        return jsonify({'error': 'Se requiere auto_snapshot_molde:true o snapshot_composicion[]'}), 400
-
     try:
-        # Obtener datos de la maquina para snapshot
-        maquina = db.session.get(Maquina, data.get('maquina_id')) if data.get('maquina_id') else None
+        # Resuelve y valida el catálogo antes de insertar la cabecera. Las
+        # variantes PiezaColor faltantes se crean dentro de esta transacción.
+        integrity = validate_order_creation(data, session=db.session)
+        maquina = integrity.maquina
+        molde = integrity.molde
+        producto = integrity.producto
         
         # ----------------------------------------------------------------
         # 1. Cabecera de la Orden
         # ----------------------------------------------------------------
         nueva_orden = OrdenProduccion(
-            numero_op               = data.get('numero_op'),
-            maquina_id              = data.get('maquina_id'),
+            numero_op               = str(data.get('numero_op')).strip(),
+            maquina_id              = maquina.id,
             maquina_codigo_snapshot = maquina.codigo if maquina else None,
             maquina_nombre_snapshot = maquina.nombre if maquina else None,
-            producto                = data.get('producto'),
-            producto_sku            = data.get('producto_sku'),
-            molde                   = data.get('molde'),
-            molde_id                = data.get('molde_id'),
-            snapshot_tiempo_ciclo   = data.get('snapshot_tiempo_ciclo', 0.0),
-            snapshot_horas_turno    = data.get('snapshot_horas_turno', 24.0),
-            snapshot_peso_colada_gr = data.get('snapshot_peso_colada_gr', 0.0),
+            producto                = producto.producto if producto else data.get('producto'),
+            producto_sku            = producto.cod_sku_pt if producto else None,
+            molde                   = molde.nombre if molde else data.get('molde'),
+            molde_id                = molde.codigo if molde else None,
+            snapshot_tiempo_ciclo   = integrity.snapshot_tiempo_ciclo,
+            snapshot_horas_turno    = integrity.snapshot_horas_turno,
+            snapshot_peso_colada_gr = integrity.snapshot_peso_colada_gr,
             tipo_cambio             = data.get('tipo_cambio'),
             fecha_inicio            = (
                 datetime.fromisoformat(data['fecha_inicio'])
@@ -152,71 +148,45 @@ def crear_orden():
         # ----------------------------------------------------------------
         # 2. Snapshot de composición del molde
         # ----------------------------------------------------------------
-        if auto_snapshot:
-            molde_id = data.get('molde_id')
-            if not molde_id:
-                return jsonify({'error': 'molde_id requerido para auto_snapshot_molde'}), 400
-
-            mp_rows = Pieza.query.filter_by(molde_id=molde_id).all()
-            if not mp_rows:
-                return jsonify({'error': f'Molde {molde_id} no tiene piezas en catálogo (Pieza)'}), 400
-
-            for mp in mp_rows:
-                # Buscar un SKU representativo de esta pieza para guardarlo en el snapshot
-                pc = PiezaColor.query.filter_by(pieza_id=mp.id).first()
-                snap = SnapshotComposicionMolde(
-                    orden_id     = nueva_orden.numero_op,
-                    pieza_sku    = pc.sku if pc else None,
-                    cavidades    = mp.cavidades,
-                    peso_unit_gr = mp.peso_unitario_gr,
-                )
-                db.session.add(snap)
-        else:
-            # Manual
-            if not composicion_manual:
-                return jsonify({'error': 'snapshot_composicion no puede estar vacío'}), 400
-            for item in composicion_manual:
-                snap = SnapshotComposicionMolde(
-                    orden_id     = nueva_orden.numero_op,
-                    pieza_sku    = item.get('pieza_sku'),
-                    cavidades    = item.get('cavidades', 1),
-                    peso_unit_gr = item.get('peso_unit_gr', 0.0),
-                )
-                db.session.add(snap)
+        snapshot_records = {}
+        for item in integrity.snapshot_rows:
+            snapshot = SnapshotComposicionMolde(
+                orden_id     = nueva_orden.numero_op,
+                pieza_id     = item.get('pieza_id'),
+                pieza_codigo_snapshot = item.get('pieza_codigo_snapshot'),
+                pieza_nombre_snapshot = item.get('pieza_nombre_snapshot'),
+                pieza_sku_legacy = item.get('pieza_sku_legacy'),
+                cavidades    = item['cavidades'],
+                peso_unit_gr = item['peso_unit_gr'],
+            )
+            db.session.add(snapshot)
+            snapshot_records[item.get('pieza_id')] = snapshot
 
         db.session.flush()  # necesitamos los snaps cargados para actualizar_metricas
 
         # ----------------------------------------------------------------
         # 3. Lotes de Color
         # ----------------------------------------------------------------
-        for l_data in data.get('lotes', []):
-            # Resolver color
-            color_produccion_id = l_data.get('color_id') # Asumimos que el front ahora envía color_produccion_id
-            
-            # SKU output (usa el de la orden o auto-discover)
+        for index, l_data in enumerate(data.get('lotes', [])):
+            color_produccion_id = integrity.lot_color_ids[index]
+            recipe = _validated_recipe_snapshot(
+                l_data.get('receta_aplicada'),
+                color_id=color_produccion_id,
+                producto_sku=nueva_orden.producto_sku,
+            )
+
+            # Una OP directa sin producto queda como reposición de PiezaColor.
+            # Nunca se infiere un PT por una coincidencia parcial y first().
             computed_sku = nueva_orden.producto_sku
-            if not computed_sku and nueva_orden.molde_id and color_produccion_id:
-                piezas_molde = [
-                    s.pieza_sku for s in nueva_orden.snapshot_composicion if s.pieza_sku
-                ]
-                if piezas_molde:
-                    match_prod = (
-                        db.session.query(ProductoTerminado)
-                        .join(ProductoPieza, ProductoPieza.producto_terminado_id == ProductoTerminado.cod_sku_pt)
-                        .join(PiezaColor, PiezaColor.sku == ProductoPieza.pieza_sku)
-                        .filter(
-                            ProductoPieza.pieza_sku.in_(piezas_molde),
-                            PiezaColor.color_produccion_id == color_produccion_id,
-                        )
-                        .first()
-                    )
-                    if match_prod:
-                        computed_sku = match_prod.cod_sku_pt
 
             nuevo_lote = LoteColor(
                 numero_op           = nueva_orden.numero_op,
                 color_produccion_id = color_produccion_id,
                 producto_sku_output  = computed_sku,
+                receta_color_maestra_id = recipe.id if recipe else None,
+                receta_revision_snapshot = recipe.revision if recipe else None,
+                receta_nombre_snapshot = recipe.nombre_variante if recipe else None,
+                receta_base_virgen_kg_snapshot = recipe.base_virgen_kg if recipe else None,
                 personas            = l_data.get('personas', 1),
                 meta_kg             = l_data.get('meta_kg', 0.0),
             )
@@ -224,11 +194,36 @@ def crear_orden():
             db.session.flush()
 
             for m_data in l_data.get('materiales', []):
-                materia = MateriaPrima.query.filter_by(nombre=m_data.get('nombre')).first()
+                requested_material_id = m_data.get('material_id')
+                material_identity = (
+                    db.session.get(ScmMaterial, requested_material_id)
+                    if requested_material_id
+                    else None
+                )
+                if requested_material_id and material_identity is None:
+                    raise ValueError('La materia prima seleccionada ya no existe')
+                if material_identity is not None and not material_identity.activo:
+                    raise ValueError('La materia prima seleccionada está inactiva')
+                if material_identity is not None and material_identity.clase != 'MATERIA_PRIMA':
+                    raise ValueError('El material seleccionado no es una materia prima')
+                materia = (
+                    material_identity.materia_prima
+                    if material_identity is not None
+                    else MateriaPrima.query.filter_by(nombre=m_data.get('nombre')).first()
+                )
                 if not materia:
-                    materia = MateriaPrima(nombre=m_data.get('nombre'), tipo=m_data.get('tipo', 'VIRGEN'))
-                    db.session.add(materia)
-                    db.session.flush()
+                    materia = create_materia_prima_with_scm(
+                        session=db.session,
+                        nombre=m_data.get('nombre'),
+                        tipo=m_data.get('tipo', 'VIRGEN'),
+                        categoria_codigo='LEGACY_POR_CONFIGURAR',
+                    )
+                ensure_materia_prima_identity(
+                    session=db.session,
+                    materia_prima=materia,
+                    categoria_codigo='LEGACY_POR_CONFIGURAR',
+                )
+                db.session.flush()
                 db.session.add(SeCompone(
                     lote_id=nuevo_lote.id,
                     materia_prima_id=materia.id,
@@ -236,11 +231,33 @@ def crear_orden():
                 ))
 
             for p_data in l_data.get('pigmentos', []):
-                colorante = Colorante.query.filter_by(nombre=p_data.get('nombre')).first()
+                requested_material_id = p_data.get('material_id')
+                material_identity = (
+                    db.session.get(ScmMaterial, requested_material_id)
+                    if requested_material_id
+                    else None
+                )
+                if requested_material_id and material_identity is None:
+                    raise ValueError('El colorante o aditivo seleccionado ya no existe')
+                if material_identity is not None and not material_identity.activo:
+                    raise ValueError('El colorante o aditivo seleccionado está inactivo')
+                if material_identity is not None and material_identity.clase != 'COLORANTE':
+                    raise ValueError('El material seleccionado no es un colorante o aditivo')
+                colorante = (
+                    material_identity.colorante
+                    if material_identity is not None
+                    else Colorante.query.filter_by(nombre=p_data.get('nombre')).first()
+                )
                 if not colorante:
-                    colorante = Colorante(nombre=p_data.get('nombre'))
-                    db.session.add(colorante)
-                    db.session.flush()
+                    colorante = create_colorante_with_scm(
+                        session=db.session,
+                        nombre=p_data.get('nombre'),
+                    )
+                ensure_colorante_identity(
+                    session=db.session,
+                    colorante=colorante,
+                )
+                db.session.flush()
                 db.session.add(SeColorea(
                     lote_id=nuevo_lote.id,
                     colorante_id=colorante.id,
@@ -251,6 +268,34 @@ def crear_orden():
         # 4. Calcular todo en cascada y guardar
         # ----------------------------------------------------------------
         nueva_orden.actualizar_metricas()
+        for lote in nueva_orden.lotes:
+            if lote.color_produccion_id is None:
+                continue
+            for pieza_id, snapshot in snapshot_records.items():
+                if pieza_id is None:
+                    continue
+                variant = PiezaColor.query.filter_by(
+                    pieza_id=pieza_id,
+                    color_produccion_id=lote.color_produccion_id,
+                ).one()
+                quantity = Decimal(str(lote.calculo_coladas or 0)) * Decimal(
+                    snapshot.cavidades
+                )
+                net_kg = quantity * Decimal(str(snapshot.peso_unit_gr)) / Decimal('1000')
+                db.session.add(LoteSalidaPiezaColor(
+                    lote_color_id=lote.id,
+                    snapshot_pieza_id=snapshot.id,
+                    pieza_id=pieza_id,
+                    pieza_color_sku=variant.sku,
+                    cavidades_snapshot=snapshot.cavidades,
+                    peso_unitario_snapshot_gr=snapshot.peso_unit_gr,
+                    cantidad_objetivo=quantity,
+                    kg_objetivo_neto=net_kg,
+                    cantidad_buena_real=0,
+                    cantidad_rechazada_real=0,
+                    kg_bueno_real=0,
+                ))
+        db.session.flush()
         db.session.commit()
 
         # ----------------------------------------------------------------
@@ -263,8 +308,29 @@ def crear_orden():
             db.session.rollback()
             print(f"[WARN] Side-effects post-OP fallaron (OP guardada igual): {e_learn}")
 
-        return jsonify(nueva_orden.to_dict()), 201
+        response = nueva_orden.to_dict()
+        generated = [
+            item for item in integrity.pending_variants if item.get('pieza_sku')
+        ]
+        if generated:
+            response['catalogo_autocreado'] = {'piezas_color': generated}
+        return jsonify(response), 201
 
+    except OrderIntegrityError as exc:
+        db.session.rollback()
+        payload = {'error': exc.message, 'codigo': exc.code}
+        if exc.details:
+            payload['details'] = exc.details
+        return jsonify(payload), exc.status
+    except ValueError as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc), 'codigo': 'PAYLOAD_INVALIDO'}), 400
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({
+            'error': 'El catálogo cambió mientras se creaba la OP; vuelva a validar y reintente',
+            'codigo': 'INTEGRIDAD_CATALOGO_CONFLICTO',
+        }), 409
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500

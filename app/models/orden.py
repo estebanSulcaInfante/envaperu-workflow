@@ -12,18 +12,48 @@ class SnapshotComposicionMolde(db.Model):
     Una fila por tipo de pieza. Un molde simple tendrá 1 fila; uno multi-pieza, N filas.
     """
     __tablename__ = 'snapshot_composicion_molde'
+    __table_args__ = (
+        db.Index('ix_snapshot_composicion_pieza_id', 'pieza_id'),
+    )
 
     id           = db.Column(db.Integer, primary_key=True, autoincrement=True)
     orden_id     = db.Column(db.String(20), db.ForeignKey('orden_produccion.numero_op'), nullable=False)
 
-    # FK a PiezaColor (nullable: permite override manual sin pieza registrada en catálogo)
-    pieza_sku    = db.Column(db.String(50), db.ForeignKey('pieza_color.sku'), nullable=True)
+    # La identidad técnica del snapshot es la Pieza abstracta. Se mantiene
+    # nullable únicamente para poder importar una OP histórica todavía no
+    # reconciliada; las OP nuevas siempre informan pieza_id.
+    pieza_id = db.Column(
+        db.Integer,
+        db.ForeignKey('pieza.id', ondelete='RESTRICT'),
+        nullable=True,
+    )
+
+    # Textos congelados: un renombre o baja posterior del maestro no altera la
+    # lectura histórica del documento.
+    pieza_codigo_snapshot = db.Column(db.String(64), nullable=True)
+    pieza_nombre_snapshot = db.Column(db.String(200), nullable=True)
+
+    # Evidencia forense del contrato anterior. No es FK ni se completa para
+    # nuevas OP; solo sirve para reconciliar una futura importación legacy.
+    pieza_sku_legacy = db.Column(db.String(50), nullable=True)
 
     cavidades    = db.Column(db.Integer,  nullable=False, default=1)
     peso_unit_gr = db.Column(db.Float,   nullable=False, default=0.0)
 
-    # Relación de lectura para nombre de pieza
-    pieza = db.relationship('PiezaColor', backref='snapshots_op')
+    pieza = db.relationship(
+        'Pieza',
+        backref='snapshots_op',
+        foreign_keys=[pieza_id],
+    )
+
+    @property
+    def pieza_sku(self):
+        """Alias transitorio de escritura/lectura para importadores legacy."""
+        return self.pieza_sku_legacy
+
+    @pieza_sku.setter
+    def pieza_sku(self, value):
+        self.pieza_sku_legacy = value
 
     @property
     def peso_subtotal_gr(self):
@@ -32,8 +62,13 @@ class SnapshotComposicionMolde(db.Model):
 
     def to_dict(self):
         return {
-            'pieza_sku':    self.pieza_sku,
-            'pieza_nombre': self.pieza.piezas if self.pieza else None,
+            'id': self.id,
+            'pieza_id': self.pieza_id,
+            'pieza_codigo_snapshot': self.pieza_codigo_snapshot,
+            'pieza_nombre_snapshot': self.pieza_nombre_snapshot,
+            # Alias visual conservado; ya no representa una PiezaColor.
+            'pieza_nombre': self.pieza_nombre_snapshot,
+            'pieza_sku_legacy': self.pieza_sku_legacy,
             'cavidades':    self.cavidades,
             'peso_unit_gr': self.peso_unit_gr,
             'peso_subtotal_gr': self.peso_subtotal_gr,

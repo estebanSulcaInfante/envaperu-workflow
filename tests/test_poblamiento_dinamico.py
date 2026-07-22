@@ -6,10 +6,16 @@ Tests para el poblamiento dinámico de la BD al crear OPs:
 """
 import pytest
 from app.models.receta_color import RecetaColorNormalizada
-from app.models.molde import Molde, Pieza
+from app.models.molde import Molde, MoldePieza, Pieza
 from app.models.producto import ColorProduccion, ColorBase, FamiliaColor, FamiliaColor, PiezaColor, Linea, Familia
 from app.models.materiales import Colorante
 from app.extensions import db
+from app.services.scm_material_service import create_colorante_with_scm
+
+
+@pytest.fixture(autouse=True)
+def _scm_configuration(scm_config):
+    return scm_config
 
 def _get_or_create_fam(nombre="SOLIDO", codigo=1):
     from app.models.producto import FamiliaColor
@@ -62,8 +68,10 @@ def _make_colorante(app, nombre="AZUL PHTALO"):
     with app.app_context():
         col = Colorante.query.filter_by(nombre=nombre).first()
         if not col:
-            col = Colorante(nombre=nombre)
-            db.session.add(col)
+            col = create_colorante_with_scm(
+                session=db.session,
+                nombre=nombre,
+            )
             db.session.commit()
         return col.id
 
@@ -145,11 +153,10 @@ class TestRecetaColorNormalizada:
 
 class TestMoldeOnTheFly:
 
-    def test_molde_se_crea_si_no_existe(self, client, app):
+    def test_molde_inexistente_se_rechaza_sin_dejar_catalogo_huerfano(self, client, app):
         """
-        Cuando se crea una OP con un molde_id que NO existe en el catálogo,
-        el side-effect debe crear el Molde (y no romperse).
-        El molde_id referenciado no necesita existir — _aprender_de_op lo crea.
+        Un molde debe crearse explícitamente (por CRUD/modal) antes de la OP.
+        La orden no aprende un molde ambiguo a partir de un snapshot libre.
         """
         with app.app_context():
             # Confirmar que el molde no existe aún
@@ -171,20 +178,19 @@ class TestMoldeOnTheFly:
         }
 
         resp = client.post('/api/ordenes', json=payload)
-        if resp.status_code != 201:
-            print(f"\nError: {resp.get_json()}")
-        assert resp.status_code == 201
+        assert resp.status_code == 400
+        assert resp.get_json()['codigo'] == 'MOLDE_NO_ENCONTRADO'
 
         with app.app_context():
-            # El molde debe haber sido creado por _aprender_de_op
-            molde = db.session.get(Molde, "MOL-OTF-01")
-            assert molde is not None
-            assert molde.activo is True
+            assert db.session.get(Molde, "MOL-OTF-01") is None
+            from app.models.orden import OrdenProduccion
 
-    def test_molde_existente_no_es_sobreescrito(self, client, app):
+            assert db.session.get(OrdenProduccion, "OP-OTF-MOLDE") is None
+
+    def test_molde_existente_rechaza_snapshot_tecnico_divergente(self, client, app):
         """
-        Si el molde YA EXISTE en el catálogo, _aprender_de_op NO lo toca.
-        El peso_tiro_gr original se preserva aunque el snapshot diga otro valor.
+        Si el molde existe, la OP no puede congelar silenciosamente otro peso.
+        La composición maestra se preserva y la orden completa se rechaza.
         """
         with app.app_context():
             linea = Linea.query.first()
@@ -200,14 +206,24 @@ class TestMoldeOnTheFly:
             db.session.add(molde_orig)
             db.session.flush()
 
+            pieza_global = Pieza(
+                codigo="PZ-ORIG-001",
+                nombre="Pieza Original",
+                linea_id=linea.id,
+                familia_id=fam.id,
+                peso_nominal_gr=45.0,
+            )
+            db.session.add(pieza_global)
+            db.session.flush()
+
             pieza_orig = PiezaColor(sku="PIEZA-ORIG", piezas="PiezaColor Original",
                                tipo="SIMPLE", linea_id=linea.id, familia_id=fam.id,
-                               cavidad=2, peso=45.0)
+                               cavidad=2, peso=45.0, pieza_id=pieza_global.id)
             db.session.add(pieza_orig)
             db.session.flush()
 
-            mp_orig = Pieza(molde_id=molde_orig.codigo, nombre="PIEZA-ORIG",
-                             cavidades=2, peso_unitario_gr=45.0)
+            mp_orig = MoldePieza(molde=molde_orig, pieza=pieza_global,
+                                 cavidades=2, peso_unitario_gr=45.0)
             db.session.add(mp_orig)
             db.session.commit()
 
@@ -226,12 +242,20 @@ class TestMoldeOnTheFly:
         }
 
         resp = client.post('/api/ordenes', json=payload)
-        assert resp.status_code == 201
+        assert resp.status_code == 409
+        assert resp.get_json()['codigo'] == 'COMPOSICION_MOLDE_VALORES_DIVERGENTES'
 
         with app.app_context():
-            mp = Pieza.query.filter_by(nombre="PIEZA-ORIG").first()
+            pieza_global = Pieza.query.filter_by(codigo="PZ-ORIG-001").one()
+            mp = MoldePieza.query.filter_by(
+                molde_id="MOL-ORIG-01",
+                pieza_id=pieza_global.id,
+            ).one()
             # Debe mantenerse el valor original (45g), no el del snapshot (999g)
             assert mp.peso_unitario_gr == 45.0
+            from app.models.orden import OrdenProduccion
+
+            assert db.session.get(OrdenProduccion, "OP-NO-OVERWRITE") is None
 
 
 # ============================================================

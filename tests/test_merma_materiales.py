@@ -5,6 +5,7 @@ from app.models.recetas import SeCompone
 from app.models.materiales import MateriaPrima
 from app.models.producto import ColorProduccion, ColorBase, FamiliaColor
 from app.extensions import db
+from app.services.scm_material_service import create_materia_prima_with_scm
 
 def _get_or_create_fam(nombre="SOLIDO", codigo=1):
     from app.models.producto import FamiliaColor
@@ -32,7 +33,7 @@ def _create_color_prod(nombre, codigo=None, familia_id=None):
 
 
 
-def test_calculo_materiales_con_merma(client, app):
+def test_calculo_materiales_con_merma(client, app, scm_config):
     """
     Verifica que SeCompone.calculo_peso_kg incluya la merma de colada.
 
@@ -45,8 +46,11 @@ def test_calculo_materiales_con_merma(client, app):
     peso_kg esperado = meta_kg * (1 + merma_pct) = 1000 * (1 + 10/110) = 1090.909 kg
     """
     with app.app_context():
-        mp = MateriaPrima(nombre="VIRGEN TEST", tipo="VIRGEN")
-        db.session.add(mp)
+        mp = create_materia_prima_with_scm(
+            session=db.session,
+            nombre="VIRGEN TEST",
+            tipo="VIRGEN",
+        )
         db.session.commit()
 
         orden = OrdenProduccion(

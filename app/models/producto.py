@@ -36,6 +36,12 @@ class FamiliaColor(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     codigo = db.Column(db.Integer, unique=True, nullable=True)  # Cod Color del CSV (1, 2, 3...)
     nombre = db.Column(db.String(50), unique=True, nullable=False)  # SOLIDO, CARAMELO, etc.
+    activo = db.Column(db.Boolean, nullable=False, default=True, server_default=db.true())
+    version = db.Column(db.Integer, nullable=False, default=1, server_default="1")
+
+    __table_args__ = (
+        db.CheckConstraint('version >= 1', name='ck_familia_color_version'),
+    )
 
 
 class Linea(db.Model):
@@ -47,6 +53,39 @@ class Linea(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     codigo = db.Column(db.Integer, unique=True, nullable=False)  # 1, 2...
     nombre = db.Column(db.String(50), unique=True, nullable=False)  # HOGAR, INDUSTRIAL
+    activo = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True,
+        server_default=db.true(),
+    )
+    version = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+
+    relaciones_familia = db.relationship(
+        "LineaFamilia",
+        back_populates="linea_rel",
+        lazy="selectin",
+        order_by="LineaFamilia.id",
+    )
+
+    __table_args__ = (
+        db.CheckConstraint("version > 0", name="ck_linea_version"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "codigo": self.codigo,
+            "codigo_display": f"LIN-{self.codigo:06d}",
+            "nombre": self.nombre,
+            "activo": self.activo,
+            "version": self.version,
+        }
     
     def __repr__(self):
         return f'<Linea {self.codigo}: {self.nombre}>'
@@ -61,9 +100,111 @@ class Familia(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     codigo = db.Column(db.Integer, unique=True, nullable=False)  # 01, 02, 03...
     nombre = db.Column(db.String(100), unique=True, nullable=False)  # Baldes, Jarras, etc.
+    activo = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True,
+        server_default=db.true(),
+    )
+    version = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+
+    relaciones_linea = db.relationship(
+        "LineaFamilia",
+        back_populates="familia_rel",
+        lazy="selectin",
+        order_by="LineaFamilia.id",
+    )
+
+    __table_args__ = (
+        db.CheckConstraint("version > 0", name="ck_familia_version"),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "codigo": self.codigo,
+            "codigo_display": f"FAM-{self.codigo:06d}",
+            "nombre": self.nombre,
+            "activo": self.activo,
+            "version": self.version,
+        }
     
     def __repr__(self):
         return f'<Familia {self.codigo}: {self.nombre}>'
+
+
+class LineaFamilia(db.Model):
+    """Combinacion permitida entre los catalogos de linea y familia."""
+
+    __tablename__ = "linea_familia"
+    __table_args__ = (
+        db.CheckConstraint("version > 0", name="ck_linea_familia_version"),
+        db.UniqueConstraint(
+            "linea_id",
+            "familia_id",
+            name="uq_linea_familia_linea_familia",
+        ),
+        db.Index(
+            "ix_linea_familia_linea_activo",
+            "linea_id",
+            "activo",
+        ),
+        db.Index(
+            "ix_linea_familia_familia_activo",
+            "familia_id",
+            "activo",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    linea_id = db.Column(
+        db.Integer,
+        db.ForeignKey("linea.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    familia_id = db.Column(
+        db.Integer,
+        db.ForeignKey("familia.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    activo = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True,
+        server_default=db.true(),
+    )
+    version = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+
+    linea_rel = db.relationship("Linea", back_populates="relaciones_familia")
+    familia_rel = db.relationship("Familia", back_populates="relaciones_linea")
+
+    def to_dict(self, include_catalogos=False):
+        data = {
+            "id": self.id,
+            "linea_id": self.linea_id,
+            "familia_id": self.familia_id,
+            "activo": self.activo,
+            "version": self.version,
+        }
+        if include_catalogos:
+            data["linea"] = self.linea_rel.to_dict() if self.linea_rel else None
+            data["familia"] = (
+                self.familia_rel.to_dict() if self.familia_rel else None
+            )
+        return data
+
+    def __repr__(self):
+        return f"<LineaFamilia {self.linea_id}/{self.familia_id}>"
 
 class ColorBase(db.Model):
     """El pigmento puro, independiente de la familia comercial."""
@@ -86,8 +227,22 @@ class ColorProduccion(db.Model):
     familia_color_rel = db.relationship('FamiliaColor', backref='colores_produccion')
     
     codigo_legacy = db.Column(db.Integer, nullable=True)
+    hex_referencia = db.Column(db.String(7), nullable=True)
+    activo = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True,
+        server_default=db.true(),
+    )
+    version = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
 
     __table_args__ = (
+        db.CheckConstraint('version > 0', name='ck_color_produccion_version'),
         db.UniqueConstraint('color_base_id', 'familia_color_id', name='uix_color_base_familia'),
     )
 
@@ -149,16 +304,13 @@ class ProductoTerminado(db.Model):
         return [cp.pieza for cp in self.composicion_piezas]
 
     def generar_sku(self):
+        """Compatibilidad: devuelve la identidad ya asignada, sin recalcularla.
+
+        Los códigos nuevos se reservan transaccionalmente mediante
+        ``generar_codigo_catalogo`` antes de construir el modelo. El nombre,
+        la línea, la familia y el color nunca deben cambiar una identidad.
         """
-        Genera el SKU basado en componentes.
-        El SKU original era importado, la autogeneración ya no usa familia de color.
-        """
-        try:
-            linea_code = self.linea_rel.codigo if self.linea_rel else 0
-            familia_code = self.familia_rel.codigo if self.familia_rel else 0
-            return f"0{linea_code}{familia_code}{self.cod_producto}"
-        except:
-            return None
+        return self.cod_sku_pt
 
 
 class PiezaColor(db.Model):
@@ -177,9 +329,9 @@ class PiezaColor(db.Model):
     # Tipo de pieza: SIMPLE, KIT, COMPONENTE
     tipo = db.Column(db.String(20), default="SIMPLE")
     
-    # --- RELACIÓN CON FORMA DEL MOLDE (Refactor) ---
-    # Vincula esta pieza (SKU coloreado) con su forma/cavidad en el molde
-    # Nullable: piezas legacy importadas del Excel pueden no tener esta relación aún
+    # --- RELACIÓN CON EL MAESTRO GLOBAL DE PIEZAS ---
+    # No identifica un molde: una misma Pieza puede estar en varios moldes mediante
+    # MoldePieza. Nullable conserva SKUs legacy aún pendientes de normalizar.
     pieza_id = db.Column(db.Integer, db.ForeignKey('pieza.id'), nullable=True)
     pieza_rel = db.relationship('Pieza', backref='variantes', foreign_keys=[pieza_id])
     
@@ -195,6 +347,8 @@ class PiezaColor(db.Model):
     color_produccion_id = db.Column(db.Integer, db.ForeignKey('color_produccion.id'), nullable=True)
     color_produccion_rel = db.relationship('ColorProduccion', backref='piezas_color')
     
+    # Campos legacy importados. ``cavidad`` no es fuente operativa: las cavidades
+    # vigentes viven en MoldePieza y se congelan en el snapshot de cada OP.
     cavidad = db.Column(db.Integer)
     peso = db.Column(db.Float)
     cod_extru = db.Column(db.Integer)
@@ -214,19 +368,27 @@ class PiezaColor(db.Model):
         """Lista de productos que usan esta pieza."""
         return [ep.producto_terminado for ep in self.en_productos]
 
+    def to_dict(self):
+        """Representación del SKU; no expone cavidades como dato operativo."""
+        return {
+            'sku': self.sku,
+            'nombre': self.piezas,
+            'tipo': self.tipo,
+            'pieza_id': self.pieza_id,
+            'linea_id': self.linea_id,
+            'familia_id': self.familia_id,
+            'color_produccion_id': self.color_produccion_id,
+            'color': (
+                self.color_produccion_rel.nombre
+                if self.color_produccion_rel else None
+            ),
+            'peso': self.peso,
+            'cavidad_legacy': self.cavidad,
+        }
+
     def generar_sku(self):
-        """
-        Genera SKU Pieza:
-        LINEA + PIEZA + COD_COL(Str) + EXTRU + COD_COLOR(Int)
-        """
-        try:
-            linea_code = self.linea_rel.codigo if self.linea_rel else 0
-            c_int = self.color_produccion_rel.codigo_legacy if self.color_produccion_rel else 0
-            if c_int is None: c_int = 0
-            
-            return f"{linea_code}{self.cod_pieza}{self.cod_extru}{c_int}"
-        except:
-            return None
+        """Compatibilidad: devuelve la identidad ya asignada, sin recalcularla."""
+        return self.sku
 
 
 class PiezaComponente(db.Model):

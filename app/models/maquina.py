@@ -14,6 +14,11 @@ class TipoMaquina(db.Model):
     modelo = db.Column(db.String(100), nullable=True)
     capacidad_toneladas = db.Column(db.Float, nullable=True)
     activo = db.Column(db.Boolean, default=True)
+    version = db.Column(db.Integer, nullable=False, default=1, server_default='1')
+
+    __table_args__ = (
+        db.CheckConstraint('version > 0', name='ck_tipo_maquina_version'),
+    )
 
     def to_dict(self):
         return {
@@ -24,7 +29,8 @@ class TipoMaquina(db.Model):
             'fabricante': self.fabricante,
             'modelo': self.modelo,
             'capacidad_toneladas': self.capacidad_toneladas,
-            'activo': self.activo
+            'activo': self.activo,
+            'version': self.version,
         }
 
 class Maquina(db.Model):

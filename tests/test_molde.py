@@ -4,7 +4,7 @@ Tests for Molde entity and related models
 import pytest
 from app import create_app
 from app.extensions import db
-from app.models.molde import Molde, Pieza
+from app.models.molde import Molde, MoldePieza, Pieza
 from app.models.producto import PiezaColor, PiezaComponente, Linea, Familia
 
 
@@ -51,7 +51,17 @@ class TestMoldeHomogeneo:
         with app.app_context():
             linea_id, familia_id = get_default_linea_familia(app)
             
-            # Crear pieza
+            # Crear maestro global y su variante coloreada.
+            pieza_global = Pieza(
+                codigo="PZ-BALDE-001",
+                nombre="Balde Romano",
+                linea_id=linea_id,
+                familia_id=familia_id,
+                peso_nominal_gr=87.0,
+            )
+            db.session.add(pieza_global)
+            db.session.flush()
+
             pieza = PiezaColor(
                 sku="BALDE-001",
                 piezas="Balde Romano",
@@ -59,7 +69,8 @@ class TestMoldeHomogeneo:
                 peso=87.0,
                 cavidad=4,
                 linea_id=linea_id,
-                familia_id=familia_id
+                familia_id=familia_id,
+                pieza_id=pieza_global.id,
             )
             db.session.add(pieza)
             db.session.commit()
@@ -75,9 +86,9 @@ class TestMoldeHomogeneo:
             db.session.commit()
             
             # Relacionar
-            mp = Pieza(
-                molde_id=molde.codigo,
-                nombre="BALDE-001",
+            mp = MoldePieza(
+                molde=molde,
+                pieza=pieza_global,
                 cavidades=4,
                 peso_unitario_gr=87.0
             )
@@ -99,14 +110,21 @@ class TestMoldeHeterogeneo:
         with app.app_context():
             linea_id, familia_id = get_default_linea_familia(app)
             
-            # Crear piezas componentes
-            tapa = PiezaColor(sku="REG-TAPA", piezas="Tapa Regadera", tipo="COMPONENTE", peso=25.0, linea_id=linea_id, familia_id=familia_id)
-            asa = PiezaColor(sku="REG-ASA", piezas="Asa Regadera", tipo="COMPONENTE", peso=40.0, linea_id=linea_id, familia_id=familia_id)
-            base = PiezaColor(sku="REG-BASE", piezas="Base Regadera", tipo="COMPONENTE", peso=120.0, linea_id=linea_id, familia_id=familia_id)
-            
-            # Crear pieza kit
-            kit = PiezaColor(sku="REG-KIT", piezas="Kit Regadera", tipo="KIT", peso=185.0, linea_id=linea_id, familia_id=familia_id)
-            
+            maestros = {
+                "tapa": Pieza(codigo="PZ-REG-TAPA", nombre="Tapa Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=25.0),
+                "asa": Pieza(codigo="PZ-REG-ASA", nombre="Asa Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=40.0),
+                "base": Pieza(codigo="PZ-REG-BASE", nombre="Base Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=120.0),
+                "kit": Pieza(codigo="PZ-REG-KIT", nombre="Kit Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=185.0),
+            }
+            db.session.add_all(maestros.values())
+            db.session.flush()
+
+            # Cada SKU coloreado apunta al maestro global correspondiente.
+            tapa = PiezaColor(sku="REG-TAPA", piezas="Tapa Regadera", tipo="COMPONENTE", peso=25.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["tapa"].id)
+            asa = PiezaColor(sku="REG-ASA", piezas="Asa Regadera", tipo="COMPONENTE", peso=40.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["asa"].id)
+            base = PiezaColor(sku="REG-BASE", piezas="Base Regadera", tipo="COMPONENTE", peso=120.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["base"].id)
+            kit = PiezaColor(sku="REG-KIT", piezas="Kit Regadera", tipo="KIT", peso=185.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["kit"].id)
+
             db.session.add_all([tapa, asa, base, kit])
             db.session.commit()
             
@@ -127,9 +145,9 @@ class TestMoldeHeterogeneo:
             db.session.commit()
             
             # Relacionar molde con kit
-            mp = Pieza(
-                molde_id=molde.codigo,
-                nombre="REG-KIT",
+            mp = MoldePieza(
+                molde=molde,
+                pieza=maestros["kit"],
                 cavidades=1,
                 peso_unitario_gr=185.0
             )
@@ -153,10 +171,14 @@ class TestPiezasProducibles:
         with app.app_context():
             linea_id, familia_id = get_default_linea_familia(app)
             
-            # Crear pieza producible (con molde)
-            pieza_prod = PiezaColor(sku="PROD-001", piezas="Producible", tipo="SIMPLE", linea_id=linea_id, familia_id=familia_id)
-            pieza_no_prod = PiezaColor(sku="COMP-001", piezas="Componente", tipo="COMPONENTE", linea_id=linea_id, familia_id=familia_id)
-            
+            maestro_prod = Pieza(codigo="PZ-PROD-001", nombre="Producible", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=45.0)
+            maestro_no_prod = Pieza(codigo="PZ-COMP-001", nombre="Componente", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=12.0)
+            db.session.add_all([maestro_prod, maestro_no_prod])
+            db.session.flush()
+
+            pieza_prod = PiezaColor(sku="PROD-001", piezas="Producible", tipo="SIMPLE", linea_id=linea_id, familia_id=familia_id, pieza_id=maestro_prod.id)
+            pieza_no_prod = PiezaColor(sku="COMP-001", piezas="Componente", tipo="COMPONENTE", linea_id=linea_id, familia_id=familia_id, pieza_id=maestro_no_prod.id)
+
             db.session.add_all([pieza_prod, pieza_no_prod])
             db.session.commit()
             
@@ -165,24 +187,79 @@ class TestPiezasProducibles:
             db.session.add(molde)
             db.session.commit()
             
-            mp = Pieza(
-                molde_id=molde.codigo,
-                nombre="PROD-001",
+            mp = MoldePieza(
+                molde=molde,
+                pieza=maestro_prod,
                 cavidades=2,
                 peso_unitario_gr=45.0
             )
             db.session.add(mp)
             db.session.commit()
             
-            pieza_prod.pieza_id = mp.id
-            db.session.commit()
-            
             # Query para piezas producibles
-            piezas_producibles = PiezaColor.query.join(Pieza).distinct().all()
+            piezas_producibles = (
+                PiezaColor.query
+                .join(Pieza, PiezaColor.pieza_id == Pieza.id)
+                .join(MoldePieza, MoldePieza.pieza_id == Pieza.id)
+                .filter(MoldePieza.activo.is_(True))
+                .distinct()
+                .all()
+            )
             skus_producibles = [p.sku for p in piezas_producibles]
             
             assert "PROD-001" in skus_producibles
             assert "COMP-001" not in skus_producibles
+
+
+class TestMoldePiezaManyToMany:
+    """Una pieza global puede formar parte de más de un molde."""
+
+    def test_misma_pieza_en_dos_moldes_con_configuracion_independiente(self, app):
+        with app.app_context():
+            linea_id, familia_id = get_default_linea_familia(app)
+            pieza = Pieza(
+                codigo="PZ-COMPARTIDA-001",
+                nombre="Tapa compartida",
+                linea_id=linea_id,
+                familia_id=familia_id,
+                peso_nominal_gr=12.5,
+            )
+            molde_a = Molde(codigo="MOL-NM-A", nombre="Molde A", peso_tiro_gr=60.0)
+            molde_b = Molde(codigo="MOL-NM-B", nombre="Molde B", peso_tiro_gr=90.0)
+            db.session.add_all([pieza, molde_a, molde_b])
+            db.session.flush()
+
+            relacion_a = MoldePieza(
+                molde=molde_a,
+                pieza=pieza,
+                cavidades=4,
+                peso_unitario_gr=12.5,
+            )
+            relacion_b = MoldePieza(
+                molde=molde_b,
+                pieza=pieza,
+                cavidades=6,
+                peso_unitario_gr=13.0,
+            )
+            db.session.add_all([relacion_a, relacion_b])
+            db.session.commit()
+
+            assert relacion_a.pieza_id == relacion_b.pieza_id == pieza.id
+            assert molde_a.peso_neto_gr == 50.0
+            assert molde_b.peso_neto_gr == 78.0
+
+            relacion_a.cavidades = 3
+            relacion_a.peso_unitario_gr = 12.0
+            relacion_a.version += 1
+            db.session.commit()
+
+            db.session.refresh(relacion_b)
+            db.session.refresh(pieza)
+            assert relacion_a.cavidades == 3
+            assert relacion_a.peso_unitario_gr == 12.0
+            assert relacion_b.cavidades == 6
+            assert relacion_b.peso_unitario_gr == 13.0
+            assert pieza.peso_nominal_gr == 12.5
 
 
 if __name__ == "__main__":

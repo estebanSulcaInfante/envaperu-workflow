@@ -45,7 +45,11 @@ def generar_op_excel(orden) -> BytesIO:
     composicion = orden.snapshot_composicion
     for i, snap in enumerate(composicion[:4]):
         row = 8 + i
-        ws[f'B{row}'] = snap.pieza.piezas if snap.pieza else f'Pieza {i+1}'
+        ws[f'B{row}'] = (
+            snap.pieza_nombre_snapshot
+            or (snap.pieza.nombre if snap.pieza else None)
+            or f'Pieza {i+1}'
+        )
         ws[f'C{row}'] = snap.cavidades
         ws[f'D{row}'] = snap.peso_unit_gr
         ws[f'E{row}'] = snap.peso_subtotal_gr

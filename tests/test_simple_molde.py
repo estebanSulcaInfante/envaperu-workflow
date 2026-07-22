@@ -1,5 +1,5 @@
 import pytest
-from app.models.molde import Molde, Pieza
+from app.models.molde import Molde, MoldePieza
 from app.models.producto import PiezaColor, Linea, Familia
 from app.extensions import db
 
@@ -17,8 +17,6 @@ def test_simple_molde_flow(client, app):
     Test de molde simple: un molde con una sola pieza (vía Pieza).
     Verifica creación, propiedades calculadas y actualización.
     """
-    molde_code = "MOL-SIMPLE-TEST"
-
     # ── Setup: necesitamos Linea y Familia para crear PiezaColor ──────────────────
     with app.app_context():
         linea  = Linea(codigo=99, nombre="LINEA-TEST")
@@ -31,7 +29,6 @@ def test_simple_molde_flow(client, app):
 
     # ── 1. CREATE MOLDE (Simple Mode vía API) ────────────────────────────────
     payload = {
-        "codigo":         molde_code,
         "nombre":         "Molde Simple Test",
         "peso_tiro_gr":   100.0,
         "tiempo_ciclo_std": 20.0,
@@ -45,7 +42,8 @@ def test_simple_molde_flow(client, app):
 
     assert resp.status_code == 201
     data = resp.get_json()
-    assert data['codigo'] == molde_code
+    molde_code = data['codigo']
+    assert molde_code == "ML-000001"
 
     # ── 2. Verify DB ─────────────────────────────────────────────────────────
     with app.app_context():
@@ -54,7 +52,7 @@ def test_simple_molde_flow(client, app):
         assert molde.peso_tiro_gr == 100.0
 
         # Debe haber UNA fila en Pieza (modo simple → 1 pieza)
-        mps = Pieza.query.filter_by(molde_id=molde_code).all()
+        mps = MoldePieza.query.filter_by(molde_id=molde_code, activo=True).all()
         assert len(mps) == 1
         mp = mps[0]
         assert mp.cavidades == 4
@@ -65,8 +63,11 @@ def test_simple_molde_flow(client, app):
         assert abs(molde.merma_pct - 0.2) < 0.001  # (100-80)/100
 
         # PiezaColor.molde_id ya NO existe — la pieza ahora se vincula solo por Pieza
-        pieza = db.session.get(PiezaColor, mp.nombre)
+        pieza = PiezaColor.query.filter_by(pieza_id=mp.pieza_id).one()
         assert pieza is not None
+        assert pieza.sku == "PC-000001"
+        assert mp.pieza.codigo == "PZ-000001"
+        assert pieza.pieza_id == mp.pieza_id
         assert not hasattr(pieza, 'molde_id') or pieza.molde_id is None  # campo eliminado
 
     # ── 3. UPDATE MOLDE ──────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ def test_simple_molde_flow(client, app):
         molde = db.session.get(Molde, molde_code)
         assert molde.peso_tiro_gr == 110.0
 
-        mp = Pieza.query.filter_by(molde_id=molde_code).first()
+        mp = MoldePieza.query.filter_by(molde_id=molde_code, activo=True).one()
         assert mp.peso_unitario_gr == 25.0
 
         assert molde.peso_neto_gr == 100.0         # 4 × 25

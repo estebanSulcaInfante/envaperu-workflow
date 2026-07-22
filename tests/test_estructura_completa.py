@@ -8,6 +8,10 @@ from app.models.producto import ProductoTerminado, FamiliaColor, ColorProduccion
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion
 from app.extensions import db
+from app.services.scm_material_service import (
+    create_colorante_with_scm,
+    create_materia_prima_with_scm,
+)
 
 def _get_or_create_fam(nombre="SOLIDO", codigo=1):
     from app.models.producto import FamiliaColor
@@ -34,7 +38,7 @@ def _create_color_prod(nombre, codigo=None, familia_id=None):
     return cp
 
 
-def test_estructura_completa_json(client, app):
+def test_estructura_completa_json(client, app, scm_config):
     """
     Verifica la estructura completa del JSON (Reporte Normalizado):
     - Cabecera
@@ -46,10 +50,20 @@ def test_estructura_completa_json(client, app):
     """
     with app.app_context():
         # 1. SETUP: MATERIALES Y COLORANTES
-        mp1 = MateriaPrima(nombre="POLIPROPILENO", tipo="VIRGEN")
-        mp2 = MateriaPrima(nombre="MOLIDO", tipo="MOLIDO")
-        color = Colorante(nombre="AZUL")
-        db.session.add_all([mp1, mp2, color])
+        mp1 = create_materia_prima_with_scm(
+            session=db.session,
+            nombre="POLIPROPILENO",
+            tipo="VIRGEN",
+        )
+        mp2 = create_materia_prima_with_scm(
+            session=db.session,
+            nombre="MOLIDO",
+            tipo="MOLIDO",
+        )
+        color = create_colorante_with_scm(
+            session=db.session,
+            nombre="AZUL",
+        )
         db.session.commit()
 
         # 1.5 SETUP: MAQUINA
@@ -161,7 +175,7 @@ def test_estructura_completa_json(client, app):
         db.session.add(col_prod)
         db.session.commit()
         
-        # B. Crear Producto con FamiliaColor (no ColorProducto) y verificar SKU
+        # B. Crear Producto con código histórico y verificar que no se recalcula
         from app.models.producto import Linea, Familia
         
         # Get or create linea and familia
@@ -178,22 +192,20 @@ def test_estructura_completa_json(client, app):
             db.session.flush()
         
         pt = ProductoTerminado(
+            cod_sku_pt="PT-LEGACY-0113",
             linea_id=linea_test.id,
             familia_id=familia_test.id,
             cod_producto=3,
             estado_revision="IMPORTADO"  # Nuevo campo obligatorio
         )
         
-        # Manually set backref relationships for SKU generation (before session)
+        # Las relaciones descriptivas no forman parte de la identidad.
         pt.linea_rel = linea_test
         pt.familia_rel = familia_test
-        
-        # Generar SKU
+
+        # El método legacy solo devuelve la identidad ya asignada.
         sku_gen = pt.generar_sku()
-        # Dynamic assertion: 0 + linea.codigo + familia.codigo + cod_producto
-        expected_sku = f"0{linea_test.codigo}{familia_test.codigo}3"
-        assert sku_gen == expected_sku, f"SKU mismatch. Expected {expected_sku}, got {sku_gen}"
-        pt.cod_sku_pt = sku_gen
+        assert sku_gen == "PT-LEGACY-0113"
         db.session.add(pt)
         db.session.commit()
         

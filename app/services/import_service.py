@@ -7,6 +7,7 @@ import pandas as pd
 from io import BytesIO, StringIO
 from app.extensions import db
 from app.models.producto import ProductoTerminado, PiezaColor, ColorProduccion, ColorBase, FamiliaColor, ProductoPieza, Linea, Familia
+from app.services.catalog_classification_service import ensure_linea_familia
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -644,14 +645,16 @@ class ImportService:
                 existe_por_codigo = cod_linea is not None and cod_linea in lineas_por_codigo
                 
                 if not existe_por_nombre and not existe_por_codigo:
+                    codigo_linea = cod_linea
+                    if codigo_linea is None:
+                        codigo_linea = max(lineas_por_codigo.keys(), default=0) + 1
                     nueva_linea = Linea(
                         nombre=linea_upper,
-                        codigo=cod_linea if cod_linea else 0
+                        codigo=codigo_linea,
                     )
                     db.session.add(nueva_linea)
                     lineas_existentes[linea_upper] = nueva_linea
-                    if cod_linea is not None:
-                        lineas_por_codigo[cod_linea] = nueva_linea
+                    lineas_por_codigo[codigo_linea] = nueva_linea
                     resultado['lineas_creadas'] += 1
                 elif existe_por_codigo and not existe_por_nombre:
                     lineas_existentes[linea_upper] = lineas_por_codigo[cod_linea]
@@ -671,14 +674,19 @@ class ImportService:
                 existe_por_codigo = cod_familia is not None and cod_familia in familias_producto_por_codigo
                 
                 if not existe_por_nombre and not existe_por_codigo:
+                    codigo_familia = cod_familia
+                    if codigo_familia is None:
+                        codigo_familia = max(
+                            familias_producto_por_codigo.keys(),
+                            default=0,
+                        ) + 1
                     nueva_familia = Familia(
                         nombre=familia_upper,
-                        codigo=cod_familia if cod_familia else 0
+                        codigo=codigo_familia,
                     )
                     db.session.add(nueva_familia)
                     familias_producto_existentes[familia_upper] = nueva_familia
-                    if cod_familia is not None:
-                        familias_producto_por_codigo[cod_familia] = nueva_familia
+                    familias_producto_por_codigo[codigo_familia] = nueva_familia
                     resultado['familias_producto_creadas'] = resultado.get('familias_producto_creadas', 0) + 1
                 elif existe_por_codigo and not existe_por_nombre:
                     familias_producto_existentes[familia_upper] = familias_producto_por_codigo[cod_familia]
@@ -710,19 +718,19 @@ class ImportService:
                 if linea_nombre and linea_nombre.upper() in lineas_existentes:
                     producto_data['linea_id'] = lineas_existentes[linea_nombre.upper()].id
                 else:
-                    # linea_id es requerido, usar HOGAR como default
-                    if 'HOGAR' in lineas_existentes:
-                        producto_data['linea_id'] = lineas_existentes['HOGAR'].id
+                    raise ValueError('Linea es obligatoria y debe existir en el archivo o catálogo')
                 
                 # Asignar FK a Familia (OBLIGATORIO) - leer directamente del CSV
                 familia_nombre = self._obtener_valor_str(row, 'Familia')
                 if familia_nombre and familia_nombre.upper() in familias_producto_existentes:
                     producto_data['familia_id'] = familias_producto_existentes[familia_nombre.upper()].id
                 else:
-                    # familia_id es requerido, buscar primera familia como default
-                    if familias_producto_existentes:
-                        primera_familia = next(iter(familias_producto_existentes.values()))
-                        producto_data['familia_id'] = primera_familia.id
+                    raise ValueError('Familia es obligatoria y debe existir en el archivo o catálogo')
+
+                ensure_linea_familia(
+                    linea_id=producto_data['linea_id'],
+                    familia_id=producto_data['familia_id'],
+                )
                 
                 # UPSERT: Verificar si existe
                 existente = db.session.get(ProductoTerminado, sku)
@@ -797,14 +805,16 @@ class ImportService:
                 existe_por_codigo = cod_linea is not None and cod_linea in lineas_por_codigo
                 
                 if not existe_por_nombre and not existe_por_codigo:
+                    codigo_linea = cod_linea
+                    if codigo_linea is None:
+                        codigo_linea = max(lineas_por_codigo.keys(), default=0) + 1
                     nueva_linea = Linea(
                         nombre=linea_upper,
-                        codigo=cod_linea if cod_linea else 0
+                        codigo=codigo_linea,
                     )
                     db.session.add(nueva_linea)
                     lineas_existentes[linea_upper] = nueva_linea
-                    if cod_linea is not None:
-                        lineas_por_codigo[cod_linea] = nueva_linea
+                    lineas_por_codigo[codigo_linea] = nueva_linea
                     resultado['lineas_creadas'] += 1
                 elif existe_por_codigo and not existe_por_nombre:
                     lineas_existentes[linea_upper] = lineas_por_codigo[cod_linea]
@@ -860,19 +870,19 @@ class ImportService:
                 if linea_nombre and linea_nombre.upper() in lineas_existentes:
                     pieza_data['linea_id'] = lineas_existentes[linea_nombre.upper()].id
                 else:
-                    # linea_id es requerido, usar HOGAR como default
-                    if 'HOGAR' in lineas_existentes:
-                        pieza_data['linea_id'] = lineas_existentes['HOGAR'].id
+                    raise ValueError('Linea es obligatoria y debe existir en el archivo o catálogo')
                 
                 # Asignar familia_id (OBLIGATORIO) - leer directamente del CSV
                 familia_nombre = self._obtener_valor_str(row, 'FAMILIA')
                 if familia_nombre and familia_nombre.upper() in familias_producto_existentes:
                     pieza_data['familia_id'] = familias_producto_existentes[familia_nombre.upper()].id
                 else:
-                    # familia_id es requerido, buscar primera familia como default
-                    if familias_producto_existentes:
-                        primera_familia = next(iter(familias_producto_existentes.values()))
-                        pieza_data['familia_id'] = primera_familia.id
+                    raise ValueError('Familia es obligatoria y debe existir en el archivo o catálogo')
+
+                ensure_linea_familia(
+                    linea_id=pieza_data['linea_id'],
+                    familia_id=pieza_data['familia_id'],
+                )
                 
                 # UPSERT: Verificar si existe
                 existente = db.session.get(PiezaColor, sku)

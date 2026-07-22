@@ -17,10 +17,15 @@ def app():
     with app.app_context():
         db.create_all()
         
-        from app.models.producto import Linea, Familia
+        from app.models.producto import Familia, Linea, LineaFamilia
         default_linea = Linea(codigo=1, nombre='INDUSTRIAL')
         default_familia = Familia(codigo=1, nombre='TEST')
         db.session.add_all([default_linea, default_familia])
+        db.session.flush()
+        db.session.add(LineaFamilia(
+            linea_id=default_linea.id,
+            familia_id=default_familia.id,
+        ))
         
         # TS-009 Dependencies
         from app.models.maquina import TipoMaquina, Maquina
@@ -43,7 +48,7 @@ def app():
         db.session.flush()
 
         db.session.commit()
-        
+
         yield app
         db.session.remove()
         db.drop_all()
@@ -55,6 +60,14 @@ def client(app):
 @pytest.fixture
 def runner(app):
     return app.test_cli_runner()
+
+
+@pytest.fixture
+def scm_config(app):
+    from app.services.scm_configuration import ensure_initial_scm_configuration
+
+    with app.app_context():
+        return ensure_initial_scm_configuration()
 
 @pytest.fixture
 def test_linea(app):
@@ -87,7 +100,7 @@ def get_or_create_test_dependencies():
     Call this inside app_context to get IDs for required FKs.
     Returns: (linea_id, familia_id)
     """
-    from app.models.producto import Linea, Familia
+    from app.models.producto import Familia, Linea, LineaFamilia
     
     linea = Linea.query.filter_by(nombre='TEST').first()
     if not linea:
@@ -100,6 +113,19 @@ def get_or_create_test_dependencies():
         familia = Familia(codigo=99, nombre='TEST')
         db.session.add(familia)
         db.session.flush()
+
+    relacion = LineaFamilia.query.filter_by(
+        linea_id=linea.id,
+        familia_id=familia.id,
+    ).first()
+    if not relacion:
+        db.session.add(LineaFamilia(
+            linea_id=linea.id,
+            familia_id=familia.id,
+        ))
+    elif not relacion.activo:
+        relacion.activo = True
+        relacion.version += 1
     
     db.session.commit()
     return linea.id, familia.id

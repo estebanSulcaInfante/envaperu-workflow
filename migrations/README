@@ -1,0 +1,81 @@
+Migraciones versionadas del backend Envaperú.
+
+- `f02b00ae2e67` representa la línea base legacy completa para instalaciones
+  nuevas.
+- `91f3774850d8` agrega el primer incremento de US-010A: catálogo común de
+  materiales, categorías de recepción, capacidades y roles configurables.
+- `58b3dd5878cd` cierra la fase contract de identidad de materiales: reconverge
+  cualquier fila legacy pendiente y exige `scm_material_id NOT NULL`.
+- `23a5f8a99a0b` agrega proveedores, OC versionadas, líneas, operaciones
+  idempotentes y eventos append-only para el primer corte HTTP de US-010A;
+  PostgreSQL también impide mutar líneas de revisiones que ya no son borrador.
+- `7c1e4a9d2b6f` agrega documentos externos, recepciones borrador, relación N:M
+  documento-recepción, líneas y pesajes individuales de bolsas de segunda. Un
+  trigger PostgreSQL protege el detalle cuando la recepción deja de ser borrador.
+
+Base nueva y descartable de pruebas:
+
+    flask --app app db upgrade head
+
+El PostgreSQL local se usa solamente para pruebas y validaciones de la cadena
+Alembic. No representa una base de aplicación ni debe reutilizarse como sustituto
+de un restore aislado de la base real.
+
+Base legacy existente:
+
+1. restaurar primero un respaldo en una base PostgreSQL aislada;
+2. comparar esa copia con la revisión de línea base;
+3. ejecutar `flask --app app db stamp f02b00ae2e67` solamente si la copia
+   corresponde al baseline;
+4. ejecutar `flask --app app db upgrade head` sobre la copia y validar conteos,
+   huérfanos y constraints;
+5. solicitar autorización independiente antes de cualquier adopción real.
+
+La línea base es deliberadamente irreversible: `downgrade base` falla antes de
+borrar tablas legacy. El rollback soportado de US-010A termina en
+`f02b00ae2e67`.
+
+No se debe ejecutar `stamp` ni `upgrade` directamente sobre la base desplegada
+como parte del desarrollo local. `SCM_RECEPCION_ENABLED` permanece en `false`.
+
+La revisión `91f3774850d8` es la fase expand: enlaza y valida las filas legacy,
+pero conserva temporalmente nullable `scm_material_id`. Antes de aplicar
+`58b3dd5878cd` se debe desplegar primero el código que crea `MateriaPrima` o
+`Colorante` y su `ScmMaterial` mediante dual-write en una sola transacción.
+
+Secuencia obligatoria para la fase contract:
+
+1. desplegar el código dual-write manteniendo `SCM_RECEPCION_ENABLED=false`;
+2. drenar y detener las instancias antiguas que aún puedan escribir sin
+   `scm_material_id`;
+3. pausar también las altas de catálogo de las instancias nuevas y esperar que
+   terminen sus transacciones en curso;
+4. verificar que no queda ningún escritor de materiales activo;
+5. ejecutar `flask --app app db upgrade head` en el entorno autorizado;
+6. mantener el feature flag apagado hasta completar las pruebas PostgreSQL y
+   la autorización de la siguiente fase.
+
+El downgrade soportado de `58b3dd5878cd` vuelve ambas columnas
+`scm_material_id` a nullable. Conserva las filas `ScmMaterial`, sus códigos y los
+vínculos existentes; no los borra ni los vuelve a crear. Esto permite revertir
+el código sin perder la identidad común ya registrada.
+
+El downgrade de `23a5f8a99a0b` sólo se permite cuando sus seis tablas están
+vacías. Si existe cualquier proveedor, OC, revisión, línea, operación o evento,
+la revisión aborta antes de borrar objetos. El rollback operativo con datos
+consiste en apagar escrituras y conservar lectura/auditoría, no en destruir el
+historial.
+
+El downgrade de `7c1e4a9d2b6f` aborta si cualquiera de sus cinco tablas contiene
+datos. Con PostgreSQL, si una bajada posterior también falla, toda la cadena se
+revierte transaccionalmente y el head permanece intacto.
+
+`crear_tablas.py` es un artefacto legacy destructivo y no forma parte del flujo
+productivo. No debe reemplazar las revisiones Alembic ni ejecutarse sobre una
+base con datos.
+
+El test automatizado de adopción usa un DDL legacy mínimo congelado e
+independiente de la revisión Alembic. Esto valida el backfill 010A, pero no
+demuestra que una base desplegada concreta coincida con las 44 tablas de la
+línea base. Ese fingerprint solo puede cerrarse con un restore anonimizado de
+la base real; mientras falte, la adopción desplegada permanece bloqueada.

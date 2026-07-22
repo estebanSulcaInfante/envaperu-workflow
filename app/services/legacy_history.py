@@ -584,6 +584,8 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
             for item in items
             if query_normalized in normalize_text(item["op_raw"])
             or any(query_normalized in value for value in item["molds"])
+            or any(query_normalized in value for value in item["colors"])
+            or any(query_normalized in value for value in item["machines"])
         ]
     if status:
         if status == "PENDIENTE_MAPEO":

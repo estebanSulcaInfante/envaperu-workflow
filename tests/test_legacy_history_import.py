@@ -211,6 +211,16 @@ def test_order_index_separates_pending_closed_and_deleted_totals(
     ).get_json()
     assert [item["op_raw"] for item in pending["items"]] == ["OP-213"]
 
+    by_color = client.get(
+        "/api/monitoring/v1/legacy-production-orders?q=VERDE"
+    ).get_json()
+    assert [item["op_raw"] for item in by_color["items"]] == ["OP-0069"]
+
+    by_machine = client.get(
+        "/api/monitoring/v1/legacy-production-orders?q=HT-160A"
+    ).get_json()
+    assert [item["op_raw"] for item in by_machine["items"]] == ["OP-0069"]
+
     detail = client.get(
         "/api/monitoring/v1/legacy-production-orders/detail",
         query_string={"station_id": history_station, "op": "OP-213"},

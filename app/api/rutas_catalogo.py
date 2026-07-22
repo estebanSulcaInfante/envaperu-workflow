@@ -4,10 +4,90 @@ Incluye endpoints de listado y búsqueda.
 """
 from flask import Blueprint, jsonify, request
 from app.extensions import db
-from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, ColorProduccion, ColorBase, Linea, Familia, FamiliaColor
+from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, ColorProduccion, ColorBase, Linea, Familia, FamiliaColor, LineaFamilia
+from app.services.catalog_classification_service import (
+    ClassificationError,
+    classification_usage,
+    ensure_linea_familia,
+    validate_linea_familia,
+)
+from app.services.catalog_code_generator import (
+    generar_codigo_catalogo,
+    generar_numero_catalogo,
+)
+from app.services.color_recipe_service import (
+    ColorRecipeError,
+    create_recipe,
+    deactivate_recipe,
+    find_default_recipe,
+    list_recipe_ingredients,
+    list_recipes,
+    normalize_hex,
+    serialize_recipe,
+    update_recipe,
+)
+from app.services.order_integrity_service import (
+    OrderIntegrityError,
+    validate_order_header_prerequisites,
+    validate_order_prerequisites,
+)
 from sqlalchemy import or_
 
 catalogo_bp = Blueprint('catalogo', __name__)
+
+
+def _next_available_numeric_code(model, key):
+    """Reserva correlativos hasta hallar uno libre en un catálogo entero legacy."""
+
+    while True:
+        candidate = generar_numero_catalogo(key)
+        if model.query.filter(model.codigo == candidate).first() is None:
+            return candidate
+
+
+@catalogo_bp.errorhandler(ColorRecipeError)
+def _handle_color_recipe_error(error):
+    payload = {'error': error.message, 'codigo': error.code}
+    if error.details:
+        payload['details'] = error.details
+    return jsonify(payload), error.status
+
+
+def _manual_identifier_error(field):
+    """Los identificadores normales los asigna el backend, no el cliente."""
+    return jsonify({
+        'error': f'{field} es automático y no admite asignación manual',
+        'codigo': 'CODIGO_MANUAL_NO_PERMITIDO',
+        'campo': field,
+    }), 400
+
+
+def _immutable_identifier_error(field, current_value):
+    """Respuesta uniforme cuando se intenta cambiar una identidad persistida."""
+    return jsonify({
+        'error': f'{field} es inmutable',
+        'codigo': 'CODIGO_INMUTABLE',
+        'campo': field,
+        'valor_actual': current_value,
+    }), 400
+
+
+def _classification_error_response(exc):
+    return jsonify({
+        'error': str(exc),
+        'codigo': exc.code,
+    }), exc.status
+
+
+def _manual_new_piece_identifier_field(payload):
+    """Devuelve el identificador manual pedido para una Pieza anidada nueva."""
+    if payload.get('pieza_id') is not None:
+        return None
+    if str(payload.get('codigo') or '').strip():
+        return 'codigo'
+    if str(payload.get('sku_override') or '').strip():
+        return 'sku_override'
+    return None
 
 @catalogo_bp.route('/productos', methods=['GET'])
 def listar_productos():
@@ -31,8 +111,12 @@ def listar_productos():
                 ProductoTerminado.nombre_gs1.ilike(search),
                 ProductoTerminado.marca.ilike(search),
                 ProductoTerminado.codigo_barra.ilike(search),
-                ProductoTerminado.familia_color.ilike(search)
+                Linea.nombre.ilike(search),
+                Familia.nombre.ilike(search),
             )
+        ).outerjoin(Linea, ProductoTerminado.linea_id == Linea.id).outerjoin(
+            Familia,
+            ProductoTerminado.familia_id == Familia.id,
         )
     
     productos = query.limit(limit).all()
@@ -74,7 +158,7 @@ def listar_piezas_abstractas():
     """
     Lista Piezas (formas abstractas sin color) con búsqueda opcional.
     """
-    from app.models.molde import Pieza
+    from app.models.molde import Molde, MoldePieza, Pieza
     q = request.args.get('q', '').strip()
     limit = request.args.get('limit', 50, type=int)
     
@@ -82,23 +166,148 @@ def listar_piezas_abstractas():
     
     if q:
         search = f"%{q}%"
-        query = query.filter(
+        query = query.outerjoin(MoldePieza).outerjoin(Molde).filter(
             or_(
                 Pieza.nombre.ilike(search),
-                Pieza.molde_id.ilike(search)
+                Pieza.codigo.ilike(search),
+                Molde.codigo.ilike(search),
+                Molde.nombre.ilike(search),
             )
+        ).distinct()
+    
+    piezas = query.order_by(Pieza.nombre, Pieza.codigo).limit(limit).all()
+    
+    return jsonify([p.to_dict(include_moldes=True) for p in piezas])
+
+
+@catalogo_bp.route('/piezas', methods=['POST'])
+def crear_pieza_maestra():
+    """Crea una Pieza global; las cavidades se configuran al asociarla a un molde."""
+    data = request.get_json() or {}
+    if str(data.get('codigo') or '').strip():
+        return _manual_identifier_error('codigo')
+    nombre = str(data.get('nombre') or '').strip()
+    try:
+        peso_nominal = float(data.get('peso_nominal_gr'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'peso_nominal_gr debe ser numérico'}), 400
+    if not nombre or peso_nominal <= 0:
+        return jsonify({
+            'error': 'nombre y peso_nominal_gr positivo son obligatorios'
+        }), 400
+    try:
+        linea, familia, _ = validate_linea_familia(
+            linea_id=data.get('linea_id'),
+            familia_id=data.get('familia_id'),
+            allow_unclassified=True,
         )
-    
-    piezas = query.limit(limit).all()
-    
-    return jsonify([{
-        'id': p.id,
-        'nombre': p.nombre,
-        'molde_id': p.molde_id,
-        'cavidades': p.cavidades,
-        'peso_unitario_gr': p.peso_unitario_gr,
-        'num_variantes': len(p.variantes_color) if hasattr(p, 'variantes_color') else 0
-    } for p in piezas])
+    except ClassificationError as exc:
+        return _classification_error_response(exc)
+
+    try:
+        codigo = generar_codigo_catalogo('PIEZA')
+        pieza = Pieza(
+            codigo=codigo,
+            nombre=nombre,
+            linea_id=linea.id if linea else None,
+            familia_id=familia.id if familia else None,
+            peso_nominal_gr=peso_nominal,
+            activo=bool(data.get('activo', True)),
+        )
+        db.session.add(pieza)
+        db.session.commit()
+        return jsonify(pieza.to_dict(include_moldes=True)), 201
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 400
+
+
+@catalogo_bp.route('/piezas/<int:pieza_id>', methods=['GET'])
+def obtener_pieza_maestra(pieza_id):
+    pieza = db.session.get(Pieza, pieza_id)
+    if not pieza:
+        return jsonify({'error': 'Pieza no encontrada'}), 404
+    return jsonify(pieza.to_dict(include_variantes=True, include_moldes=True))
+
+
+@catalogo_bp.route('/piezas/<int:pieza_id>', methods=['PUT'])
+def actualizar_pieza_maestra(pieza_id):
+    pieza = db.session.get(Pieza, pieza_id)
+    if not pieza:
+        return jsonify({'error': 'Pieza no encontrada'}), 404
+    data = request.get_json() or {}
+    if data.get('version') is None:
+        return jsonify({
+            'error': 'version es obligatoria para actualizar la pieza',
+            'codigo': 'VERSION_REQUIRED',
+        }), 400
+    try:
+        expected_version = int(data['version'])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'version debe ser un entero positivo'}), 400
+    if expected_version <= 0:
+        return jsonify({'error': 'version debe ser un entero positivo'}), 400
+    if expected_version != pieza.version:
+        return jsonify({
+            'error': 'La pieza cambió desde que fue cargada',
+            'codigo': 'VERSION_CONFLICT',
+            'actual': pieza.to_dict(include_moldes=True),
+        }), 409
+
+    codigo_solicitado = str(data.get('codigo') or '').strip()
+    if codigo_solicitado and codigo_solicitado != pieza.codigo:
+        return _immutable_identifier_error('codigo', pieza.codigo)
+    nombre = str(data.get('nombre', pieza.nombre)).strip()
+    try:
+        peso_nominal = float(data.get('peso_nominal_gr', pieza.peso_nominal_gr))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'peso_nominal_gr debe ser numérico'}), 400
+    if not nombre or peso_nominal <= 0:
+        return jsonify({'error': 'Nombre y peso nominal positivo son obligatorios'}), 400
+    try:
+        linea, familia, _ = validate_linea_familia(
+            linea_id=data.get('linea_id', pieza.linea_id),
+            familia_id=data.get('familia_id', pieza.familia_id),
+            allow_unclassified=True,
+        )
+    except ClassificationError as exc:
+        return _classification_error_response(exc)
+
+    nuevo_activo = bool(data.get('activo', pieza.activo))
+    if not nuevo_activo and any(item.activo for item in pieza.molde_piezas):
+        return jsonify({
+            'error': 'Desvincule la pieza de todos los moldes antes de inactivarla'
+        }), 409
+    pieza.nombre = nombre
+    pieza.peso_nominal_gr = peso_nominal
+    pieza.linea_id = linea.id if linea else None
+    pieza.familia_id = familia.id if familia else None
+    for variante in pieza.variantes:
+        variante.linea_id = pieza.linea_id
+        variante.familia_id = pieza.familia_id
+    pieza.activo = nuevo_activo
+    pieza.version += 1
+    try:
+        db.session.commit()
+        return jsonify(pieza.to_dict(include_moldes=True)), 200
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 400
+
+
+@catalogo_bp.route('/piezas/<int:pieza_id>', methods=['DELETE'])
+def inactivar_pieza_maestra(pieza_id):
+    pieza = db.session.get(Pieza, pieza_id)
+    if not pieza:
+        return jsonify({'error': 'Pieza no encontrada'}), 404
+    if any(item.activo for item in pieza.molde_piezas):
+        return jsonify({
+            'error': 'Desvincule la pieza de todos los moldes antes de inactivarla'
+        }), 409
+    pieza.activo = False
+    pieza.version += 1
+    db.session.commit()
+    return jsonify(pieza.to_dict(include_moldes=True)), 200
 
 
 @catalogo_bp.route('/piezas-color', methods=['GET'])
@@ -199,14 +408,26 @@ def crear_producto():
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
+
+    if str(data.get('cod_sku_pt') or '').strip():
+        return _manual_identifier_error('cod_sku_pt')
+    if not str(data.get('producto') or '').strip():
+        return jsonify({'error': 'producto es obligatorio'}), 400
+    try:
+        linea, familia, _ = validate_linea_familia(
+            linea_id=data.get('linea_id'),
+            familia_id=data.get('familia_id'),
+        )
+    except ClassificationError as exc:
+        return _classification_error_response(exc)
     
     try:
         producto = ProductoTerminado(
-            cod_sku_pt=data['cod_sku_pt'],
-            producto=data['producto'],
+            cod_sku_pt=generar_codigo_catalogo('PRODUCTO_TERMINADO'),
+            producto=str(data['producto']).strip(),
             cod_producto=data.get('cod_producto'),
-            linea_id=data.get('linea_id', 1),
-            familia_id=data.get('familia_id', 1),
+            linea_id=linea.id,
+            familia_id=familia.id,
             peso_g=data.get('peso_g'),
             precio_estimado=data.get('precio_estimado'),
             precio_sin_igv=data.get('precio_sin_igv'),
@@ -242,12 +463,22 @@ def actualizar_producto(cod_sku_pt):
     if not producto:
         return jsonify({'error': 'Producto no encontrado'}), 404
     
-    data = request.get_json()
+    data = request.get_json() or {}
+    codigo_solicitado = str(data.get('cod_sku_pt') or '').strip()
+    if codigo_solicitado and codigo_solicitado != producto.cod_sku_pt:
+        return _immutable_identifier_error('cod_sku_pt', producto.cod_sku_pt)
+    try:
+        linea, familia, _ = validate_linea_familia(
+            linea_id=data.get('linea_id', producto.linea_id),
+            familia_id=data.get('familia_id', producto.familia_id),
+        )
+    except ClassificationError as exc:
+        return _classification_error_response(exc)
     
     producto.producto = data.get('producto', producto.producto)
     producto.cod_producto = data.get('cod_producto', producto.cod_producto)
-    producto.linea_id = data.get('linea_id', producto.linea_id)
-    producto.familia_id = data.get('familia_id', producto.familia_id)
+    producto.linea_id = linea.id
+    producto.familia_id = familia.id
     producto.peso_g = data.get('peso_g', producto.peso_g)
     producto.precio_estimado = data.get('precio_estimado', producto.precio_estimado)
     producto.precio_sin_igv = data.get('precio_sin_igv', producto.precio_sin_igv)
@@ -301,8 +532,203 @@ def listar_maquinas():
 # ============================================================
 # MOLDES CRUD
 # ============================================================
-from app.models.molde import Molde, Pieza
+from app.models.molde import Molde, MoldePieza, Pieza
 from app.models.producto import PiezaComponente
+
+
+def _ensure_default_line_family():
+    """Resuelve los catálogos obligatorios para variantes legacy/autogeneradas."""
+    linea = Linea.query.filter_by(nombre='GENERAL').first()
+    if not linea:
+        linea = Linea(
+            codigo=_next_available_numeric_code(Linea, 'LINEA'),
+            nombre='GENERAL',
+        )
+        db.session.add(linea)
+        db.session.flush()
+    elif not linea.activo:
+        linea.activo = True
+        linea.version += 1
+
+    familia = Familia.query.filter_by(nombre='COMPONENTES').first()
+    if not familia:
+        familia = Familia(
+            codigo=_next_available_numeric_code(Familia, 'FAMILIA'),
+            nombre='COMPONENTES',
+        )
+        db.session.add(familia)
+        db.session.flush()
+    elif not familia.activo:
+        familia.activo = True
+        familia.version += 1
+    ensure_linea_familia(
+        linea_id=linea.id,
+        familia_id=familia.id,
+    )
+    return linea, familia
+
+
+def _pieza_color_to_dict(pieza):
+    """Serializa el SKU coloreado sin usar su cavidad legacy como configuración."""
+    relaciones = []
+    if pieza.pieza_rel:
+        relaciones = [
+            item.to_summary_dict()
+            for item in pieza.pieza_rel.molde_piezas
+            if item.activo
+        ]
+    return {
+        'sku': pieza.sku,
+        'nombre': pieza.piezas,
+        'piezas': pieza.piezas,
+        'tipo': pieza.tipo,
+        'peso': pieza.peso,
+        'cavidad': pieza.cavidad,
+        'cavidad_legacy': pieza.cavidad,
+        'linea_id': pieza.linea_id,
+        'familia_id': pieza.familia_id,
+        'color_produccion_id': pieza.color_produccion_id,
+        'color': pieza.color_produccion_rel.nombre if pieza.color_produccion_rel else None,
+        'pieza_id': pieza.pieza_id,
+        'pieza_codigo': pieza.pieza_rel.codigo if pieza.pieza_rel else None,
+        'moldes': relaciones,
+    }
+
+
+def _resolve_pieza_color_classification(data, current=None):
+    """Impide que una variante coloreada se separe de su maestro ``Pieza``."""
+    if 'pieza_id' in data:
+        requested_piece_id = data.get('pieza_id')
+    else:
+        requested_piece_id = current.pieza_id if current else None
+    if requested_piece_id == '':
+        requested_piece_id = None
+
+    if requested_piece_id is not None:
+        try:
+            requested_piece_id = int(requested_piece_id)
+        except (TypeError, ValueError):
+            raise ClassificationError(
+                'pieza_id debe ser un entero positivo',
+                'PIEZA_INVALIDA',
+            )
+        if requested_piece_id <= 0:
+            raise ClassificationError(
+                'pieza_id debe ser un entero positivo',
+                'PIEZA_INVALIDA',
+            )
+        pieza_maestra = db.session.get(Pieza, requested_piece_id)
+        if not pieza_maestra or not pieza_maestra.activo:
+            raise ClassificationError(
+                'La pieza maestra no existe o estÃ¡ inactiva',
+                'PIEZA_NO_ENCONTRADA',
+                404,
+            )
+        supplied_linea = data.get('linea_id')
+        supplied_familia = data.get('familia_id')
+        if pieza_maestra.linea_id is None or pieza_maestra.familia_id is None:
+            raise ClassificationError(
+                'La pieza maestra debe tener Línea y Familia antes de crear variantes',
+                'PIEZA_SIN_CLASIFICACION',
+                409,
+            )
+        else:
+            linea, familia, _ = validate_linea_familia(
+                linea_id=pieza_maestra.linea_id,
+                familia_id=pieza_maestra.familia_id,
+            )
+
+        if supplied_linea not in (None, '') or supplied_familia not in (None, ''):
+            try:
+                matches_master = (
+                    int(supplied_linea) == linea.id
+                    and int(supplied_familia) == familia.id
+                )
+            except (TypeError, ValueError):
+                matches_master = False
+            if not matches_master:
+                raise ClassificationError(
+                    'La clasificaciÃ³n de la variante debe ser la de su pieza maestra',
+                    'CLASIFICACION_PIEZA_DIVERGENTE',
+                    409,
+                )
+        return pieza_maestra, linea, familia
+
+    linea, familia, _ = validate_linea_familia(
+        linea_id=data.get('linea_id', current.linea_id if current else None),
+        familia_id=data.get('familia_id', current.familia_id if current else None),
+    )
+    return None, linea, familia
+
+
+def _piece_and_composition_from_payload(molde, data):
+    """Resuelve/crea Pieza global y devuelve una composición aún no persistida."""
+    pieza_id = data.get('pieza_id')
+    if pieza_id is not None:
+        try:
+            pieza_id = int(pieza_id)
+        except (TypeError, ValueError):
+            raise ValueError('pieza_id debe ser un entero')
+        pieza = db.session.get(Pieza, pieza_id)
+        if not pieza or not pieza.activo:
+            raise ValueError('La pieza global no existe o está inactiva')
+    else:
+        nombre = str(data.get('nombre') or '').strip()
+        peso_nominal = data.get('peso_nominal_gr', data.get('peso_unitario_gr'))
+        if str(data.get('codigo') or '').strip():
+            raise ValueError('codigo es automático y no admite asignación manual')
+        if str(data.get('sku_override') or '').strip():
+            raise ValueError('sku_override ya no admite asignación manual')
+        if not nombre or peso_nominal is None:
+            raise ValueError('nombre y peso_nominal_gr son obligatorios al crear una pieza')
+        linea, familia, _ = validate_linea_familia(
+            linea_id=data.get('linea_id'),
+            familia_id=data.get('familia_id'),
+            allow_unclassified=True,
+        )
+        pieza = Pieza(
+            codigo=generar_codigo_catalogo('PIEZA'),
+            nombre=nombre,
+            linea_id=linea.id if linea else None,
+            familia_id=familia.id if familia else None,
+            peso_nominal_gr=float(peso_nominal),
+            activo=True,
+        )
+        if pieza.peso_nominal_gr <= 0:
+            raise ValueError('peso_nominal_gr debe ser positivo')
+        db.session.add(pieza)
+        db.session.flush()
+
+    try:
+        cavidades = int(data['cavidades'])
+        peso_operativo = float(
+            data.get('peso_unitario_gr', pieza.peso_nominal_gr)
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError('cavidades y peso_unitario_gr deben ser numéricos')
+    if cavidades <= 0 or peso_operativo <= 0:
+        raise ValueError('cavidades y peso_unitario_gr deben ser positivos')
+
+    existing = MoldePieza.query.filter_by(
+        molde_id=molde.codigo,
+        pieza_id=pieza.id,
+    ).first()
+    if existing:
+        if existing.activo:
+            raise ValueError('La pieza ya está asociada a este molde')
+        existing.activo = True
+        existing.cavidades = cavidades
+        existing.peso_unitario_gr = peso_operativo
+        existing.version += 1
+        return pieza, existing
+
+    return pieza, MoldePieza(
+        molde=molde,
+        pieza=pieza,
+        cavidades=cavidades,
+        peso_unitario_gr=peso_operativo,
+        activo=True,
+    )
 
 @catalogo_bp.route('/moldes/exportar', methods=['GET'])
 def exportar_moldes():
@@ -313,11 +739,16 @@ def exportar_moldes():
     for m in moldes:
         piezas = []
         for mp in m.piezas:
-            pieza = db.session.get(PiezaColor, mp.pieza_sku)
+            if not mp.activo:
+                continue
+            variantes = sorted(mp.variantes, key=lambda item: item.sku)
+            variante = variantes[0] if variantes else None
             piezas.append({
-                'sku': mp.pieza_sku,
-                'nombre': pieza.piezas if pieza else mp.pieza_sku,
-                'tipo': pieza.tipo if pieza else 'SIMPLE',
+                'pieza_id': mp.pieza_id,
+                'pieza_codigo': mp.pieza.codigo,
+                'sku': variante.sku if variante else None,
+                'nombre': mp.nombre,
+                'tipo': variante.tipo if variante else 'SIMPLE',
                 'cavidades': mp.cavidades,
                 'peso_unitario_gr': mp.peso_unitario_gr
             })
@@ -355,11 +786,19 @@ def crear_molde():
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
+    if str(data.get('codigo') or '').strip():
+        return _manual_identifier_error('codigo')
+    if not str(data.get('nombre') or '').strip():
+        return jsonify({'error': 'nombre es obligatorio'}), 400
+    for pieza_data in data.get('piezas', []):
+        manual_field = _manual_new_piece_identifier_field(pieza_data)
+        if manual_field:
+            return _manual_identifier_error(f'piezas.{manual_field}')
     
     try:
         molde = Molde(
-            codigo=data['codigo'],
-            nombre=data['nombre'],
+            codigo=generar_codigo_catalogo('MOLDE'),
+            nombre=str(data['nombre']).strip(),
             peso_tiro_gr=data['peso_tiro_gr'],
             tiempo_ciclo_std=data.get('tiempo_ciclo_std', 30.0),
             activo=data.get('activo', True),
@@ -370,59 +809,49 @@ def crear_molde():
         # Agregar piezas si se proveen
         if 'piezas' in data and len(data['piezas']) > 0:
             for pieza_data in data.get('piezas', []):
-                mp = Pieza(
-                    molde_id=molde.codigo,
-                    nombre=pieza_data.get('nombre', pieza_data.get('pieza_sku', 'Forma Genérica')),
-                    cavidades=pieza_data['cavidades'],
-                    peso_unitario_gr=pieza_data['peso_unitario_gr']
-                )
+                _, mp = _piece_and_composition_from_payload(molde, pieza_data)
                 db.session.add(mp)
         
         # --- SIMPLE MODE: Crear pieza automática si no se especificaron piezas ---
         elif data.get('cavidades') and data.get('peso_unitario_gr'):
-            # Generar una pieza automática
-            pieza_sku = f"{molde.codigo}-STD"
-            
-            # Verificar si existe, sino crear
-            pieza = db.session.get(PiezaColor, pieza_sku)
-            if not pieza:
-                # Obtener o crear Linea y Familia por defecto
-                linea_default = Linea.query.filter_by(nombre='GENERAL').first()
-                if not linea_default:
-                    max_cod = db.session.query(db.func.max(Linea.codigo)).scalar() or 0
-                    linea_default = Linea(codigo=max_cod + 1, nombre='GENERAL')
-                    db.session.add(linea_default)
-                    db.session.flush()
-                
-                familia_default = Familia.query.filter_by(nombre='COMPONENTES').first()
-                if not familia_default:
-                    max_cod = db.session.query(db.func.max(Familia.codigo)).scalar() or 0
-                    familia_default = Familia(codigo=max_cod + 1, nombre='COMPONENTES')
-                    db.session.add(familia_default)
-                    db.session.flush()
-
-                pieza = PiezaColor(
-                    sku=pieza_sku,
-                    piezas=f"{molde.nombre} (Std)",
-                    linea_id=linea_default.id,
-                    familia_id=familia_default.id,
-                    peso=float(data.get('peso_unitario_gr')),
-                    cavidad=int(data.get('cavidades')),
-                    tipo='SIMPLE',
-                )
-                db.session.add(pieza)
+            linea_default, familia_default = _ensure_default_line_family()
+            pieza_global = Pieza(
+                codigo=generar_codigo_catalogo('PIEZA'),
+                nombre=f"{molde.nombre} (Std)",
+                linea_id=linea_default.id,
+                familia_id=familia_default.id,
+                peso_nominal_gr=float(data.get('peso_unitario_gr')),
+                activo=True,
+            )
+            db.session.add(pieza_global)
+            db.session.flush()
+            pieza_color = PiezaColor(
+                sku=generar_codigo_catalogo('PIEZA_COLOR'),
+                piezas=f"{molde.nombre} (Std)",
+                linea_id=linea_default.id,
+                familia_id=familia_default.id,
+                peso=float(data.get('peso_unitario_gr')),
+                cavidad=None,
+                tipo='SIMPLE',
+                pieza_id=pieza_global.id,
+            )
+            db.session.add(pieza_color)
             
             # Crear relación Molde-PiezaColor
-            mp = Pieza(
-                molde_id=molde.codigo,
-                nombre=pieza_sku,  # Usamos el SKU como nombre de la forma por ahora
+            mp = MoldePieza(
+                molde=molde,
+                pieza=pieza_global,
                 cavidades=int(data.get('cavidades')),
-                peso_unitario_gr=float(data.get('peso_unitario_gr'))
+                peso_unitario_gr=float(data.get('peso_unitario_gr')),
+                activo=True,
             )
             db.session.add(mp)
         
         db.session.commit()
         return jsonify(molde.to_dict()), 201
+    except ClassificationError as exc:
+        db.session.rollback()
+        return _classification_error_response(exc)
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
@@ -435,67 +864,81 @@ def actualizar_molde(codigo):
     if not molde:
         return jsonify({'error': 'Molde no encontrado'}), 404
     
-    data = request.get_json()
+    data = request.get_json() or {}
+    codigo_solicitado = str(data.get('codigo') or '').strip()
+    if codigo_solicitado and codigo_solicitado != molde.codigo:
+        return _immutable_identifier_error('codigo', molde.codigo)
+    for pieza_data in data.get('piezas', []):
+        manual_field = _manual_new_piece_identifier_field(pieza_data)
+        if manual_field:
+            return _manual_identifier_error(f'piezas.{manual_field}')
     
-    molde.nombre = data.get('nombre', molde.nombre)
-    molde.peso_tiro_gr = data.get('peso_tiro_gr', molde.peso_tiro_gr)
-    molde.tiempo_ciclo_std = data.get('tiempo_ciclo_std', molde.tiempo_ciclo_std)
-    molde.activo = data.get('activo', molde.activo)
-    molde.notas = data.get('notas', molde.notas)
-    
-    # Actualizar piezas si se proveen
-    # Actualizar piezas si se proveen explicitamente
-    if 'piezas' in data:
-        Pieza.query.filter_by(molde_id=codigo).delete()
-        for pieza_data in data['piezas']:
-            mp = Pieza(
-                molde_id=codigo,
-                nombre=pieza_data.get('nombre', pieza_data.get('pieza_sku', 'Forma Genérica')),
-                cavidades=pieza_data['cavidades'],
-                peso_unitario_gr=pieza_data['peso_unitario_gr']
-            )
-            db.session.add(mp)
-            
-    # --- SIMPLE MODE: Actualizar primera pieza existente ---
-    elif 'cavidades' in data and 'peso_unitario_gr' in data:
-        piezas_molde = Pieza.query.filter_by(molde_id=codigo).all()
-        
-        if piezas_molde:
-            # Update first piece
-            mp = piezas_molde[0]
-            mp.cavidades = int(data['cavidades'])
-            mp.peso_unitario_gr = float(data['peso_unitario_gr'])
-            
-            # Tambien actualizar la pieza base para consistencia
-            pieza = db.session.get(PiezaColor, mp.nombre)
-            if pieza:
-                pieza.peso = mp.peso_unitario_gr
-                pieza.cavidad = mp.cavidades
-                
-        else:
-            # No tiene piezas, CREAR la default (copy logic from create)
-            pieza_sku = f"{molde.codigo}-STD"
-            pieza = db.session.get(PiezaColor, pieza_sku)
-            if not pieza:
-                pieza = PiezaColor(
-                    sku=pieza_sku,
+    try:
+        molde.nombre = data.get('nombre', molde.nombre)
+        molde.peso_tiro_gr = data.get('peso_tiro_gr', molde.peso_tiro_gr)
+        molde.tiempo_ciclo_std = data.get('tiempo_ciclo_std', molde.tiempo_ciclo_std)
+        molde.activo = data.get('activo', molde.activo)
+        molde.notas = data.get('notas', molde.notas)
+
+        # Actualizar piezas si se proveen explicitamente.
+        if 'piezas' in data:
+            for relacion in molde.piezas:
+                relacion.activo = False
+                relacion.version += 1
+            for pieza_data in data['piezas']:
+                _, mp = _piece_and_composition_from_payload(molde, pieza_data)
+                db.session.add(mp)
+
+        # --- SIMPLE MODE: Actualizar primera pieza existente ---
+        elif 'cavidades' in data and 'peso_unitario_gr' in data:
+            piezas_molde = [item for item in molde.piezas if item.activo]
+
+            if piezas_molde:
+                mp = piezas_molde[0]
+                mp.cavidades = int(data['cavidades'])
+                mp.peso_unitario_gr = float(data['peso_unitario_gr'])
+                mp.version += 1
+            else:
+                linea_default, familia_default = _ensure_default_line_family()
+                pieza_global = Pieza(
+                    codigo=generar_codigo_catalogo('PIEZA'),
+                    nombre=f"{molde.nombre} (Std)",
+                    linea_id=linea_default.id,
+                    familia_id=familia_default.id,
+                    peso_nominal_gr=float(data['peso_unitario_gr']),
+                    activo=True,
+                )
+                db.session.add(pieza_global)
+                db.session.flush()
+                pieza_color = PiezaColor(
+                    sku=generar_codigo_catalogo('PIEZA_COLOR'),
                     piezas=f"{molde.nombre} (Std)",
                     peso=float(data['peso_unitario_gr']),
-                    cavidad=int(data['cavidades']),
+                    cavidad=None,
                     tipo='SIMPLE',
+                    linea_id=linea_default.id,
+                    familia_id=familia_default.id,
+                    pieza_id=pieza_global.id,
                 )
-                db.session.add(pieza)
-            
-            mp = Pieza(
-                molde_id=molde.codigo,
-                pieza_sku=pieza_sku,
-                cavidades=int(data['cavidades']),
-                peso_unitario_gr=float(data['peso_unitario_gr'])
-            )
-            db.session.add(mp)
-    
-    db.session.commit()
-    return jsonify(molde.to_dict()), 200
+                db.session.add(pieza_color)
+
+                mp = MoldePieza(
+                    molde=molde,
+                    pieza=pieza_global,
+                    cavidades=int(data['cavidades']),
+                    peso_unitario_gr=float(data['peso_unitario_gr']),
+                    activo=True,
+                )
+                db.session.add(mp)
+
+        db.session.commit()
+        return jsonify(molde.to_dict()), 200
+    except ClassificationError as exc:
+        db.session.rollback()
+        return _classification_error_response(exc)
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 400
 
 
 @catalogo_bp.route('/moldes/<codigo>', methods=['DELETE'])
@@ -512,80 +955,122 @@ def eliminar_molde(codigo):
 
 @catalogo_bp.route('/moldes/<codigo>/formas', methods=['POST'])
 def crear_forma_molde(codigo):
-    """Crea una nueva forma física (cavidad) en el molde"""
+    """Asocia una Pieza global al molde y configura su composición física."""
     molde = db.session.get(Molde, codigo)
     if not molde:
         return jsonify({'error': 'Molde no encontrado'}), 404
-        
-    data = request.get_json()
-    if not data or not data.get('nombre') or not data.get('cavidades') or not data.get('peso_unitario_gr'):
-        return jsonify({'error': 'Faltan campos (nombre, cavidades, peso_unitario_gr)'}), 400
-        
+
+    data = request.get_json() or {}
+    manual_field = _manual_new_piece_identifier_field(data)
+    if manual_field:
+        return _manual_identifier_error(manual_field)
     try:
-        # Validar unicidad (ya existe una forma con ese nombre en este molde)
-        if Pieza.query.filter_by(molde_id=codigo, nombre=data['nombre']).first():
-            return jsonify({'error': f"La forma '{data['nombre']}' ya existe en el molde"}), 409
-            
-        forma = Pieza(
-            molde_id=codigo,
-            nombre=data['nombre'],
-            cavidades=int(data['cavidades']),
-            peso_unitario_gr=float(data['peso_unitario_gr'])
-        )
-        db.session.add(forma)
+        _, composicion = _piece_and_composition_from_payload(molde, data)
+        db.session.add(composicion)
         db.session.commit()
-        return jsonify(forma.to_dict()), 201
+        return jsonify(composicion.to_dict(include_variantes=True)), 201
+    except ClassificationError as exc:
+        db.session.rollback()
+        return _classification_error_response(exc)
+    except ValueError as exc:
+        db.session.rollback()
+        status = 409 if 'ya está asociada' in str(exc) else 400
+        return jsonify({'error': str(exc)}), status
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
 
+@catalogo_bp.route('/formas/<int:forma_id>', methods=['PUT'])
+def actualizar_forma_molde(forma_id):
+    """Actualiza cavidades/peso de una asociación, nunca el maestro Pieza."""
+    composicion = db.session.get(MoldePieza, forma_id)
+    if not composicion or not composicion.activo:
+        return jsonify({'error': 'Composición de molde no encontrada'}), 404
+    data = request.get_json() or {}
+    if data.get('version') is None:
+        return jsonify({
+            'error': 'version es obligatoria para actualizar la composición',
+            'codigo': 'VERSION_REQUIRED',
+        }), 400
+    try:
+        expected_version = int(data['version'])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'version debe ser un entero positivo'}), 400
+    if expected_version <= 0:
+        return jsonify({'error': 'version debe ser un entero positivo'}), 400
+    if expected_version != composicion.version:
+        return jsonify({
+            'error': 'La composición cambió desde que fue cargada',
+            'codigo': 'VERSION_CONFLICT',
+            'actual': composicion.to_dict(include_variantes=True),
+        }), 409
+    try:
+        cavidades = int(data.get('cavidades', composicion.cavidades))
+        peso = float(data.get('peso_unitario_gr', composicion.peso_unitario_gr))
+        if cavidades <= 0 or peso <= 0:
+            raise ValueError('cavidades y peso_unitario_gr deben ser positivos')
+        composicion.cavidades = cavidades
+        composicion.peso_unitario_gr = peso
+        composicion.version += 1
+        db.session.commit()
+        return jsonify(composicion.to_dict(include_variantes=True)), 200
+    except (TypeError, ValueError) as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 400
+
+
 @catalogo_bp.route('/formas/<int:forma_id>/colores', methods=['POST'])
 def crear_color_forma(forma_id):
-    """Crea una variante física SKU (PiezaColor) para la forma dada"""
-    forma = db.session.get(Pieza, forma_id)
-    if not forma:
-        return jsonify({'error': 'Forma no encontrada'}), 404
-        
-    data = request.get_json()
-    if not data or not data.get('color_id'):
+    """Crea/reutiliza una variante de color de la Pieza global asociada."""
+    composicion = db.session.get(MoldePieza, forma_id)
+    if not composicion or not composicion.activo:
+        return jsonify({'error': 'Composición de molde no encontrada'}), 404
+
+    data = request.get_json() or {}
+    if str(data.get('sku') or '').strip():
+        return _manual_identifier_error('sku')
+    if data.get('color_id') is None:
         return jsonify({'error': 'Debe proveer un color_id'}), 400
-        
+
     color = db.session.get(ColorProduccion, data['color_id'])
     if not color:
         return jsonify({'error': 'Color no encontrado'}), 404
-        
+
     try:
-        molde_codigo = forma.molde_id
-        base_sku = molde_codigo.replace('MOL-', '')
-        sku_pieza = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
-        
-        if db.session.get(PiezaColor, sku_pieza):
-            return jsonify({'error': f'El SKU {sku_pieza} ya existe'}), 409
-            
-        nombre_coloreado = f"{forma.nombre} {color.nombre}"
-        
-        linea_id = None
-        familia_id = None
-        linea_default = Linea.query.filter_by(nombre='GENERAL').first()
-        familia_default = Familia.query.filter_by(nombre='COMPONENTES').first()
-        if linea_default: linea_id = linea_default.id
-        if familia_default: familia_id = familia_default.id
-             
+        existente = PiezaColor.query.filter_by(
+            pieza_id=composicion.pieza_id,
+            color_produccion_id=color.id,
+        ).first()
+        if existente:
+            payload = _pieza_color_to_dict(existente)
+            payload['existed'] = True
+            return jsonify(payload), 200
+
+        sku_pieza = generar_codigo_catalogo('PIEZA_COLOR')
+        _, linea, familia = _resolve_pieza_color_classification({
+            'pieza_id': composicion.pieza_id,
+        })
         pieza = PiezaColor(
             sku=sku_pieza,
-            piezas=nombre_coloreado,
-            peso=forma.peso_unitario_gr,
-            cavidad=forma.cavidades,
+            piezas=f"{composicion.nombre} {color.nombre}",
+            peso=composicion.pieza.peso_nominal_gr,
+            # Compatibilidad de lectura; no es la fuente de cavidades operativas.
+            cavidad=None,
             tipo='SIMPLE',
-            linea_id=linea_id,
-            familia_id=familia_id,
+            linea_id=linea.id,
+            familia_id=familia.id,
             color_produccion_id=color.id,
-            pieza_id=forma.id
+            pieza_id=composicion.pieza_id,
         )
         db.session.add(pieza)
         db.session.commit()
-        return jsonify(pieza.to_dict()), 201
+        payload = _pieza_color_to_dict(pieza)
+        payload['existed'] = False
+        return jsonify(payload), 201
+    except ClassificationError as exc:
+        db.session.rollback()
+        return _classification_error_response(exc)
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
@@ -593,68 +1078,63 @@ def crear_color_forma(forma_id):
 
 @catalogo_bp.route('/formas/<int:forma_id>', methods=['DELETE'])
 def eliminar_forma(forma_id):
-    """Elimina una forma física si no tiene SKUs (PiezaColor) asociados"""
-    forma = db.session.get(Pieza, forma_id)
-    if not forma:
-        return jsonify({'error': 'Forma no encontrada'}), 404
-        
-    if forma.variantes and len(forma.variantes) > 0:
-        return jsonify({'error': 'No se puede eliminar la Forma porque tiene SKUs de inventario asociados. Elimine los SKUs primero.'}), 400
-        
-    try:
-        db.session.delete(forma)
-        db.session.commit()
-        return jsonify({'message': f'Forma {forma_id} eliminada'}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 400
+    """Desvincula lógicamente la Pieza del molde; conserva maestro y SKUs."""
+    composicion = db.session.get(MoldePieza, forma_id)
+    if not composicion or not composicion.activo:
+        return jsonify({'error': 'Composición de molde no encontrada'}), 404
+    composicion.activo = False
+    composicion.version += 1
+    db.session.commit()
+    return jsonify({
+        'message': f'Pieza desvinculada del molde {composicion.molde_id}',
+        'composicion': composicion.to_dict(),
+    }), 200
 
 
 # ============================================================
 # PIEZAS CON TIPO Y COMPONENTES
 # ============================================================
 
-@catalogo_bp.route('/piezas/<sku>', methods=['GET'])
-def obtener_pieza(sku):
+@catalogo_bp.route('/piezas-color/<sku>', methods=['GET'])
+def obtener_pieza_color(sku):
     """Obtiene una pieza específica con componentes si es KIT"""
     pieza = db.session.get(PiezaColor, sku)
     if not pieza:
         return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
-    return jsonify({
-        'sku': pieza.sku,
-        'nombre': pieza.piezas,
-        'tipo': pieza.tipo,
-        'peso': pieza.peso,
-        'cavidad': pieza.cavidad,
-        'linea': pieza.linea_rel.nombre if pieza.linea_rel else None,
-        'familia': pieza.familia_rel.nombre if pieza.familia_rel else None,
-        'color': pieza.color_produccion_rel.nombre if pieza.color_produccion_rel else None,
-        'componentes': [c.to_dict() for c in pieza.componentes] if pieza.tipo == 'KIT' else [],
-        'moldes': [{'molde_id': mp.molde_id, 'cavidades': mp.cavidades, 'peso_unitario': mp.peso_unitario_gr} 
-                   for mp in pieza.molde_piezas] if hasattr(pieza, 'molde_piezas') else []
-    }), 200
+    payload = _pieza_color_to_dict(pieza)
+    payload['linea'] = pieza.linea_rel.nombre if pieza.linea_rel else None
+    payload['familia'] = pieza.familia_rel.nombre if pieza.familia_rel else None
+    payload['componentes'] = [
+        item.to_dict() for item in pieza.componentes
+    ] if pieza.tipo == 'KIT' else []
+    return jsonify(payload), 200
 
 
-@catalogo_bp.route('/piezas', methods=['POST'])
-def crear_pieza():
-    """Crea una nueva pieza"""
+@catalogo_bp.route('/piezas-color', methods=['POST'])
+def crear_pieza_color():
+    """Crea un SKU coloreado vinculado opcionalmente al maestro Pieza."""
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
+    if str(data.get('sku') or '').strip():
+        return _manual_identifier_error('sku')
+    if not str(data.get('nombre') or '').strip():
+        return jsonify({'error': 'nombre es obligatorio'}), 400
     
     try:
+        pieza_maestra, linea, familia = _resolve_pieza_color_classification(data)
         pieza = PiezaColor(
-            sku=data['sku'],
-            piezas=data['nombre'],
+            sku=generar_codigo_catalogo('PIEZA_COLOR'),
+            piezas=str(data['nombre']).strip(),
             tipo=data.get('tipo', 'SIMPLE'),
             peso=data.get('peso'),
-            cavidad=data.get('cavidad'),
+            cavidad=data.get('cavidad'),  # legado, no gobierna el molde
             color_produccion_id=data.get('color_produccion_id'),
             cod_pieza=data.get('cod_pieza'),
-            linea_id=data.get('linea_id', 1),
-            familia_id=data.get('familia_id', 1),
-            pieza_id=data.get('pieza_id'),
+            linea_id=linea.id,
+            familia_id=familia.id,
+            pieza_id=pieza_maestra.id if pieza_maestra else None,
             cod_extru=data.get('cod_extru'),
             tipo_extruccion=data.get('tipo_extruccion'),
             cod_mp=data.get('cod_mp'),
@@ -674,63 +1154,87 @@ def crear_pieza():
         
         db.session.commit()
         return jsonify({'sku': pieza.sku, 'nombre': pieza.piezas}), 201
+    except ClassificationError as exc:
+        db.session.rollback()
+        return _classification_error_response(exc)
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
 
-@catalogo_bp.route('/piezas/<sku>', methods=['PUT'])
-def actualizar_pieza(sku):
-    """Actualiza una pieza existente"""
+@catalogo_bp.route('/piezas-color/<sku>', methods=['PUT'])
+def actualizar_pieza_color(sku):
+    """Actualiza un SKU coloreado; las cavidades se editan en MoldePieza."""
     pieza = db.session.get(PiezaColor, sku)
     if not pieza:
         return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
-    data = request.get_json()
+    data = request.get_json() or {}
+    sku_solicitado = str(data.get('sku') or '').strip()
+    if sku_solicitado and sku_solicitado != pieza.sku:
+        return _immutable_identifier_error('sku', pieza.sku)
     
-    pieza.piezas = data.get('nombre', pieza.piezas)
-    pieza.tipo = data.get('tipo', pieza.tipo)
-    pieza.peso = data.get('peso', pieza.peso)
-    pieza.cavidad = data.get('cavidad', pieza.cavidad)
-    pieza.color_produccion_id = data.get('color_produccion_id', pieza.color_produccion_id)
-    pieza.cod_pieza = data.get('cod_pieza', pieza.cod_pieza)
-    pieza.linea_id = data.get('linea_id', pieza.linea_id)
-    pieza.familia_id = data.get('familia_id', pieza.familia_id)
-    pieza.pieza_id = data.get('pieza_id', pieza.pieza_id)
-    pieza.cod_extru = data.get('cod_extru', pieza.cod_extru)
-    pieza.tipo_extruccion = data.get('tipo_extruccion', pieza.tipo_extruccion)
-    pieza.cod_mp = data.get('cod_mp', pieza.cod_mp)
-    pieza.mp = data.get('mp', pieza.mp)
-    
-    # Actualizar componentes si es KIT
-    if data.get('componentes') is not None:
-        PiezaComponente.query.filter_by(kit_sku=sku).delete()
-        for comp in data['componentes']:
-            pc = PiezaComponente(
-                kit_sku=sku,
-                componente_sku=comp['componente_sku'],
-                cantidad=comp.get('cantidad', 1)
-            )
-            db.session.add(pc)
-    
-    db.session.commit()
-    return jsonify({'sku': pieza.sku, 'nombre': pieza.piezas}), 200
+    try:
+        pieza_maestra, linea, familia = _resolve_pieza_color_classification(
+            data,
+            current=pieza,
+        )
+        pieza.piezas = data.get('nombre', pieza.piezas)
+        pieza.tipo = data.get('tipo', pieza.tipo)
+        pieza.peso = data.get('peso', pieza.peso)
+        pieza.color_produccion_id = data.get(
+            'color_produccion_id',
+            pieza.color_produccion_id,
+        )
+        pieza.cod_pieza = data.get('cod_pieza', pieza.cod_pieza)
+        pieza.linea_id = linea.id
+        pieza.familia_id = familia.id
+        pieza.pieza_id = pieza_maestra.id if pieza_maestra else None
+        pieza.cod_extru = data.get('cod_extru', pieza.cod_extru)
+        pieza.tipo_extruccion = data.get(
+            'tipo_extruccion',
+            pieza.tipo_extruccion,
+        )
+        pieza.cod_mp = data.get('cod_mp', pieza.cod_mp)
+        pieza.mp = data.get('mp', pieza.mp)
+
+        # Actualizar componentes si es KIT
+        if data.get('componentes') is not None:
+            PiezaComponente.query.filter_by(kit_sku=sku).delete()
+            for comp in data['componentes']:
+                pc = PiezaComponente(
+                    kit_sku=sku,
+                    componente_sku=comp['componente_sku'],
+                    cantidad=comp.get('cantidad', 1)
+                )
+                db.session.add(pc)
+
+        db.session.commit()
+        return jsonify({'sku': pieza.sku, 'nombre': pieza.piezas}), 200
+    except ClassificationError as exc:
+        db.session.rollback()
+        return _classification_error_response(exc)
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 400
 
 
-@catalogo_bp.route('/piezas/<sku>', methods=['DELETE'])
-def eliminar_pieza(sku):
-    """Elimina una pieza"""
+@catalogo_bp.route('/piezas-color/<sku>', methods=['DELETE'])
+def eliminar_pieza_color(sku):
+    """Elimina un SKU coloreado si sus referencias permiten hacerlo."""
     pieza = db.session.get(PiezaColor, sku)
     if not pieza:
         return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
-    # Verificar que no esté en uso
-    if Pieza.query.filter_by(pieza_sku=sku).first():
-        return jsonify({'error': 'No se puede eliminar: pieza está asociada a un molde'}), 400
-    
-    db.session.delete(pieza)
-    db.session.commit()
-    return jsonify({'message': f'PiezaColor {sku} eliminada'}), 200
+    if ProductoPieza.query.filter_by(pieza_sku=sku).first():
+        return jsonify({'error': 'No se puede eliminar: el SKU integra un producto terminado'}), 409
+    try:
+        db.session.delete(pieza)
+        db.session.commit()
+        return jsonify({'message': f'PiezaColor {sku} eliminada'}), 200
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 409
 
 
 # ============================================================
@@ -739,28 +1243,31 @@ def eliminar_pieza(sku):
 
 @catalogo_bp.route('/piezas-producibles', methods=['GET'])
 def obtener_piezas_producibles():
-    """Retorna solo piezas que tienen un molde asignado via Pieza (producibles)"""
-    from app.models.molde import Pieza as MP
+    """Retorna un registro por SKU y composición activa capaz de producirlo."""
     piezas = (
         PiezaColor.query
-        .join(MP, MP.id == PiezaColor.pieza_id)
+        .join(Pieza, Pieza.id == PiezaColor.pieza_id)
+        .join(MoldePieza, MoldePieza.pieza_id == Pieza.id)
+        .filter(Pieza.activo.is_(True), MoldePieza.activo.is_(True))
         .order_by(PiezaColor.piezas)
         .all()
     )
 
     result = []
     for p in piezas:
-        mp_row = p.pieza_rel
-        molde_obj = mp_row.molde if mp_row else None
-        
-        result.append({
-            'sku': p.sku,
-            'nombre': p.piezas,
-            'tipo': p.tipo,
-            'molde': molde_obj.to_dict(include_variantes=False) if molde_obj else None,
-            'cavidades': mp_row.cavidades if mp_row else p.cavidad,
-            'peso_unitario_gr': mp_row.peso_unitario_gr if mp_row else p.peso
-        })
+        for composicion in p.pieza_rel.molde_piezas:
+            if not composicion.activo or not composicion.molde.activo:
+                continue
+            result.append({
+                'sku': p.sku,
+                'nombre': p.piezas,
+                'tipo': p.tipo,
+                'pieza_id': p.pieza_id,
+                'molde_pieza_id': composicion.id,
+                'molde': composicion.molde.to_dict(include_variantes=False),
+                'cavidades': composicion.cavidades,
+                'peso_unitario_gr': composicion.peso_unitario_gr,
+            })
     
     return jsonify(result), 200
 
@@ -769,37 +1276,172 @@ def obtener_piezas_producibles():
 # COLORES
 # ============================================================
 
+
+def _color_to_dict(color, *, existed=None):
+    payload = {
+        'id': color.id,
+        'nombre': str(color),
+        'codigo': color.codigo_legacy or color.id,
+        'codigo_legacy': color.codigo_legacy,
+        'color_base_id': color.color_base_id,
+        'color_base_nombre': color.color_base_rel.nombre if color.color_base_rel else None,
+        'familia_color_id': color.familia_color_id,
+        'familia_color_nombre': (
+            color.familia_color_rel.nombre if color.familia_color_rel else None
+        ),
+        'hex_referencia': color.hex_referencia,
+        'activo': color.activo,
+        'version': color.version,
+    }
+    if existed is not None:
+        payload['existed'] = existed
+    return payload
+
+
 @catalogo_bp.route('/colores', methods=['GET'])
 def listar_colores():
     """Lista todos los colores de producción disponibles"""
-    colores = ColorProduccion.query.all()
-    # Para el frontend devolvemos el ID del ColorProduccion pero con el nombre combinado (ej. ROJO SOLIDO)
-    return jsonify([{
-        'id': c.id,
-        'nombre': str(c),
-        'codigo': c.codigo_legacy or c.id
-    } for c in sorted(colores, key=lambda x: str(x))])
+    include_inactive = _query_flag('include_inactive', default=False)
+    query = ColorProduccion.query
+    if not include_inactive:
+        query = query.filter(ColorProduccion.activo.is_(True))
+    colores = query.all()
+    return jsonify([_color_to_dict(c) for c in sorted(colores, key=lambda x: str(x))])
 
 @catalogo_bp.route('/familias-color', methods=['GET'])
 def listar_familias_color():
-    from app.models.producto import FamiliaColor
-    familias_color = FamiliaColor.query.order_by(FamiliaColor.nombre).all()
-    return jsonify([{'id': fc.id, 'nombre': fc.nombre, 'codigo': fc.codigo} for fc in familias_color])
+    query = FamiliaColor.query
+    if not _query_flag('include_inactive', default=False):
+        query = query.filter(FamiliaColor.activo.is_(True))
+    familias_color = query.order_by(FamiliaColor.nombre).all()
+    return jsonify([_familia_color_to_dict(item) for item in familias_color])
+
+
+def _familia_color_to_dict(item):
+    return {
+        'id': item.id,
+        'nombre': item.nombre,
+        'codigo': item.codigo,
+        'codigo_display': (
+            f'FC-{item.codigo:06d}' if item.codigo is not None else None
+        ),
+        'activo': item.activo,
+        'version': item.version,
+    }
+
+
+def _familia_color_payload(data, *, current_id=None):
+    nombre = str(data.get('nombre', '')).strip().upper()
+    if not nombre:
+        raise ValueError('Nombre de familia requerido')
+    raw_codigo = data.get('codigo')
+    try:
+        codigo = int(raw_codigo) if raw_codigo not in (None, '') else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError('El código debe ser un número entero') from exc
+
+    duplicate_name = FamiliaColor.query.filter(
+        db.func.upper(FamiliaColor.nombre) == nombre,
+        FamiliaColor.id != current_id,
+    ).first()
+    if duplicate_name is not None:
+        raise ValueError('Ya existe una familia de color con ese nombre')
+    if codigo is not None:
+        duplicate_code = FamiliaColor.query.filter(
+            FamiliaColor.codigo == codigo,
+            FamiliaColor.id != current_id,
+        ).first()
+        if duplicate_code is not None:
+            raise ValueError('Ya existe una familia de color con ese código')
+    return nombre, codigo
+
+
+@catalogo_bp.route('/familias-color', methods=['POST'])
+def crear_familia_color():
+    data = request.get_json() or {}
+    if data.get('codigo') in (None, ''):
+        data['codigo'] = _next_available_numeric_code(
+            FamiliaColor, 'FAMILIA_COLOR'
+        )
+    try:
+        nombre, codigo = _familia_color_payload(data)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    item = FamiliaColor(nombre=nombre, codigo=codigo, activo=True)
+    db.session.add(item)
+    db.session.commit()
+    return jsonify(_familia_color_to_dict(item)), 201
+
+
+@catalogo_bp.route('/familias-color/<int:familia_id>', methods=['PUT'])
+def actualizar_familia_color(familia_id):
+    item = db.session.get(FamiliaColor, familia_id)
+    if item is None:
+        return jsonify({'error': 'Familia de color no encontrada'}), 404
+    data = request.get_json() or {}
+    try:
+        expected_version = int(data.get('version'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'version es requerida', 'codigo': 'VERSION_REQUERIDA'}), 400
+    if expected_version != item.version:
+        return jsonify({'error': 'La familia cambió; recargue antes de guardar', 'codigo': 'FAMILIA_COLOR_VERSION_CONFLICTO'}), 409
+    try:
+        nombre, codigo = _familia_color_payload({
+            'nombre': data.get('nombre', item.nombre),
+            'codigo': data.get('codigo', item.codigo),
+        }, current_id=item.id)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if codigo != item.codigo:
+        return jsonify({
+            'error': 'El código es inmutable.',
+            'codigo': 'CODIGO_INMUTABLE',
+        }), 400
+    item.nombre = nombre
+    item.codigo = codigo
+    if 'activo' in data:
+        item.activo = bool(data['activo'])
+    item.version += 1
+    db.session.commit()
+    return jsonify(_familia_color_to_dict(item)), 200
+
+
+@catalogo_bp.route('/familias-color/<int:familia_id>', methods=['DELETE'])
+def inactivar_familia_color(familia_id):
+    item = db.session.get(FamiliaColor, familia_id)
+    if item is None:
+        return jsonify({'error': 'Familia de color no encontrada'}), 404
+    try:
+        expected_version = int(request.args.get('version'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'version es requerida', 'codigo': 'VERSION_REQUERIDA'}), 400
+    if expected_version != item.version:
+        return jsonify({'error': 'La familia cambió; recargue antes de guardar', 'codigo': 'FAMILIA_COLOR_VERSION_CONFLICTO'}), 409
+    item.activo = False
+    item.version += 1
+    db.session.commit()
+    return jsonify(_familia_color_to_dict(item)), 200
 
 
 @catalogo_bp.route('/formas', methods=['GET'])
 def listar_formas():
-    """Lista todas las formas (Pieza) de los moldes"""
-    from app.models.molde import Pieza, Molde
-    formas = Pieza.query.join(Molde).all()
-    return jsonify([{
-        'id': f.id,
-        'nombre': f.nombre,
-        'molde_codigo': f.molde.codigo,
-        'molde_nombre': f.molde.nombre,
-        'cavidades': f.cavidades,
-        'peso_unitario_gr': f.peso_unitario_gr
-    } for f in formas])
+    """Lista composiciones activas de molde; ``id`` identifica MoldePieza."""
+    formas = (
+        MoldePieza.query
+        .join(Pieza)
+        .join(Molde)
+        .filter(MoldePieza.activo.is_(True))
+        .order_by(MoldePieza.molde_id, Pieza.nombre)
+        .all()
+    )
+    return jsonify([
+        {
+            **item.to_dict(include_variantes=False),
+            'molde_codigo': item.molde.codigo,
+            'molde_nombre': item.molde.nombre,
+        }
+        for item in formas
+    ])
 
 @catalogo_bp.route('/colores', methods=['POST'])
 def crear_color():
@@ -807,6 +1449,7 @@ def crear_color():
     data = request.get_json()
     nombre = data.get('nombre', '').strip().upper()
     familia_color_id = data.get('familia_color_id')
+    hex_referencia = normalize_hex(data.get('hex_referencia'))
     
     if not nombre:
         return jsonify({'error': 'Nombre de color base requerido'}), 400
@@ -837,24 +1480,92 @@ def crear_color():
     ).first()
     
     if prod_existente:
-        return jsonify({
-            'id': prod_existente.id,
-            'nombre': str(prod_existente),
-            'codigo': prod_existente.codigo_legacy or prod_existente.id,
-            'existed': True
-        }), 200
+        return jsonify(_color_to_dict(prod_existente, existed=True)), 200
         
     # Crear nuevo ColorProduccion
-    nuevo = ColorProduccion(color_base_id=base_existente.id, familia_color_id=familia_color_id)
+    nuevo = ColorProduccion(
+        color_base_id=base_existente.id,
+        familia_color_id=familia_color_id,
+        hex_referencia=hex_referencia,
+        activo=bool(data.get('activo', True)),
+    )
     db.session.add(nuevo)
     db.session.commit()
     
-    return jsonify({
-        'id': nuevo.id,
-        'nombre': str(nuevo),
-        'codigo': nuevo.codigo_legacy or nuevo.id,
-        'existed': False
-    }), 201
+    return jsonify(_color_to_dict(nuevo, existed=False)), 201
+
+
+@catalogo_bp.route('/colores/<int:color_id>', methods=['PUT'])
+def actualizar_color(color_id):
+    data = request.get_json() or {}
+    color = db.session.get(ColorProduccion, color_id)
+    if color is None:
+        return jsonify({'error': 'Color de producción no encontrado'}), 404
+    try:
+        expected_version = int(data.get('version'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'version es requerida', 'codigo': 'VERSION_REQUERIDA'}), 400
+    if expected_version != color.version:
+        return jsonify({
+            'error': 'El color cambió; recargue antes de guardar',
+            'codigo': 'COLOR_VERSION_CONFLICTO',
+        }), 409
+
+    nombre = str(data.get('nombre', color.color_base_rel.nombre)).strip().upper()
+    if not nombre:
+        return jsonify({'error': 'Nombre de color base requerido'}), 400
+    try:
+        familia_id = int(data.get('familia_color_id', color.familia_color_id))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'familia_color_id inválido'}), 400
+    familia = db.session.get(FamiliaColor, familia_id)
+    if familia is None:
+        return jsonify({'error': 'Familia de color no encontrada'}), 404
+
+    base = ColorBase.query.filter(db.func.upper(ColorBase.nombre) == nombre).first()
+    if base is None:
+        base = ColorBase(nombre=nombre)
+        db.session.add(base)
+        db.session.flush()
+    duplicate = ColorProduccion.query.filter(
+        ColorProduccion.color_base_id == base.id,
+        ColorProduccion.familia_color_id == familia_id,
+        ColorProduccion.id != color.id,
+    ).first()
+    if duplicate is not None:
+        return jsonify({
+            'error': 'Ya existe esa combinación de color base y acabado',
+            'codigo': 'COLOR_PRODUCCION_DUPLICADO',
+        }), 409
+
+    color.color_base_id = base.id
+    color.familia_color_id = familia_id
+    color.hex_referencia = normalize_hex(data.get('hex_referencia', color.hex_referencia))
+    if 'activo' in data:
+        color.activo = bool(data['activo'])
+    color.version += 1
+    db.session.commit()
+    return jsonify(_color_to_dict(color)), 200
+
+
+@catalogo_bp.route('/colores/<int:color_id>', methods=['DELETE'])
+def inactivar_color(color_id):
+    color = db.session.get(ColorProduccion, color_id)
+    if color is None:
+        return jsonify({'error': 'Color de producción no encontrado'}), 404
+    try:
+        expected_version = int(request.args.get('version'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'version es requerida', 'codigo': 'VERSION_REQUERIDA'}), 400
+    if expected_version != color.version:
+        return jsonify({
+            'error': 'El color cambió; recargue antes de inactivarlo',
+            'codigo': 'COLOR_VERSION_CONFLICTO',
+        }), 409
+    color.activo = False
+    color.version += 1
+    db.session.commit()
+    return jsonify(_color_to_dict(color)), 200
 
 
 # ============================================================
@@ -866,31 +1577,135 @@ def configurar_producto_cascada():
     """
     Crea Molde + Formas (Pieza) + Piezas coloreadas (opcional) + Kit (opcional).
 
-    Las FORMAS (Pieza) definen las cavidades del molde — sin color.
-    Las PIEZAS coloreadas (SKUs de inventario) se crean opcionalmente
-    y apuntan a su forma vía molde_pieza_id.
+    Las PIEZAS son maestras globales. MoldePieza define cavidades y peso
+    operativo para este molde. Los SKUs coloreados apuntan a Pieza, no a
+    una composición concreta.
 
     Payload:
     {
-        "molde": { "codigo", "nombre", "peso_tiro_gr", "tiempo_ciclo_std", "usar_existente" },
+        "molde": { "nombre", "peso_tiro_gr", "tiempo_ciclo_std", "usar_existente" },
         "piezas": [ { "nombre", "cavidades", "peso_unitario_gr" } ],
-        "kit": { "nombre", "sku_override" },
+        "kit": { "nombre" },
         "color_ids": [1, 2, 3],       // opcional: colores de inyección
         "linea": "JUGUETES", "cod_linea": 2,
         "familia": "PLAYEROS", "cod_familia": 14
     }
     """
     from app.models.producto import PiezaComponente, ProductoTerminado, ProductoPieza
-    from app.models.molde import Molde, Pieza
+    from app.models.molde import Molde, MoldePieza, Pieza
 
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
 
+    molde_solicitado = data.get('molde') or {}
+    if (
+        not molde_solicitado.get('usar_existente')
+        and str(molde_solicitado.get('codigo') or '').strip()
+    ):
+        return _manual_identifier_error('molde.codigo')
+    formas_solicitadas = data.get('formas', data.get('piezas', []))
+    if not isinstance(formas_solicitadas, list) or not all(
+        isinstance(forma, dict) for forma in formas_solicitadas
+    ):
+        return jsonify({'error': 'formas debe ser una lista de objetos'}), 400
+    if not molde_solicitado.get('usar_existente') and not formas_solicitadas:
+        return jsonify({
+            'error': 'Un molde nuevo requiere al menos una pieza en su composición',
+            'codigo': 'COMPOSICION_REQUERIDA',
+        }), 400
+    nombres_solicitados = [
+        str(forma.get('nombre') or '').strip()
+        for forma in formas_solicitadas
+    ]
+    nombres_no_vacios = [nombre for nombre in nombres_solicitados if nombre]
+    if len(nombres_no_vacios) != len(set(nombres_no_vacios)):
+        return jsonify({'error': 'Los nombres de pieza no pueden repetirse'}), 400
+    for forma_solicitada in formas_solicitadas:
+        manual_field = _manual_new_piece_identifier_field(forma_solicitada)
+        if manual_field:
+            return _manual_identifier_error(f'pieza.{manual_field}')
+
+    color_ids_raw = data.get('color_ids', [])
+    if color_ids_raw is None:
+        color_ids_raw = []
+    if not isinstance(color_ids_raw, list):
+        return jsonify({'error': 'color_ids debe ser una lista'}), 400
+    color_ids = []
+    for raw_color_id in color_ids_raw:
+        try:
+            color_id = int(raw_color_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Cada color_id debe ser un entero positivo'}), 400
+        if isinstance(raw_color_id, bool) or color_id <= 0 or str(raw_color_id).strip() != str(color_id):
+            return jsonify({'error': 'Cada color_id debe ser un entero positivo'}), 400
+        if color_id not in color_ids:
+            color_ids.append(color_id)
+
+    colores = ColorProduccion.query.filter(
+        ColorProduccion.id.in_(color_ids)
+    ).all() if color_ids else []
+    colores_por_id = {color.id: color for color in colores}
+    color_ids_faltantes = [color_id for color_id in color_ids if color_id not in colores_por_id]
+    if color_ids_faltantes:
+        return jsonify({
+            'error': 'Uno o más colores de producción no existen',
+            'codigo': 'COLOR_NO_ENCONTRADO',
+            'color_ids': color_ids_faltantes,
+        }), 400
+    colores = [colores_por_id[color_id] for color_id in color_ids]
+
+    kit_solicitado = data.get('kit')
+    if str((kit_solicitado or {}).get('sku_override') or '').strip():
+        return _manual_identifier_error('kit.sku_override')
+    if kit_solicitado and not colores:
+        return jsonify({
+            'error': 'Seleccione al menos un color para crear variantes de kit',
+            'codigo': 'KIT_REQUIERE_COLOR',
+        }), 400
+    pt_solicitado = data.get('producto_terminado') or {}
+    if (
+        pt_solicitado
+        and not pt_solicitado.get('usar_existente')
+        and str(pt_solicitado.get('cod_sku_pt') or '').strip()
+    ):
+        return _manual_identifier_error('producto_terminado.cod_sku_pt')
+    if (
+        pt_solicitado.get('usar_existente')
+        and not str(pt_solicitado.get('cod_sku_pt') or '').strip()
+    ):
+        return jsonify({
+            'error': 'Código de producto requerido para usar uno existente'
+        }), 400
+    producto_existente_solicitado = None
+    if pt_solicitado.get('usar_existente'):
+        codigo_producto_existente = str(
+            pt_solicitado['cod_sku_pt']
+        ).strip()
+        producto_existente_solicitado = db.session.get(
+            ProductoTerminado,
+            codigo_producto_existente,
+        )
+        if not producto_existente_solicitado:
+            return jsonify({
+                'error': (
+                    f'Producto Terminado {codigo_producto_existente} no encontrado'
+                )
+            }), 404
+
     resultado = {
         'molde_creado': None,
+        'molde_reutilizado': None,
         'formas_creadas': [],
+        'formas_reutilizadas': [],
+        'asociaciones_creadas': [],
+        'asociaciones_reutilizadas': [],
+        'piezas_maestras_creadas': [],
+        'piezas_maestras_reutilizadas': [],
+        'composicion_molde': [],
         'piezas_creadas': [],
+        'variantes_creadas': [],
+        'variantes_reutilizadas': [],
         'kit_creado': None,
         'producto_terminado': None,
         'errores': []
@@ -904,14 +1719,14 @@ def configurar_producto_cascada():
         familia_obj = None
 
         if linea_id:
-            linea_obj = Linea.query.get(linea_id)
+            linea_obj = db.session.get(Linea, linea_id)
         elif data.get('cod_linea'):
             linea_obj = Linea.query.filter_by(codigo=data.get('cod_linea')).first()
         elif data.get('linea'):
             linea_obj = Linea.query.filter(Linea.nombre.ilike(data.get('linea'))).first()
 
         if familia_id:
-            familia_obj = Familia.query.get(familia_id)
+            familia_obj = db.session.get(Familia, familia_id)
         elif data.get('cod_familia'):
             familia_obj = Familia.query.filter_by(codigo=data.get('cod_familia')).first()
         elif data.get('familia'):
@@ -919,125 +1734,193 @@ def configurar_producto_cascada():
 
         if not linea_obj or not familia_obj:
             return jsonify({'error': 'Linea y Familia son requeridas'}), 400
+        linea_obj, familia_obj, _ = validate_linea_familia(
+            linea_id=linea_obj.id,
+            familia_id=familia_obj.id,
+        )
+        if producto_existente_solicitado and (
+            producto_existente_solicitado.linea_id != linea_obj.id
+            or producto_existente_solicitado.familia_id != familia_obj.id
+        ):
+            raise ClassificationError(
+                'El producto existente pertenece a otra combinaciÃ³n de lÃ­nea y familia',
+                'CLASIFICACION_PRODUCTO_DIVERGENTE',
+                409,
+            )
 
         # ── 1. CREAR O OBTENER MOLDE ──
         molde_data = data.get('molde', {})
-        molde_codigo = molde_data.get('codigo')
-
-        if not molde_codigo:
-            return jsonify({'error': 'Código de molde requerido'}), 400
 
         if molde_data.get('usar_existente'):
+            molde_codigo = str(molde_data.get('codigo') or '').strip()
+            if not molde_codigo:
+                return jsonify({'error': 'Código de molde requerido para usar uno existente'}), 400
             molde = db.session.get(Molde, molde_codigo)
             if not molde:
                 return jsonify({'error': f'Molde {molde_codigo} no encontrado'}), 404
+            if not molde.activo:
+                return jsonify({
+                    'error': f'Molde {molde_codigo} está inactivo',
+                    'codigo': 'MOLDE_INACTIVO',
+                }), 409
+            resultado['molde_reutilizado'] = molde.codigo
         else:
-            molde = db.session.get(Molde, molde_codigo)
-            if molde:
-                resultado['errores'].append(f'Molde {molde_codigo} ya existe, usando existente')
-            else:
-                molde = Molde(
-                    codigo=molde_codigo,
-                    nombre=molde_data.get('nombre', molde_codigo),
-                    peso_tiro_gr=molde_data.get('peso_tiro_gr', 0),
-                    tiempo_ciclo_std=molde_data.get('tiempo_ciclo_std', 30.0),
-                    activo=True
-                )
-                db.session.add(molde)
-                db.session.flush()
-                resultado['molde_creado'] = molde.codigo
+            molde_codigo = generar_codigo_catalogo('MOLDE')
+            molde = Molde(
+                codigo=molde_codigo,
+                nombre=molde_data.get('nombre') or molde_codigo,
+                peso_tiro_gr=molde_data.get('peso_tiro_gr', 0),
+                tiempo_ciclo_std=molde_data.get('tiempo_ciclo_std', 30.0),
+                activo=True
+            )
+            db.session.add(molde)
+            db.session.flush()
+            resultado['molde_creado'] = molde.codigo
 
-        # ── 2. CREAR FORMAS (Pieza) — sin color, sin SKU ──
+        # ── 2. ASOCIAR PIEZAS GLOBALES AL MOLDE ──
         formas_creadas = []
-        nombres_vistos = set()
-        
-        # Validar duplicados en payload para evitar colisión de SKUs
-        formas_payload = data.get('formas') or data.get('piezas', [])
-        for pieza_data in formas_payload:
-            nf = pieza_data.get('nombre', '')
-            if nf in nombres_vistos:
-                return jsonify({'error': f'Nombre de forma duplicado en request: {nf}', 'resultado': resultado}), 400
-            nombres_vistos.add(nf)
+        asociaciones_creadas_ids = set()
+        piezas_maestras_creadas_ids = set()
+        formas_payload = formas_solicitadas
 
         for idx, pieza_data in enumerate(formas_payload):
-            nombre_forma = pieza_data.get('nombre', f'Forma {idx+1}')
-            cavidades = pieza_data.get('cavidades', 1)
-            peso_unitario = pieza_data.get('peso_unitario_gr', 0)
+            payload_forma = dict(pieza_data)
+            payload_forma.setdefault('nombre', f'Forma {idx + 1}')
+            payload_forma.setdefault('linea_id', linea_obj.id)
+            payload_forma.setdefault('familia_id', familia_obj.id)
 
-            # Verificar si ya existe esta forma en el molde
-            forma_existente = Pieza.query.filter_by(
-                molde_id=molde.codigo, nombre=nombre_forma
-            ).first()
-
-            if forma_existente:
-                resultado['errores'].append(f'Forma "{nombre_forma}" ya existe en molde, usando existente')
-                formas_creadas.append(forma_existente)
-            else:
-                forma = Pieza(
+            existente = None
+            if payload_forma.get('pieza_id') is not None:
+                existente = MoldePieza.query.filter_by(
                     molde_id=molde.codigo,
-                    nombre=nombre_forma,
-                    cavidades=cavidades,
-                    peso_unitario_gr=peso_unitario
+                    pieza_id=int(payload_forma['pieza_id']),
+                    activo=True,
+                ).first()
+            if existente:
+                resultado['errores'].append(
+                    f'Pieza {existente.pieza.codigo} ya asociada al molde; usando existente'
                 )
-                db.session.add(forma)
-                db.session.flush()  # Obtener forma.id
-                formas_creadas.append(forma)
-                resultado['formas_creadas'].append(nombre_forma)
+                formas_creadas.append(existente)
+                resultado['formas_reutilizadas'].append(existente.pieza.nombre)
+                continue
+
+            pieza_global, composicion = _piece_and_composition_from_payload(
+                molde,
+                payload_forma,
+            )
+            db.session.add(composicion)
+            db.session.flush()
+            formas_creadas.append(composicion)
+            asociaciones_creadas_ids.add(composicion.id)
+            if payload_forma.get('pieza_id') is None:
+                piezas_maestras_creadas_ids.add(pieza_global.id)
+            resultado['formas_creadas'].append(pieza_global.nombre)
+
+        # Al reutilizar un molde, los colores, kits y BOM se generan sobre TODA
+        # su composición vigente. El payload solo expresa asociaciones nuevas o
+        # explícitamente seleccionadas; nunca recorta las piezas ya existentes.
+        if molde_data.get('usar_existente'):
+            formas_creadas = MoldePieza.query.filter_by(
+                molde_id=molde.codigo,
+                activo=True,
+            ).order_by(MoldePieza.id).all()
+
+        if not formas_creadas:
+            raise ValueError('El molde debe tener al menos una pieza activa')
+
+        resultado['composicion_molde'] = [
+            {
+                'molde_pieza_id': forma.id,
+                'pieza_id': forma.pieza_id,
+                'pieza_codigo': forma.pieza.codigo,
+                'pieza_nombre': forma.pieza.nombre,
+                'cavidades': forma.cavidades,
+                'peso_unitario_gr': forma.peso_unitario_gr,
+            }
+            for forma in formas_creadas
+        ]
+        resultado['asociaciones_creadas'] = [
+            item for item in resultado['composicion_molde']
+            if item['molde_pieza_id'] in asociaciones_creadas_ids
+        ]
+        resultado['asociaciones_reutilizadas'] = [
+            item for item in resultado['composicion_molde']
+            if item['molde_pieza_id'] not in asociaciones_creadas_ids
+        ]
+        resultado['piezas_maestras_creadas'] = [
+            {
+                'id': forma.pieza.id,
+                'codigo': forma.pieza.codigo,
+                'nombre': forma.pieza.nombre,
+            }
+            for forma in formas_creadas
+            if forma.pieza_id in piezas_maestras_creadas_ids
+        ]
+        resultado['piezas_maestras_reutilizadas'] = [
+            {
+                'id': forma.pieza.id,
+                'codigo': forma.pieza.codigo,
+                'nombre': forma.pieza.nombre,
+            }
+            for forma in formas_creadas
+            if forma.pieza_id not in piezas_maestras_creadas_ids
+        ]
 
         # ── 3. CREAR PIEZAS COLOREADAS (opcional) ──
-        color_ids = data.get('color_ids', [])
-        colores = ColorProduccion.query.filter(
-            ColorProduccion.id.in_(color_ids)
-        ).all() if color_ids else []
-
         if colores:
             for color in colores:
                 for forma in formas_creadas:
-                    base_sku = molde_codigo.replace('MOL-', '')
-                    sku_pieza = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
                     nombre_coloreado = f"{forma.nombre} {color.nombre}"
 
-                    pieza_existente = db.session.get(PiezaColor, sku_pieza)
+                    pieza_existente = PiezaColor.query.filter_by(
+                        pieza_id=forma.pieza_id,
+                        color_produccion_id=color.id,
+                    ).first()
                     if pieza_existente:
-                        resultado['errores'].append(f'PiezaColor {sku_pieza} ya existe')
+                        resultado['errores'].append(
+                            f'PiezaColor {pieza_existente.sku} ya existe'
+                        )
+                        resultado['variantes_reutilizadas'].append(pieza_existente.sku)
                         continue
 
+                    sku_pieza = generar_codigo_catalogo('PIEZA_COLOR')
+                    _, forma_linea, forma_familia = (
+                        _resolve_pieza_color_classification({
+                            'pieza_id': forma.pieza_id,
+                        })
+                    )
                     pieza = PiezaColor(
                         sku=sku_pieza,
                         piezas=nombre_coloreado,
                         peso=forma.peso_unitario_gr,
-                        cavidad=forma.cavidades,
+                        cavidad=None,
                         tipo='SIMPLE',
-                        linea_id=linea_obj.id,
-                        familia_id=familia_obj.id,
-                        color_id=color.id,
-                        cod_color=color.codigo,
-                        color=color.nombre,
-                        pieza_id=forma.id  # ← Vínculo con la forma
+                        linea_id=forma_linea.id,
+                        familia_id=forma_familia.id,
+                        color_produccion_id=color.id,
+                        pieza_id=forma.pieza_id,
                     )
                     db.session.add(pieza)
                     resultado['piezas_creadas'].append(sku_pieza)
+                    resultado['variantes_creadas'].append(sku_pieza)
 
         db.session.flush()
 
         # ── 4. CREAR KIT (opcional, si >1 forma y hay piezas coloreadas) ──
-        kit_data = data.get('kit')
+        kit_data = kit_solicitado
 
-        if kit_data and len(formas_creadas) > 1 and colores:
-            kit_nombre_base = kit_data.get('nombre', f'{molde.nombre} Completo')
-            kit_sku_base = kit_data.get('sku_override')
-            if not kit_sku_base:
-                base_sku = molde_codigo.replace('MOL-', '')
-                kit_sku_base = f"{base_sku}-KIT"
+        if kit_data and len(formas_creadas) <= 1:
+            raise ValueError('Un kit requiere al menos dos piezas en la composición del molde')
+
+        if kit_data:
+            kit_nombre_base = str(
+                kit_data.get('nombre') or f'{molde.nombre} Completo'
+            ).strip()
+            kits_creados = []
 
             for color in colores:
-                kit_sku = f"{kit_sku_base}-C{color.codigo}"
+                kit_sku = generar_codigo_catalogo('PIEZA_COLOR')
                 kit_nombre = f"{kit_nombre_base} {color.nombre}"
-
-                kit_pieza = db.session.get(PiezaColor, kit_sku)
-                if kit_pieza:
-                    resultado['errores'].append(f'Kit {kit_sku} ya existe')
-                    continue
 
                 peso_kit = sum(f.peso_unitario_gr for f in formas_creadas)
                 kit_pieza = PiezaColor(
@@ -1048,18 +1931,17 @@ def configurar_producto_cascada():
                     tipo='KIT',
                     linea_id=linea_obj.id,
                     familia_id=familia_obj.id,
-                    color_id=color.id,
-                    cod_color=color.codigo,
-                    color=color.nombre,
+                    color_produccion_id=color.id,
                 )
                 db.session.add(kit_pieza)
                 db.session.flush()
 
                 # PiezaComponente: buscar piezas de este color
                 for forma in formas_creadas:
-                    base_sku = molde_codigo.replace('MOL-', '')
-                    comp_sku = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-C{color.codigo}"
-                    comp = db.session.get(PiezaColor, comp_sku)
+                    comp = PiezaColor.query.filter_by(
+                        pieza_id=forma.pieza_id,
+                        color_produccion_id=color.id,
+                    ).first()
                     if comp:
                         db.session.add(PiezaComponente(
                             kit_sku=kit_sku,
@@ -1068,52 +1950,37 @@ def configurar_producto_cascada():
                         ))
 
                 resultado['piezas_creadas'].append(kit_sku)
+                kits_creados.append(kit_sku)
 
-            resultado['kit_creado'] = kit_sku_base
+            resultado['kit_creado'] = kits_creados
 
         # ── 5. CREAR O VINCULAR PRODUCTO TERMINADO (BOM Comercial) ──
         pt_data = data.get('producto_terminado')
         if pt_data:
-            cod_sku_pt = pt_data.get('cod_sku_pt')
             usar_existente = pt_data.get('usar_existente', False)
             
             producto = None
-            if usar_existente and cod_sku_pt:
-                producto = db.session.get(ProductoTerminado, cod_sku_pt)
-                if not producto:
-                    resultado['errores'].append(f'Producto Terminado {cod_sku_pt} no encontrado')
+            if usar_existente:
+                producto = producto_existente_solicitado
             else:
-                # Crear nuevo PT
-                # Autogenerar SKU si no viene
-                if not cod_sku_pt:
-                    # Lógica simple de auto-sku para PT
-                    pt_base = pt_data.get('producto', 'PT').upper().replace(' ', '-')[:15]
-                    cod_sku_pt = f"PT-{pt_base}"
-                
-                # Verificar si ya existe por si acaso
-                producto = db.session.get(ProductoTerminado, cod_sku_pt)
-                if producto:
-                    resultado['errores'].append(f'Producto Terminado {cod_sku_pt} ya existe, actualizando BOM')
-                else:
-                    producto = ProductoTerminado(
-                        cod_sku_pt=cod_sku_pt,
-                        producto=pt_data.get('producto', f'Producto derivado de {molde.nombre}'),
-                        um=pt_data.get('um', 'Docena'),
-                        familia_color=pt_data.get('familia_color', 'SÓLIDO'),
-                        doc_x_paq=pt_data.get('doc_x_paq', 1.0),
-                        doc_x_bulto=pt_data.get('doc_x_bulto', 10.0),
-                        peso_g=pt_data.get('peso_g', 0.0),
-                        linea_id=linea_obj.id,
-                        familia_id=familia_obj.id,
-                        # Campos legacy/vacios requeridos por DB
-                        cod_producto=0,
-                        cod_familia_color=0,
-                        precio_estimado=0.0,
-                        precio_sin_igv=0.0
-                    )
-                    db.session.add(producto)
-                    db.session.flush()
-                    resultado['producto_terminado'] = cod_sku_pt
+                cod_sku_pt = generar_codigo_catalogo('PRODUCTO_TERMINADO')
+                producto = ProductoTerminado(
+                    cod_sku_pt=cod_sku_pt,
+                    producto=pt_data.get('producto', f'Producto derivado de {molde.nombre}'),
+                    um=pt_data.get('um', 'Docena'),
+                    doc_x_paq=pt_data.get('doc_x_paq', 1.0),
+                    doc_x_bulto=pt_data.get('doc_x_bulto', 10.0),
+                    peso_g=pt_data.get('peso_g', 0.0),
+                    linea_id=linea_obj.id,
+                    familia_id=familia_obj.id,
+                    # Campos legacy/vacios requeridos por DB
+                    cod_producto=0,
+                    precio_estimado=0.0,
+                    precio_sin_igv=0.0
+                )
+                db.session.add(producto)
+                db.session.flush()
+                resultado['producto_terminado'] = cod_sku_pt
 
             if producto:
                 # Actualizar el BOM (ProductoPieza) eliminando las anteriores si las hubiera
@@ -1126,26 +1993,35 @@ def configurar_producto_cascada():
                 # Primero, necesitamos asegurarnos de que existan piezas "Base" o "STD" para cada forma,
                 # independientes del color.
                 for forma in formas_creadas:
-                    base_sku = molde_codigo.replace('MOL-', '')
-                    # Generamos una pieza STD por forma
-                    sku_std = f"{base_sku}-{forma.nombre.upper().replace(' ', '-')[:10]}-STD"
-                    
-                    pieza_std = db.session.get(PiezaColor, sku_std)
+                    pieza_std = PiezaColor.query.filter_by(
+                        pieza_id=forma.pieza_id,
+                        color_produccion_id=None,
+                        tipo='SIMPLE',
+                    ).first()
                     if not pieza_std:
+                        sku_std = generar_codigo_catalogo('PIEZA_COLOR')
+                        _, forma_linea, forma_familia = (
+                            _resolve_pieza_color_classification({
+                                'pieza_id': forma.pieza_id,
+                            })
+                        )
                         pieza_std = PiezaColor(
                             sku=sku_std,
                             piezas=f"{forma.nombre} (Genérico)",
                             peso=forma.peso_unitario_gr,
-                            cavidad=forma.cavidades,
+                            cavidad=None,
                             tipo='SIMPLE',
-                            linea_id=linea_obj.id,
-                            familia_id=familia_obj.id,
-                            pieza_id=forma.id
+                            linea_id=forma_linea.id,
+                            familia_id=forma_familia.id,
+                            pieza_id=forma.pieza_id
                             # Sin color
                         )
                         db.session.add(pieza_std)
                         db.session.flush()
                         resultado['piezas_creadas'].append(sku_std)
+                        resultado['variantes_creadas'].append(sku_std)
+                    elif pieza_std.sku not in resultado['variantes_reutilizadas']:
+                        resultado['variantes_reutilizadas'].append(pieza_std.sku)
                     
                     # Agregar al BOM del Producto
                     db.session.add(ProductoPieza(
@@ -1161,6 +2037,9 @@ def configurar_producto_cascada():
             'resultado': resultado
         }), 201
 
+    except ClassificationError as exc:
+        db.session.rollback()
+        return _classification_error_response(exc)
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e), 'resultado': resultado}), 400
@@ -1183,92 +2062,116 @@ def validar_orden_prereq():
         - color_ids: lista de IDs de colores separados por coma (opcional)
     """
     molde_id = request.args.get('molde_id', '').strip()
+    producto_sku = request.args.get('producto_sku', '').strip() or None
+    maquina_id = request.args.get('maquina_id', '').strip() or None
+    numero_op = request.args.get('numero_op', '').strip() or None
     color_ids_str = request.args.get('color_ids', '')
-    
+
     result = {
         'valid': True,
         'warnings': [],
         'errors': [],
+        'issues': [],
         'molde': None,
-        'colores_info': []
+        'maquina': None,
+        'numero_op': numero_op,
+        'producto_sku': producto_sku,
+        'colores_info': [],
+        'variantes_por_crear': [],
     }
-    
-    if not molde_id:
-        return jsonify(result), 200
-    
-    # Buscar molde
-    from app.models.molde import Molde, Pieza
-    molde = Molde.query.filter_by(codigo=molde_id).first()
-    
-    if not molde:
-        result['errors'].append(f'Molde "{molde_id}" no encontrado')
-        result['valid'] = False
-        return jsonify(result), 200
-    
-    # Info del molde
-    piezas_rel = Pieza.query.filter_by(molde_id=molde.codigo).all()
-    piezas_count = len(piezas_rel)
-    
-    result['molde'] = {
-        'codigo': molde.codigo,
-        'nombre': molde.nombre,
-        'tiene_piezas': piezas_count > 0,
-        'piezas_count': piezas_count,
-        'tiempo_ciclo_std': molde.tiempo_ciclo_std,
-        'peso_tiro_gr': molde.peso_tiro_gr
-    }
-    
-    if piezas_count == 0:
-        result['warnings'].append(f'⚠️ Molde "{molde.nombre}" no tiene piezas vinculadas')
-    
-    # Validar colores si se proporcionaron
-    if color_ids_str:
+
+    try:
+        maquina = validate_order_header_prerequisites(
+            numero_op=numero_op,
+            maquina_id=maquina_id,
+            session=db.session,
+            require_values=False,
+        )
+        if maquina is not None:
+            result['maquina'] = {
+                'id': maquina.id,
+                'codigo': maquina.codigo,
+                'nombre': maquina.nombre,
+                'estado': maquina.estado,
+                'activo': maquina.activo,
+            }
+        if not molde_id:
+            return jsonify(result), 200
+
         try:
-            color_ids = [int(cid.strip()) for cid in color_ids_str.split(',') if cid.strip()]
+            color_ids = [
+                int(value.strip())
+                for value in color_ids_str.split(',')
+                if value.strip()
+            ]
         except ValueError:
-            color_ids = []
-        
+            raise OrderIntegrityError(
+                'color_ids debe contener enteros separados por coma',
+                'COLOR_IDS_INVALIDOS',
+                400,
+            )
+
+        context = validate_order_prerequisites(
+            molde_id=molde_id,
+            color_ids=color_ids,
+            producto_sku=producto_sku,
+            session=db.session,
+        )
+        molde = context.molde
+        result['molde'] = {
+            'codigo': molde.codigo,
+            'nombre': molde.nombre,
+            'tiene_piezas': bool(context.snapshot_rows),
+            'piezas_count': len(context.snapshot_rows),
+            'tiempo_ciclo_std': molde.tiempo_ciclo_std,
+            'peso_tiro_gr': molde.peso_tiro_gr,
+            'composicion': list(context.snapshot_rows),
+        }
+        result['variantes_por_crear'] = list(context.pending_variants)
+        if context.pending_variants:
+            result['warnings'].append(
+                f"Se crearán {len(context.pending_variants)} variantes PiezaColor al guardar la OP"
+            )
+
         for color_id in color_ids:
-            color_prod = ColorProduccion.query.get(color_id)
-            if not color_prod:
-                result['colores_info'].append({
-                    'color_id': color_id,
-                    'color_nombre': '(desconocido)',
-                    'sku_encontrado': None,
-                    'sku_exists': False
-                })
-                result['warnings'].append(f'⚠️ Color Produccion ID {color_id} no encontrado')
-                continue
-            
-            # Buscar SKU: PiezaColor que tenga color_produccion_id igual y pertenezca a alguna forma del molde
-            sku_encontrado = None
-            forma_ids = [p.id for p in piezas_rel]
-            if forma_ids:
-                pieza_color = PiezaColor.query.filter(
-                    PiezaColor.color_produccion_id == color_prod.id,
-                    PiezaColor.pieza_id.in_(forma_ids)
-                ).first()
-                
-                if pieza_color:
-                    # Encontrar el ProductoTerminado que contenga esta PiezaColor
-                    prod_pieza = ProductoPieza.query.filter_by(pieza_sku=pieza_color.sku).first()
-                    if prod_pieza and prod_pieza.producto_terminado:
-                        sku_encontrado = prod_pieza.producto_terminado.cod_sku_pt
-            
+            color_prod = db.session.get(ColorProduccion, color_id)
+            pending = [
+                item for item in context.pending_variants
+                if item['color_id'] == color_id
+            ]
+            existing = []
+            for row in context.snapshot_rows:
+                if row.get('pieza_id') is None:
+                    continue
+                variant = PiezaColor.query.filter_by(
+                    pieza_id=row['pieza_id'],
+                    color_produccion_id=color_id,
+                ).one_or_none()
+                if variant:
+                    existing.append(variant.sku)
             result['colores_info'].append({
                 'color_id': color_id,
                 'color_nombre': str(color_prod),
-                'sku_encontrado': sku_encontrado,
-                'sku_exists': sku_encontrado is not None
+                # Alias legacy: ya no se infiere un PT con first().
+                'sku_encontrado': producto_sku,
+                'sku_exists': bool(producto_sku),
+                'pieza_color_skus': sorted(existing),
+                'variantes_por_crear': pending,
             })
-            
-            if not sku_encontrado:
-                pass # Legacy warning removed: Agile catalog allows dynamic color/sku generation
-    
-    # Si hay warnings, marcamos como válido pero con advertencias
-    # Solo errors hacen invalid
-    result['valid'] = len(result['errors']) == 0
-    
+
+    except OrderIntegrityError as exc:
+        db.session.rollback()
+        result['valid'] = False
+        result['errors'].append(exc.message)
+        issue = {
+            'codigo': exc.code,
+            'mensaje': exc.message,
+            'status': exc.status,
+        }
+        if exc.details:
+            issue['details'] = exc.details
+        result['issues'].append(issue)
+
     return jsonify(result), 200
 
 
@@ -1774,6 +2677,7 @@ def estadisticas_revision():
 # ============================================================================
 
 @catalogo_bp.route('/piezas/revision', methods=['GET'])
+@catalogo_bp.route('/piezas-color/revision', methods=['GET'])
 def listar_piezas_revision():
     """
     Lista piezas con filtros de revisión.
@@ -1839,6 +2743,7 @@ def listar_piezas_revision():
 
 
 @catalogo_bp.route('/piezas/<sku>/revision', methods=['PUT'])
+@catalogo_bp.route('/piezas-color/<sku>/revision', methods=['PUT'])
 def actualizar_revision_pieza(sku):
     """Actualiza el estado de revisión de una pieza."""
     from datetime import datetime
@@ -1874,6 +2779,7 @@ def actualizar_revision_pieza(sku):
 
 
 @catalogo_bp.route('/piezas/revision/bulk', methods=['PUT'])
+@catalogo_bp.route('/piezas-color/revision/bulk', methods=['PUT'])
 def actualizar_revision_piezas_bulk():
     """Actualiza el estado de revisión de múltiples piezas."""
     from datetime import datetime
@@ -1912,6 +2818,7 @@ def actualizar_revision_piezas_bulk():
 
 
 @catalogo_bp.route('/piezas/revision/estadisticas', methods=['GET'])
+@catalogo_bp.route('/piezas-color/revision/estadisticas', methods=['GET'])
 def estadisticas_revision_piezas():
     """Retorna estadísticas de revisión de piezas."""
     from sqlalchemy import func
@@ -1953,6 +2860,64 @@ def estadisticas_revision_piezas():
 # RECETA COLOR NORMALIZADA — Prefill inteligente de pigmentos
 # ============================================================
 
+
+@catalogo_bp.route('/catalogo/ingredientes-receta-color', methods=['GET'])
+def listar_ingredientes_receta_color():
+    return jsonify(list_recipe_ingredients(
+        db.session,
+        include_inactive=_query_flag('include_inactive', default=False),
+    )), 200
+
+
+@catalogo_bp.route('/catalogo/recetas-color', methods=['GET'])
+def listar_recetas_color():
+    color_id = request.args.get('color_produccion_id', type=int)
+    return jsonify({
+        'items': list_recipes(
+            db.session,
+            color_produccion_id=color_id,
+            include_inactive=_query_flag('include_inactive', default=False),
+        )
+    }), 200
+
+
+@catalogo_bp.route('/catalogo/recetas-color/<int:recipe_id>', methods=['GET'])
+def obtener_receta_color_maestra(recipe_id):
+    from app.models.receta_color import RecetaColorMaestra
+
+    recipe = db.session.get(RecetaColorMaestra, recipe_id)
+    if recipe is None:
+        raise ColorRecipeError(
+            f'Receta {recipe_id} no encontrada.',
+            code='RECETA_NO_ENCONTRADA',
+            status=404,
+        )
+    return jsonify(serialize_recipe(recipe)), 200
+
+
+@catalogo_bp.route('/catalogo/recetas-color', methods=['POST'])
+def crear_receta_color_maestra():
+    return jsonify(create_recipe(db.session, request.get_json() or {})), 201
+
+
+@catalogo_bp.route('/catalogo/recetas-color/<int:recipe_id>', methods=['PUT'])
+def actualizar_receta_color_maestra(recipe_id):
+    return jsonify(update_recipe(
+        db.session,
+        recipe_id,
+        request.get_json() or {},
+    )), 200
+
+
+@catalogo_bp.route('/catalogo/recetas-color/<int:recipe_id>', methods=['DELETE'])
+def inactivar_receta_color_maestra(recipe_id):
+    return jsonify(deactivate_recipe(
+        db.session,
+        recipe_id,
+        version=request.args.get('version'),
+    )), 200
+
+
 @catalogo_bp.route('/catalogo/receta-color', methods=['GET'])
 def obtener_receta_color():
     """
@@ -1976,6 +2941,63 @@ def obtener_receta_color():
     color = db.session.get(ColorProduccion, color_produccion_id)
     if not color:
         return jsonify({'error': f'ColorProduccion {color_produccion_id} no encontrado'}), 404
+
+    manual_recipe = find_default_recipe(
+        db.session,
+        color_produccion_id=color_produccion_id,
+        producto_sku=producto_sku,
+    )
+    if manual_recipe is not None:
+        kg_virgen_base = request.args.get('kg_virgen_base', type=float)
+        materials = []
+        pigments = []
+        for line in manual_recipe.lineas:
+            if line.tipo_componente == 'MATERIA_PRIMA':
+                materials.append({
+                    'material_id': line.material_id,
+                    'nombre': line.material.nombre if line.material else None,
+                    'fraccion': float(line.cantidad),
+                    'categoria_recepcion_codigo': (
+                        line.material.categoria_recepcion.codigo
+                        if line.material and line.material.categoria_recepcion
+                        else None
+                    ),
+                    'modalidad_recepcion': (
+                        line.material.categoria_recepcion.modalidad_default
+                        if line.material and line.material.categoria_recepcion
+                        else None
+                    ),
+                })
+                continue
+            item = {
+                'material_id': line.material_id,
+                'colorante_id': (
+                    line.material.colorante.id
+                    if line.material and line.material.colorante
+                    else None
+                ),
+                'nombre': line.material.nombre if line.material else None,
+                'tipo_componente': line.tipo_componente,
+                'dosis_gramos': float(line.cantidad),
+                'base_kg': float(line.base_kg),
+            }
+            if kg_virgen_base is not None and kg_virgen_base > 0:
+                item['gramos'] = round(
+                    float(line.cantidad) * kg_virgen_base / float(line.base_kg),
+                    2,
+                )
+            pigments.append(item)
+        return jsonify({
+            'color_produccion_id': color_produccion_id,
+            'color_nombre': color.nombre,
+            'producto_sku': manual_recipe.producto_sku,
+            'tiene_receta': True,
+            'fuente': 'RECETA_MAESTRA',
+            'receta': serialize_recipe(manual_recipe),
+            'materias_primas': materials,
+            'pigmentos': pigments,
+            'n_muestras_min': 0,
+        }), 200
 
     # Estrategia: buscar receta específica primero, luego genérica como fallback
     if producto_sku:
@@ -2015,24 +3037,417 @@ def obtener_receta_color():
         'pigmentos': [r.to_dict(meta_kg=meta_kg) for r in recetas]
     }), 200
 
+def _query_flag(name, default=False):
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {'1', 'true', 'si', 'sí', 'yes'}
+
+
+def _payload_bool(value, field):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'si', 'sí', 'yes'}:
+        return True
+    if normalized in {'0', 'false', 'no'}:
+        return False
+    raise ClassificationError(
+        f'{field} debe ser booleano',
+        'CATALOGO_INVALIDO',
+    )
+
+
+def _catalog_payload(data, current=None):
+    codigo_raw = data.get('codigo', current.codigo if current else None)
+    try:
+        codigo = int(codigo_raw)
+    except (TypeError, ValueError):
+        raise ClassificationError(
+            'codigo debe ser un entero positivo',
+            'CATALOGO_INVALIDO',
+        )
+    nombre = str(data.get('nombre', current.nombre if current else '')).strip()
+    if codigo <= 0 or not nombre:
+        raise ClassificationError(
+            'codigo positivo y nombre son obligatorios',
+            'CATALOGO_INVALIDO',
+        )
+    activo_raw = data.get('activo', current.activo if current else True)
+    activo = _payload_bool(activo_raw, 'activo')
+    return codigo, nombre, activo
+
+
+def _catalog_duplicate(model, *, codigo, nombre, exclude_id=None):
+    query = model.query.filter(or_(
+        model.codigo == codigo,
+        db.func.lower(model.nombre) == nombre.lower(),
+    ))
+    if exclude_id is not None:
+        query = query.filter(model.id != exclude_id)
+    return query.first()
+
+
+def _expected_catalog_version(data=None):
+    raw = (data or {}).get('version')
+    if raw is None:
+        raw = request.args.get('version')
+    if raw is None:
+        raise ClassificationError(
+            'version es obligatoria',
+            'VERSION_REQUIRED',
+        )
+    try:
+        version = int(raw)
+    except (TypeError, ValueError):
+        raise ClassificationError(
+            'version debe ser un entero positivo',
+            'VERSION_INVALIDA',
+        )
+    if version <= 0:
+        raise ClassificationError(
+            'version debe ser un entero positivo',
+            'VERSION_INVALIDA',
+        )
+    return version
+
+
+def _catalog_usage_response(item, usage):
+    return jsonify({
+        'error': 'No se puede inactivar un clasificador que está en uso',
+        'codigo': 'CATALOGO_EN_USO',
+        'actual': item.to_dict(),
+        'uso': usage,
+    }), 409
+
+
+def _create_catalog(model, noun, code_key):
+    data = request.get_json() or {}
+    if data.get('codigo') in (None, ''):
+        data['codigo'] = _next_available_numeric_code(model, code_key)
+    try:
+        codigo, nombre, activo = _catalog_payload(data)
+    except ClassificationError as exc:
+        return _classification_error_response(exc)
+    if _catalog_duplicate(model, codigo=codigo, nombre=nombre):
+        return jsonify({
+            'error': f'Ya existe otra {noun} con ese código o nombre',
+            'codigo': 'CATALOGO_DUPLICADO',
+        }), 409
+    item = model(codigo=codigo, nombre=nombre, activo=activo)
+    db.session.add(item)
+    try:
+        db.session.commit()
+        return jsonify(item.to_dict()), 201
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 409
+
+
+def _update_catalog(model, item_id, noun, usage_key):
+    item = db.session.get(model, item_id)
+    if not item:
+        return jsonify({'error': f'{noun.capitalize()} no encontrada'}), 404
+    data = request.get_json() or {}
+    try:
+        expected_version = _expected_catalog_version(data)
+        codigo, nombre, activo = _catalog_payload(data, current=item)
+    except ClassificationError as exc:
+        return _classification_error_response(exc)
+    if codigo != item.codigo:
+        return jsonify({
+            'error': 'El código es inmutable.',
+            'codigo': 'CODIGO_INMUTABLE',
+        }), 400
+    if expected_version != item.version:
+        return jsonify({
+            'error': f'La {noun} cambió desde que fue cargada',
+            'codigo': 'VERSION_CONFLICT',
+            'actual': item.to_dict(),
+        }), 409
+    if _catalog_duplicate(
+        model,
+        codigo=codigo,
+        nombre=nombre,
+        exclude_id=item.id,
+    ):
+        return jsonify({
+            'error': f'Ya existe otra {noun} con ese código o nombre',
+            'codigo': 'CATALOGO_DUPLICADO',
+        }), 409
+    if item.activo and not activo:
+        usage = classification_usage(**{usage_key: item.id})
+        if usage['total']:
+            return _catalog_usage_response(item, usage)
+
+    item.codigo = codigo
+    item.nombre = nombre
+    item.activo = activo
+    item.version += 1
+    try:
+        db.session.commit()
+        return jsonify(item.to_dict()), 200
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 409
+
+
+def _deactivate_catalog(model, item_id, noun, usage_key):
+    item = db.session.get(model, item_id)
+    if not item:
+        return jsonify({'error': f'{noun.capitalize()} no encontrada'}), 404
+    try:
+        expected_version = _expected_catalog_version()
+    except ClassificationError as exc:
+        return _classification_error_response(exc)
+    if expected_version != item.version:
+        return jsonify({
+            'error': f'La {noun} cambió desde que fue cargada',
+            'codigo': 'VERSION_CONFLICT',
+            'actual': item.to_dict(),
+        }), 409
+    if not item.activo:
+        return jsonify(item.to_dict()), 200
+    usage = classification_usage(**{usage_key: item.id})
+    if usage['total']:
+        return _catalog_usage_response(item, usage)
+    item.activo = False
+    item.version += 1
+    db.session.commit()
+    return jsonify(item.to_dict()), 200
+
+
 @catalogo_bp.route('/catalogo/lineas', methods=['GET'])
 def listar_lineas():
-    """Retorna todas las líneas."""
-    lineas = Linea.query.all()
-    return jsonify([{
-        'id': l.id,
-        'codigo': l.codigo,
-        'nombre': l.nombre
-    } for l in lineas]), 200
+    """Lista líneas y filtra opcionalmente por una familia asociada."""
+    query = Linea.query
+    if not _query_flag('include_inactive'):
+        query = query.filter(Linea.activo.is_(True))
+    familia_id = request.args.get('familia_id', type=int)
+    if request.args.get('familia_id') is not None and familia_id is None:
+        return jsonify({'error': 'familia_id debe ser un entero'}), 400
+    if familia_id is not None:
+        query = query.join(LineaFamilia).filter(
+            LineaFamilia.familia_id == familia_id,
+            LineaFamilia.activo.is_(True),
+        )
+    q = request.args.get('q', '').strip()
+    if q:
+        criteria = [Linea.nombre.ilike(f'%{q}%')]
+        if q.isdigit():
+            criteria.append(Linea.codigo == int(q))
+        query = query.filter(or_(*criteria))
+    return jsonify([
+        item.to_dict()
+        for item in query.order_by(Linea.codigo, Linea.nombre).all()
+    ]), 200
+
+
+@catalogo_bp.route('/catalogo/lineas/<int:linea_id>', methods=['GET'])
+def obtener_linea(linea_id):
+    linea = db.session.get(Linea, linea_id)
+    if not linea:
+        return jsonify({'error': 'Línea no encontrada'}), 404
+    return jsonify(linea.to_dict()), 200
+
+
+@catalogo_bp.route('/catalogo/lineas', methods=['POST'])
+def crear_linea():
+    return _create_catalog(Linea, 'línea', 'LINEA')
+
+
+@catalogo_bp.route('/catalogo/lineas/<int:linea_id>', methods=['PUT'])
+def actualizar_linea(linea_id):
+    return _update_catalog(Linea, linea_id, 'línea', 'linea_id')
+
+
+@catalogo_bp.route('/catalogo/lineas/<int:linea_id>', methods=['DELETE'])
+def inactivar_linea(linea_id):
+    return _deactivate_catalog(Linea, linea_id, 'línea', 'linea_id')
+
 
 @catalogo_bp.route('/catalogo/familias', methods=['GET'])
 def listar_familias():
-    """Retorna familias filtrando opcionalmente por linea_id en frontend."""
-    # Nota: familia no tiene linea_id en DB (D2), el filtro por linea será a nivel front o lógicamente aquí si aplicara.
-    # Como D2 dictó que son independientes, enviamos todas las familias.
-    familias = Familia.query.all()
-    return jsonify([{
-        'id': f.id,
-        'codigo': f.codigo,
-        'nombre': f.nombre
-    } for f in familias]), 200
+    """Lista familias; ``linea_id`` devuelve solo asociaciones vigentes."""
+    query = Familia.query
+    if not _query_flag('include_inactive'):
+        query = query.filter(Familia.activo.is_(True))
+    linea_id = request.args.get('linea_id', type=int)
+    if request.args.get('linea_id') is not None and linea_id is None:
+        return jsonify({'error': 'linea_id debe ser un entero'}), 400
+    if linea_id is not None:
+        query = query.join(LineaFamilia).filter(
+            LineaFamilia.linea_id == linea_id,
+            LineaFamilia.activo.is_(True),
+        )
+    q = request.args.get('q', '').strip()
+    if q:
+        criteria = [Familia.nombre.ilike(f'%{q}%')]
+        if q.isdigit():
+            criteria.append(Familia.codigo == int(q))
+        query = query.filter(or_(*criteria))
+    return jsonify([
+        item.to_dict()
+        for item in query.order_by(Familia.codigo, Familia.nombre).all()
+    ]), 200
+
+
+@catalogo_bp.route('/catalogo/familias/<int:familia_id>', methods=['GET'])
+def obtener_familia(familia_id):
+    familia = db.session.get(Familia, familia_id)
+    if not familia:
+        return jsonify({'error': 'Familia no encontrada'}), 404
+    return jsonify(familia.to_dict()), 200
+
+
+@catalogo_bp.route('/catalogo/familias', methods=['POST'])
+def crear_familia():
+    return _create_catalog(Familia, 'familia', 'FAMILIA')
+
+
+@catalogo_bp.route('/catalogo/familias/<int:familia_id>', methods=['PUT'])
+def actualizar_familia(familia_id):
+    return _update_catalog(Familia, familia_id, 'familia', 'familia_id')
+
+
+@catalogo_bp.route('/catalogo/familias/<int:familia_id>', methods=['DELETE'])
+def inactivar_familia(familia_id):
+    return _deactivate_catalog(Familia, familia_id, 'familia', 'familia_id')
+
+
+@catalogo_bp.route('/catalogo/lineas/<int:linea_id>/familias', methods=['GET'])
+def listar_familias_de_linea(linea_id):
+    linea = db.session.get(Linea, linea_id)
+    if not linea:
+        return jsonify({'error': 'Línea no encontrada'}), 404
+    query = LineaFamilia.query.filter_by(linea_id=linea_id)
+    if not _query_flag('include_inactive'):
+        query = query.filter(LineaFamilia.activo.is_(True))
+    relaciones = query.join(Familia).order_by(Familia.codigo, Familia.nombre).all()
+    return jsonify([
+        relacion.to_dict(include_catalogos=True)
+        for relacion in relaciones
+    ]), 200
+
+
+@catalogo_bp.route('/catalogo/lineas/<int:linea_id>/familias', methods=['POST'])
+def asociar_familia_a_linea(linea_id):
+    data = request.get_json() or {}
+    linea = db.session.get(Linea, linea_id)
+    if not linea:
+        return jsonify({'error': 'Línea no encontrada'}), 404
+    if not linea.activo:
+        return jsonify({
+            'error': 'Solo se pueden asociar familias a una línea activa',
+            'codigo': 'CATALOGO_INACTIVO',
+        }), 409
+
+    familia_data = data.get('familia')
+    familia_id_raw = data.get('familia_id')
+    if familia_data is not None and familia_id_raw not in (None, ''):
+        return jsonify({
+            'error': 'Envíe familia_id o familia, no ambos',
+            'codigo': 'CATALOGO_INVALIDO',
+        }), 400
+
+    if familia_data is not None:
+        if not isinstance(familia_data, dict):
+            return jsonify({
+                'error': 'familia debe ser un objeto con codigo y nombre',
+                'codigo': 'CATALOGO_INVALIDO',
+            }), 400
+        if familia_data.get('codigo') in (None, ''):
+            familia_data['codigo'] = _next_available_numeric_code(
+                Familia, 'FAMILIA'
+            )
+        try:
+            codigo, nombre, activo = _catalog_payload(familia_data)
+        except ClassificationError as exc:
+            return _classification_error_response(exc)
+        if not activo:
+            return jsonify({
+                'error': 'La familia creada en contexto debe iniciar activa',
+                'codigo': 'CATALOGO_INACTIVO',
+            }), 409
+        if _catalog_duplicate(Familia, codigo=codigo, nombre=nombre):
+            return jsonify({
+                'error': 'Ya existe otra familia con ese código o nombre',
+                'codigo': 'CATALOGO_DUPLICADO',
+            }), 409
+        familia = Familia(codigo=codigo, nombre=nombre, activo=True)
+        db.session.add(familia)
+        db.session.flush()
+    else:
+        try:
+            familia_id = int(familia_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({
+                'error': 'familia_id debe ser un entero positivo',
+                'codigo': 'CATALOGO_INVALIDO',
+            }), 400
+        if familia_id <= 0:
+            return jsonify({
+                'error': 'familia_id debe ser un entero positivo',
+                'codigo': 'CATALOGO_INVALIDO',
+            }), 400
+        familia = db.session.get(Familia, familia_id)
+        if not familia:
+            return jsonify({'error': 'Familia no encontrada'}), 404
+
+    if not familia.activo:
+        return jsonify({
+            'error': 'Solo se pueden asociar familias activas',
+            'codigo': 'CATALOGO_INACTIVO',
+        }), 409
+
+    relacion = LineaFamilia.query.filter_by(
+        linea_id=linea_id,
+        familia_id=familia.id,
+    ).first()
+    status = 200
+    if not relacion:
+        relacion = LineaFamilia(
+            linea_id=linea_id,
+            familia_id=familia.id,
+            activo=True,
+        )
+        db.session.add(relacion)
+        status = 201
+    elif not relacion.activo:
+        relacion.activo = True
+        relacion.version += 1
+    try:
+        db.session.commit()
+        return jsonify(relacion.to_dict(include_catalogos=True)), status
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            'error': str(exc),
+            'codigo': 'CATALOGO_DUPLICADO',
+        }), 409
+
+
+@catalogo_bp.route(
+    '/catalogo/lineas/<int:linea_id>/familias/<int:familia_id>',
+    methods=['DELETE'],
+)
+def desasociar_familia_de_linea(linea_id, familia_id):
+    relacion = LineaFamilia.query.filter_by(
+        linea_id=linea_id,
+        familia_id=familia_id,
+        activo=True,
+    ).first()
+    if not relacion:
+        return jsonify({'error': 'Asociación activa no encontrada'}), 404
+    usage = classification_usage(linea_id=linea_id, familia_id=familia_id)
+    if usage['total']:
+        return jsonify({
+            'error': 'No se puede desasociar una combinación que está en uso',
+            'codigo': 'LINEA_FAMILIA_EN_USO',
+            'asociacion': relacion.to_dict(include_catalogos=True),
+            'uso': usage,
+        }), 409
+    relacion.activo = False
+    relacion.version += 1
+    db.session.commit()
+    return jsonify(relacion.to_dict(include_catalogos=True)), 200

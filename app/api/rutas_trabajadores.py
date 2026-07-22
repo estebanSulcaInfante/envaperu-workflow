@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from app.extensions import db
 from app.models.trabajador import Trabajador, RolOperativo
+from app.services.catalog_code_generator import generar_codigo_catalogo
 
 rutas_trabajadores = Blueprint('rutas_trabajadores', __name__)
 
@@ -40,14 +41,12 @@ def create_trabajador():
     data = request.json
     try:
         # Generar código auto-secuencial si no existe
-        codigo = data.get('codigo')
-        if not codigo:
-            count = Trabajador.query.count() + 1
-            codigo = f"TR-{count:03d}"
-            # Ensure unique
-            while Trabajador.query.filter_by(codigo=codigo).first():
-                count += 1
-                codigo = f"TR-{count:03d}"
+        if str(data.get('codigo') or '').strip():
+            return jsonify({
+                'error': 'El código se asigna automáticamente.',
+                'codigo': 'CODIGO_MANUAL_NO_PERMITIDO',
+            }), 400
+        codigo = generar_codigo_catalogo('TRABAJADOR')
 
         nuevo_trabajador = Trabajador(
             codigo=codigo,
@@ -80,11 +79,10 @@ def update_trabajador(id):
     data = request.json
     try:
         if 'codigo' in data and data['codigo'] != trabajador.codigo:
-             # Prevent changing if already exists
-             exists = Trabajador.query.filter_by(codigo=data['codigo']).first()
-             if exists and exists.id != id:
-                 return jsonify({'error': 'Código ya existe'}), 400
-             trabajador.codigo = data['codigo']
+             return jsonify({
+                 'error': 'El código es inmutable.',
+                 'codigo': 'CODIGO_INMUTABLE',
+             }), 400
 
         trabajador.nombres = data.get('nombres', trabajador.nombres).strip()
         trabajador.apellidos = data.get('apellidos', trabajador.apellidos).strip()
