@@ -5,6 +5,7 @@ from uuid import UUID
 from flask import Blueprint, jsonify, request
 
 from app.extensions import db
+from app.services.scm_auth import request_actor_id
 from app.services.scm_alert_service import (
     approve_alert_rule_revision,
     create_alert_rule_revision,
@@ -55,12 +56,9 @@ def _body():
 
 def _actor_id():
     try:
-        value = int(request.headers.get("X-Actor-Id"))
-    except (TypeError, ValueError):
-        value = None
-    if value is None or value <= 0:
-        raise ScmServiceError("ACTOR_HEADER_REQUIRED", "X-Actor-Id debe identificar un trabajador valido.", status_code=400)
-    return value
+        return request_actor_id()
+    except ValueError as error:
+        raise ScmServiceError("ACTOR_HEADER_REQUIRED", "X-Actor-Id debe identificar un trabajador valido.", status_code=400) from error
 
 
 def _operation_id():

@@ -11,6 +11,7 @@ from app.services.scm_service_support import (
     actor_snapshot,
     expected_version,
     load_actor,
+    load_actor_any,
     reject_no_changes,
     reject_unknown_fields,
     require_patch_field,
@@ -86,10 +87,13 @@ def get_provider(session, *, actor_id, provider_id):
 
 def create_provider(session, *, actor_id, data):
     try:
-        actor = load_actor(
+        actor = load_actor_any(
             session,
             actor_id,
-            capability="PROVEEDOR_ADMINISTRAR",
+            capabilities=(
+                "PROVEEDOR_ADMINISTRAR",
+                "CATALOGO_PROVEEDOR_ADMINISTRAR",
+            ),
         )
         reject_unknown_fields(
             data,
@@ -149,10 +153,13 @@ def create_provider(session, *, actor_id, data):
 
 def update_provider(session, *, actor_id, provider_id, data):
     try:
-        actor = load_actor(
+        actor = load_actor_any(
             session,
             actor_id,
-            capability="PROVEEDOR_ADMINISTRAR",
+            capabilities=(
+                "PROVEEDOR_ADMINISTRAR",
+                "CATALOGO_PROVEEDOR_ADMINISTRAR",
+            ),
         )
         reject_unknown_fields(
             data,

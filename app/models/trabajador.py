@@ -52,6 +52,7 @@ class Trabajador(db.Model):
     nombre_corto = db.Column(db.String(100), nullable=True)
     activo = db.Column(db.Boolean, default=True)
     observaciones = db.Column(db.Text, nullable=True)
+    auth_user_id = db.Column(db.Uuid(as_uuid=True), unique=True, nullable=True)
 
     # Relación N:M
     roles = db.relationship('RolOperativo', secondary=trabajador_rol, lazy='subquery',

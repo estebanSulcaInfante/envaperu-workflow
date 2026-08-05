@@ -252,7 +252,10 @@ def test_categoria_recepcion_crud_logico_exige_config_y_version(
     )
     error = _assert_error(denied, 403, "CAPABILITY_REQUIRED")
     assert error["details"] == {
-        "capability": "CONFIG_RECEPCION_ADMINISTRAR"
+        "capabilities_any": [
+            "CONFIG_RECEPCION_ADMINISTRAR",
+            "CATALOGO_MATERIAL_ADMINISTRAR",
+        ]
     }
 
     invalid_create = client.post(

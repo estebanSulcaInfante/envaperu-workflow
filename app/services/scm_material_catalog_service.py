@@ -24,6 +24,7 @@ from app.services.scm_service_support import (
     actor_snapshot,
     expected_version,
     load_actor,
+    load_actor_any,
     positive_integer,
     reject_no_changes,
     reject_unknown_fields,
@@ -34,6 +35,7 @@ from app.services.scm_service_support import (
 
 
 CONFIG_CAPABILITY = "CONFIG_RECEPCION_ADMINISTRAR"
+CATALOG_CAPABILITY = "CATALOGO_MATERIAL_ADMINISTRAR"
 CATEGORY_CREATE_FIELDS = {
     "codigo",
     "nombre",
@@ -254,10 +256,10 @@ def get_reception_category(session, *, actor_id, category_id):
 
 def create_reception_category(session, *, actor_id, data):
     try:
-        actor = load_actor(
+        actor = load_actor_any(
             session,
             actor_id,
-            capability=CONFIG_CAPABILITY,
+            capabilities=(CONFIG_CAPABILITY, CATALOG_CAPABILITY),
         )
         reject_unknown_fields(data, allowed=CATEGORY_CREATE_FIELDS)
         code = (
@@ -332,10 +334,10 @@ def update_reception_category(
     data,
 ):
     try:
-        actor = load_actor(
+        actor = load_actor_any(
             session,
             actor_id,
-            capability=CONFIG_CAPABILITY,
+            capabilities=(CONFIG_CAPABILITY, CATALOG_CAPABILITY),
         )
         reject_unknown_fields(
             data,
@@ -482,10 +484,10 @@ def get_material(session, *, actor_id, material_id):
 
 def create_material(session, *, actor_id, data):
     try:
-        actor = load_actor(
+        actor = load_actor_any(
             session,
             actor_id,
-            capability=CONFIG_CAPABILITY,
+            capabilities=(CONFIG_CAPABILITY, CATALOG_CAPABILITY),
         )
         reject_unknown_fields(data, allowed=MATERIAL_CREATE_FIELDS)
         material_class = _material_class(data.get("clase"))
@@ -572,10 +574,10 @@ def create_material(session, *, actor_id, data):
 
 def update_material(session, *, actor_id, material_id, data):
     try:
-        actor = load_actor(
+        actor = load_actor_any(
             session,
             actor_id,
-            capability=CONFIG_CAPABILITY,
+            capabilities=(CONFIG_CAPABILITY, CATALOG_CAPABILITY),
         )
         reject_unknown_fields(
             data,

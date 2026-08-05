@@ -47,6 +47,10 @@ def create_app():
     )
 
     validate_catalog_image_storage_config(app.config)
+
+    from app.services.scm_auth import configure_scm_auth
+
+    configure_scm_auth(app)
     
     # Configurar logging
     setup_logging(app)
@@ -70,6 +74,7 @@ def create_app():
         integration_station_bp,
         monitoring_station_bp,
     )
+    from app.api.rutas_auth import auth_bp
     
     # Todo lo que esté en ese archivo empezará con /api
     app.register_blueprint(produccion_bp, url_prefix='/api')
@@ -89,6 +94,7 @@ def create_app():
         monitoring_station_bp,
         url_prefix='/api/monitoring/v1',
     )
+    app.register_blueprint(auth_bp, url_prefix='/api/auth')
 
     from app.cli import register_scm_commands, register_station_commands
 

@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, current_app, g, request, jsonify
 from app.extensions import db
 from app.models.trabajador import Trabajador, RolOperativo
 from app.services.catalog_code_generator import generar_codigo_catalogo
@@ -34,7 +34,24 @@ def get_trabajadores():
         query = query.filter(Trabajador.activo == is_active)
 
     trabajadores = query.order_by(Trabajador.apellidos).all()
-    return jsonify([t.to_dict() for t in trabajadores]), 200
+    actor = getattr(g, 'scm_actor', None)
+    can_view_authorization = (
+        current_app.config.get('SCM_AUTH_MODE') != 'supabase'
+        or (actor is not None and actor.tiene_capacidad('AUTORIZACION_SCM_ADMINISTRAR'))
+    )
+    if can_view_authorization:
+        payload = [t.to_dict() for t in trabajadores]
+    else:
+        payload = [{
+            'id': t.id,
+            'codigo': t.codigo,
+            'nombres': t.nombres,
+            'apellidos': t.apellidos,
+            'nombre_corto': t.nombre_corto,
+            'nombre_completo': t.nombre_completo,
+            'activo': t.activo,
+        } for t in trabajadores]
+    return jsonify(payload), 200
 
 @rutas_trabajadores.route('/api/catalogo/trabajadores', methods=['POST'])
 def create_trabajador():

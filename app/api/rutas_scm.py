@@ -30,6 +30,7 @@ from app.services.scm_purchase_service import (
     update_purchase_order_revision,
 )
 from app.services.scm_service_support import ScmServiceError
+from app.services.scm_auth import request_actor_id
 from app.services.scm_reception_draft_service import (
     create_reception_draft,
     create_supplier_document,
@@ -205,18 +206,14 @@ def _json_body():
 
 
 def _actor_id():
-    raw_value = request.headers.get("X-Actor-Id")
     try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        value = None
-    if value is None or value <= 0:
+        return request_actor_id()
+    except ValueError as error:
         raise ScmServiceError(
             "ACTOR_HEADER_REQUIRED",
             "X-Actor-Id debe identificar un trabajador valido.",
             status_code=400,
-        )
-    return value
+        ) from error
 
 
 def _idempotency_key():

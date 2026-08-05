@@ -59,3 +59,10 @@ class Config:
     SCM_RECEPCION_ENABLED = (
         os.getenv('SCM_RECEPCION_ENABLED', 'false').lower() == 'true'
     )
+    SCM_AUTH_MODE = os.getenv('SCM_AUTH_MODE', 'local_actor').strip().lower()
+    SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip().rstrip('/')
+    SUPABASE_JWT_AUDIENCE = os.getenv(
+        'SUPABASE_JWT_AUDIENCE',
+        'authenticated',
+    ).strip()
+    SUPABASE_JWT_ISSUER = os.getenv('SUPABASE_JWT_ISSUER', '').strip().rstrip('/')

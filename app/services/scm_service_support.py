@@ -182,6 +182,19 @@ def load_actor(session, actor_id, *, capability=None):
     return actor
 
 
+def load_actor_any(session, actor_id, *, capabilities):
+    actor = load_actor(session, actor_id)
+    required = tuple(capabilities or ())
+    if required and not any(actor.tiene_capacidad(code) for code in required):
+        raise ScmServiceError(
+            "CAPABILITY_REQUIRED",
+            f"El actor requiere una de las capacidades: {', '.join(required)}.",
+            status_code=403,
+            details={"capabilities_any": list(required)},
+        )
+    return actor
+
+
 def actor_snapshot(actor):
     return {
         "id": actor.id,
