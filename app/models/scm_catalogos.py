@@ -61,6 +61,10 @@ class ScmProveedor(db.Model):
     codigo = db.Column(db.String(64), nullable=False)
     razon_social = db.Column(db.String(200), nullable=False)
     ruc = db.Column(db.String(11), nullable=True)
+    contacto = db.Column(db.String(200), nullable=True)
+    telefono = db.Column(db.String(50), nullable=True)
+    whatsapp = db.Column(db.String(50), nullable=True)
+    correo = db.Column(db.String(254), nullable=True)
     activo = db.Column(
         db.Boolean,
         nullable=False,
@@ -99,6 +103,10 @@ class ScmProveedor(db.Model):
             "codigo": self.codigo,
             "razon_social": self.razon_social,
             "ruc": self.ruc,
+            "contacto": self.contacto,
+            "telefono": self.telefono,
+            "whatsapp": self.whatsapp,
+            "correo": self.correo,
             "activo": self.activo,
             "version": self.version,
             "created_at": _isoformat(self.created_at),

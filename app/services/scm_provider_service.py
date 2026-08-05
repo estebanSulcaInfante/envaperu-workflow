@@ -21,7 +21,14 @@ from app.services.scm_service_support import (
 
 
 _RUC_SEPARATORS = re.compile(r"[\s.\-]")
-PROVIDER_MUTABLE_FIELDS = {"razon_social", "ruc", "activo"}
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PROVIDER_CONTACT_FIELDS = {"contacto", "telefono", "whatsapp", "correo"}
+PROVIDER_MUTABLE_FIELDS = {
+    "razon_social",
+    "ruc",
+    *PROVIDER_CONTACT_FIELDS,
+    "activo",
+}
 
 
 def _active_value(data, *, default):
@@ -48,6 +55,50 @@ def _normalized_ruc(value):
             status_code=422,
         )
     return normalized
+
+
+def _optional_text(value, *, field, max_length):
+    if value is None or str(value).strip() == "":
+        return None
+    normalized = str(value).strip()
+    if len(normalized) > max_length:
+        raise ScmServiceError(
+            "INVALID_FIELD_LENGTH",
+            f"El campo {field} excede {max_length} caracteres.",
+            status_code=422,
+        )
+    return normalized
+
+
+def _normalized_email(value):
+    normalized = _optional_text(value, field="correo", max_length=254)
+    if normalized is None:
+        return None
+    normalized = normalized.lower()
+    if not _EMAIL_PATTERN.fullmatch(normalized):
+        raise ScmServiceError(
+            "INVALID_EMAIL",
+            "El correo del proveedor no tiene un formato valido.",
+            status_code=422,
+        )
+    return normalized
+
+
+def _contact_values(data, *, current=None):
+    values = {}
+    limits = {"contacto": 200, "telefono": 50, "whatsapp": 50}
+    for field, max_length in limits.items():
+        values[field] = (
+            _optional_text(data[field], field=field, max_length=max_length)
+            if field in data
+            else getattr(current, field, None)
+        )
+    values["correo"] = (
+        _normalized_email(data["correo"])
+        if "correo" in data
+        else getattr(current, "correo", None)
+    )
+    return values
 
 
 def _provider_event(provider, actor, event_type, *, before=None):
@@ -97,7 +148,13 @@ def create_provider(session, *, actor_id, data):
         )
         reject_unknown_fields(
             data,
-            allowed={"codigo", "razon_social", "ruc", "activo"},
+            allowed={
+                "codigo",
+                "razon_social",
+                "ruc",
+                *PROVIDER_CONTACT_FIELDS,
+                "activo",
+            },
         )
         code = (
             stable_code(data.get("codigo"))
@@ -110,6 +167,7 @@ def create_provider(session, *, actor_id, data):
             max_length=200,
         )
         ruc = _normalized_ruc(data.get("ruc"))
+        contacts = _contact_values(data)
 
         if session.scalar(
             select(ScmProveedor.id).where(ScmProveedor.codigo == code)
@@ -132,6 +190,7 @@ def create_provider(session, *, actor_id, data):
             codigo=code,
             razon_social=business_name,
             ruc=ruc,
+            **contacts,
             activo=_active_value(data, default=True),
         )
         session.add(provider)
@@ -215,6 +274,7 @@ def update_provider(session, *, actor_id, provider_id, data):
             if "ruc" in data
             else provider.ruc
         )
+        contacts = _contact_values(data, current=provider)
         if ruc != provider.ruc:
             conflict = (
                 session.scalar(
@@ -236,12 +296,15 @@ def update_provider(session, *, actor_id, provider_id, data):
         if not any((
             business_name != provider.razon_social,
             ruc != provider.ruc,
+            *(contacts[field] != getattr(provider, field) for field in PROVIDER_CONTACT_FIELDS),
             active != provider.activo,
         )):
             reject_no_changes()
 
         provider.razon_social = business_name
         provider.ruc = ruc
+        for field, value in contacts.items():
+            setattr(provider, field, value)
         provider.activo = active
 
         provider.version += 1

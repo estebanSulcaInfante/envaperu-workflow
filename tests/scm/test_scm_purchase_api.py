@@ -107,6 +107,10 @@ def test_proveedor_crud_logico_exige_capacidad_y_version_optimista(
         "codigo": "PROV-TEST-01",
         "razon_social": "Proveedor canonico de prueba",
         "ruc": "20-524360-366",
+        "contacto": "  Piero Compras  ",
+        "telefono": "01 708-2613",
+        "whatsapp": "+51 998 123 628",
+        "correo": "  COMPRAS@PROVEEDOR.PE ",
     }
 
     denied = client.post(
@@ -126,6 +130,10 @@ def test_proveedor_crud_logico_exige_capacidad_y_version_optimista(
     assert provider["codigo"] == "PROV-TEST-01"
     assert provider["razon_social"] == "Proveedor canonico de prueba"
     assert provider["ruc"] == "20524360366"
+    assert provider["contacto"] == "Piero Compras"
+    assert provider["telefono"] == "01 708-2613"
+    assert provider["whatsapp"] == "+51 998 123 628"
+    assert provider["correo"] == "compras@proveedor.pe"
     assert provider["activo"] is True
     assert provider["version"] == 1
 
@@ -151,12 +159,16 @@ def test_proveedor_crud_logico_exige_capacidad_y_version_optimista(
         json={
             "version": 1,
             "razon_social": "Proveedor canonico actualizado",
+            "contacto": "Maria Abastecimiento",
+            "telefono": None,
         },
     )
     assert updated.status_code == 200, updated.get_json()
     assert updated.get_json()["razon_social"] == (
         "Proveedor canonico actualizado"
     )
+    assert updated.get_json()["contacto"] == "Maria Abastecimiento"
+    assert updated.get_json()["telefono"] is None
     assert updated.get_json()["version"] == 2
 
     stale = client.patch(
@@ -185,6 +197,25 @@ def test_proveedor_crud_logico_exige_capacidad_y_version_optimista(
     )
     assert historical_detail.status_code == 200
     assert historical_detail.get_json()["activo"] is False
+
+
+def test_proveedor_rechaza_correo_invalido(
+    client,
+    scm_purchase_context,
+):
+    response = client.post(
+        f"{API_BASE}/proveedores",
+        headers=_headers(
+            scm_purchase_context.compras_id,
+            idempotency_key=uuid4(),
+        ),
+        json={
+            "razon_social": "Proveedor con correo invalido",
+            "correo": "correo-sin-dominio",
+        },
+    )
+
+    _assert_error(response, 422, "INVALID_EMAIL")
 
 
 def test_rec_40_oc_versionada_rechaza_autoaprobacion_y_aprueba_gerencia(
