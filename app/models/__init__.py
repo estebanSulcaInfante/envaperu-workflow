@@ -13,6 +13,103 @@ from app.models.scm_compras import (
     ScmOrdenCompraRevision,
 )
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
+from app.models.scm_articulos import (
+    ScmArticulo,
+    ScmArticuloPiezaColor,
+    ScmArticuloProducto,
+    ScmDefinicionWip,
+)
+from app.models.scm_estructuras import (
+    ScmEstructuraComponente,
+    ScmEstructuraRevision,
+)
+from app.models.scm_rutas import (
+    ScmCentroTrabajo,
+    ScmOperacionPrecedencia,
+    ScmOperacionRuta,
+    ScmRutaRevision,
+)
+from app.models.scm_empaque import (
+    ScmArticuloPerfil,
+    ScmPerfilEmpacable,
+    ScmReglaEmpaque,
+    ScmReglaEmpaqueRevision,
+    ScmTipoContenedor,
+)
+from app.models.scm_ot import (
+    ScmAsignacionPlanMangaOt,
+    ScmEtiquetaManga,
+    ScmLoteArticulo,
+    ScmManga,
+    ScmPlanMangaOp,
+    ScmPlanMangaOpLinea,
+    ScmSolicitudMangaExtra,
+    ScmTrabajoImpresionManga,
+    ScmPesajeManga,
+    ScmAnulacionPesajeManga,
+    ScmCorreccionPesajeManga,
+)
+from app.models.scm_production_orders import (
+    ScmAsignacionDemandaSuministro,
+    ScmCorridaFabricacion,
+    ScmOrdenFabricacion,
+    ScmOrdenOperacion,
+    ScmOrdenOperacionSalida,
+    ScmPlanProduccion,
+    ScmOrdenProduccion,
+    ScmOrdenProduccionLinea,
+)
+from app.models.scm_inventory import (
+    ScmLoteAperturaInventario,
+    ScmLoteAperturaLinea,
+    ScmMovimientoMaterialInventario,
+    ScmMovimientoInventario,
+    ScmReservaInventario,
+    ScmSaldoInventario,
+    ScmSaldoMaterialInventario,
+    ScmUbicacionInventario,
+)
+from app.models.scm_warehouse import (
+    ScmExistenciaManga,
+    ScmRechazoRecepcionManga,
+    ScmReversionRecepcionManga,
+    ScmSesionRecepcionManga,
+)
+from app.models.scm_internal_supply import (
+    ScmAsignacionAbastecimiento,
+    ScmAsignacionPoolArmado,
+    ScmPoolOrigenArmado,
+    ScmSolicitudAbastecimiento,
+    ScmSolicitudAbastecimientoLinea,
+)
+from app.models.scm_assembly_execution import (
+    ScmConfirmacionMangaArmado,
+    ScmConsumoComponenteArmado,
+    ScmCorreccionMangaArmado,
+)
+from app.models.scm_material_execution import (
+    ScmDevolucionMaterial,
+    ScmEmisionMaterial,
+    ScmLotePremezcla,
+    ScmLotePremezclaInput,
+    ScmRequerimientoMaterial,
+    ScmReservaMaterial,
+)
+from app.models.scm_reproceso import (
+    ScmAlertaEvento,
+    ScmAlertaOperativa,
+    ScmCondicionMerma,
+    ScmFamiliaMaterialReproceso,
+    ScmLoteMaterialRecuperado,
+    ScmLoteMermaRecuperable,
+    ScmMovimientoMerma,
+    ScmOrdenMolienda,
+    ScmOrdenMoliendaAporte,
+    ScmProcesoMaterialReproceso,
+    ScmReglaAlerta,
+    ScmReglaAlertaRevision,
+    ScmReglaCompatibilidadReproceso,
+)
 from app.models.scm_recepcion import (
     ScmDocumentoProveedor,
     ScmPesajeBolsa,
@@ -31,7 +128,6 @@ from app.models.producto import (
     Linea,
     LineaFamilia,
     PiezaColor,
-    PiezaComponente,
     ProductoPieza,
     ProductoTerminado,
 )

@@ -35,6 +35,7 @@ ROLES_SCM_INICIALES = {
     "COMPRAS",
     "ALMACEN_RECEPCION",
     "CALIDAD",
+    "GERENTE_GENERAL",
     "GERENCIA",
     "SUPERVISOR",
     "CONFIGURACION_SCM",
@@ -209,11 +210,17 @@ def test_seed_scm_es_idempotente_y_no_asigna_personas(app, runner):
         assert CAPACIDADES_MINIMAS <= capacidades
         assert ROLES_SCM_INICIALES <= set(roles)
         assert {
+            item.codigo for item in roles["GERENTE_GENERAL"].capacidades
+        } == capacidades
+        assert {
             item.codigo for item in roles["GERENCIA"].capacidades
         } >= {"OC_APROBAR", "CORRECCION_APROBAR"}
         assert {
             item.codigo for item in roles["CONFIGURACION_SCM"].capacidades
         } >= {"CONFIG_RECEPCION_ADMINISTRAR"}
+        assert {
+            item.codigo for item in roles["JEFE_PRODUCCION"].capacidades
+        } >= {"MANGA_ETIQUETA_PRE_GENERAR"}
         assert categorias["RESINA_VIRGEN"].modalidad_default == MODALIDAD_VIRGEN
         assert (
             categorias["LEGACY_POR_CONFIGURAR"].modalidad_default
@@ -221,7 +228,7 @@ def test_seed_scm_es_idempotente_y_no_asigna_personas(app, runner):
         )
         assert categorias["LEGACY_POR_CONFIGURAR"].recepcion_habilitada is False
         assert roles["COMPRAS"].nombre == "Compras configurado localmente"
-        assert "PROVEEDOR_ADMINISTRAR" not in {
+        assert "PROVEEDOR_ADMINISTRAR" in {
             item.codigo for item in roles["COMPRAS"].capacidades
         }
         assert db.session.scalar(

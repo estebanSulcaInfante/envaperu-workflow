@@ -5,7 +5,7 @@ import pytest
 from app import create_app
 from app.extensions import db
 from app.models.molde import Molde, MoldePieza, Pieza
-from app.models.producto import PiezaColor, PiezaComponente, Linea, Familia
+from app.models.producto import PiezaColor, Linea, Familia
 
 
 @pytest.fixture
@@ -65,7 +65,6 @@ class TestMoldeHomogeneo:
             pieza = PiezaColor(
                 sku="BALDE-001",
                 piezas="Balde Romano",
-                tipo="SIMPLE",
                 peso=87.0,
                 cavidad=4,
                 linea_id=linea_id,
@@ -103,10 +102,10 @@ class TestMoldeHomogeneo:
 
 
 class TestMoldeHeterogeneo:
-    """Test para moldes con múltiples piezas (Kit Regadera)"""
+    """Test para moldes con múltiples piezas físicas."""
     
-    def test_crear_molde_heterogeneo_con_kit(self, client, app):
-        """Crear un molde que produce un kit (tapa + asa + base)"""
+    def test_crear_molde_heterogeneo_con_piezas(self, client, app):
+        """Crear un molde que produce tapa, asa y base en un mismo tiro."""
         with app.app_context():
             linea_id, familia_id = get_default_linea_familia(app)
             
@@ -114,25 +113,16 @@ class TestMoldeHeterogeneo:
                 "tapa": Pieza(codigo="PZ-REG-TAPA", nombre="Tapa Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=25.0),
                 "asa": Pieza(codigo="PZ-REG-ASA", nombre="Asa Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=40.0),
                 "base": Pieza(codigo="PZ-REG-BASE", nombre="Base Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=120.0),
-                "kit": Pieza(codigo="PZ-REG-KIT", nombre="Kit Regadera", linea_id=linea_id, familia_id=familia_id, peso_nominal_gr=185.0),
             }
             db.session.add_all(maestros.values())
             db.session.flush()
 
             # Cada SKU coloreado apunta al maestro global correspondiente.
-            tapa = PiezaColor(sku="REG-TAPA", piezas="Tapa Regadera", tipo="COMPONENTE", peso=25.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["tapa"].id)
-            asa = PiezaColor(sku="REG-ASA", piezas="Asa Regadera", tipo="COMPONENTE", peso=40.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["asa"].id)
-            base = PiezaColor(sku="REG-BASE", piezas="Base Regadera", tipo="COMPONENTE", peso=120.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["base"].id)
-            kit = PiezaColor(sku="REG-KIT", piezas="Kit Regadera", tipo="KIT", peso=185.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["kit"].id)
+            tapa = PiezaColor(sku="REG-TAPA", piezas="Tapa Regadera", peso=25.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["tapa"].id)
+            asa = PiezaColor(sku="REG-ASA", piezas="Asa Regadera", peso=40.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["asa"].id)
+            base = PiezaColor(sku="REG-BASE", piezas="Base Regadera", peso=120.0, linea_id=linea_id, familia_id=familia_id, pieza_id=maestros["base"].id)
 
-            db.session.add_all([tapa, asa, base, kit])
-            db.session.commit()
-            
-            # Crear relaciones de componentes
-            pc1 = PiezaComponente(kit_sku="REG-KIT", componente_sku="REG-TAPA", cantidad=1)
-            pc2 = PiezaComponente(kit_sku="REG-KIT", componente_sku="REG-ASA", cantidad=1)
-            pc3 = PiezaComponente(kit_sku="REG-KIT", componente_sku="REG-BASE", cantidad=1)
-            db.session.add_all([pc1, pc2, pc3])
+            db.session.add_all([tapa, asa, base])
             db.session.commit()
             
             # Crear molde
@@ -144,23 +134,33 @@ class TestMoldeHeterogeneo:
             db.session.add(molde)
             db.session.commit()
             
-            # Relacionar molde con kit
-            mp = MoldePieza(
-                molde=molde,
-                pieza=maestros["kit"],
-                cavidades=1,
-                peso_unitario_gr=185.0
-            )
-            db.session.add(mp)
+            # La composición física del molde permanece separada de la BOM.
+            db.session.add_all([
+                MoldePieza(
+                    molde=molde,
+                    pieza=maestros["tapa"],
+                    cavidades=1,
+                    peso_unitario_gr=25.0,
+                ),
+                MoldePieza(
+                    molde=molde,
+                    pieza=maestros["asa"],
+                    cavidades=1,
+                    peso_unitario_gr=40.0,
+                ),
+                MoldePieza(
+                    molde=molde,
+                    pieza=maestros["base"],
+                    cavidades=1,
+                    peso_unitario_gr=120.0,
+                ),
+            ])
             db.session.commit()
-            
-            # Verificar kit tiene componentes
-            assert len(kit.componentes) == 3
-            
+
             # Verificar molde cálculos
             assert molde.peso_neto_gr == 185.0  # 185 × 1
             assert molde.peso_colada_gr == 10.0  # 195 - 185
-            assert molde.cavidades_totales == 1
+            assert molde.cavidades_totales == 3
 
 
 class TestPiezasProducibles:
@@ -176,8 +176,8 @@ class TestPiezasProducibles:
             db.session.add_all([maestro_prod, maestro_no_prod])
             db.session.flush()
 
-            pieza_prod = PiezaColor(sku="PROD-001", piezas="Producible", tipo="SIMPLE", linea_id=linea_id, familia_id=familia_id, pieza_id=maestro_prod.id)
-            pieza_no_prod = PiezaColor(sku="COMP-001", piezas="Componente", tipo="COMPONENTE", linea_id=linea_id, familia_id=familia_id, pieza_id=maestro_no_prod.id)
+            pieza_prod = PiezaColor(sku="PROD-001", piezas="Producible", linea_id=linea_id, familia_id=familia_id, pieza_id=maestro_prod.id)
+            pieza_no_prod = PiezaColor(sku="COMP-001", piezas="Componente", linea_id=linea_id, familia_id=familia_id, pieza_id=maestro_no_prod.id)
 
             db.session.add_all([pieza_prod, pieza_no_prod])
             db.session.commit()

@@ -1,18 +1,189 @@
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import Uuid
+
 from app.extensions import db
-from datetime import datetime
 from app.models.maquina import Maquina  # Import for relationship resolution
+
+
+def _legacy_ot_code():
+    """Fallback for callers that still create the historical daily record."""
+    return f"OT-LEGACY-NEW-{uuid.uuid4().hex[:12].upper()}"
+
 
 class RegistroDiarioProduccion(db.Model):
     """
     CABECERA: Representa la 'Hoja de Producción' física.
     """
     __tablename__ = 'registro_diario_produccion'
+    __table_args__ = (
+        db.CheckConstraint(
+            "estado IN ('BORRADOR', 'PLANIFICADA', 'EN_EJECUCION', "
+            "'CERRADA', 'ANULADA', "
+            "'MIGRADA_PENDIENTE_CLASIFICACION')",
+            name="ck_registro_diario_estado_ot",
+        ),
+        db.CheckConstraint(
+            "version > 0",
+            name="ck_registro_diario_version_ot",
+        ),
+        db.CheckConstraint(
+            "secuencia_siguiente_manga > 0",
+            name="ck_registro_diario_secuencia_manga",
+        ),
+        db.CheckConstraint(
+            "tipo_ot IN ('FABRICACION', 'ENSAMBLE')",
+            name="ck_registro_diario_tipo_ot",
+        ),
+        db.CheckConstraint(
+            "(tipo_ot = 'FABRICACION' AND maquina_id IS NOT NULL) OR "
+            "(tipo_ot = 'ENSAMBLE' AND centro_trabajo_id IS NOT NULL)",
+            name="ck_registro_diario_recurso_ot",
+        ),
+        db.CheckConstraint(
+            "cantidad_objetivo IS NULL OR cantidad_objetivo > 0",
+            name="ck_registro_diario_cantidad_objetivo",
+        ),
+        db.CheckConstraint(
+            "(tipo_ot = 'ENSAMBLE' AND modo_ejecucion_ensamble IN "
+            "('MESA', 'CONCURRENTE')) OR "
+            "(tipo_ot <> 'ENSAMBLE' AND modo_ejecucion_ensamble IS NULL)",
+            name="ck_registro_diario_modo_ensamble",
+        ),
+        db.CheckConstraint(
+            "(modo_ejecucion_ensamble = 'CONCURRENTE' AND "
+            "ot_fabricacion_contexto_id IS NOT NULL) OR "
+            "(modo_ejecucion_ensamble IS DISTINCT FROM 'CONCURRENTE' AND "
+            "ot_fabricacion_contexto_id IS NULL)",
+            name="ck_registro_diario_contexto_ensamble",
+        ),
+    )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+
+    # Identidad canónica de OT. Las filas históricas reciben un código
+    # sintético mediante migración y no participan en el piloto SCM hasta su
+    # conciliación explícita.
+    public_id = db.Column(
+        Uuid(as_uuid=True),
+        nullable=False,
+        unique=True,
+        default=uuid.uuid4,
+    )
+    codigo_ot = db.Column(
+        db.String(32),
+        nullable=False,
+        unique=True,
+        default=_legacy_ot_code,
+    )
+    codigo_ot_sintetico = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True,
+        server_default=db.false(),
+    )
+    estado = db.Column(
+        db.String(32),
+        nullable=False,
+        default="MIGRADA_PENDIENTE_CLASIFICACION",
+        server_default="BORRADOR",
+    )
+    tipo_ot = db.Column(
+        db.String(20),
+        nullable=False,
+        default="FABRICACION",
+        server_default="FABRICACION",
+    )
+    modo_ejecucion_ensamble = db.Column(db.String(20), nullable=True)
+    ot_fabricacion_contexto_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey(
+            'registro_diario_produccion.public_id', ondelete='RESTRICT'
+        ),
+        nullable=True,
+    )
+    timezone_snapshot = db.Column(
+        db.String(64),
+        nullable=False,
+        default="America/Lima",
+        server_default="America/Lima",
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    created_at_source = db.Column(
+        db.String(32),
+        nullable=False,
+        default="CENTRAL",
+        server_default="CENTRAL",
+    )
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    iniciada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    cerrada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    created_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    maquinista_previsto_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    version = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    secuencia_siguiente_manga = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
     
     # RELACIONES FK
-    orden_id = db.Column(db.String(20), db.ForeignKey('orden_produccion.numero_op'), nullable=False)
-    maquina_id = db.Column(db.Integer, db.ForeignKey('maquina.id'), nullable=False)
+    orden_id = db.Column(
+        db.String(20),
+        db.ForeignKey('orden_produccion.numero_op'),
+        nullable=True,
+    )
+    # Identidad canónica TS-010P. Durante expand son nullables para no inventar
+    # genealogía en OT legacy; las OT v2 exigirán ambos campos desde servicio.
+    orden_operacion_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey('scm_orden_operacion.id', ondelete='RESTRICT'),
+        nullable=True,
+    )
+    corrida_fabricacion_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey('scm_corrida_fabricacion.id', ondelete='RESTRICT'),
+        nullable=True,
+    )
+    maquina_id = db.Column(db.Integer, db.ForeignKey('maquina.id'), nullable=True)
+    centro_trabajo_id = db.Column(
+        db.Integer,
+        db.ForeignKey('scm_centro_trabajo.id', ondelete='RESTRICT'),
+        nullable=True,
+    )
+    responsable_id = db.Column(
+        db.Integer,
+        db.ForeignKey('trabajador.id', ondelete='RESTRICT'),
+        nullable=True,
+    )
+    cantidad_objetivo = db.Column(db.Numeric(15, 3), nullable=True)
+    cantidad_confirmada = db.Column(
+        db.Numeric(15, 3), nullable=False, default=0, server_default="0"
+    )
     
     # INPUTS: DATOS GENERALES (CABECERA)
     fecha = db.Column(db.Date, nullable=False)
@@ -50,9 +221,28 @@ class RegistroDiarioProduccion(db.Model):
 
     # Relaciones
     orden = db.relationship('OrdenProduccion', backref='registros_diarios', lazy=True)
+    orden_operacion = db.relationship('ScmOrdenOperacion')
+    corrida_fabricacion = db.relationship('ScmCorridaFabricacion')
     maquina = db.relationship('Maquina', backref='registros_diarios', lazy=True)
+    centro_trabajo = db.relationship('ScmCentroTrabajo')
+    responsable = db.relationship(
+        'Trabajador', foreign_keys=[responsable_id]
+    )
     detalles = db.relationship('DetalleProduccionHora', backref='cabecera', cascade="all, delete-orphan", lazy=True)
     controles_peso = db.relationship('ControlPeso', backref='registro', cascade="all, delete-orphan", lazy=True)
+    created_by = db.relationship(
+        "Trabajador",
+        foreign_keys=[created_by_id],
+    )
+    maquinista_previsto = db.relationship(
+        "Trabajador",
+        foreign_keys=[maquinista_previsto_id],
+    )
+    ot_fabricacion_contexto = db.relationship(
+        'RegistroDiarioProduccion',
+        remote_side=[public_id],
+        foreign_keys=[ot_fabricacion_contexto_id],
+    )
     
     def actualizar_totales(self):
         """
@@ -109,12 +299,81 @@ class RegistroDiarioProduccion(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'public_id': str(self.public_id) if self.public_id else None,
+            'codigo_ot': self.codigo_ot,
+            'codigo_ot_sintetico': self.codigo_ot_sintetico,
+            'estado': self.estado,
+            'tipo_ot': self.tipo_ot,
+            'modo_ejecucion_ensamble': self.modo_ejecucion_ensamble,
+            'ot_fabricacion_contexto_id': (
+                str(self.ot_fabricacion_contexto_id)
+                if self.ot_fabricacion_contexto_id else None
+            ),
+            'ot_fabricacion_contexto': (
+                {
+                    'public_id': str(self.ot_fabricacion_contexto.public_id),
+                    'codigo_ot': self.ot_fabricacion_contexto.codigo_ot,
+                    'estado': self.ot_fabricacion_contexto.estado,
+                    'fecha_operativa': (
+                        self.ot_fabricacion_contexto.fecha.isoformat()
+                        if self.ot_fabricacion_contexto.fecha else None
+                    ),
+                    'maquina': (
+                        self.ot_fabricacion_contexto.maquina_nombre_snapshot
+                        or (
+                            self.ot_fabricacion_contexto.maquina.nombre
+                            if self.ot_fabricacion_contexto.maquina else None
+                        )
+                    ),
+                }
+                if self.ot_fabricacion_contexto else None
+            ),
             'fecha': self.fecha.isoformat() if self.fecha else None,
+            'fecha_operativa': self.fecha.isoformat() if self.fecha else None,
             'turno': self.turno,
+            'maquinista_previsto_id': self.maquinista_previsto_id,
+            'maquinista_previsto': (
+                self.maquinista_previsto.nombre_completo
+                if self.maquinista_previsto
+                else None
+            ),
             'maquina_id': self.maquina_id,
             'maquina': self.maquina_nombre_snapshot or (self.maquina.nombre if self.maquina else None),
             'maquina_codigo': self.maquina_codigo_snapshot or (self.maquina.codigo if self.maquina else None),
+            'centro_trabajo': (
+                self.centro_trabajo.to_dict() if self.centro_trabajo else None
+            ),
+            'responsable_id': self.responsable_id,
+            'responsable': (
+                self.responsable.nombre_completo if self.responsable else None
+            ),
+            'cantidad_objetivo': (
+                format(self.cantidad_objetivo, 'f')
+                if self.cantidad_objetivo is not None else None
+            ),
+            'cantidad_confirmada': format(
+                self.cantidad_confirmada or 0, 'f'
+            ),
             'orden': self.orden_id,
+            'orden_operacion_id': (
+                str(self.orden_operacion_id)
+                if self.orden_operacion_id else None
+            ),
+            'corrida_fabricacion_id': (
+                str(self.corrida_fabricacion_id)
+                if self.corrida_fabricacion_id else None
+            ),
+            'orden_fabricacion': (
+                {
+                    'id': str(self.orden_operacion.id),
+                    'codigo': self.orden_operacion.codigo,
+                    'codigo_legacy_op': (
+                        self.orden_operacion.fabricacion.codigo_legacy_op
+                        if self.orden_operacion.fabricacion else None
+                    ),
+                }
+                if self.orden_operacion else None
+            ),
             'contadores': {
                 'inicial': self.colada_inicial,
                 'final': self.colada_final,
@@ -128,7 +387,18 @@ class RegistroDiarioProduccion(db.Model):
                  'piezas': self.total_piezas_buenas,
                  'kg_total': self.total_kg_real
             },
-            'detalles': [d.to_dict() for d in self.detalles]
+            'detalles': [d.to_dict() for d in self.detalles],
+            'version': self.version,
+            'created_at': (
+                self.created_at.isoformat() if self.created_at else None
+            ),
+            'created_at_source': self.created_at_source,
+            'iniciada_at': (
+                self.iniciada_at.isoformat() if self.iniciada_at else None
+            ),
+            'cerrada_at': (
+                self.cerrada_at.isoformat() if self.cerrada_at else None
+            ),
         }
 
 

@@ -115,6 +115,8 @@ def test_creates_all_required_masters_then_queries_exceptional_order(
         'producto': 'Caja organizadora amarilla E2E',
         'linea_id': line['id'],
         'familia_id': family['id'],
+        # Adaptador de compatibilidad requerido por /api/ordenes hasta que el
+        # endpoint excepcional consuma la estructura aprobada de Ingeniería SCM.
         'piezas': [{'pieza_sku': variant['sku'], 'cantidad': 1}],
     }))
     recipe = _created(client.post('/api/catalogo/recetas-color', json={

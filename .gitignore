@@ -201,6 +201,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Temporary Codex migration artifacts (may contain encrypted credentials or DB backups)
+.codex_tmp/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

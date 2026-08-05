@@ -105,7 +105,6 @@ erDiagram
         int linea_id FK
         int familia_id FK
         int familia_color_id FK "nullable"
-        int cod_producto
         string producto "nombre display"
         float peso_g
         string status

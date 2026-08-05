@@ -129,7 +129,6 @@ def _create_variant(catalog, *, sku, piece_id=None, color_id=None, familia_id=No
     variant = PiezaColor(
         sku=sku,
         piezas=sku,
-        tipo="SIMPLE",
         pieza_id=piece.id,
         linea_id=piece.linea_id,
         familia_id=familia_id or piece.familia_id,

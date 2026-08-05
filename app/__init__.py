@@ -40,7 +40,13 @@ def create_app():
 
     db.init_app(app)
     migrate.init_app(app, db, compare_type=True)
-    cors.init_app(app) # Importante para que el Frontend pueda llamar al Backend
+    cors.init_app(app, origins=app.config['CORS_ORIGINS'])
+
+    from app.services.catalog_image_storage import (
+        validate_catalog_image_storage_config,
+    )
+
+    validate_catalog_image_storage_config(app.config)
     
     # Configurar logging
     setup_logging(app)
@@ -48,17 +54,18 @@ def create_app():
     # --- IMPORTAR MODELOS ---
     # Es crucial importar los modelos aquí para que SQLAlchemy los registre
     # antes de que cualquier blueprint intente usarlos.
-    from app.models import correlativo_catalogo, orden, lote, materiales, recetas, producto, registro, control_peso, kardex, scm_catalogos, scm_recepcion, trabajador, maquina, estacion_pesaje, legacy_pesaje
+    from app.models import correlativo_catalogo, orden, lote, materiales, recetas, producto, registro, control_peso, scm_catalogos, scm_recepcion, scm_ot, scm_inventory, scm_warehouse, scm_internal_supply, scm_assembly_execution, scm_reproceso, trabajador, maquina, estacion_pesaje, legacy_pesaje
 
     # --- REGISTRO DE RUTAS ---
     from app.api.rutas_produccion import produccion_bp
     from app.api.rutas_catalogo import catalogo_bp
     from app.api.rutas_talonarios import talonarios_bp
     from app.api.rutas_sync import sync_bp
-    from app.api.rutas_kardex import kardex_bp
     from app.api.rutas_trabajadores import rutas_trabajadores
     from app.api.rutas_maquinas import rutas_maquinas
     from app.api.rutas_scm import scm_bp
+    from app.api.rutas_scm_reproceso import scm_reprocessing_bp
+    from app.api.rutas_scm_warehouse import scm_warehouse_bp
     from app.api.rutas_estaciones_pesaje import (
         integration_station_bp,
         monitoring_station_bp,
@@ -70,9 +77,10 @@ def create_app():
     app.register_blueprint(rutas_trabajadores)
     app.register_blueprint(rutas_maquinas)
     app.register_blueprint(scm_bp, url_prefix='/api/scm/v1')
+    app.register_blueprint(scm_reprocessing_bp, url_prefix='/api/scm/v1')
+    app.register_blueprint(scm_warehouse_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(talonarios_bp)
     app.register_blueprint(sync_bp, url_prefix='/api')
-    app.register_blueprint(kardex_bp, url_prefix='/api')
     app.register_blueprint(
         integration_station_bp,
         url_prefix='/api/integration/v1',

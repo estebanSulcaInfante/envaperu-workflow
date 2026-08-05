@@ -6,7 +6,7 @@ from app.extensions import db
 
 def _mk_pieza(linea_id, familia_id, sku, nombre, cavidad, peso):
     return PiezaColor(
-        sku=sku, cod_pieza=int(sku[-1]), piezas=nombre, tipo="SIMPLE",
+        sku=sku, cod_pieza=int(sku[-1]), piezas=nombre,
         linea_id=linea_id, familia_id=familia_id,
         cavidad=cavidad, peso=peso
     )

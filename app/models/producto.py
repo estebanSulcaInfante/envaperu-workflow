@@ -265,6 +265,12 @@ class ProductoTerminado(db.Model):
     El color específico (Rojo, Azul, Verde) está en las Piezas.
     """
     __tablename__ = 'producto_terminado'
+    __table_args__ = (
+        db.CheckConstraint(
+            "length(trim(producto)) > 0",
+            name="ck_producto_terminado_nombre_no_vacio",
+        ),
+    )
 
     # Relación normalizada con Linea (REFACTORIZADO - eliminados campos legacy)
     linea_id = db.Column(db.Integer, db.ForeignKey('linea.id'), nullable=False)
@@ -274,14 +280,18 @@ class ProductoTerminado(db.Model):
     familia_id = db.Column(db.Integer, db.ForeignKey('familia.id'), nullable=False)
     familia_rel = db.relationship('Familia', backref='productos_terminados')
     
-    cod_producto = db.Column(db.Integer)
-    producto = db.Column(db.String(200))
+    producto = db.Column(db.String(200), nullable=False)
     cod_sku_pt = db.Column(db.String(50), primary_key=True)
 
     um = db.Column(db.String(20))
     doc_x_paq = db.Column(db.Integer)
     doc_x_bulto = db.Column(db.Integer)
     peso_g = db.Column(db.Float)
+    imagen_mime = db.Column(db.String(32), nullable=True)
+    imagen_data = db.Column(db.LargeBinary, nullable=True)
+    imagen_storage_key = db.Column(db.String(512), nullable=True)
+    imagen_sha256 = db.Column(db.String(64), nullable=True)
+    imagen_size_bytes = db.Column(db.Integer, nullable=True)
     precio_estimado = db.Column(db.Float)
     precio_sin_igv = db.Column(db.Float)
     indicador_x_kg = db.Column(db.Float)
@@ -326,9 +336,6 @@ class PiezaColor(db.Model):
     familia_id = db.Column(db.Integer, db.ForeignKey('familia.id'), nullable=False)
     familia_rel = db.relationship('Familia', backref='piezas')
     
-    # Tipo de pieza: SIMPLE, KIT, COMPONENTE
-    tipo = db.Column(db.String(20), default="SIMPLE")
-    
     # --- RELACIÓN CON EL MAESTRO GLOBAL DE PIEZAS ---
     # No identifica un molde: una misma Pieza puede estar en varios moldes mediante
     # MoldePieza. Nullable conserva SKUs legacy aún pendientes de normalizar.
@@ -355,6 +362,11 @@ class PiezaColor(db.Model):
     tipo_extruccion = db.Column(db.String(50))
     cod_mp = db.Column(db.String(50))
     mp = db.Column(db.String(100))
+    imagen_mime = db.Column(db.String(32), nullable=True)
+    imagen_data = db.Column(db.LargeBinary, nullable=True)
+    imagen_storage_key = db.Column(db.String(512), nullable=True)
+    imagen_sha256 = db.Column(db.String(64), nullable=True)
+    imagen_size_bytes = db.Column(db.Integer, nullable=True)
     
     # --- CAMPOS DE REVISIÓN PROGRESIVA ---
     estado_revision = db.Column(db.String(20), default='IMPORTADO')  # IMPORTADO, EN_REVISION, VERIFICADO
@@ -373,7 +385,6 @@ class PiezaColor(db.Model):
         return {
             'sku': self.sku,
             'nombre': self.piezas,
-            'tipo': self.tipo,
             'pieza_id': self.pieza_id,
             'linea_id': self.linea_id,
             'familia_id': self.familia_id,
@@ -382,46 +393,20 @@ class PiezaColor(db.Model):
                 self.color_produccion_rel.nombre
                 if self.color_produccion_rel else None
             ),
+            'color_hex': (
+                self.color_produccion_rel.hex_referencia
+                if self.color_produccion_rel else None
+            ),
             'peso': self.peso,
             'cavidad_legacy': self.cavidad,
+            'imagen_url': (
+                f'/api/piezas-color/{self.sku}/imagen'
+                if self.imagen_storage_key or self.imagen_data else None
+            ),
+            'estado_revision': self.estado_revision,
         }
 
     def generar_sku(self):
         """Compatibilidad: devuelve la identidad ya asignada, sin recalcularla."""
         return self.sku
-
-
-class PiezaComponente(db.Model):
-    """
-    Relación auto-referencial para Kits.
-    Un Kit (PiezaColor) puede tener múltiples componentes (otras PiezasColor).
-    """
-    __tablename__ = 'pieza_componente'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    
-    kit_sku = db.Column(db.String(50), db.ForeignKey('pieza_color.sku'), nullable=False)
-    componente_sku = db.Column(db.String(50), db.ForeignKey('pieza_color.sku'), nullable=False)
-    cantidad = db.Column(db.Integer, default=1)
-    
-    # Relaciones
-    kit = db.relationship('PiezaColor', foreign_keys=[kit_sku], backref='componentes')
-    componente = db.relationship('PiezaColor', foreign_keys=[componente_sku])
-    
-    # Constraint único
-    __table_args__ = (
-        db.UniqueConstraint('kit_sku', 'componente_sku', name='uq_pieza_componente'),
-    )
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'kit_sku': self.kit_sku,
-            'componente_sku': self.componente_sku,
-            'componente_nombre': self.componente.piezas if self.componente else None,
-            'cantidad': self.cantidad
-        }
-    
-    def __repr__(self):
-        return f'<PiezaComponente {self.kit_sku} -> {self.componente_sku} x{self.cantidad}>'
 

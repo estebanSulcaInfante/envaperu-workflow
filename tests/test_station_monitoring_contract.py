@@ -153,6 +153,8 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "heartbeat",
         "catalog",
         "weight_event",
+        "manga_prelabel",
+        "manga_weighing",
     }
     assert (
         "station-production-progress-v1"
@@ -164,6 +166,8 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "monitoring": True,
         "remote_hardware_commands": False,
         "pilot_data_commands": True,
+        "scm_manga_prelabel": True,
+        "scm_manga_weighing": True,
     }
 
 

@@ -3,6 +3,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _csv_env(name, default=""):
+    return [
+        item.strip()
+        for item in os.getenv(name, default).split(",")
+        if item.strip()
+    ]
+
 class Config:
     # Heroku usa postgres:// pero SQLAlchemy requiere postgresql://
     _db_url = os.getenv('DATABASE_URL', 'postgresql://postgres:1234@localhost:5432/enva_test')
@@ -10,6 +18,33 @@ class Config:
         _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
     SQLALCHEMY_DATABASE_URI = _db_url
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'pool_pre_ping': True,
+        'pool_recycle': 300,
+    }
+    CORS_ORIGINS = _csv_env('ALLOWED_ORIGINS', '*') or ['*']
+    CATALOG_IMAGE_STORAGE = os.getenv(
+        'CATALOG_IMAGE_STORAGE',
+        'database',
+    ).strip().lower()
+    CATALOG_IMAGE_KEEP_DATABASE_COPY = os.getenv(
+        'CATALOG_IMAGE_KEEP_DATABASE_COPY',
+        'true',
+    ).strip().lower() == 'true'
+    SUPABASE_S3_ENDPOINT = os.getenv('SUPABASE_S3_ENDPOINT', '').strip()
+    SUPABASE_S3_REGION = os.getenv('SUPABASE_S3_REGION', '').strip()
+    SUPABASE_S3_ACCESS_KEY_ID = os.getenv(
+        'SUPABASE_S3_ACCESS_KEY_ID',
+        '',
+    ).strip()
+    SUPABASE_S3_SECRET_ACCESS_KEY = os.getenv(
+        'SUPABASE_S3_SECRET_ACCESS_KEY',
+        '',
+    ).strip()
+    SUPABASE_STORAGE_BUCKET = os.getenv(
+        'SUPABASE_STORAGE_BUCKET',
+        'catalog-images',
+    ).strip()
     MINIMUM_STATION_VERSION = os.getenv('MINIMUM_STATION_VERSION', '1.1.0')
     HEARTBEAT_SECONDS = int(os.getenv('HEARTBEAT_SECONDS', '30'))
     HEARTBEAT_DELAYED_SECONDS = int(

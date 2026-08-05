@@ -20,14 +20,28 @@
         "supported_contracts": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["heartbeat", "catalog", "weight_event"],
+          "required": [
+            "heartbeat",
+            "catalog",
+            "weight_event",
+            "manga_prelabel",
+            "manga_weighing"
+          ],
           "properties": {
             "heartbeat": {
               "type": "array",
               "contains": {"const": "station-heartbeat-v1"}
             },
             "catalog": {"type": "array", "items": {"type": "string"}},
-            "weight_event": {"type": "array", "items": {"type": "string"}}
+            "weight_event": {"type": "array", "items": {"type": "string"}},
+            "manga_prelabel": {
+              "type": "array",
+              "contains": {"const": "scm-manga-prelabel-v1"}
+            },
+            "manga_weighing": {
+              "type": "array",
+              "contains": {"const": "scm-manga-weighing-v1"}
+            }
           }
         },
         "features": {
@@ -38,14 +52,18 @@
             "catalog_snapshot",
             "legacy_weight_ingest_enabled",
             "remote_hardware_commands",
-            "pilot_data_commands"
+            "pilot_data_commands",
+            "scm_manga_prelabel",
+            "scm_manga_weighing"
           ],
           "properties": {
             "monitoring": {"type": "boolean"},
             "catalog_snapshot": {"type": "boolean"},
             "legacy_weight_ingest_enabled": {"type": "boolean"},
             "remote_hardware_commands": {"type": "boolean"},
-            "pilot_data_commands": {"type": "boolean"}
+            "pilot_data_commands": {"type": "boolean"},
+            "scm_manga_prelabel": {"type": "boolean"},
+            "scm_manga_weighing": {"type": "boolean"}
           }
         }
       }

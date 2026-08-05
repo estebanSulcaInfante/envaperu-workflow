@@ -17,7 +17,7 @@ from app import create_app
 from app.extensions import db
 from app.models.producto import (
     Linea, Familia, FamiliaColor, ColorProducto,
-    PiezaColor, PiezaComponente
+    PiezaColor
 )
 from app.models.molde import Molde, Pieza
 
@@ -111,7 +111,6 @@ with app.app_context():
         piezas='Cuerpo Balde 20L',
         peso=600,
         cavidad=1,
-        tipo='SIMPLE',
         linea_id=industrial.id,
         familia_id=baldes.id,
         molde_pieza_id=forma_cuerpo.id
@@ -158,7 +157,6 @@ with app.app_context():
             piezas=f'Tapa Regadera {color.nombre}',
             peso=forma_tapa.peso_unitario_gr,
             cavidad=forma_tapa.cavidades,
-            tipo='SIMPLE',
             linea_id=hogar.id,
             familia_id=jarras.id,
             color_id=color.id,
@@ -172,7 +170,6 @@ with app.app_context():
             piezas=f'Base Regadera {color.nombre}',
             peso=forma_base.peso_unitario_gr,
             cavidad=forma_base.cavidades,
-            tipo='SIMPLE',
             linea_id=hogar.id,
             familia_id=jarras.id,
             color_id=color.id,
@@ -182,25 +179,8 @@ with app.app_context():
         )
         db.session.add_all([tapa, base])
 
-        # Kit por color
-        kit = PiezaColor(
-            sku=f'JARRA-REG-KIT-C{color.codigo}',
-            piezas=f'Jarra Regadera Completa {color.nombre}',
-            peso=forma_tapa.peso_unitario_gr + forma_base.peso_unitario_gr,
-            cavidad=1,
-            tipo='KIT',
-            linea_id=hogar.id,
-            familia_id=jarras.id,
-            color_id=color.id,
-            cod_color=color.codigo,
-            color=color.nombre
-        )
-        db.session.add(kit)
-        db.session.flush()
-
-        # Componentes del kit
-        db.session.add(PiezaComponente(kit_sku=kit.sku, componente_sku=tapa.sku, cantidad=1))
-        db.session.add(PiezaComponente(kit_sku=kit.sku, componente_sku=base.sku, cantidad=1))
+        # La composición de una regadera se modela después como Artículo WIP
+        # o ProductoTerminado + BOM. No se crean KIT PiezaColor legacy.
 
     db.session.commit()
 

@@ -1,4 +1,10 @@
-# Resumen: Entidad Pesajes, Sincronización Offline-First y Módulo Kardex
+# Resumen archivado: Entidad Pesajes, Sincronización Offline-First y Módulo Kardex
+
+> **Retirado el 2026-08-03.** La fábrica no posee saldos digitales legacy que
+> deban conservarse. Los endpoints `/api/kardex/*`, `InventarioManga` y
+> `MovimientoKardex` ya no forman parte de la aplicación. Este archivo se
+> conserva únicamente como antecedente; los pesajes históricos permanecen en
+> sus tablas originales y el inventario vigente usa `/api/scm/v1/*`.
 
 ## 1. Entidad Pesaje — Módulo de Balanza (Desktop)
 

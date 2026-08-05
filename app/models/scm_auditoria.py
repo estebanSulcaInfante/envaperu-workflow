@@ -89,7 +89,8 @@ class ScmEvento(db.Model):
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     aggregate_type = db.Column(db.String(64), nullable=False)
-    aggregate_id = db.Column(db.Integer, nullable=False)
+    # UUIDs de OP/OF/OE y enteros legacy comparten el mismo journal.
+    aggregate_id = db.Column(db.String(64), nullable=False)
     tipo = db.Column(db.String(64), nullable=False)
     actor_id = db.Column(
         db.Integer,

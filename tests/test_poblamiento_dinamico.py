@@ -217,7 +217,7 @@ class TestMoldeOnTheFly:
             db.session.flush()
 
             pieza_orig = PiezaColor(sku="PIEZA-ORIG", piezas="PiezaColor Original",
-                               tipo="SIMPLE", linea_id=linea.id, familia_id=fam.id,
+                               linea_id=linea.id, familia_id=fam.id,
                                cavidad=2, peso=45.0, pieza_id=pieza_global.id)
             db.session.add(pieza_orig)
             db.session.flush()

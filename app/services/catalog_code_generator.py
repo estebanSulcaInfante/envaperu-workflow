@@ -37,6 +37,16 @@ CATALOG_CODE_SPECS = MappingProxyType({
     "LINEA": CatalogCodeSpec("LIN"),
     "FAMILIA": CatalogCodeSpec("FAM"),
     "FAMILIA_COLOR": CatalogCodeSpec("FC"),
+    "SUBENSAMBLE_WIP": CatalogCodeSpec("WIP"),
+    "CENTRO_TRABAJO": CatalogCodeSpec("CT"),
+    "TIPO_MANGA": CatalogCodeSpec("TMG"),
+    "TIPO_CONTENEDOR": CatalogCodeSpec("TCO"),
+    "PERFIL_EMPAQUE": CatalogCodeSpec("PEM"),
+    "ORDEN_TRABAJO": CatalogCodeSpec("OT"),
+    "ORDEN_PRODUCCION": CatalogCodeSpec("OP"),
+    "ORDEN_FABRICACION": CatalogCodeSpec("OF"),
+    "ORDEN_ENSAMBLE": CatalogCodeSpec("OE"),
+    "SOLICITUD_ABASTECIMIENTO": CatalogCodeSpec("SA"),
 })
 
 

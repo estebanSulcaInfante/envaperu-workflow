@@ -182,6 +182,10 @@ class LoteSalidaPiezaColor(db.Model):
             'AND kg_bueno_real >= 0',
             name='ck_lote_salida_reales_no_negativos',
         ),
+        db.Index(
+            'ix_lote_salida_pieza_color_sku',
+            'pieza_color_sku',
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)

@@ -57,7 +57,7 @@ def _setup_molde(app):
         db.session.flush()
 
         pieza = PiezaColor(sku="PIEZA-TEST", cod_pieza=101, piezas="PiezaColor Test",
-                      tipo="SIMPLE", linea_id=linea.id, familia_id=familia.id,
+                      linea_id=linea.id, familia_id=familia.id,
                       cavidad=2, peso=10.0, pieza_id=pieza_global.id)
         mp_rel = MoldePieza(
             molde=molde,

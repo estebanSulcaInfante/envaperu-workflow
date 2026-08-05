@@ -25,7 +25,8 @@ RECEPTION_DRAFT_REVISION = "7c1e4a9d2b6f"
 MOLDE_PIEZA_REVISION = "8f4c2d1a9b7e"
 CATALOG_COUNTER_REVISION = "b31f9a2c7d04"
 LINEA_FAMILIA_REVISION = "c42d8e6f1a03"
-HEAD_REVISION = LINEA_FAMILIA_REVISION
+LEGACY_ADOPTION_TARGET = LINEA_FAMILIA_REVISION
+HEAD_REVISION = "f71d0e6f8b32"
 
 
 def _isolated_postgres_url():
@@ -34,7 +35,7 @@ def _isolated_postgres_url():
         pytest.skip("TEST_DATABASE_URL is required for PostgreSQL tests")
 
     base_url = make_url(raw_url)
-    assert base_url.database == "envaperu_test"
+    assert base_url.database in {"envaperu_test", "enva_test"}
     assert base_url.host in {"localhost", "127.0.0.1"}
 
     schema = f"scm_mig_{uuid4().hex[:12]}"
@@ -134,7 +135,69 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 "scm_recepcion_linea",
                 "scm_pesaje_bolsa",
                 "scm_rol_capacidad",
+                "scm_articulo",
+                "scm_articulo_pieza_color",
+                "scm_definicion_wip",
+                "scm_articulo_producto",
+                "scm_estructura_revision",
+                "scm_estructura_componente",
+                "scm_centro_trabajo",
+                "scm_ruta_revision",
+                "scm_operacion_ruta",
+                "scm_operacion_precedencia",
+                "scm_tipo_contenedor",
+                "scm_perfil_empacable",
+                "scm_articulo_perfil",
+                "scm_regla_empaque",
+                "scm_regla_empaque_revision",
+                "scm_lote_articulo",
+                "scm_plan_manga_op",
+                "scm_plan_manga_op_linea",
+                "scm_asignacion_plan_manga_ot",
+                "scm_manga",
+                "scm_solicitud_manga_extra",
+                "scm_trabajo_impresion_manga",
+                "scm_etiqueta_manga",
+                "scm_pesaje_manga",
+                "scm_correccion_pesaje_manga",
+                "scm_orden_produccion",
+                "scm_orden_produccion_linea",
+                "scm_orden_operacion",
+                "scm_orden_fabricacion",
+                "scm_corrida_fabricacion",
+                "scm_orden_operacion_salida",
+                "scm_asignacion_demanda_suministro",
+                "scm_ubicacion_inventario",
+                "scm_saldo_inventario",
+                "scm_movimiento_inventario",
+                "scm_existencia_manga",
+                "scm_solicitud_abastecimiento",
+                "scm_solicitud_abastecimiento_linea",
+                "scm_asignacion_abastecimiento",
+                "scm_confirmacion_manga_armado",
+                "scm_consumo_componente_armado",
+                "scm_pool_origen_armado",
+                "scm_pool_origen_candidato",
+                "scm_asignacion_pool_armado",
+                "scm_correccion_manga_armado",
+                "scm_saldo_material_inventario",
+                "scm_movimiento_material_inventario",
+                "scm_lote_apertura_inventario",
+                "scm_lote_apertura_linea",
+                "scm_requerimiento_material",
+                "scm_reserva_material",
+                "scm_emision_material",
+                "scm_devolucion_material",
+                "scm_lote_premezcla",
+                "scm_lote_premezcla_input",
             } <= tables
+            assert "inventario_manga" not in tables
+            assert "movimiento_kardex" not in tables
+            assert "pieza_componente" not in tables
+            assert "tipo" not in {
+                column["name"]
+                for column in inspect(schema_engine).get_columns("pieza_color")
+            }
             with schema_engine.connect() as connection:
                 assert connection.execute(
                     text("SELECT current_schema()")
@@ -158,6 +221,14 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                     "DEVOLUCION_REGISTRAR",
                     "CONFIG_RECEPCION_ADMINISTRAR",
                     "DOCUMENTO_PROVEEDOR_REGISTRAR",
+                    "GENEALOGIA_VER",
+                    "ENSAMBLE_PLANIFICAR",
+                    "ENSAMBLE_MANGA_CERRAR",
+                    "GENEALOGIA_LEGACY_APERTURA",
+                    "ENSAMBLE_CORREGIR_SOLICITAR",
+                    "ENSAMBLE_CORREGIR_APROBAR",
+                    "INVENTARIO_APERTURA_PREPARAR",
+                    "INVENTARIO_APERTURA_APROBAR",
                 } <= capacidades
                 assert connection.execute(
                     text("SELECT count(*) FROM trabajador")
@@ -167,10 +238,31 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                     FROM correlativo_catalogo
                     ORDER BY clave
                 """)).tuples().all() == [
-                    ("MOLDE", "ML", 1, 6),
+                        ("ADITIVO", "ADT", 1, 6),
+                        ("CATEGORIA_RECEPCION", "CAT", 1, 6),
+                        ("CENTRO_TRABAJO", "CT", 1, 6),
+                        ("COLORANTE", "COL", 1, 6),
+                    ("FAMILIA", "FAM", 1, 6),
+                    ("FAMILIA_COLOR", "FC", 1, 6),
+                    ("LINEA", "LIN", 1, 6),
+                    ("MAQUINA", "MAQ", 1, 6),
+                    ("MATERIA_PRIMA", "MP", 1, 6),
+                        ("MOLDE", "ML", 1, 6),
+                        ("ORDEN_ENSAMBLE", "OE", 1, 6),
+                        ("ORDEN_FABRICACION", "OF", 1, 6),
+                        ("ORDEN_PRODUCCION", "OP", 1, 6),
+                        ("ORDEN_TRABAJO", "OT", 1, 6),
+                        ("PERFIL_EMPAQUE", "PEM", 1, 6),
                     ("PIEZA", "PZ", 1, 6),
                     ("PIEZA_COLOR", "PC", 1, 6),
                     ("PRODUCTO_TERMINADO", "PT", 1, 6),
+                    ("PROVEEDOR", "PRV", 1, 6),
+                    ("SOLICITUD_ABASTECIMIENTO", "SA", 1, 6),
+                    ("SUBENSAMBLE_WIP", "WIP", 1, 6),
+                    ("TIPO_CONTENEDOR", "TCO", 1, 6),
+                    ("TIPO_MANGA", "TMG", 1, 6),
+                    ("TIPO_MAQUINA", "TMQ", 1, 6),
+                    ("TRABAJADOR", "TRB", 1, 6),
                 ]
 
             materia_columns = {
@@ -282,6 +374,66 @@ def test_catalog_counter_migration_uses_existing_numeric_suffixes():
         _drop_isolated_schema(admin_engine, schema)
 
 
+def test_legacy_kit_contract_aborta_con_evidencia_y_luego_retira_esquema():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url)
+    try:
+        _run_flask_db(schema_url, "upgrade", "f49b7e5a3d02")
+        with schema_engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO linea (id, codigo, nombre)
+                VALUES (731, 731, 'Linea contract KIT')
+            """))
+            connection.execute(text("""
+                INSERT INTO familia (id, codigo, nombre)
+                VALUES (732, 732, 'Familia contract KIT')
+            """))
+            connection.execute(text("""
+                INSERT INTO pieza_color (
+                    sku, linea_id, familia_id, tipo, piezas
+                ) VALUES (
+                    'KIT-CONTRACT-01',
+                    731,
+                    732,
+                    'KIT',
+                    'Fixture que debe bloquear'
+                )
+            """))
+
+        failed = _run_flask_db_failure(
+            schema_url,
+            "upgrade",
+            HEAD_REVISION,
+        )
+        assert "LEGACY_KIT_PRECONDITION_FAILED" in (
+            failed.stdout + failed.stderr
+        )
+        with schema_engine.begin() as connection:
+            connection.execute(text("""
+                DELETE FROM pieza_color
+                WHERE sku = 'KIT-CONTRACT-01'
+            """))
+
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        inspector = inspect(schema_engine)
+        assert "pieza_componente" not in inspector.get_table_names()
+        assert "tipo" not in {
+            column["name"]
+            for column in inspector.get_columns("pieza_color")
+        }
+
+        _run_flask_db(schema_url, "downgrade", "f49b7e5a3d02")
+        inspector = inspect(schema_engine)
+        assert "pieza_componente" in inspector.get_table_names()
+        assert "tipo" in {
+            column["name"]
+            for column in inspector.get_columns("pieza_color")
+        }
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
 def test_catalog_code_generator_is_unique_under_postgres_concurrency():
     from app.services.catalog_code_generator import generar_codigo_catalogo
 
@@ -314,6 +466,546 @@ def test_catalog_code_generator_is_unique_under_postgres_concurrency():
                 FROM correlativo_catalogo
                 WHERE clave = 'PIEZA'
             """)).scalar_one() == 37
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_article_r1_backfills_catalogs_and_enforces_deferred_subtype():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url)
+    try:
+        _run_flask_db(schema_url, "upgrade", "b7e9f1a4d510")
+        with schema_engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO linea (
+                    id, codigo, nombre, activo, version
+                ) VALUES (711, 711, 'Linea R1', true, 1)
+            """))
+            connection.execute(text("""
+                INSERT INTO familia (
+                    id, codigo, nombre, activo, version
+                ) VALUES (712, 712, 'Familia R1', true, 1)
+            """))
+            connection.execute(text("""
+                INSERT INTO pieza_color (
+                    sku, linea_id, familia_id, tipo, piezas
+                ) VALUES (
+                    'PC-R1-PG-01', 711, 712, 'SIMPLE', 'Asa R1 PG'
+                )
+            """))
+            connection.execute(text("""
+                INSERT INTO producto_terminado (
+                    cod_sku_pt, linea_id, familia_id, producto
+                ) VALUES
+                    (
+                        'PT-R1-PG-01', 711, 712, 'Balde R1 PG'
+                    ),
+                    (
+                        '', 711, 712, 'Producto legacy sin codigo'
+                    )
+            """))
+
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+
+        with schema_engine.connect() as connection:
+            assert connection.execute(text("""
+                SELECT codigo, clase
+                FROM scm_articulo
+                ORDER BY codigo
+            """)).tuples().all() == [
+                ("PC-R1-PG-01", "PIEZA_COLOR"),
+                ("PT-LEGACY-SIN-CODIGO", "PRODUCTO_TERMINADO"),
+                ("PT-R1-PG-01", "PRODUCTO_TERMINADO"),
+            ]
+            assert connection.execute(text("""
+                SELECT count(*) FROM scm_articulo_pieza_color
+            """)).scalar_one() == 1
+            assert connection.execute(text("""
+                SELECT count(*) FROM scm_articulo_producto
+            """)).scalar_one() == 2
+            assert connection.execute(text("""
+                SELECT count(*) FROM trabajador_rol
+            """)).scalar_one() == 0
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_rol_capacidad AS relation
+                JOIN rol_operativo AS role
+                  ON role.id = relation.rol_operativo_id
+                JOIN scm_capacidad AS capability
+                  ON capability.id = relation.capacidad_id
+                WHERE role.codigo = 'MAQUINISTA'
+                  AND capability.codigo = 'MANGA_PESAR'
+            """)).scalar_one() == 1
+
+        with pytest.raises(DBAPIError) as subtype_error:
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    INSERT INTO scm_articulo (
+                        public_id, codigo, nombre, clase, unidad_base
+                    ) VALUES (
+                        :public_id,
+                        'WIP-R1-ORPHAN',
+                        'WIP sin subtipo',
+                        'SUBENSAMBLE_WIP',
+                        'UN'
+                    )
+                """), {"public_id": uuid4()})
+        assert "article_subtype_mismatch" in str(
+            subtype_error.value.orig
+        ).lower()
+
+        with pytest.raises(DBAPIError) as immutable_error:
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE scm_articulo
+                    SET codigo = 'PC-R1-PG-CHANGED'
+                    WHERE codigo = 'PC-R1-PG-01'
+                """))
+        assert "immutable_article_identity" in str(
+            immutable_error.value.orig
+        ).lower()
+
+        _run_flask_db(schema_url, "downgrade", "b7e9f1a4d510")
+        assert "scm_articulo" not in inspect(
+            schema_engine
+        ).get_table_names()
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_structure_approval_serializes_concurrent_cycle_and_freezes_lines():
+    from app.services.scm_article_service import create_wip_article
+    from app.services.scm_service_support import ScmServiceError
+    from app.services.scm_structure_service import (
+        approve_structure,
+        create_structure,
+        send_structure_for_approval,
+    )
+
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(
+        schema_url,
+        pool_size=6,
+        max_overflow=2,
+    )
+    try:
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        with schema_engine.begin() as connection:
+            actors = {
+                row.codigo: row.id
+                for row in connection.execute(text("""
+                    INSERT INTO trabajador (
+                        codigo, nombres, apellidos, activo
+                    )
+                    VALUES
+                        ('TRB-R2-CREATOR', 'Creador', 'R2', true),
+                        ('TRB-R2-APPROVER', 'Aprobador', 'R2', true)
+                    RETURNING id, codigo
+                """))
+            }
+            connection.execute(text("""
+                INSERT INTO trabajador_rol (
+                    trabajador_id, rol_operativo_id
+                )
+                SELECT :actor_id, id
+                FROM rol_operativo
+                WHERE codigo = 'INGENIERIA_SCM'
+            """), {"actor_id": actors["TRB-R2-CREATOR"]})
+            connection.execute(text("""
+                INSERT INTO trabajador_rol (
+                    trabajador_id, rol_operativo_id
+                )
+                SELECT :actor_id, id
+                FROM rol_operativo
+                WHERE codigo = 'JEFE_PRODUCCION'
+            """), {"actor_id": actors["TRB-R2-APPROVER"]})
+
+        with Session(schema_engine, expire_on_commit=False) as session:
+            article_a = create_wip_article(
+                session,
+                actor_id=actors["TRB-R2-CREATOR"],
+                data={"nombre": "WIP R2 A"},
+            )["id"]
+            article_b = create_wip_article(
+                session,
+                actor_id=actors["TRB-R2-CREATOR"],
+                data={"nombre": "WIP R2 B"},
+            )["id"]
+            revision_a = create_structure(
+                session,
+                actor_id=actors["TRB-R2-CREATOR"],
+                article_id=article_a,
+                data={
+                    "componentes": [
+                        {"articulo_id": article_b, "cantidad": "1"}
+                    ]
+                },
+            )
+            revision_a = send_structure_for_approval(
+                session,
+                actor_id=actors["TRB-R2-CREATOR"],
+                structure_id=revision_a["id"],
+                operation_id=uuid4(),
+                data={"version": revision_a["version"]},
+            )
+            revision_b = create_structure(
+                session,
+                actor_id=actors["TRB-R2-CREATOR"],
+                article_id=article_b,
+                data={
+                    "componentes": [
+                        {"articulo_id": article_a, "cantidad": "1"}
+                    ]
+                },
+            )
+            revision_b = send_structure_for_approval(
+                session,
+                actor_id=actors["TRB-R2-CREATOR"],
+                structure_id=revision_b["id"],
+                operation_id=uuid4(),
+                data={"version": revision_b["version"]},
+            )
+
+        def approve_candidate(candidate):
+            with Session(schema_engine, expire_on_commit=False) as session:
+                try:
+                    result = approve_structure(
+                        session,
+                        actor_id=actors["TRB-R2-APPROVER"],
+                        structure_id=candidate["id"],
+                        operation_id=uuid4(),
+                        data={"version": candidate["version"]},
+                    )
+                    return ("approved", result["id"])
+                except ScmServiceError as error:
+                    return (error.code, candidate["id"])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(
+                approve_candidate,
+                (revision_a, revision_b),
+            ))
+
+        assert sorted(item[0] for item in outcomes) == [
+            "STRUCTURE_CYCLE",
+            "approved",
+        ]
+        approved_id = next(
+            item[1] for item in outcomes if item[0] == "approved"
+        )
+        with schema_engine.connect() as connection:
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_estructura_revision
+                WHERE estado = 'APROBADA'
+            """)).scalar_one() == 1
+            component_id = connection.execute(text("""
+                SELECT id
+                FROM scm_estructura_componente
+                WHERE revision_id = :revision_id
+            """), {"revision_id": approved_id}).scalar_one()
+
+        with pytest.raises(DBAPIError) as immutable_error:
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE scm_estructura_componente
+                    SET cantidad = 2
+                    WHERE id = :component_id
+                """), {"component_id": component_id})
+        assert "structure_immutable" in str(
+            immutable_error.value.orig
+        ).lower()
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_route_approval_uses_cte_dag_and_freezes_published_operations():
+    from app.services.scm_route_service import (
+        approve_route,
+        create_route,
+        create_work_center,
+        update_route,
+    )
+    from app.services.scm_service_support import ScmServiceError
+
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url)
+    try:
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        with schema_engine.begin() as connection:
+            actors = {
+                row.codigo: row.id
+                for row in connection.execute(text("""
+                    INSERT INTO trabajador (
+                        codigo, nombres, apellidos, activo
+                    )
+                    VALUES
+                        ('TRB-R3-CREATOR', 'Creador', 'R3', true),
+                        ('TRB-R3-APPROVER', 'Aprobador', 'R3', true)
+                    RETURNING id, codigo
+                """))
+            }
+            connection.execute(text("""
+                INSERT INTO trabajador_rol (
+                    trabajador_id, rol_operativo_id
+                )
+                SELECT :actor_id, id
+                FROM rol_operativo
+                WHERE codigo = 'INGENIERIA_SCM'
+            """), {"actor_id": actors["TRB-R3-CREATOR"]})
+            connection.execute(text("""
+                INSERT INTO trabajador_rol (
+                    trabajador_id, rol_operativo_id
+                )
+                SELECT :actor_id, id
+                FROM rol_operativo
+                WHERE codigo = 'JEFE_PRODUCCION'
+            """), {"actor_id": actors["TRB-R3-APPROVER"]})
+            connection.execute(text("""
+                INSERT INTO linea (
+                    id, codigo, nombre, activo, version
+                ) VALUES (731, 731, 'Linea R3', true, 1)
+            """))
+            connection.execute(text("""
+                INSERT INTO familia (
+                    id, codigo, nombre, activo, version
+                ) VALUES (732, 732, 'Familia R3', true, 1)
+            """))
+            connection.execute(text("""
+                INSERT INTO producto_terminado (
+                    cod_sku_pt, linea_id, familia_id, producto
+                ) VALUES (
+                    'PT-R3-PG-01', 731, 732, 'Producto R3 PG'
+                )
+            """))
+            target_id = connection.execute(text("""
+                INSERT INTO scm_articulo (
+                    public_id, codigo, nombre, clase, unidad_base
+                ) VALUES (
+                    :public_id,
+                    'PT-R3-PG-01',
+                    'Producto R3 PG',
+                    'PRODUCTO_TERMINADO',
+                    'UN'
+                )
+                RETURNING id
+            """), {"public_id": uuid4()}).scalar_one()
+            connection.execute(text("""
+                INSERT INTO scm_articulo_producto (
+                    articulo_id, producto_terminado_id
+                ) VALUES (:article_id, 'PT-R3-PG-01')
+            """), {"article_id": target_id})
+
+        with Session(schema_engine, expire_on_commit=False) as session:
+            center = create_work_center(
+                session,
+                actor_id=actors["TRB-R3-CREATOR"],
+                data={
+                    "nombre": "Centro R3 PG",
+                    "tipo": "INYECCION",
+                },
+            )
+            operation = lambda key, sequence: {
+                "clave": key,
+                "secuencia_visible": sequence,
+                "nombre": f"Operacion {key}",
+                "tipo": "INYECCION",
+                "executor_kind": "OP_OT",
+                "centro_trabajo_id": center["id"],
+                "articulo_salida_id": target_id,
+                "permite_concurrente": False,
+            }
+            route = create_route(
+                session,
+                actor_id=actors["TRB-R3-CREATOR"],
+                product_id="PT-R3-PG-01",
+                data={
+                    "operaciones": [
+                        operation("A", 10),
+                        operation("B", 20),
+                        operation("C", 30),
+                    ],
+                    "precedencias": [
+                        {
+                            "anterior_clave": "A",
+                            "siguiente_clave": "B",
+                        },
+                        {
+                            "anterior_clave": "B",
+                            "siguiente_clave": "C",
+                        },
+                        {
+                            "anterior_clave": "C",
+                            "siguiente_clave": "A",
+                        },
+                    ],
+                },
+            )
+            with pytest.raises(ScmServiceError) as cycle_error:
+                approve_route(
+                    session,
+                    actor_id=actors["TRB-R3-APPROVER"],
+                    route_id=route["id"],
+                    operation_id=uuid4(),
+                    data={"version": route["version"]},
+                )
+            assert cycle_error.value.code == "ROUTE_CYCLE"
+
+            route = update_route(
+                session,
+                actor_id=actors["TRB-R3-CREATOR"],
+                route_id=route["id"],
+                data={
+                    "version": route["version"],
+                    "operaciones": [operation("FINAL", 10)],
+                    "precedencias": [],
+                },
+            )
+            route = approve_route(
+                session,
+                actor_id=actors["TRB-R3-APPROVER"],
+                route_id=route["id"],
+                operation_id=uuid4(),
+                data={"version": route["version"]},
+            )
+            operation_id = route["operaciones"][0]["id"]
+
+        with pytest.raises(DBAPIError) as immutable_error:
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE scm_operacion_ruta
+                    SET nombre = 'Mutacion SQL'
+                    WHERE id = :operation_id
+                """), {"operation_id": operation_id})
+        assert "route_immutable" in str(
+            immutable_error.value.orig
+        ).lower()
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_packaging_rule_snapshots_survive_master_change_and_sql_is_blocked():
+    from app.services.scm_packaging_service import (
+        approve_packaging_rule,
+        calculate_packaging_plan,
+        create_container_type,
+        create_packable_profile,
+        create_packaging_rule,
+        update_container_type,
+    )
+
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url)
+    try:
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        with schema_engine.begin() as connection:
+            actors = {
+                row.codigo: row.id
+                for row in connection.execute(text("""
+                    INSERT INTO trabajador (
+                        codigo, nombres, apellidos, activo
+                    )
+                    VALUES
+                        ('TRB-R4-CREATOR', 'Creador', 'R4', true),
+                        ('TRB-R4-APPROVER', 'Aprobador', 'R4', true)
+                    RETURNING id, codigo
+                """))
+            }
+            connection.execute(text("""
+                INSERT INTO trabajador_rol (
+                    trabajador_id, rol_operativo_id
+                )
+                SELECT :actor_id, id
+                FROM rol_operativo
+                WHERE codigo = 'INGENIERIA_SCM'
+            """), {"actor_id": actors["TRB-R4-CREATOR"]})
+            connection.execute(text("""
+                INSERT INTO trabajador_rol (
+                    trabajador_id, rol_operativo_id
+                )
+                SELECT :actor_id, id
+                FROM rol_operativo
+                WHERE codigo = 'JEFE_PRODUCCION'
+            """), {"actor_id": actors["TRB-R4-APPROVER"]})
+
+        with Session(schema_engine, expire_on_commit=False) as session:
+            container = create_container_type(
+                session,
+                actor_id=actors["TRB-R4-CREATOR"],
+                data={
+                    "clase": "MANGA",
+                    "nombre": "Manga R4 PG",
+                    "tara_nominal_g": "1000",
+                    "tolerancia_tara_g": "0",
+                    "peso_bruto_max_kg": "10",
+                },
+            )
+            profile = create_packable_profile(
+                session,
+                actor_id=actors["TRB-R4-CREATOR"],
+                data={
+                    "nombre": "Perfil R4 PG",
+                    "descripcion_fisica": "Prueba PostgreSQL",
+                },
+            )
+            rule = create_packaging_rule(
+                session,
+                actor_id=actors["TRB-R4-CREATOR"],
+                data={
+                    "perfil_empacable_id": profile["id"],
+                    "tipo_contenedor_id": container["id"],
+                    "medicion_fisica_probada": True,
+                    "cantidad_objetivo_un": 20,
+                    "cantidad_maxima_probada_un": 20,
+                    "peso_neto_operativo_max_kg": "20",
+                    "margen_seguridad_kg": "0",
+                    "tolerancia_peso_abs_g": "0",
+                    "tolerancia_peso_pct": "0",
+                },
+            )
+            approved = approve_packaging_rule(
+                session,
+                actor_id=actors["TRB-R4-APPROVER"],
+                revision_id=rule["revision_id"],
+                operation_id=uuid4(),
+                data={"version": rule["version"]},
+            )
+            assert approved["tara_nominal_g_snapshot"] == "1000.000"
+
+            update_container_type(
+                session,
+                actor_id=actors["TRB-R4-CREATOR"],
+                container_id=container["id"],
+                data={
+                    "version": container["version"],
+                    "tara_nominal_g": "0",
+                },
+            )
+            plan = calculate_packaging_plan(
+                session,
+                actor_id=actors["TRB-R4-CREATOR"],
+                data={
+                    "regla_revision_id": approved["revision_id"],
+                    "cantidad_planificada_un": 20,
+                    "peso_unitario_snapshot_g": "1000",
+                },
+            )
+            assert plan["capacidad_efectiva_un"] == 9
+
+        with pytest.raises(DBAPIError) as immutable_error:
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE scm_regla_empaque_revision
+                    SET cantidad_objetivo_un = 8
+                    WHERE id = :revision_id
+                """), {"revision_id": approved["revision_id"]})
+        assert "packaging_rule_immutable" in str(
+            immutable_error.value.orig
+        ).lower()
     finally:
         schema_engine.dispose()
         _drop_isolated_schema(admin_engine, schema)
@@ -1629,13 +2321,13 @@ def test_migration_adopta_legacy_backfill_y_rollback_sin_perder_filas():
                 WHERE codigo = 'MP-CONTRACT-00000014'
             """))
 
-        _run_flask_db(schema_url, "upgrade", "head")
-        _run_flask_db(schema_url, "upgrade", "head")
+        _run_flask_db(schema_url, "upgrade", LEGACY_ADOPTION_TARGET)
+        _run_flask_db(schema_url, "upgrade", LEGACY_ADOPTION_TARGET)
 
         with schema_engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == HEAD_REVISION
+            ).scalar_one() == LEGACY_ADOPTION_TARGET
             materia_contract = {
                 row.id: (row.codigo, row.categoria)
                 for row in connection.execute(text("""
@@ -1854,12 +2546,12 @@ def test_migration_adopta_legacy_backfill_y_rollback_sin_perder_filas():
                 ORDER BY id
             """)).tuples().all()) == all_colorante_links
 
-        _run_flask_db(schema_url, "upgrade", "head")
-        _run_flask_db(schema_url, "upgrade", "head")
+        _run_flask_db(schema_url, "upgrade", LEGACY_ADOPTION_TARGET)
+        _run_flask_db(schema_url, "upgrade", LEGACY_ADOPTION_TARGET)
         with schema_engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == HEAD_REVISION
+            ).scalar_one() == LEGACY_ADOPTION_TARGET
             assert connection.execute(
                 text("SELECT count(*) FROM scm_material")
             ).scalar_one() == 7
@@ -1917,14 +2609,14 @@ def test_migration_adopta_legacy_backfill_y_rollback_sin_perder_filas():
                 text("SELECT count(*) FROM materia_prima")
             ).scalar_one() == 5
 
-        _run_flask_db(schema_url, "upgrade", "head")
+        _run_flask_db(schema_url, "upgrade", LEGACY_ADOPTION_TARGET)
         with schema_engine.connect() as connection:
             assert connection.execute(
                 text("SELECT count(*) FROM scm_material")
             ).scalar_one() == 7
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == HEAD_REVISION
+            ).scalar_one() == LEGACY_ADOPTION_TARGET
     finally:
         schema_engine.dispose()
         _drop_isolated_schema(admin_engine, schema)

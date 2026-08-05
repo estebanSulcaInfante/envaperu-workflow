@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from flask import Blueprint, current_app, g, jsonify, request
@@ -33,6 +34,17 @@ from app.services.legacy_continuity import (
     pending_commands,
     process_history_delta,
 )
+from app.services.scm_ot_service import (
+    acknowledge_station_print_job,
+    get_station_print_job,
+)
+from app.services.scm_service_support import ScmServiceError
+from app.services.scm_weighing_service import (
+    confirm_manga_weighing,
+    get_label_print_payload,
+    get_operation_result,
+    resolve_manga_label,
+)
 
 
 integration_station_bp = Blueprint("integration_station", __name__)
@@ -63,6 +75,8 @@ def capabilities():
                     "station-legacy-history-v1",
                     "station-legacy-continuity-v1",
                 ],
+                "manga_prelabel": ["scm-manga-prelabel-v1"],
+                "manga_weighing": ["scm-manga-weighing-v1"],
             },
             "features": {
                 "monitoring": True,
@@ -72,6 +86,8 @@ def capabilities():
                 "legacy_weight_ingest_enabled": False,
                 "remote_hardware_commands": False,
                 "pilot_data_commands": True,
+                "scm_manga_prelabel": True,
+                "scm_manga_weighing": True,
             },
         }
     )
@@ -232,6 +248,114 @@ def _station_matches(station_id):
         ),
         403,
     )
+
+
+def _integration_error(exc):
+    db.session.rollback()
+    return jsonify({"error": exc.to_dict()}), exc.status_code
+
+
+@integration_station_bp.get("/manga-labels/<uuid:label_id>/resolve")
+@require_station_auth
+def manga_label_resolve(label_id):
+    try:
+        return jsonify(resolve_manga_label(db.session, label_id=label_id))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/manga-weighings")
+@require_station_auth
+def manga_weighing_confirm():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({
+            "code": "JSON_REQUIRED",
+            "message": "Se requiere un objeto JSON.",
+        }), 415
+    try:
+        operation_id = request.headers.get("Idempotency-Key")
+        operation_id = UUID(str(operation_id))
+        actor_id = int(payload.get("pesado_por_id"))
+    except (TypeError, ValueError, AttributeError):
+        return jsonify({
+            "code": "IDENTITY_REQUIRED",
+            "message": (
+                "Idempotency-Key UUID y pesado_por_id son obligatorios."
+            ),
+        }), 400
+    try:
+        result = confirm_manga_weighing(
+            db.session,
+            station_id=g.authenticated_station.station_id,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            data=payload,
+        )
+        return jsonify(result)
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.get("/operations/<uuid:operation_id>")
+@require_station_auth
+def manga_operation_result(operation_id):
+    try:
+        return jsonify(get_operation_result(
+            db.session, operation_id=operation_id
+        ))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.get("/labels/<uuid:label_id>/print-payload")
+@require_station_auth
+def manga_label_print_payload(label_id):
+    try:
+        return jsonify(get_label_print_payload(
+            db.session, label_id=label_id
+        ))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.get(
+    "/stations/<station_id>/print-jobs/<uuid:print_job_id>"
+)
+@require_station_auth
+def station_print_job(station_id, print_job_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(get_station_print_job(
+            db.session,
+            station_id=station_id,
+            print_job_id=print_job_id,
+        ))
+    except ScmServiceError as exc:
+        db.session.rollback()
+        return jsonify({"error": exc.to_dict()}), exc.status_code
+
+
+@integration_station_bp.put(
+    "/stations/<station_id>/print-jobs/<uuid:print_job_id>/result"
+)
+@require_station_auth
+def station_print_job_result(station_id, print_job_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(acknowledge_station_print_job(
+            db.session,
+            station_id=station_id,
+            print_job_id=print_job_id,
+            data=request.get_json(silent=True) or {},
+        ))
+    except ScmServiceError as exc:
+        db.session.rollback()
+        return jsonify({"error": exc.to_dict()}), exc.status_code
 
 
 @integration_station_bp.get("/stations/<station_id>/legacy-history/sync-state")

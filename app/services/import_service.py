@@ -94,7 +94,6 @@ class ImportService:
     # NOTA: 'Cod Color' en CSV de productos = cod_familia_color (código de familia)
     # REFACTORIZADO: 'Cod Linea', 'Linea', 'Cod Familia', 'Familia' ya no se mapean - se usan para lookup de FK
     MAPEO_PRODUCTOS = {
-        'Cod Producto': 'cod_producto',
         'Producto': 'producto',
         'Cod Color': 'cod_familia_color',  # RENOMBRADO: Es código de familia de color, no de color
         'Familia Color': 'familia_color',
@@ -701,7 +700,7 @@ class ImportService:
                 for excel_col, model_col in self.MAPEO_PRODUCTOS.items():
                     val = self._obtener_valor_str(row, excel_col)
                     if val:
-                        if model_col in ['cod_producto', 'cod_familia_color', 'doc_x_paq', 'doc_x_bulto']:
+                        if model_col in ['cod_familia_color', 'doc_x_paq', 'doc_x_bulto']:
                             producto_data[model_col] = self._obtener_valor_int(row, excel_col)
                         elif model_col in ['peso_g', 'precio_estimado', 'precio_sin_igv', 'indicador_x_kg']:
                             producto_data[model_col] = self._obtener_valor_float(row, excel_col)

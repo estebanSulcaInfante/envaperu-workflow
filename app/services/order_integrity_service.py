@@ -282,7 +282,6 @@ def _resolve_variant(
                             session=active_session,
                         ),
                         piezas=f"{pieza.nombre} {color.nombre}",
-                        tipo="SIMPLE",
                         pieza_id=pieza.id,
                         linea_id=pieza.linea_id,
                         familia_id=pieza.familia_id,

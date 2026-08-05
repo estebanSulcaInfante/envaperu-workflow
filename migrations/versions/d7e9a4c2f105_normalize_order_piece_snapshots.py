@@ -18,6 +18,10 @@ depends_on = None
 TABLE = "snapshot_composicion_molde"
 
 
+def _table_exists(connection):
+    return TABLE in sa.inspect(connection).get_table_names()
+
+
 def _column_names(connection):
     return {
         column["name"]
@@ -143,6 +147,11 @@ def _replace_old_fk_and_column(connection):
 
 def upgrade():
     connection = op.get_bind()
+    # Algunas instalaciones adoptadas contienen el catálogo legacy pero nunca
+    # llegaron a crear snapshots de OP. En ese caso no existe evidencia que
+    # normalizar y la revisión debe poder avanzar sin fabricar una tabla vacía.
+    if not _table_exists(connection):
+        return
     _add_columns(connection)
     _backfill_exact_legacy_identity(connection)
     if "pieza_sku" in _column_names(connection):
@@ -168,6 +177,8 @@ def _assert_lossless_downgrade(connection):
 
 def downgrade():
     connection = op.get_bind()
+    if not _table_exists(connection):
+        return
     _assert_lossless_downgrade(connection)
 
     op.add_column(

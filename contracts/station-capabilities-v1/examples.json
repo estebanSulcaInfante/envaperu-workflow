@@ -11,14 +11,18 @@
         "station-production-progress-v1",
         "station-legacy-history-v1",
         "station-legacy-continuity-v1"
-      ]
+      ],
+      "manga_prelabel": ["scm-manga-prelabel-v1"],
+      "manga_weighing": ["scm-manga-weighing-v1"]
     },
     "features": {
       "monitoring": true,
       "catalog_snapshot": false,
       "legacy_weight_ingest_enabled": false,
       "remote_hardware_commands": false,
-      "pilot_data_commands": true
+      "pilot_data_commands": true,
+      "scm_manga_prelabel": true,
+      "scm_manga_weighing": true
     }
   }
 }

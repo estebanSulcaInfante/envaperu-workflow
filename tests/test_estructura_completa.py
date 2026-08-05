@@ -193,9 +193,9 @@ def test_estructura_completa_json(client, app, scm_config):
         
         pt = ProductoTerminado(
             cod_sku_pt="PT-LEGACY-0113",
+            producto="Producto histórico de prueba",
             linea_id=linea_test.id,
             familia_id=familia_test.id,
-            cod_producto=3,
             estado_revision="IMPORTADO"  # Nuevo campo obligatorio
         )
         

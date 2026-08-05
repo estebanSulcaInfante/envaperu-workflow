@@ -15,7 +15,6 @@ from app.models.talonario import Talonario
 from app.models.molde import Molde, MoldePieza, Pieza
 from app.models.historial_estado import HistorialEstadoOrden
 from app.models.receta_color import RecetaColorNormalizada
-from app.models.kardex import InventarioManga, MovimientoKardex
 from app.services.scm_configuration import ensure_initial_scm_configuration
 from app.services.scm_material_service import (
     create_colorante_with_scm,
@@ -153,7 +152,6 @@ def inicializar_bd():
             producto="Balde Romano 20L Completo",
             linea_id=linea_industrial.id,
             familia_id=familia_baldes.id,
-            cod_producto=100,
             cod_familia_color=1,
             familia_color="SOLIDO",
             familia_color_id=fam_solido.id,

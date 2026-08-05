@@ -41,7 +41,6 @@ def migrar_productos_terminados(ws):
         pt.linea = row[1]
         pt.cod_familia = row[2]
         pt.familia = row[3]
-        pt.cod_producto = row[4]
         pt.producto = str(row[5]).strip() if row[5] else None 
         # Campos de color eliminados en US-008
         # row[8] es SKU
