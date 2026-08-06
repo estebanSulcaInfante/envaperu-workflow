@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from sqlalchemy import select
 
 from app.models.producto import ProductoTerminado
+from app.models.scm_commercial import ScmPresentacionComercial
 from app.models.scm_articulos import ScmArticulo, ScmArticuloProducto
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
 from app.models.scm_production_orders import (
@@ -194,6 +195,17 @@ def _serialize_line(line):
             else None
         ),
         "cantidad_solicitada": format(line.cantidad_solicitada, "f"),
+        "presentacion_comercial": (
+            {
+                "id": line.presentacion_comercial_id,
+                "codigo": line.snapshot_presentacion_codigo,
+                "nombre": line.snapshot_presentacion_nombre,
+                "unidades_base": line.snapshot_unidades_por_presentacion,
+                "cantidad": line.cantidad_presentaciones,
+            }
+            if line.presentacion_comercial_id is not None
+            else None
+        ),
         "fecha_necesidad": _iso(line.fecha_necesidad),
         "estructura_revision_id": line.estructura_revision_id,
         "estructura_hash": line.estructura_hash,
@@ -358,6 +370,8 @@ def create_production_order(
                 allowed={
                     "producto_terminado_id",
                     "cantidad_solicitada",
+                    "presentacion_comercial_id",
+                    "cantidad_presentaciones",
                     "fecha_necesidad",
                 },
             )
@@ -381,11 +395,64 @@ def create_production_order(
                     status_code=422,
                     details={"producto_terminado_id": product_id},
                 )
+            presentation = None
+            presentation_count = None
+            has_presentation = raw_line.get("presentacion_comercial_id") is not None
+            has_presentation_count = raw_line.get("cantidad_presentaciones") is not None
+            if has_presentation != has_presentation_count:
+                raise ScmServiceError(
+                    "COMMERCIAL_PRESENTATION_QUANTITY_REQUIRED",
+                    "Selecciona la presentacion y su cantidad.",
+                    status_code=422,
+                )
+            if has_presentation:
+                presentation_id = raw_line.get("presentacion_comercial_id")
+                if not isinstance(presentation_id, int) or isinstance(presentation_id, bool):
+                    raise ScmServiceError(
+                        "INVALID_COMMERCIAL_PRESENTATION",
+                        "presentacion_comercial_id debe ser un entero.",
+                        status_code=422,
+                    )
+                presentation = session.get(
+                    ScmPresentacionComercial,
+                    presentation_id,
+                )
+                if (
+                    presentation is None
+                    or not presentation.activo
+                    or presentation.producto_terminado_id != product_id
+                ):
+                    raise ScmServiceError(
+                        "COMMERCIAL_PRESENTATION_NOT_AVAILABLE",
+                        "La presentacion no esta activa para el producto seleccionado.",
+                        status_code=422,
+                    )
+                presentation_count = _quantity(
+                    raw_line.get("cantidad_presentaciones")
+                )
+                requested_quantity = _quantity(
+                    presentation_count * presentation.unidades_base
+                )
+            else:
+                requested_quantity = _quantity(
+                    raw_line.get("cantidad_solicitada")
+                )
             structure, route = _approved_snapshots(session, product_id)
             order.lineas.append(ScmOrdenProduccionLinea(
                 producto_terminado_id=product_id,
-                cantidad_solicitada=_quantity(
-                    raw_line.get("cantidad_solicitada")
+                cantidad_solicitada=requested_quantity,
+                presentacion_comercial_id=(presentation.id if presentation else None),
+                cantidad_presentaciones=(
+                    int(presentation_count) if presentation_count is not None else None
+                ),
+                snapshot_presentacion_codigo=(
+                    presentation.codigo if presentation else None
+                ),
+                snapshot_presentacion_nombre=(
+                    presentation.nombre if presentation else None
+                ),
+                snapshot_unidades_por_presentacion=(
+                    presentation.unidades_base if presentation else None
                 ),
                 fecha_necesidad=(
                     _parse_date(

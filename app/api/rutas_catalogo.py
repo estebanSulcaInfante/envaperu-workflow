@@ -7,6 +7,7 @@ import math
 from flask import Blueprint, Response, jsonify, request
 from app.extensions import db
 from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, ColorProduccion, ColorBase, Linea, Familia, FamiliaColor, LineaFamilia
+from app.models.scm_commercial import ScmPresentacionComercial
 from app.services.catalog_classification_service import (
     ClassificationError,
     classification_usage,
@@ -574,6 +575,15 @@ def crear_producto():
             um=data.get('um', 'Unidad')
         )
         db.session.add(producto)
+        db.session.flush()
+        db.session.add(ScmPresentacionComercial(
+            codigo=generar_codigo_catalogo('PRESENTACION_COMERCIAL'),
+            producto_terminado_id=producto.cod_sku_pt,
+            nombre='Unidad',
+            unidades_base=1,
+            codigo_barra=data.get('codigo_barra'),
+            predeterminada=True,
+        ))
 
         # Adaptador transitorio para consumidores legacy. El frontend nuevo no
         # envía esta colección; las BOM nuevas viven en Ingeniería SCM.

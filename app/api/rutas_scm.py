@@ -90,6 +90,11 @@ from app.services.scm_packaging_service import (
     update_packable_profile,
     update_packaging_rule,
 )
+from app.services.scm_commercial_presentation_service import (
+    create_commercial_presentation,
+    list_commercial_presentations,
+    update_commercial_presentation,
+)
 from app.services.scm_ot_service import (
     add_normal_mangas,
     annul_manga,
@@ -242,6 +247,35 @@ def _optional_active_filter():
         "El filtro activo debe ser true o false.",
         status_code=400,
     )
+
+
+@scm_bp.get("/presentaciones-comerciales")
+def presentaciones_comerciales_listar():
+    return jsonify(list_commercial_presentations(
+        db.session,
+        actor_id=_actor_id(),
+        product_id=request.args.get("producto_terminado_id") or None,
+        active=_optional_active_filter(),
+    ))
+
+
+@scm_bp.post("/presentaciones-comerciales")
+def presentacion_comercial_crear():
+    return jsonify(create_commercial_presentation(
+        db.session,
+        actor_id=_actor_id(),
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.patch("/presentaciones-comerciales/<int:presentation_id>")
+def presentacion_comercial_actualizar(presentation_id):
+    return jsonify(update_commercial_presentation(
+        db.session,
+        actor_id=_actor_id(),
+        presentation_id=presentation_id,
+        data=_json_body(),
+    ))
 
 
 @scm_bp.get("/inventario/saldos")

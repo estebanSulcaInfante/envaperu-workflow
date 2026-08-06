@@ -36,6 +36,7 @@ from app.models.scm_empaque import (
     ScmReglaEmpaqueRevision,
     ScmTipoContenedor,
 )
+from app.models.scm_commercial import ScmPresentacionComercial
 from app.models.scm_ot import (
     ScmAsignacionPlanMangaOt,
     ScmEtiquetaManga,

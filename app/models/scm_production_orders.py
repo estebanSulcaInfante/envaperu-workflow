@@ -150,6 +150,19 @@ class ScmOrdenProduccionLinea(db.Model):
             "estado IN ('ACTIVA', 'CANCELADA', 'SATISFECHA')",
             name="ck_scm_op_linea_estado",
         ),
+        db.CheckConstraint(
+            "(presentacion_comercial_id IS NULL "
+            "AND cantidad_presentaciones IS NULL "
+            "AND snapshot_presentacion_codigo IS NULL "
+            "AND snapshot_presentacion_nombre IS NULL "
+            "AND snapshot_unidades_por_presentacion IS NULL) OR "
+            "(presentacion_comercial_id IS NOT NULL "
+            "AND cantidad_presentaciones > 0 "
+            "AND snapshot_presentacion_codigo IS NOT NULL "
+            "AND snapshot_presentacion_nombre IS NOT NULL "
+            "AND snapshot_unidades_por_presentacion > 0)",
+            name="ck_scm_op_linea_presentacion_snapshot",
+        ),
         db.CheckConstraint("version > 0", name="ck_scm_op_linea_version"),
     )
 
@@ -171,6 +184,15 @@ class ScmOrdenProduccionLinea(db.Model):
         nullable=False,
     )
     cantidad_solicitada = db.Column(db.Numeric(15, 3), nullable=False)
+    presentacion_comercial_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_presentacion_comercial.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    cantidad_presentaciones = db.Column(db.Integer, nullable=True)
+    snapshot_presentacion_codigo = db.Column(db.String(32), nullable=True)
+    snapshot_presentacion_nombre = db.Column(db.String(100), nullable=True)
+    snapshot_unidades_por_presentacion = db.Column(db.Integer, nullable=True)
     fecha_necesidad = db.Column(db.Date, nullable=True)
     estructura_revision_id = db.Column(
         db.Integer,
@@ -202,6 +224,7 @@ class ScmOrdenProduccionLinea(db.Model):
         back_populates="lineas",
     )
     producto_terminado = db.relationship("ProductoTerminado")
+    presentacion_comercial = db.relationship("ScmPresentacionComercial")
     asignaciones = db.relationship(
         "ScmAsignacionDemandaSuministro",
         back_populates="orden_produccion_linea",

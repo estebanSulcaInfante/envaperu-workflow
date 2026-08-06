@@ -42,6 +42,7 @@ CATALOG_CODE_SPECS = MappingProxyType({
     "TIPO_MANGA": CatalogCodeSpec("TMG"),
     "TIPO_CONTENEDOR": CatalogCodeSpec("TCO"),
     "PERFIL_EMPAQUE": CatalogCodeSpec("PEM"),
+    "PRESENTACION_COMERCIAL": CatalogCodeSpec("PRE"),
     "ORDEN_TRABAJO": CatalogCodeSpec("OT"),
     "ORDEN_PRODUCCION": CatalogCodeSpec("OP"),
     "ORDEN_FABRICACION": CatalogCodeSpec("OF"),
