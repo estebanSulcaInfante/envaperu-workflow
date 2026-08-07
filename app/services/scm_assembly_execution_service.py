@@ -113,7 +113,7 @@ def _load_assembly_ot(session, public_id, *, lock=False):
     if ot is None:
         raise ScmServiceError(
             "OT_ENSAMBLE_NOT_FOUND",
-            "La OT diaria de Ensamble no existe.",
+            "La OT diaria de Armado no existe.",
             status_code=404,
         )
     return ot
@@ -175,7 +175,7 @@ def recalculate_assembly_manga_plan(
 ):
     reject_unknown_fields(data, allowed=set())
     actor = load_actor(session, actor_id, capability="ENSAMBLE_PLANIFICAR")
-    endpoint = f"/ordenes-ensamble/{order_id}/plan-mangas/recalcular"
+    endpoint = f"/ordenes-armado/{order_id}/plan-mangas/recalcular"
     operation, replay = _reserve_operation(
         session, operation_id, endpoint, actor, data
     )
@@ -532,7 +532,7 @@ def approve_assembly_quantity_correction(
         data.get("motivo_aprobacion"), field="motivo_aprobacion", max_length=500
     )
     command = {"correction_id": str(correction_id), "motivo_aprobacion": resolution_reason}
-    endpoint = f"/correcciones-ensamble/{correction_id}/aprobar"
+    endpoint = f"/correcciones-armado/{correction_id}/aprobar"
     operation, replay = _reserve_operation(session, operation_id, endpoint, actor, command)
     if replay is not None:
         return replay
@@ -716,7 +716,7 @@ def close_assembly_manga(
         ot = _load_assembly_ot(session, manga.ot.public_id, lock=True)
         if ot.estado != "EN_EJECUCION":
             raise ScmServiceError(
-                "WORK_ORDER_NOT_READY", "La OT de Ensamble debe estar iniciada.", status_code=409
+                "WORK_ORDER_NOT_READY", "La OT de Armado debe estar iniciada.", status_code=409
             )
         if ot.responsable_id != actor.id:
             raise ScmServiceError(

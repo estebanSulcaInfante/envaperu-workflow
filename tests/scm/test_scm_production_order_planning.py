@@ -316,7 +316,7 @@ def test_calcular_y_confirmar_plan_crea_of_y_oe_en_borrador(app, scm_config):
         )
         product = ProductoTerminado(
             cod_sku_pt="PT-PLAN-FLOW",
-            producto="Producto ensamblado",
+            producto="Producto armado",
             linea_id=line_master.id,
             familia_id=family.id,
         )
@@ -392,7 +392,7 @@ def test_calcular_y_confirmar_plan_crea_of_y_oe_en_borrador(app, scm_config):
             ruta=route,
             clave="ENSAMBLAR",
             secuencia_visible=2,
-            nombre="Ensamblar producto",
+            nombre="Armar producto",
             tipo="ENSAMBLE",
             executor_kind="ORDEN_OPERACION",
             centro_trabajo_id=center.id,

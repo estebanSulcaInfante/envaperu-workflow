@@ -285,7 +285,7 @@ def update_wip_article(session, *, actor_id, article_id, data):
         ):
             raise ScmServiceError(
                 "ARTICLE_SUBTYPE_MISMATCH",
-                "Solo un articulo SUBENSAMBLE_WIP admite esta operacion.",
+                "Solo un articulo WIP admite esta operacion.",
                 status_code=422,
             )
         received = expected_version(data.get("version"))

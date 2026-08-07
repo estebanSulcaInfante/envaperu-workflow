@@ -1,4 +1,4 @@
-"""Modelo documental SCM para demanda, fabricacion, ensamble y cobertura.
+"""Modelo documental SCM para demanda, fabricacion, armado y cobertura.
 
 Estas tablas son la fase *expand* de TS-010P. La tabla legacy
 ``orden_produccion`` permanece intacta y se vincula como alias tecnico de una

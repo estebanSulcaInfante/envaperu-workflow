@@ -304,6 +304,8 @@ class RegistroDiarioProduccion(db.Model):
             'codigo_ot_sintetico': self.codigo_ot_sintetico,
             'estado': self.estado,
             'tipo_ot': self.tipo_ot,
+            'modo_ejecucion_armado': self.modo_ejecucion_ensamble,
+            # Alias técnico heredado para clientes anteriores al cambio de vocabulario.
             'modo_ejecucion_ensamble': self.modo_ejecucion_ensamble,
             'ot_fabricacion_contexto_id': (
                 str(self.ot_fabricacion_contexto_id)

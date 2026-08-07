@@ -541,16 +541,18 @@ def orden_fabricacion_liberar(order_id):
     ))
 
 
+@scm_bp.get("/ordenes-armado")
 @scm_bp.get("/ordenes-ensamble")
-def ordenes_ensamble_listar():
+def ordenes_armado_listar():
     return jsonify(list_assembly_orders(
         db.session,
         actor_id=_actor_id(),
     ))
 
 
+@scm_bp.get("/ordenes-armado/<uuid:order_id>")
 @scm_bp.get("/ordenes-ensamble/<uuid:order_id>")
-def orden_ensamble_detalle(order_id):
+def orden_armado_detalle(order_id):
     return jsonify(get_assembly_order(
         db.session,
         actor_id=_actor_id(),
@@ -558,8 +560,9 @@ def orden_ensamble_detalle(order_id):
     ))
 
 
+@scm_bp.get("/ordenes-armado/<uuid:order_id>/ots")
 @scm_bp.get("/ordenes-ensamble/<uuid:order_id>/ots")
-def orden_ensamble_ots_listar(order_id):
+def orden_armado_ots_listar(order_id):
     return jsonify(list_assembly_ots(
         db.session,
         actor_id=_actor_id(),
@@ -567,8 +570,9 @@ def orden_ensamble_ots_listar(order_id):
     ))
 
 
+@scm_bp.post("/ordenes-armado/<uuid:order_id>/ots")
 @scm_bp.post("/ordenes-ensamble/<uuid:order_id>/ots")
-def orden_ensamble_ot_crear(order_id):
+def orden_armado_ot_crear(order_id):
     return jsonify(create_assembly_ot(
         db.session,
         actor_id=_actor_id(),
@@ -578,8 +582,9 @@ def orden_ensamble_ot_crear(order_id):
     )), 201
 
 
+@scm_bp.get("/ordenes-armado/<uuid:order_id>/plan-mangas")
 @scm_bp.get("/ordenes-ensamble/<uuid:order_id>/plan-mangas")
-def orden_ensamble_plan_mangas_detalle(order_id):
+def orden_armado_plan_mangas_detalle(order_id):
     return jsonify(get_assembly_manga_plan(
         db.session,
         actor_id=_actor_id(),
@@ -587,8 +592,9 @@ def orden_ensamble_plan_mangas_detalle(order_id):
     ))
 
 
+@scm_bp.post("/ordenes-armado/<uuid:order_id>/plan-mangas/recalcular")
 @scm_bp.post("/ordenes-ensamble/<uuid:order_id>/plan-mangas/recalcular")
-def orden_ensamble_plan_mangas_recalcular(order_id):
+def orden_armado_plan_mangas_recalcular(order_id):
     return jsonify(recalculate_assembly_manga_plan(
         db.session,
         actor_id=_actor_id(),
@@ -598,8 +604,9 @@ def orden_ensamble_plan_mangas_recalcular(order_id):
     )), 201
 
 
+@scm_bp.post("/ordenes-armado/<uuid:order_id>/<action>")
 @scm_bp.post("/ordenes-ensamble/<uuid:order_id>/<action>")
-def orden_ensamble_transicionar(order_id, action):
+def orden_armado_transicionar(order_id, action):
     return jsonify(transition_assembly_order(
         db.session,
         actor_id=_actor_id(),
@@ -621,7 +628,7 @@ def abastecimiento_crear(public_id):
 
 
 @scm_bp.post("/ots/<uuid:public_id>/mangas-salida")
-def orden_ensamble_mangas_salida_asignar(public_id):
+def orden_armado_mangas_salida_asignar(public_id):
     return jsonify(assign_assembly_output_mangas(
         db.session,
         actor_id=_actor_id(),
@@ -659,6 +666,7 @@ def manga_armado_correccion_solicitar(manga_id):
     )), 201
 
 
+@scm_bp.post("/correcciones-armado/<uuid:correction_id>/aprobar")
 @scm_bp.post("/correcciones-ensamble/<uuid:correction_id>/aprobar")
 def manga_armado_correccion_aprobar(correction_id):
     return jsonify(approve_assembly_quantity_correction(

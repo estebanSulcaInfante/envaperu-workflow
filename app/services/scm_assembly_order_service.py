@@ -60,7 +60,7 @@ def _load(session, order_id, *, lock=False):
     if order is None:
         raise ScmServiceError(
             "OE_NOT_FOUND",
-            "La orden de ensamble no existe.",
+            "La orden de armado no existe.",
             status_code=404,
         )
     return order
@@ -221,7 +221,7 @@ def transition_assembly_order(
     audit, replay = _reserve_operation(
         session,
         operation_id,
-        f"POST /ordenes-ensamble/{{id}}/{action}",
+        f"POST /ordenes-armado/{{id}}/{action}",
         actor,
         {"order_id": str(order_id), **data, "version": version},
     )

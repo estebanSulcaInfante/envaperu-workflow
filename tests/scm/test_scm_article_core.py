@@ -76,7 +76,7 @@ def test_api_crea_wip_con_codigo_correlativo_y_autorizacion_server_side(
         headers={"X-Actor-Id": str(actor_id)},
         json={
             "nombre": "Balde con asa prearmada",
-            "descripcion": "WIP normalizado previo al ensamble final",
+            "descripcion": "WIP normalizado previo al armado final",
             "requiere_calidad": False,
         },
     )

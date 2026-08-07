@@ -1,4 +1,4 @@
-"""Abastecimiento interno exacto desde Kardex hacia una OT de Ensamble."""
+"""Abastecimiento interno exacto desde Kardex hacia una OT de Armado."""
 
 import uuid
 from datetime import datetime, timezone
@@ -374,6 +374,10 @@ def request_payload(item):
         "codigo": item.codigo,
         "estado": item.estado,
         "version": item.version,
+        "orden_armado": {
+            "id": str(item.orden_ensamble.id),
+            "codigo": item.orden_ensamble.codigo,
+        },
         "orden_ensamble": {
             "id": str(item.orden_ensamble.id),
             "codigo": item.orden_ensamble.codigo,

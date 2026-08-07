@@ -985,7 +985,7 @@ def adjust_production_plan_targets(
     if not isinstance(raw_adjustments, list) or not raw_adjustments:
         raise ScmServiceError(
             "PLAN_TARGETS_REQUIRED",
-            "Incluye al menos una meta de fabricacion o ensamble.",
+            "Incluye al menos una meta de fabricacion o armado.",
             status_code=422,
         )
     command = {

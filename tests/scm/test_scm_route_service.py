@@ -381,9 +381,9 @@ def test_orden_operacion_usa_bom_aprobada_compatible_sin_copiar_cantidades(
         creator, approver = _actors()
         product, target = _product(
             "PT-R3-BOM",
-            "Producto ensamblado",
+            "Producto armado",
         )
-        component_id = _wip(creator, "WIP componente de ensamble")
+        component_id = _wip(creator, "WIP componente de armado")
         center = _center(creator, "BOM")
 
         structure = create_structure(

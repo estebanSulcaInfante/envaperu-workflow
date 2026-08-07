@@ -110,7 +110,7 @@ def _load_ot(session, public_id, *, lock=False):
     except (TypeError, ValueError, AttributeError) as error:
         raise ScmServiceError(
             "OT_ENSAMBLE_ID_INVALID",
-            "El identificador de la OT de Ensamble no es válido.",
+            "El identificador de la OT de Armado no es válido.",
             status_code=400,
         ) from error
     statement = select(RegistroDiarioProduccion).where(
@@ -122,7 +122,7 @@ def _load_ot(session, public_id, *, lock=False):
     item = session.scalar(statement)
     if item is None:
         raise ScmServiceError(
-            "OT_ENSAMBLE_NOT_FOUND", "La OT de Ensamble no existe.", status_code=404
+            "OT_ENSAMBLE_NOT_FOUND", "La OT de Armado no existe.", status_code=404
         )
     return item
 
@@ -178,7 +178,7 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
         ),
     }
     operation, replay = _reserve_operation(
-        session, operation_id, f"POST /ordenes-ensamble/{order_id}/ots", actor, command
+        session, operation_id, f"POST /ordenes-armado/{order_id}/ots", actor, command
     )
     if replay is not None:
         return replay

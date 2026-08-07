@@ -1,4 +1,4 @@
-"""Cierre trazable de mangas producidas por una OT de Ensamble."""
+"""Cierre trazable de mangas producidas por una OT de Armado."""
 
 import uuid
 from datetime import datetime, timezone
@@ -101,6 +101,7 @@ class ScmConfirmacionMangaArmado(db.Model):
             "id": str(self.id),
             "manga_id": str(self.manga.public_id),
             "manga_codigo": self.manga.codigo,
+            "orden_armado_id": str(self.orden_ensamble_id),
             "orden_ensamble_id": str(self.orden_ensamble_id),
             "orden_trabajo_id": str(self.orden_trabajo.public_id),
             "articulo_salida": self.articulo_salida.to_dict(),

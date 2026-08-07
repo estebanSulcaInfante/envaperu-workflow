@@ -1044,7 +1044,7 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
             ruta=route,
             clave="ENSAMBLAR_H",
             secuencia_visible=1,
-            nombre="Ensamblar producto H",
+            nombre="Armar producto H",
             tipo="ENSAMBLE",
             executor_kind="ORDEN_OPERACION",
             centro_trabajo=assembly_center,

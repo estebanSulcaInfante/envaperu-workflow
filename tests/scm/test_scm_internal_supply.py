@@ -77,7 +77,7 @@ def _assembly_order():
         ruta=route,
         clave="ENSAMBLAR",
         secuencia_visible=1,
-        nombre="Ensamblar balde",
+        nombre="Armar balde",
         tipo="ENSAMBLE",
         executor_kind="ORDEN_OPERACION",
         centro_trabajo=center,
