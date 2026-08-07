@@ -87,7 +87,7 @@ def _assembly_order():
     db.session.add(operation)
     db.session.flush()
     order = ScmOrdenOperacion(
-        codigo="OE-H-000001",
+        codigo="OA-H-000001",
         tipo="ENSAMBLE",
         origen_demanda="ORDEN_PRODUCCION",
         estado="LIBERADA",
@@ -263,4 +263,4 @@ def test_legacy_close_is_blocked_when_assembly_order_has_traceable_ot(
                 },
             )
 
-        assert error.value.code == "OE_TRACEABLE_CLOSE_REQUIRED"
+        assert error.value.code == "OA_TRACEABLE_CLOSE_REQUIRED"

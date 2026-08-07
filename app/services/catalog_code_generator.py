@@ -46,7 +46,7 @@ CATALOG_CODE_SPECS = MappingProxyType({
     "ORDEN_TRABAJO": CatalogCodeSpec("OT"),
     "ORDEN_PRODUCCION": CatalogCodeSpec("OP"),
     "ORDEN_FABRICACION": CatalogCodeSpec("OF"),
-    "ORDEN_ENSAMBLE": CatalogCodeSpec("OE"),
+    "ORDEN_ARMADO": CatalogCodeSpec("OA"),
     "SOLICITUD_ABASTECIMIENTO": CatalogCodeSpec("SA"),
 })
 

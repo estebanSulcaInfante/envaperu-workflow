@@ -1746,7 +1746,7 @@ def _label_payload(manga, label_id, version):
         **(
             {
                 (
-                    "oe_ot"
+                    "oa_ot"
                     if manga.ot.tipo_ot == "ENSAMBLE"
                     else "of_ot"
                 ): f"{order_code} - {manga.ot.codigo_ot}"

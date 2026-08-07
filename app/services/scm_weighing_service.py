@@ -119,7 +119,7 @@ def _order_ot_identity(manga):
     if manga.ot.orden_operacion_id is not None:
         return {
             (
-                "oe_ot"
+                "oa_ot"
                 if manga.ot.tipo_ot == "ENSAMBLE"
                 else "of_ot"
             ): (

@@ -100,7 +100,7 @@ def _load_assembly_order(session, order_id, *, lock=False):
         statement = statement.with_for_update()
     order = session.scalar(statement)
     if order is None:
-        raise ScmServiceError("OE_NOT_FOUND", "La OE no existe.", status_code=404)
+        raise ScmServiceError("OA_NOT_FOUND", "La OA no existe.", status_code=404)
     return order
 
 
@@ -186,13 +186,13 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
         order = _load_assembly_order(session, order_id, lock=True)
         if order.estado not in ("LIBERADA", "EN_EJECUCION"):
             raise ScmServiceError(
-                "OE_NOT_RELEASED",
-                "La OE debe estar liberada para crear una OT diaria.",
+                "OA_NOT_RELEASED",
+                "La OA debe estar liberada para crear una OT diaria.",
                 status_code=409,
             )
         if len(order.salidas) != 1:
             raise ScmServiceError(
-                "OE_OUTPUT_INVALID", "La OE debe tener una sola salida.", status_code=409
+                "OA_OUTPUT_INVALID", "La OA debe tener una sola salida.", status_code=409
             )
         route_operation = session.get(ScmOperacionRuta, order.operacion_ruta_revision_id)
         mode = command["modo_ejecucion"]
@@ -287,7 +287,7 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
         if assigned + target > Decimal(order.salidas[0].cantidad_objetivo):
             raise ScmServiceError(
                 "ASSEMBLY_OT_QUOTA_EXCEEDED",
-                "La cuota excede el saldo pendiente de la OE.",
+                "La cuota excede el saldo pendiente de la OA.",
                 status_code=409,
             )
         item = RegistroDiarioProduccion(
@@ -368,8 +368,8 @@ def create_supply_request(session, *, actor_id, ot_id, operation_id):
         route_operation = session.get(ScmOperacionRuta, order.operacion_ruta_revision_id)
         if route_operation is None or route_operation.estructura_revision is None:
             raise ScmServiceError(
-                "OE_BOM_SNAPSHOT_MISSING",
-                "La OE no conserva una BOM resoluble.",
+                "OA_BOM_SNAPSHOT_MISSING",
+                "La OA no conserva una BOM resoluble.",
                 status_code=409,
             )
         request = ScmSolicitudAbastecimiento(

@@ -1433,7 +1433,7 @@ def confirm_production_plan(
             code_kind = (
                 "ORDEN_FABRICACION"
                 if item["tipo"] == "FABRICACION"
-                else "ORDEN_ENSAMBLE"
+                else "ORDEN_ARMADO"
             )
             operation_order = ScmOrdenOperacion(
                 codigo=generar_codigo_catalogo(code_kind, session=session),

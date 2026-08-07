@@ -59,7 +59,7 @@ def _load(session, order_id, *, lock=False):
     order = session.scalar(statement)
     if order is None:
         raise ScmServiceError(
-            "OE_NOT_FOUND",
+            "OA_NOT_FOUND",
             "La orden de armado no existe.",
             status_code=404,
         )
@@ -69,8 +69,8 @@ def _load(session, order_id, *, lock=False):
 def _operation_snapshot(session, order):
     if len(order.salidas) != 1:
         raise ScmServiceError(
-            "OE_OUTPUT_INVALID",
-            "La OE debe conservar exactamente una salida.",
+            "OA_OUTPUT_INVALID",
+            "La OA debe conservar exactamente una salida.",
             status_code=409,
         )
     operation = session.get(
@@ -83,8 +83,8 @@ def _operation_snapshot(session, order):
         or operation.estructura_revision is None
     ):
         raise ScmServiceError(
-            "OE_ROUTE_SNAPSHOT_INVALID",
-            "La OE no conserva una operacion y BOM resolubles.",
+            "OA_ROUTE_SNAPSHOT_INVALID",
+            "La OA no conserva una operacion y BOM resolubles.",
             status_code=409,
         )
     if (
@@ -92,8 +92,8 @@ def _operation_snapshot(session, order):
         or operation.articulo_salida_id != order.salidas[0].articulo_scm_id
     ):
         raise ScmServiceError(
-            "OE_ROUTE_SNAPSHOT_DRIFT",
-            "La ruta congelada de la OE ya no coincide.",
+            "OA_ROUTE_SNAPSHOT_DRIFT",
+            "La ruta congelada de la OA ya no coincide.",
             status_code=409,
         )
     return operation
@@ -188,7 +188,7 @@ def _serialize(session, order):
 
 
 def list_assembly_orders(session, *, actor_id):
-    load_actor(session, actor_id, capability="OE_VER")
+    load_actor(session, actor_id, capability="OA_VER")
     orders = session.scalars(
         select(ScmOrdenOperacion)
         .where(ScmOrdenOperacion.tipo == "ENSAMBLE")
@@ -198,7 +198,7 @@ def list_assembly_orders(session, *, actor_id):
 
 
 def get_assembly_order(session, *, actor_id, order_id):
-    load_actor(session, actor_id, capability="OE_VER")
+    load_actor(session, actor_id, capability="OA_VER")
     return _serialize(session, _load(session, order_id))
 
 
@@ -211,7 +211,7 @@ def transition_assembly_order(
     action,
     data,
 ):
-    capability = "OE_LIBERAR" if action == "liberar" else "OE_EJECUTAR"
+    capability = "OA_LIBERAR" if action == "liberar" else "OA_EJECUTAR"
     actor = load_actor(session, actor_id, capability=capability)
     allowed = {"version"}
     if action == "cerrar":
@@ -232,7 +232,7 @@ def transition_assembly_order(
         if order.version != version:
             raise ScmServiceError(
                 "VERSION_CONFLICT",
-                "La OE fue modificada por otro usuario.",
+                "La OA fue modificada por otro usuario.",
                 status_code=409,
             )
         transitions = {
@@ -242,15 +242,15 @@ def transition_assembly_order(
         }
         if action not in transitions:
             raise ScmServiceError(
-                "INVALID_OE_ACTION",
-                "La transicion de OE no existe.",
+                "INVALID_OA_ACTION",
+                "La transicion de OA no existe.",
                 status_code=400,
             )
         expected_state, next_state = transitions[action]
         if order.estado != expected_state:
             raise ScmServiceError(
-                "INVALID_OE_STATE",
-                f"La OE debe estar en {expected_state}.",
+                "INVALID_OA_STATE",
+                f"La OA debe estar en {expected_state}.",
                 status_code=409,
             )
         _operation_snapshot(session, order)
@@ -272,8 +272,8 @@ def transition_assembly_order(
             )
             if traceable_ot_id is not None:
                 raise ScmServiceError(
-                    "OE_TRACEABLE_CLOSE_REQUIRED",
-                    "La OE tiene OT de armado y debe cerrarse desde sus mangas "
+                    "OA_TRACEABLE_CLOSE_REQUIRED",
+                    "La OA tiene OT de armado y debe cerrarse desde sus mangas "
                     "con consumo trazable de componentes.",
                     status_code=409,
                 )
@@ -289,7 +289,7 @@ def transition_assembly_order(
             )
             if accepted + rejected <= 0:
                 raise ScmServiceError(
-                    "OE_EMPTY_RESULT",
+                    "OA_EMPTY_RESULT",
                     "El cierre debe registrar produccion o rechazo.",
                     status_code=422,
                 )
@@ -337,9 +337,9 @@ def transition_assembly_order(
         audit.response_json = copy.deepcopy(response)
         audit.estado_http = 200
         session.add(ScmEvento(
-            aggregate_type="ORDEN_ENSAMBLE",
+            aggregate_type="ORDEN_ARMADO",
             aggregate_id=str(order.id),
-            tipo=f"OE_{action.upper()}",
+            tipo=f"OA_{action.upper()}",
             actor_id=actor.id,
             actor_snapshot=actor_snapshot(actor),
             motivo=data.get("motivo"),

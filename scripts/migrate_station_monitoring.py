@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+from flask_migrate import upgrade
 from sqlalchemy import inspect
 
 
@@ -63,6 +64,10 @@ def create_station_monitoring_tables(engine):
 def main():
     app = create_app()
     with app.app_context():
+        # Render ejecuta este script antes de iniciar Gunicorn. Mantener aqui
+        # el upgrade evita levantar una version de la API contra un contrato
+        # de base de datos anterior (por ejemplo, capacidades OE en vez de OA).
+        upgrade()
         created = create_station_monitoring_tables(db.engine)
 
     if created:

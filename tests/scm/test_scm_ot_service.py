@@ -1054,7 +1054,7 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
         db.session.add(route_operation)
         db.session.flush()
         assembly_order = ScmOrdenOperacion(
-            codigo="OE-H-FLOW",
+            codigo="OA-H-FLOW",
             tipo="ENSAMBLE",
             origen_demanda="ORDEN_PRODUCCION",
             estado="LIBERADA",
@@ -1259,7 +1259,7 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
         assert assembly_weighing["weighing"]["fuente_cantidad"] == (
             "RESPONSABLE_ARMADO"
         )
-        assert assembly_weighing["post_label"]["payload"]["oe_ot"] == (
+        assert assembly_weighing["post_label"]["payload"]["oa_ot"] == (
             f"{assembly_order.codigo} - {assembly_ot['codigo_ot']}"
         )
         assert ScmPesajeManga.query.count() == 2

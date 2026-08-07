@@ -323,7 +323,7 @@ class ScmPlanProduccion(db.Model):
 
 
 class ScmOrdenOperacion(db.Model):
-    """Cabecera comun para OF y OE."""
+    """Cabecera comun para OF y OA."""
 
     __tablename__ = "scm_orden_operacion"
     __table_args__ = (
@@ -586,7 +586,7 @@ class ScmCorridaFabricacion(db.Model):
 
 
 class ScmOrdenOperacionSalida(db.Model):
-    """Salida planificada generica de una OF u OE."""
+    """Salida planificada generica de una OF u OA."""
 
     __tablename__ = "scm_orden_operacion_salida"
     __table_args__ = (

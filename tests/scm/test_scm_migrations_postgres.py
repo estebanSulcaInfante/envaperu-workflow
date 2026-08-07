@@ -26,7 +26,7 @@ MOLDE_PIEZA_REVISION = "8f4c2d1a9b7e"
 CATALOG_COUNTER_REVISION = "b31f9a2c7d04"
 LINEA_FAMILIA_REVISION = "c42d8e6f1a03"
 LEGACY_ADOPTION_TARGET = LINEA_FAMILIA_REVISION
-HEAD_REVISION = "f71d0e6f8b32"
+HEAD_REVISION = "f76d5e0a3b87"
 
 
 def _isolated_postgres_url():
@@ -229,7 +229,12 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                     "ENSAMBLE_CORREGIR_APROBAR",
                     "INVENTARIO_APERTURA_PREPARAR",
                     "INVENTARIO_APERTURA_APROBAR",
+                    "OA_VER",
+                    "OA_LIBERAR",
+                    "OA_EJECUTAR",
+                    "OA_ANULAR",
                 } <= capacidades
+                assert not any(code.startswith("OE_") for code in capacidades)
                 assert connection.execute(
                     text("SELECT count(*) FROM trabajador")
                 ).scalar_one() == 0
@@ -248,13 +253,14 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                     ("MAQUINA", "MAQ", 1, 6),
                     ("MATERIA_PRIMA", "MP", 1, 6),
                         ("MOLDE", "ML", 1, 6),
-                        ("ORDEN_ENSAMBLE", "OE", 1, 6),
+                        ("ORDEN_ARMADO", "OA", 1, 6),
                         ("ORDEN_FABRICACION", "OF", 1, 6),
                         ("ORDEN_PRODUCCION", "OP", 1, 6),
                         ("ORDEN_TRABAJO", "OT", 1, 6),
                         ("PERFIL_EMPAQUE", "PEM", 1, 6),
                     ("PIEZA", "PZ", 1, 6),
                     ("PIEZA_COLOR", "PC", 1, 6),
+                    ("PRESENTACION_COMERCIAL", "PRE", 1, 6),
                     ("PRODUCTO_TERMINADO", "PT", 1, 6),
                     ("PROVEEDOR", "PRV", 1, 6),
                     ("SOLICITUD_ABASTECIMIENTO", "SA", 1, 6),

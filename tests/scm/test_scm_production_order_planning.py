@@ -255,7 +255,7 @@ def test_create_and_release_exceptional_fabrication_order(
     assert released.get_json()["corridas"][0]["estado"] == "LIBERADA"
 
 
-def test_calcular_y_confirmar_plan_crea_of_y_oe_en_borrador(app, scm_config):
+def test_calcular_y_confirmar_plan_crea_of_y_oa_en_borrador(app, scm_config):
     from app.models.molde import Molde, MoldePieza, Pieza
     from app.models.producto import (
         ColorBase,

@@ -98,7 +98,7 @@ def _load_order(session, order_id, *, lock=False):
         statement = statement.with_for_update()
     order = session.scalar(statement)
     if order is None:
-        raise ScmServiceError("OE_NOT_FOUND", "La OE no existe.", status_code=404)
+        raise ScmServiceError("OA_NOT_FOUND", "La OA no existe.", status_code=404)
     return order
 
 
@@ -185,13 +185,13 @@ def recalculate_assembly_manga_plan(
         order = _load_order(session, order_id, lock=True)
         if order.estado not in ("LIBERADA", "EN_EJECUCION"):
             raise ScmServiceError(
-                "OE_NOT_RELEASED",
-                "La OE debe estar liberada para planificar sus mangas de salida.",
+                "OA_NOT_RELEASED",
+                "La OA debe estar liberada para planificar sus mangas de salida.",
                 status_code=409,
             )
         if len(order.salidas) != 1:
             raise ScmServiceError(
-                "OE_OUTPUT_INVALID", "La OE debe poseer una sola salida.", status_code=409
+                "OA_OUTPUT_INVALID", "La OA debe poseer una sola salida.", status_code=409
             )
         previous = session.scalar(
             select(ScmPlanMangaOp)
@@ -210,7 +210,7 @@ def recalculate_assembly_manga_plan(
             if materialized:
                 raise ScmServiceError(
                     "ASSEMBLY_PLAN_ALREADY_MATERIALIZED",
-                    "El plan ya tiene mangas. Ajusta la OE mediante una nueva revision autorizada.",
+                    "El plan ya tiene mangas. Ajusta la OA mediante una nueva revision autorizada.",
                     status_code=409,
                 )
 
@@ -332,7 +332,7 @@ def recalculate_assembly_manga_plan(
         response = {"plan": _serialize_plan(plan)}
         _complete_operation(operation, response)
         session.add(_event(
-            "PLAN_MANGA_OE", plan.id, "ASSEMBLY_BAG_PLAN_CALCULATED",
+            "PLAN_MANGA_OA", plan.id, "ASSEMBLY_BAG_PLAN_CALCULATED",
             actor, operation, response,
         ))
         session.commit()
@@ -374,7 +374,7 @@ def assign_assembly_output_mangas(
         if plan is None or len(plan.lineas) != 1:
             raise ScmServiceError(
                 "PACKAGING_RULE_MISSING",
-                "La OE aun no tiene un plan de mangas de salida activo.",
+                "La OA aun no tiene un plan de mangas de salida activo.",
                 status_code=422,
             )
         line = plan.lineas[0]
@@ -757,8 +757,8 @@ def close_assembly_manga(
         structure = route_operation.estructura_revision if route_operation else None
         if structure is None or not structure.content_hash:
             raise ScmServiceError(
-                "OE_BOM_SNAPSHOT_MISSING",
-                "La OE no conserva una estructura congelada resoluble.",
+                "OA_BOM_SNAPSHOT_MISSING",
+                "La OA no conserva una estructura congelada resoluble.",
                 status_code=409,
             )
         request = session.scalar(
