@@ -18,6 +18,7 @@ EXECUTOR_KINDS = (EXECUTOR_OP_OT, EXECUTOR_ORDEN_OPERACION)
 
 TIPOS_OPERACION = (
     "INYECCION",
+    "SOPLADO",
     "PREARMADO",
     "ENSAMBLE",
     "ACABADO",
@@ -46,7 +47,7 @@ class ScmCentroTrabajo(db.Model):
         ),
         db.CheckConstraint(
             "tipo IN "
-            "('INYECCION', 'PREARMADO', 'ENSAMBLE', "
+            "('INYECCION', 'SOPLADO', 'PREARMADO', 'ENSAMBLE', "
             "'ACABADO', 'EMPAQUE')",
             name="ck_scm_centro_trabajo_tipo",
         ),
@@ -270,7 +271,7 @@ class ScmOperacionRuta(db.Model):
         ),
         db.CheckConstraint(
             "tipo IN "
-            "('INYECCION', 'PREARMADO', 'ENSAMBLE', "
+            "('INYECCION', 'SOPLADO', 'PREARMADO', 'ENSAMBLE', "
             "'ACABADO', 'EMPAQUE')",
             name="ck_scm_operacion_ruta_tipo",
         ),

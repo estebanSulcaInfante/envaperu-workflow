@@ -71,13 +71,13 @@ def _wip(actor, name):
     return payload["id"]
 
 
-def _center(actor, suffix):
+def _center(actor, suffix, *, operation_type="INYECCION"):
     return create_work_center(
         db.session,
         actor_id=actor.id,
         data={
             "nombre": f"Centro {suffix}",
-            "tipo": "INYECCION",
+            "tipo": operation_type,
         },
     )
 
@@ -90,12 +90,13 @@ def _operation(
     *,
     executor_kind="OP_OT",
     structure_id=None,
+    operation_type="INYECCION",
 ):
     payload = {
         "clave": key,
         "secuencia_visible": sequence,
         "nombre": f"Operacion {key}",
-        "tipo": "INYECCION",
+        "tipo": operation_type,
         "executor_kind": executor_kind,
         "centro_trabajo_id": center_id,
         "articulo_salida_id": output_id,
@@ -116,6 +117,50 @@ def test_centro_trabajo_genera_codigo_automatico(app):
         assert len(first["codigo"]) == 9
         assert second["codigo"].startswith("CT-")
         assert first["codigo"] != second["codigo"]
+
+
+def test_soplado_es_operacion_de_fabricacion_valida(app):
+    with app.app_context():
+        _creator, leader = _actors()
+        product, target = _product(
+            "PT-R3-SOPLADO",
+            "Alcancia fabricada por soplado",
+        )
+        center = _center(
+            leader,
+            "SOPLADO",
+            operation_type="SOPLADO",
+        )
+        route = create_route(
+            db.session,
+            actor_id=leader.id,
+            product_id=product.cod_sku_pt,
+            data={
+                "operaciones": [
+                    _operation(
+                        "SOPLAR",
+                        10,
+                        center["id"],
+                        target.id,
+                        operation_type="SOPLADO",
+                    ),
+                ],
+                "precedencias": [],
+            },
+        )
+
+        published = publish_route_directly(
+            db.session,
+            actor_id=leader.id,
+            route_id=route["id"],
+            operation_id=uuid4(),
+            data={"version": route["version"]},
+        )
+
+        assert center["tipo"] == "SOPLADO"
+        assert published["estado"] == "APROBADA"
+        assert published["operaciones"][0]["tipo"] == "SOPLADO"
+        assert published["operaciones"][0]["executor_kind"] == "OP_OT"
 
 
 def test_jefatura_publica_su_propia_ruta_directamente(app):
