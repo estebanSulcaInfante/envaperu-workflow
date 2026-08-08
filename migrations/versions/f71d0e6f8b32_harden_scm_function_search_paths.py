@@ -6,6 +6,7 @@ Create Date: 2026-08-05
 """
 
 from alembic import op
+import sqlalchemy as sa
 
 
 revision = "f71d0e6f8b32"
@@ -33,14 +34,28 @@ FUNCTIONS = (
 )
 
 
+def _quoted_current_schema():
+    # Production resolves to ``public``; migration tests use one isolated
+    # schema per case. Quoting keeps either identifier safe in DDL.
+    connection = op.get_bind()
+    schema = connection.execute(
+        sa.text("SELECT current_schema()")
+    ).scalar_one()
+    return connection.dialect.identifier_preparer.quote_identifier(schema)
+
+
 def upgrade():
+    schema = _quoted_current_schema()
     for function in FUNCTIONS:
         op.execute(
-            f"ALTER FUNCTION public.{function} "
-            "SET search_path = pg_catalog, public"
+            f"ALTER FUNCTION {schema}.{function} "
+            f"SET search_path = pg_catalog, {schema}"
         )
 
 
 def downgrade():
+    schema = _quoted_current_schema()
     for function in FUNCTIONS:
-        op.execute(f"ALTER FUNCTION public.{function} RESET search_path")
+        op.execute(
+            f"ALTER FUNCTION {schema}.{function} RESET search_path"
+        )

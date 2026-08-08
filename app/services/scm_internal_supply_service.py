@@ -23,7 +23,7 @@ from app.models.scm_inventory import (
     ScmSaldoInventario,
     ScmUbicacionInventario,
 )
-from app.models.scm_ot import ScmEtiquetaManga, ScmManga
+from app.models.scm_ot import ScmEtiquetaManga, ScmManga, ScmTrabajoOt
 from app.models.scm_production_orders import ScmOrdenOperacion
 from app.models.scm_rutas import ScmCentroTrabajo, ScmOperacionRuta
 from app.models.scm_warehouse import ScmExistenciaManga
@@ -158,6 +158,7 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
         "fecha_operativa", "turno", "centro_trabajo_id", "responsable_id",
         "cantidad_objetivo", "modo_ejecucion",
         "ot_fabricacion_contexto_id",
+        "trabajo_color_contexto_id",
     })
     actor = load_actor(session, actor_id, capability="OT_CREAR")
     command = {
@@ -175,6 +176,10 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
         "ot_fabricacion_contexto_id": (
             str(data.get("ot_fabricacion_contexto_id")).strip()
             if data.get("ot_fabricacion_contexto_id") else None
+        ),
+        "trabajo_color_contexto_id": (
+            str(data.get("trabajo_color_contexto_id")).strip()
+            if data.get("trabajo_color_contexto_id") else None
         ),
     }
     operation, replay = _reserve_operation(
@@ -203,6 +208,7 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
                 status_code=422,
             )
         fabrication_context = None
+        color_work_context = None
         if mode == "CONCURRENTE":
             if route_operation is None or not route_operation.permite_concurrente:
                 raise ScmServiceError(
@@ -210,11 +216,51 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
                     "La operación de ruta no permite ejecución concurrente.",
                     status_code=422,
                 )
-            if not command["ot_fabricacion_contexto_id"]:
+            if not (
+                command["ot_fabricacion_contexto_id"]
+                or command["trabajo_color_contexto_id"]
+            ):
                 raise ScmServiceError(
                     "ASSEMBLY_FABRICATION_CONTEXT_REQUIRED",
                     "Selecciona la OT de fabricación con la que se ejecutará el prearmado.",
                     status_code=422,
+                )
+            if command["trabajo_color_contexto_id"]:
+                try:
+                    work_id = uuid.UUID(command["trabajo_color_contexto_id"])
+                except (TypeError, ValueError, AttributeError) as error:
+                    raise ScmServiceError(
+                        "ASSEMBLY_COLOR_WORK_CONTEXT_INVALID",
+                        "El trabajo de color seleccionado no es valido.",
+                        status_code=422,
+                    ) from error
+                color_work_context = session.scalar(
+                    select(ScmTrabajoOt).where(
+                        ScmTrabajoOt.id == work_id,
+                        ScmTrabajoOt.tipo == "COLOR",
+                        ScmTrabajoOt.estado.in_((
+                            "PLANIFICADO", "EN_EJECUCION", "PAUSADO"
+                        )),
+                    )
+                )
+                if color_work_context is None:
+                    raise ScmServiceError(
+                        "ASSEMBLY_COLOR_WORK_CONTEXT_INVALID",
+                        "Selecciona un trabajo de color activo.",
+                        status_code=422,
+                    )
+                if (
+                    command["ot_fabricacion_contexto_id"]
+                    and command["ot_fabricacion_contexto_id"]
+                    != str(color_work_context.orden_trabajo.public_id)
+                ):
+                    raise ScmServiceError(
+                        "TRABAJO_NO_PERTENECE_A_OT",
+                        "El trabajo no pertenece a la OT de contexto.",
+                        status_code=409,
+                    )
+                command["ot_fabricacion_contexto_id"] = str(
+                    color_work_context.orden_trabajo.public_id
                 )
             try:
                 context_id = uuid.UUID(command["ot_fabricacion_contexto_id"])
@@ -238,7 +284,26 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
                     "Selecciona una OT de fabricación activa.",
                     status_code=422,
                 )
-        elif command["ot_fabricacion_contexto_id"]:
+            if color_work_context is None:
+                candidates = [
+                    work for work in fabrication_context.trabajos_ot
+                    if work.tipo == "COLOR"
+                    and work.estado in (
+                        "PLANIFICADO", "EN_EJECUCION", "PAUSADO"
+                    )
+                ]
+                if len(candidates) == 1:
+                    color_work_context = candidates[0]
+                elif len(candidates) > 1:
+                    raise ScmServiceError(
+                        "ASSEMBLY_COLOR_WORK_CONTEXT_REQUIRED",
+                        "La OT contiene varios trabajos de color; selecciona el que abastece el prearmado.",
+                        status_code=422,
+                    )
+        elif (
+            command["ot_fabricacion_contexto_id"]
+            or command["trabajo_color_contexto_id"]
+        ):
             raise ScmServiceError(
                 "ASSEMBLY_FABRICATION_CONTEXT_INVALID",
                 "La modalidad en mesa no utiliza una OT de fabricación de contexto.",
@@ -298,6 +363,9 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
             modo_ejecucion_ensamble=mode,
             ot_fabricacion_contexto_id=(
                 fabrication_context.public_id if fabrication_context else None
+            ),
+            trabajo_color_contexto_id=(
+                color_work_context.id if color_work_context else None
             ),
             orden_operacion_id=order.id,
             maquina_id=None,

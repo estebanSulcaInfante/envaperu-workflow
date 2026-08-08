@@ -169,6 +169,16 @@ def _candidate_payload(session, manga, label, resolution):
             "La manga todavía no posee un pesaje final confirmado.",
             status_code=409,
         )
+    if manga.trabajo is not None and (
+        manga.asignacion_personal_trabajo_id is None
+        or weighing.asignacion_personal_trabajo_id
+        != manga.asignacion_personal_trabajo_id
+    ):
+        raise ScmServiceError(
+            "ASSIGNMENT_WORK_MISMATCH",
+            "El pesaje no conserva la asignacion del trabajo de la manga.",
+            status_code=409,
+        )
     if manga.estado == "ANULADA":
         raise ScmServiceError(
             "MANGA_ANULADA", "La manga fue anulada y no puede recibirse.", status_code=409
@@ -211,6 +221,27 @@ def _candidate_payload(session, manga, label, resolution):
             "fecha_operativa": manga.ot.fecha.isoformat(),
             "turno": manga.ot.turno,
         },
+        "trabajo_color": (
+            {
+                "id": str(manga.trabajo.id),
+                "codigo": manga.trabajo.codigo,
+                "estado": manga.trabajo.estado,
+                "orden_fabricacion_id": str(
+                    manga.trabajo.orden_operacion_id
+                ),
+                "orden_fabricacion_codigo": (
+                    manga.trabajo.orden_operacion.codigo
+                ),
+                "corrida_fabricacion_id": str(
+                    manga.trabajo.trabajo_color.corrida_fabricacion_id
+                ),
+            }
+            if manga.trabajo is not None else None
+        ),
+        "asignacion_personal_trabajo_id": (
+            str(manga.asignacion_personal_trabajo_id)
+            if manga.asignacion_personal_trabajo_id else None
+        ),
         "color": manga.color_snapshot,
     }
 

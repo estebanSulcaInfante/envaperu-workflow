@@ -15,6 +15,7 @@ from app.models.scm_inventory import (
 )
 from app.models.scm_ot import (
     ScmAnulacionPesajeManga,
+    ScmAsignacionPersonalTrabajoOt,
     ScmAsignacionPlanMangaOt,
     ScmEtiquetaManga,
     ScmCorreccionPesajeManga,
@@ -29,6 +30,7 @@ from app.services.scm_ot_service import (
     _event,
     _json_hash,
     _reserve_operation,
+    _recompute_parent_state,
     _serialize_label,
     _serialize_manga,
 )
@@ -116,6 +118,19 @@ def _current_label(manga, label_type):
 
 
 def _order_ot_identity(manga):
+    if manga.trabajo is not None:
+        work = manga.trabajo
+        return {
+            "of_ot": (
+                f"{work.orden_operacion.codigo} - {manga.ot.codigo_ot}"
+            ),
+            "ot_id": str(manga.ot.public_id),
+            "trabajo_color_id": str(work.id),
+            "trabajo_color_codigo": work.codigo,
+            "corrida_fabricacion_id": str(
+                work.trabajo_color.corrida_fabricacion_id
+            ),
+        }
     if manga.ot.orden_operacion_id is not None:
         return {
             (
@@ -151,6 +166,12 @@ def _resolve_payload(label):
         manga.cantidad_confirmada_un
         if is_assembly else manga.cantidad_asignada_un
     )
+    personal = manga.asignacion_personal_trabajo
+    worker = personal.trabajador if personal is not None else manga.maquinista_previsto
+    work_ready = (
+        manga.trabajo is None
+        or manga.trabajo.estado in {"EN_EJECUCION", "PAUSADO"}
+    )
     return {
         "label": _serialize_label(label),
         "manga": {
@@ -181,7 +202,43 @@ def _resolve_payload(label):
                 Decimal(manga.peso_bruto_max_kg_snapshot), "f"
             ),
             "fecha_operativa": manga.ot.fecha.isoformat(),
-            "maquinista": manga.maquinista_previsto.nombre_completo,
+            "maquinista": worker.nombre_completo if worker else None,
+            "ot": {
+                "id": str(manga.ot.public_id),
+                "codigo": manga.ot.codigo_ot,
+                "maquina": (
+                    manga.ot.maquina_nombre_snapshot
+                    or (manga.ot.maquina.nombre if manga.ot.maquina else None)
+                ),
+                "turno": manga.ot.turno,
+            },
+            "trabajo_color": (
+                {
+                    "id": str(manga.trabajo.id),
+                    "codigo": manga.trabajo.codigo,
+                    "estado": manga.trabajo.estado,
+                    "orden_fabricacion": manga.trabajo.orden_operacion.codigo,
+                    "corrida": manga.trabajo.trabajo_color.corrida.codigo,
+                    "color": manga.trabajo.trabajo_color.color_nombre_snapshot,
+                }
+                if manga.trabajo is not None else None
+            ),
+            "asignacion_vigente": (
+                {
+                    "id": str(personal.id),
+                    "estado": personal.estado,
+                    "maquinista_id": personal.trabajador_id,
+                    "maquinista": (
+                        personal.trabajador.nombre_completo
+                        if personal.trabajador else None
+                    ),
+                }
+                if personal is not None else None
+            ),
+            "asignacion_personal_trabajo_id": (
+                str(manga.asignacion_personal_trabajo_id)
+                if manga.asignacion_personal_trabajo_id else None
+            ),
             "pieza_color": _piece_color_label(manga),
             "color": manga.color_snapshot,
             **_order_ot_identity(manga),
@@ -192,6 +249,7 @@ def _resolve_payload(label):
             and label.estado == "IMPRESA"
             and manga.estado == expected_state
             and weighing is None
+            and work_ready
         ),
     }
 
@@ -220,13 +278,18 @@ def resolve_manga_label(session, *, label_id):
 
 
 def _post_label_payload(manga, weighing, label_id, version):
-    canonical = manga.ot.orden_operacion_id is not None
+    canonical = (
+        manga.trabajo is not None
+        or manga.ot.orden_operacion_id is not None
+    )
+    personal = manga.asignacion_personal_trabajo
+    worker = personal.trabajador if personal is not None else manga.maquinista_previsto
     return {
         "template": {
             "version": (
-                "POSTPESAJE_TSPL_2"
-                if canonical
-                else "POSTPESAJE_TSPL_1"
+                "POSTPESAJE_TSPL_3"
+                if manga.trabajo is not None and manga.ot.orden_operacion_id is None
+                else ("POSTPESAJE_TSPL_2" if canonical else "POSTPESAJE_TSPL_1")
             ),
             "dpi": 203,
             "sheet_width_mm": 109,
@@ -239,7 +302,14 @@ def _post_label_payload(manga, weighing, label_id, version):
         },
         "generated_at": utc_now().isoformat(),
         "fecha_ot": manga.ot.fecha.isoformat(),
-        "maquinista": manga.maquinista_previsto.nombre_completo,
+        "maquinista": worker.nombre_completo if worker else None,
+        "trabajo_color": (
+            {
+                "id": str(manga.trabajo.id),
+                "codigo": manga.trabajo.codigo,
+            }
+            if manga.trabajo is not None else None
+        ),
         "pieza_color": _piece_color_label(manga),
         "color": manga.color_snapshot,
         "codigo_manga": manga.codigo,
@@ -256,6 +326,9 @@ def _post_label_payload(manga, weighing, label_id, version):
             "label_id": str(label_id),
             "label_type": "POSTPESAJE",
             "label_version": version,
+            "trabajo_color_id": (
+                str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
+            ),
         },
         **_order_ot_identity(manga),
     }
@@ -338,6 +411,23 @@ def confirm_manga_weighing(
                 "La manga no se encuentra lista para pesaje.",
                 status_code=409,
             )
+        if manga.trabajo is not None:
+            if manga.trabajo.estado not in {"EN_EJECUCION", "PAUSADO"}:
+                raise ScmServiceError(
+                    "COLOR_WORK_NOT_WEIGHABLE",
+                    "El trabajo debe estar en ejecucion o pausado para pesar.",
+                    status_code=409,
+                )
+            personal = manga.asignacion_personal_trabajo
+            if (
+                personal is None
+                or personal.trabajo_ot_id != manga.trabajo_ot_id
+            ):
+                raise ScmServiceError(
+                    "ASSIGNMENT_WORK_MISMATCH",
+                    "La manga no tiene una asignacion valida de su trabajo.",
+                    status_code=409,
+                )
 
         gross = _kg(data.get("peso_bruto_kg"), "peso_bruto_kg")
         tare = _kg(data.get("tara_kg"), "tara_kg", allow_zero=True)
@@ -418,9 +508,16 @@ def confirm_manga_weighing(
             alerta_fecha=late_operational_date,
             motivo_desfase_texto=drift_reason or None,
             pesado_por_id=actor.id,
+            asignacion_personal_trabajo_id=(
+                manga.asignacion_personal_trabajo_id
+            ),
             snapshots_json={
                 **_order_ot_identity(manga),
                 "maquinista_previsto_id": manga.maquinista_previsto_id,
+                "asignacion_personal_trabajo_id": (
+                    str(manga.asignacion_personal_trabajo_id)
+                    if manga.asignacion_personal_trabajo_id else None
+                ),
                 "pieza_color_sku": manga.pieza_color_sku_snapshot,
                 "color": manga.color_snapshot,
                 "tipo_manga": manga.tipo_contenedor_nombre_snapshot,
@@ -435,6 +532,11 @@ def confirm_manga_weighing(
         manga.cantidad_contenida_un = quantity
         manga.estado = "PESADA"
         manga.version += 1
+        if manga.trabajo is not None:
+            manga.trabajo.cantidad_confirmada_un = (
+                Decimal(manga.trabajo.cantidad_confirmada_un or 0) + quantity
+            )
+            manga.trabajo.version += 1
         session.flush()
 
         label_version = max(
@@ -617,11 +719,42 @@ def annul_manga_weighing(
             Decimal(assignment.cantidad_asignada_un) - quantity
         )
         assignment.mangas_asignadas -= 1
+        work_reopened = False
+        if manga.trabajo is not None:
+            manga.trabajo.cantidad_objetivo_un = max(
+                Decimal(manga.trabajo.cantidad_objetivo_un) - quantity,
+                Decimal("0"),
+            )
+            manga.trabajo.cantidad_confirmada_un = max(
+                Decimal(manga.trabajo.cantidad_confirmada_un) - quantity,
+                Decimal("0"),
+            )
+            work_reopened = manga.trabajo.estado == "COMPLETADO"
+            if work_reopened:
+                manga.trabajo.estado = "PAUSADO"
+                manga.trabajo.completada_at = None
+                manga.trabajo.pausada_at = now
+            has_replacement_assignment = any(
+                item.estado in {"PREVISTA", "ACTIVA"}
+                for item in manga.trabajo.asignaciones_personal
+            )
+            previous_personal = manga.asignacion_personal_trabajo
+            if not has_replacement_assignment and previous_personal is not None:
+                session.add(ScmAsignacionPersonalTrabajoOt(
+                    trabajo_ot_id=manga.trabajo.id,
+                    trabajador_id=previous_personal.trabajador_id,
+                    estado="PREVISTA",
+                    asignada_por_id=actor.id,
+                    motivo="Reposicion requerida por anulacion de pesaje",
+                ))
+            manga.trabajo.version += 1
         ot_reopened = manga.ot.estado == "CERRADA"
         if ot_reopened:
             manga.ot.estado = "EN_EJECUCION"
             manga.ot.cerrada_at = None
             manga.ot.version += 1
+        elif work_reopened:
+            _recompute_parent_state(session, manga.trabajo)
         manga.estado = "ANULADA"
         manga.anulada_at = now
         manga.anulada_por_id = actor.id
@@ -664,6 +797,10 @@ def annul_manga_weighing(
                 "mangas_asignadas": assignment.mangas_asignadas,
             },
             "ot_reabierta": ot_reopened,
+            "trabajo_color_reabierto": work_reopened,
+            "trabajo_color_id": (
+                str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
+            ),
         }
         session.add(_event(
             "PESAJE_MANGA", weighing.id, "MANGA_WEIGHING_ANNULLED",
@@ -935,6 +1072,9 @@ def approve_weighing_correction(
             .with_for_update()
         )
         current = _effective_projection(weighing)
+        previous_manga_quantity = Decimal(
+            manga.cantidad_confirmada_un or current["cantidad_confirmada"]
+        )
         proposed = correction.proposed_json
         if weighing.anulacion is not None or manga.estado == "ANULADA":
             raise ScmServiceError(
@@ -1082,6 +1222,13 @@ def approve_weighing_correction(
         manga.cantidad_contenida_un = quantity
         manga.estado = "RECIBIDA" if existence is not None else "PESADA"
         manga.version += 1
+        if manga.trabajo is not None:
+            delta = quantity - previous_manga_quantity
+            manga.trabajo.cantidad_confirmada_un = max(
+                Decimal(manga.trabajo.cantidad_confirmada_un or 0) + delta,
+                Decimal("0"),
+            )
+            manga.trabajo.version += 1
         for label in manga.etiquetas:
             if (
                 label.tipo == "POSTPESAJE"

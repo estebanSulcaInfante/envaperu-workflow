@@ -96,9 +96,13 @@ from app.services.scm_commercial_presentation_service import (
     update_commercial_presentation,
 )
 from app.services.scm_ot_service import (
+    add_color_work,
     add_normal_mangas,
+    add_work_mangas,
     annul_manga,
+    assign_color_work_worker,
     approve_extra_manga,
+    create_fabrication_ot_header,
     create_ot,
     create_fabrication_ot,
     generate_prelabels,
@@ -111,6 +115,7 @@ from app.services.scm_ot_service import (
     recalculate_fabrication_manga_plan,
     replace_prelabel,
     request_extra_manga,
+    transition_color_work,
     transition_ot,
 )
 from app.services.scm_weighing_service import (
@@ -873,6 +878,61 @@ def ots_of_crear(order_id):
     )), 201
 
 
+@scm_bp.post("/ots/fabricacion")
+def ots_fabricacion_cabecera_crear():
+    return jsonify(create_fabrication_ot_header(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.post("/ots/<uuid:ot_id>/trabajos-color")
+def trabajos_color_crear(ot_id):
+    return jsonify(add_color_work(
+        db.session,
+        actor_id=_actor_id(),
+        ot_id=ot_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.post("/trabajos-color/<uuid:work_id>/<action>")
+def trabajos_color_transicionar(work_id, action):
+    return jsonify(transition_color_work(
+        db.session,
+        actor_id=_actor_id(),
+        work_id=work_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+        action=action,
+    ))
+
+
+@scm_bp.post("/trabajos-color/<uuid:work_id>/asignaciones")
+def trabajos_color_asignar_personal(work_id):
+    return jsonify(assign_color_work_worker(
+        db.session,
+        actor_id=_actor_id(),
+        work_id=work_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.post("/trabajos-color/<uuid:work_id>/mangas")
+def trabajos_color_agregar_mangas(work_id):
+    return jsonify(add_work_mangas(
+        db.session,
+        actor_id=_actor_id(),
+        work_id=work_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 201
+
+
 @scm_bp.get("/ots/<uuid:public_id>")
 def ots_detalle(public_id):
     return jsonify(get_ot(
@@ -890,6 +950,12 @@ def ots_listar():
         op_number=request.args.get("orden_id"),
         operation_order_id=request.args.get("orden_operacion_id"),
         tipo_ot=request.args.get("tipo_ot"),
+        operational_date=(
+            request.args.get("fecha_operativa") or request.args.get("fecha")
+        ),
+        machine_id=request.args.get("maquina_id"),
+        machine=request.args.get("maquina"),
+        shift=request.args.get("turno"),
     ))
 
 

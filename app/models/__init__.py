@@ -38,6 +38,7 @@ from app.models.scm_empaque import (
 )
 from app.models.scm_commercial import ScmPresentacionComercial
 from app.models.scm_ot import (
+    ScmAsignacionPersonalTrabajoOt,
     ScmAsignacionPlanMangaOt,
     ScmEtiquetaManga,
     ScmLoteArticulo,
@@ -46,6 +47,8 @@ from app.models.scm_ot import (
     ScmPlanMangaOpLinea,
     ScmSolicitudMangaExtra,
     ScmTrabajoImpresionManga,
+    ScmTrabajoColor,
+    ScmTrabajoOt,
     ScmPesajeManga,
     ScmAnulacionPesajeManga,
     ScmCorreccionPesajeManga,

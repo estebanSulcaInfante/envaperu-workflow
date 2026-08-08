@@ -211,6 +211,17 @@ class ScmExistenciaManga(db.Model):
             "id": str(self.id),
             "manga_id": str(self.manga.public_id),
             "manga_codigo": self.manga.codigo,
+            "trabajo_color_id": (
+                str(self.manga.trabajo_ot_id)
+                if self.manga.trabajo_ot_id else None
+            ),
+            "trabajo_color_codigo": (
+                self.manga.trabajo.codigo if self.manga.trabajo else None
+            ),
+            "asignacion_personal_trabajo_id": (
+                str(self.manga.asignacion_personal_trabajo_id)
+                if self.manga.asignacion_personal_trabajo_id else None
+            ),
             "sesion_id": str(self.sesion_id) if self.sesion_id else None,
             "etiqueta_id": str(self.etiqueta.public_id),
             "articulo": {

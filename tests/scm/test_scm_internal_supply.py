@@ -16,6 +16,7 @@ from app.models.scm_production_orders import (
     ScmOrdenOperacion,
     ScmOrdenOperacionSalida,
 )
+from app.models.scm_ot import ScmTrabajoOt
 from app.models.scm_rutas import (
     ScmCentroTrabajo,
     ScmOperacionRuta,
@@ -225,6 +226,59 @@ def test_concurrent_assembly_ot_stores_fabrication_context(app, scm_config):
         assert created["modo_ejecucion_ensamble"] == "CONCURRENTE"
         assert created["ot_fabricacion_contexto_id"] == str(fabrication_ot.public_id)
         assert created["ot_fabricacion_contexto"]["codigo_ot"] == fabrication_ot.codigo_ot
+
+
+def test_concurrent_assembly_ot_accepts_color_work_adapter(app, scm_config):
+    with app.app_context():
+        actor, order, center = _assembly_order()
+        operation = db.session.get(ScmOperacionRuta, order.operacion_ruta_revision_id)
+        operation.permite_concurrente = True
+        machine = Maquina.query.first()
+        fabrication_ot = RegistroDiarioProduccion(
+            codigo_ot=f"OT-FAB-{uuid4().hex[:8].upper()}",
+            codigo_ot_sintetico=False,
+            estado="EN_EJECUCION",
+            tipo_ot="FABRICACION",
+            maquina_id=machine.id,
+            fecha=date(2026, 8, 4),
+            turno="DIA",
+            created_by_id=actor.id,
+            secuencia_siguiente_trabajo=2,
+        )
+        db.session.add(fabrication_ot)
+        db.session.flush()
+        color_work = ScmTrabajoOt(
+            orden_trabajo_id=fabrication_ot.id,
+            codigo=f"{fabrication_ot.codigo_ot}-TC01",
+            tipo="COLOR",
+            secuencia=1,
+            estado="EN_EJECUCION",
+            orden_operacion_id=order.id,
+            cantidad_objetivo_un=5,
+            cantidad_confirmada_un=0,
+            created_by_id=actor.id,
+        )
+        db.session.add(color_work)
+        db.session.commit()
+
+        created = create_assembly_ot(
+            db.session,
+            actor_id=actor.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={
+                "fecha_operativa": "2026-08-04",
+                "turno": "DIA",
+                "centro_trabajo_id": center.id,
+                "responsable_id": actor.id,
+                "cantidad_objetivo": 5,
+                "modo_ejecucion": "CONCURRENTE",
+                "trabajo_color_contexto_id": str(color_work.id),
+            },
+        )["ot"]
+
+        assert created["ot_fabricacion_contexto_id"] == str(fabrication_ot.public_id)
+        assert created["trabajo_color_contexto_id"] == str(color_work.id)
 
 
 def test_legacy_close_is_blocked_when_assembly_order_has_traceable_ot(

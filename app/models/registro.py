@@ -33,6 +33,10 @@ class RegistroDiarioProduccion(db.Model):
             name="ck_registro_diario_secuencia_manga",
         ),
         db.CheckConstraint(
+            "secuencia_siguiente_trabajo > 0",
+            name="ck_registro_diario_secuencia_trabajo",
+        ),
+        db.CheckConstraint(
             "tipo_ot IN ('FABRICACION', 'ENSAMBLE')",
             name="ck_registro_diario_tipo_ot",
         ),
@@ -52,11 +56,40 @@ class RegistroDiarioProduccion(db.Model):
             name="ck_registro_diario_modo_ensamble",
         ),
         db.CheckConstraint(
-            "(modo_ejecucion_ensamble = 'CONCURRENTE' AND "
-            "ot_fabricacion_contexto_id IS NOT NULL) OR "
+            "(modo_ejecucion_ensamble = 'CONCURRENTE' AND ("
+            "ot_fabricacion_contexto_id IS NOT NULL OR "
+            "trabajo_color_contexto_id IS NOT NULL)) OR "
             "(modo_ejecucion_ensamble IS DISTINCT FROM 'CONCURRENTE' AND "
-            "ot_fabricacion_contexto_id IS NULL)",
+            "ot_fabricacion_contexto_id IS NULL AND "
+            "trabajo_color_contexto_id IS NULL)",
             name="ck_registro_diario_contexto_ensamble",
+        ),
+        db.Index(
+            "ix_registro_diario_trabajo_color_contexto",
+            "trabajo_color_contexto_id",
+        ),
+        db.Index(
+            "uq_registro_ot_fabricacion_recurso_turno_activa",
+            "maquina_id",
+            "fecha",
+            "turno",
+            unique=True,
+            postgresql_where=db.text(
+                "tipo_ot = 'FABRICACION' "
+                "AND codigo_ot_sintetico = false "
+                "AND estado <> 'ANULADA' "
+                "AND orden_id IS NULL "
+                "AND orden_operacion_id IS NULL "
+                "AND corrida_fabricacion_id IS NULL"
+            ),
+            sqlite_where=db.text(
+                "tipo_ot = 'FABRICACION' "
+                "AND codigo_ot_sintetico = 0 "
+                "AND estado <> 'ANULADA' "
+                "AND orden_id IS NULL "
+                "AND orden_operacion_id IS NULL "
+                "AND corrida_fabricacion_id IS NULL"
+            ),
         ),
     )
 
@@ -150,6 +183,12 @@ class RegistroDiarioProduccion(db.Model):
         default=1,
         server_default="1",
     )
+    secuencia_siguiente_trabajo = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
     
     # RELACIONES FK
     orden_id = db.Column(
@@ -167,6 +206,11 @@ class RegistroDiarioProduccion(db.Model):
     corrida_fabricacion_id = db.Column(
         Uuid(as_uuid=True),
         db.ForeignKey('scm_corrida_fabricacion.id', ondelete='RESTRICT'),
+        nullable=True,
+    )
+    trabajo_color_contexto_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey('scm_trabajo_ot.id', ondelete='RESTRICT'),
         nullable=True,
     )
     maquina_id = db.Column(db.Integer, db.ForeignKey('maquina.id'), nullable=True)
@@ -243,6 +287,17 @@ class RegistroDiarioProduccion(db.Model):
         remote_side=[public_id],
         foreign_keys=[ot_fabricacion_contexto_id],
     )
+    trabajos_ot = db.relationship(
+        'ScmTrabajoOt',
+        back_populates='orden_trabajo',
+        foreign_keys='ScmTrabajoOt.orden_trabajo_id',
+        lazy='selectin',
+        order_by='ScmTrabajoOt.secuencia',
+    )
+    trabajo_color_contexto = db.relationship(
+        'ScmTrabajoOt',
+        foreign_keys=[trabajo_color_contexto_id],
+    )
     
     def actualizar_totales(self):
         """
@@ -310,6 +365,10 @@ class RegistroDiarioProduccion(db.Model):
             'ot_fabricacion_contexto_id': (
                 str(self.ot_fabricacion_contexto_id)
                 if self.ot_fabricacion_contexto_id else None
+            ),
+            'trabajo_color_contexto_id': (
+                str(self.trabajo_color_contexto_id)
+                if self.trabajo_color_contexto_id else None
             ),
             'ot_fabricacion_contexto': (
                 {

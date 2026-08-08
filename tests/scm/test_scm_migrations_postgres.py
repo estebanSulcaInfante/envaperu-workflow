@@ -4,6 +4,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -26,7 +27,8 @@ MOLDE_PIEZA_REVISION = "8f4c2d1a9b7e"
 CATALOG_COUNTER_REVISION = "b31f9a2c7d04"
 LINEA_FAMILIA_REVISION = "c42d8e6f1a03"
 LEGACY_ADOPTION_TARGET = LINEA_FAMILIA_REVISION
-HEAD_REVISION = "f77e6f1b4c98"
+WORK_COLOR_REVISION = "f78a7b3c9d20"
+HEAD_REVISION = WORK_COLOR_REVISION
 
 
 def _isolated_postgres_url():
@@ -190,6 +192,9 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 "scm_devolucion_material",
                 "scm_lote_premezcla",
                 "scm_lote_premezcla_input",
+                "scm_trabajo_ot",
+                "scm_trabajo_color",
+                "scm_asignacion_personal_trabajo_ot",
             } <= tables
             assert "inventario_manga" not in tables
             assert "movimiento_kardex" not in tables
@@ -202,6 +207,16 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 assert connection.execute(
                     text("SELECT current_schema()")
                 ).scalar_one() == schema
+                function_config = connection.execute(text("""
+                    SELECT array_to_string(function.proconfig, ',')
+                    FROM pg_proc AS function
+                    JOIN pg_namespace AS namespace
+                      ON namespace.oid = function.pronamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND function.proname = 'scm_article_child_guard'
+                """)).scalar_one()
+                assert "search_path=pg_catalog" in function_config
+                assert schema in function_config
                 assert connection.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one() == HEAD_REVISION
@@ -308,6 +323,1525 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
         _run_flask_db(schema_url, "check")
     finally:
         _drop_isolated_schema(admin_engine, schema)
+
+
+def test_trabajo_color_backfill_enlaza_ot_canonica_y_preserva_legacy():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url)
+    canonical_ot_public_id = uuid4()
+    second_canonical_ot_public_id = uuid4()
+    assembly_ot_public_id = uuid4()
+    synthetic_ot_public_id = uuid4()
+    order_id = uuid4()
+    run_id = uuid4()
+    try:
+        _run_flask_db(schema_url, "upgrade", "f77e6f1b4c98")
+        with schema_engine.begin() as connection:
+            worker_id = connection.execute(text("""
+                INSERT INTO trabajador (
+                    codigo, nombres, apellidos, activo
+                )
+                VALUES ('TR-TC-001', 'Ana', 'Operaria', true)
+                RETURNING id
+            """)).scalar_one()
+            machine_type_id = connection.execute(text("""
+                INSERT INTO tipo_maquina (
+                    codigo, nombre, proceso, activo, version
+                )
+                VALUES ('TM-TC-001', 'Inyectora prueba', 'INYECCION', true, 1)
+                RETURNING id
+            """)).scalar_one()
+            machine_id = connection.execute(text("""
+                INSERT INTO maquina (
+                    codigo, nombre, tipo_maquina_id, estado, activo
+                )
+                VALUES (
+                    'MAQ-TC-001', 'Maquina trabajo color',
+                    :machine_type_id, 'OPERATIVA', true
+                )
+                RETURNING id
+            """), {"machine_type_id": machine_type_id}).scalar_one()
+            work_center_id = connection.execute(text("""
+                INSERT INTO scm_centro_trabajo (
+                    codigo, nombre, tipo, activo, version
+                )
+                VALUES ('CT-TC-001', 'Mesa prueba', 'ENSAMBLE', true, 1)
+                RETURNING id
+            """)).scalar_one()
+            connection.execute(text("""
+                INSERT INTO scm_orden_operacion (
+                    id, codigo, tipo, origen_demanda, estado, version,
+                    created_by_id
+                )
+                VALUES (
+                    :order_id, 'OF-TC-001', 'FABRICACION', 'MANUAL',
+                    'EN_EJECUCION', 1, :worker_id
+                )
+            """), {"order_id": order_id, "worker_id": worker_id})
+            connection.execute(text("""
+                INSERT INTO scm_orden_fabricacion (
+                    orden_operacion_id, snapshot_peso_colada_gr
+                )
+                VALUES (:order_id, 3.2500)
+            """), {"order_id": order_id})
+            connection.execute(text("""
+                INSERT INTO scm_corrida_fabricacion (
+                    id, orden_fabricacion_id, codigo, secuencia,
+                    receta_hash, ciclos_objetivo, estado
+                )
+                VALUES (
+                    :run_id, :order_id, 'COR-TC-001', 1,
+                    :recipe_hash, 100, 'EN_EJECUCION'
+                )
+            """), {
+                "run_id": run_id,
+                "order_id": order_id,
+                "recipe_hash": "a" * 64,
+            })
+            canonical_ot_id = connection.execute(text("""
+                INSERT INTO registro_diario_produccion (
+                    public_id, codigo_ot, codigo_ot_sintetico, estado,
+                    tipo_ot, fecha, turno, maquina_id, orden_operacion_id,
+                    corrida_fabricacion_id, cantidad_objetivo,
+                    cantidad_confirmada, created_by_id,
+                    maquinista_previsto_id, created_at, updated_at,
+                    iniciada_at, colada_inicial, colada_final,
+                    snapshot_cavidades, snapshot_peso_neto_gr,
+                    snapshot_peso_colada_gr
+                )
+                VALUES (
+                    :public_id, 'OT-COLOR-001', false, 'EN_EJECUCION',
+                    'FABRICACION', DATE '2026-08-08', 'DIA', :machine_id,
+                    :order_id, :run_id, 1000, 250, :worker_id, :worker_id,
+                    TIMESTAMPTZ '2026-08-08 12:00:00+00',
+                    TIMESTAMPTZ '2026-08-08 13:00:00+00',
+                    TIMESTAMPTZ '2026-08-08 12:30:00+00',
+                    10, 35, 4, 12.5, 3.25
+                )
+                RETURNING id
+            """), {
+                "public_id": canonical_ot_public_id,
+                "machine_id": machine_id,
+                "order_id": order_id,
+                "run_id": run_id,
+                "worker_id": worker_id,
+            }).scalar_one()
+            second_canonical_ot_id = connection.execute(text("""
+                INSERT INTO registro_diario_produccion (
+                    public_id, codigo_ot, codigo_ot_sintetico, estado,
+                    tipo_ot, fecha, turno, maquina_id, orden_operacion_id,
+                    corrida_fabricacion_id, cantidad_objetivo,
+                    cantidad_confirmada, created_by_id,
+                    maquinista_previsto_id
+                )
+                VALUES (
+                    :public_id, 'OT-COLOR-002', false, 'PLANIFICADA',
+                    'FABRICACION', DATE '2026-08-08', 'DIA', :machine_id,
+                    :order_id, :run_id, 500, 0, :worker_id, :worker_id
+                )
+                RETURNING id
+            """), {
+                "public_id": second_canonical_ot_public_id,
+                "machine_id": machine_id,
+                "order_id": order_id,
+                "run_id": run_id,
+                "worker_id": worker_id,
+            }).scalar_one()
+            connection.execute(text("""
+                INSERT INTO registro_diario_produccion (
+                    public_id, codigo_ot, codigo_ot_sintetico, estado,
+                    tipo_ot, fecha, maquina_id, orden_operacion_id,
+                    corrida_fabricacion_id
+                )
+                VALUES (
+                    :public_id, 'OT-LEGACY-TC-001', true, 'PLANIFICADA',
+                    'FABRICACION', DATE '2026-08-08', :machine_id,
+                    :order_id, :run_id
+                )
+            """), {
+                "public_id": synthetic_ot_public_id,
+                "machine_id": machine_id,
+                "order_id": order_id,
+                "run_id": run_id,
+            })
+            assembly_ot_id = connection.execute(text("""
+                INSERT INTO registro_diario_produccion (
+                    public_id, codigo_ot, codigo_ot_sintetico, estado,
+                    tipo_ot, modo_ejecucion_ensamble,
+                    ot_fabricacion_contexto_id, fecha, centro_trabajo_id,
+                    responsable_id
+                )
+                VALUES (
+                    :public_id, 'OT-ARMADO-001', false, 'PLANIFICADA',
+                    'ENSAMBLE', 'CONCURRENTE', :fabrication_public_id,
+                    DATE '2026-08-08', :work_center_id, :worker_id
+                )
+                RETURNING id
+            """), {
+                "public_id": assembly_ot_public_id,
+                "fabrication_public_id": canonical_ot_public_id,
+                "work_center_id": work_center_id,
+                "worker_id": worker_id,
+            }).scalar_one()
+
+        _run_flask_db(schema_url, "upgrade", WORK_COLOR_REVISION)
+
+        inspector = inspect(schema_engine)
+        assert {
+            "scm_trabajo_ot",
+            "scm_trabajo_color",
+            "scm_asignacion_personal_trabajo_ot",
+        } <= set(inspector.get_table_names())
+        work_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("scm_trabajo_ot")
+        }
+        assert work_columns["continua_de_id"]["nullable"] is True
+        assert {
+            foreign_key["name"]
+            for foreign_key in inspector.get_foreign_keys("scm_trabajo_ot")
+        } >= {"fk_scm_trabajo_ot_continua_de"}
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints(
+                "scm_trabajo_ot"
+            )
+        } >= {"uq_scm_trabajo_ot_continuacion"}
+        for table_name in (
+            "scm_asignacion_plan_manga_ot",
+            "scm_manga",
+            "scm_solicitud_manga_extra",
+        ):
+            columns = {
+                column["name"]: column
+                for column in inspector.get_columns(table_name)
+            }
+            assert columns["trabajo_ot_id"]["nullable"] is True
+        manga_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("scm_manga")
+        }
+        assert manga_columns[
+            "asignacion_personal_trabajo_id"
+        ]["nullable"] is True
+        weighing_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("scm_pesaje_manga")
+        }
+        assert weighing_columns[
+            "asignacion_personal_trabajo_id"
+        ]["nullable"] is True
+        color_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("scm_trabajo_color")
+        }
+        assert str(color_columns["cavidades_snapshot"]["type"]).upper() == (
+            "INTEGER"
+        )
+        for column_name in (
+            "peso_neto_snapshot_g",
+            "peso_colada_snapshot_g",
+        ):
+            assert color_columns[column_name]["type"].precision == 15
+            assert color_columns[column_name]["type"].scale == 4
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints(
+                "scm_trabajo_color"
+            )
+        } >= {
+            "ck_scm_trabajo_color_cavidades",
+            "ck_scm_trabajo_color_peso_neto",
+            "ck_scm_trabajo_color_peso_colada",
+        }
+        ot_columns = {
+            column["name"]: column
+            for column in inspector.get_columns(
+                "registro_diario_produccion"
+            )
+        }
+        assert ot_columns["trabajo_color_contexto_id"]["nullable"] is True
+        assert ot_columns["secuencia_siguiente_trabajo"]["nullable"] is False
+        assert "1" in str(
+            ot_columns["secuencia_siguiente_trabajo"]["default"]
+        )
+        for table_name, foreign_key_name in (
+            (
+                "scm_asignacion_plan_manga_ot",
+                "fk_scm_asignacion_plan_trabajo_ot",
+            ),
+            ("scm_manga", "fk_scm_manga_trabajo_ot"),
+            (
+                "scm_solicitud_manga_extra",
+                "fk_scm_solicitud_extra_trabajo_ot",
+            ),
+        ):
+            foreign_keys = {
+                foreign_key["name"]: foreign_key
+                for foreign_key in inspector.get_foreign_keys(table_name)
+            }
+            work_foreign_key = foreign_keys[foreign_key_name]
+            assert work_foreign_key["constrained_columns"] == [
+                "trabajo_ot_id", "ot_id",
+            ]
+            assert work_foreign_key["referred_table"] == "scm_trabajo_ot"
+            assert work_foreign_key["referred_columns"] == [
+                "id", "orden_trabajo_id",
+            ]
+        manga_foreign_keys = {
+            foreign_key["name"]: foreign_key
+            for foreign_key in inspector.get_foreign_keys("scm_manga")
+        }
+        manga_assignment_fk = manga_foreign_keys[
+            "fk_scm_manga_asignacion_personal_trabajo"
+        ]
+        assert manga_assignment_fk["constrained_columns"] == [
+            "asignacion_personal_trabajo_id", "trabajo_ot_id",
+        ]
+        assert manga_assignment_fk["referred_columns"] == [
+            "id", "trabajo_ot_id",
+        ]
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints(
+                "scm_asignacion_personal_trabajo_ot"
+            )
+        } >= {"uq_scm_asignacion_personal_id_trabajo"}
+        assert {
+            foreign_key["name"]
+            for foreign_key in inspector.get_foreign_keys(
+                "scm_pesaje_manga"
+            )
+        } >= {"fk_scm_pesaje_asignacion_personal"}
+
+        with schema_engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == WORK_COLOR_REVISION
+            work = connection.execute(text("""
+                SELECT
+                    trabajo.id,
+                    trabajo.codigo,
+                    trabajo.tipo,
+                    trabajo.secuencia,
+                    trabajo.estado,
+                    trabajo.orden_operacion_id,
+                    trabajo.cantidad_objetivo_un,
+                    trabajo.cantidad_confirmada_un,
+                    trabajo.iniciada_at,
+                    color.corrida_fabricacion_id,
+                    color.receta_hash_snapshot,
+                    color.cavidades_snapshot,
+                    color.peso_neto_snapshot_g,
+                    color.peso_colada_snapshot_g,
+                    color.colada_inicial,
+                    color.colada_final
+                FROM scm_trabajo_ot AS trabajo
+                JOIN scm_trabajo_color AS color
+                  ON color.trabajo_ot_id = trabajo.id
+                WHERE trabajo.orden_trabajo_id = :ot_id
+            """), {"ot_id": canonical_ot_id}).mappings().one()
+            assert work["codigo"] == "OT-COLOR-001-TC01"
+            assert work["tipo"] == "COLOR"
+            assert work["secuencia"] == 1
+            assert work["estado"] == "EN_EJECUCION"
+            assert work["orden_operacion_id"] == order_id
+            assert work["cantidad_objetivo_un"] == Decimal("1000")
+            assert work["cantidad_confirmada_un"] == Decimal("250")
+            assert work["corrida_fabricacion_id"] == run_id
+            assert work["receta_hash_snapshot"] == "a" * 64
+            assert work["cavidades_snapshot"] == 4
+            assert work["peso_neto_snapshot_g"] == Decimal("12.5")
+            assert work["peso_colada_snapshot_g"] == Decimal("3.25")
+            assert work["colada_inicial"] == 10
+            assert work["colada_final"] == 35
+            assert connection.execute(text("""
+                SELECT
+                    estado,
+                    trabajador_id,
+                    asignada_por_id,
+                    iniciada_at IS NOT NULL
+                FROM scm_asignacion_personal_trabajo_ot
+                WHERE trabajo_ot_id = :work_id
+            """), {"work_id": work["id"]}).one() == (
+                "ACTIVA", worker_id, worker_id, True,
+            )
+            assert connection.execute(text("""
+                SELECT trabajo_color_contexto_id
+                FROM registro_diario_produccion
+                WHERE id = :assembly_ot_id
+            """), {
+                "assembly_ot_id": assembly_ot_id,
+            }).scalar_one() == work["id"]
+            assert connection.execute(text("""
+                SELECT secuencia_siguiente_trabajo
+                FROM registro_diario_produccion
+                WHERE id = :canonical_ot_id
+            """), {
+                "canonical_ot_id": canonical_ot_id,
+            }).scalar_one() == 2
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_trabajo_ot
+            """)).scalar_one() == 2
+            assert connection.execute(text("""
+                SELECT trabajo.estado, asignacion.estado
+                FROM scm_trabajo_ot AS trabajo
+                JOIN scm_asignacion_personal_trabajo_ot AS asignacion
+                  ON asignacion.trabajo_ot_id = trabajo.id
+                WHERE trabajo.orden_trabajo_id = :ot_id
+            """), {
+                "ot_id": second_canonical_ot_id,
+            }).one() == ("PLANIFICADO", "PREVISTA")
+            assert connection.execute(text("""
+                SELECT secuencia_siguiente_trabajo
+                FROM registro_diario_produccion
+                WHERE public_id = :synthetic_public_id
+            """), {
+                "synthetic_public_id": synthetic_ot_public_id,
+            }).scalar_one() == 1
+            indexes = dict(connection.execute(text("""
+                SELECT indexname, lower(indexdef)
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname IN (
+                    'uq_scm_asignacion_plan_trabajo',
+                    'uq_scm_asignacion_plan_ot_legacy',
+                    'uq_scm_trabajo_ot_activo',
+                    'uq_scm_asignacion_personal_activa',
+                    'uq_registro_ot_fabricacion_recurso_turno_activa',
+                    'ix_scm_asignacion_plan_trabajo',
+                    'ix_scm_manga_trabajo',
+                    'ix_scm_manga_asignacion_personal',
+                    'ix_scm_solicitud_extra_trabajo',
+                    'ix_scm_trabajo_ot_created_by',
+                    'ix_scm_trabajo_ot_anulada_por',
+                    'ix_scm_asignacion_personal_trabajo',
+                    'ix_scm_asignacion_personal_asignada_por',
+                    'ix_scm_asignacion_personal_finalizada_por'
+                  )
+            """)).tuples().all())
+            assert {
+                "uq_scm_asignacion_plan_trabajo",
+                "uq_scm_asignacion_plan_ot_legacy",
+                "uq_scm_trabajo_ot_activo",
+                "uq_scm_asignacion_personal_activa",
+                "uq_registro_ot_fabricacion_recurso_turno_activa",
+                "ix_scm_asignacion_plan_trabajo",
+                "ix_scm_manga_trabajo",
+                "ix_scm_manga_asignacion_personal",
+                "ix_scm_solicitud_extra_trabajo",
+                "ix_scm_trabajo_ot_created_by",
+                "ix_scm_trabajo_ot_anulada_por",
+                "ix_scm_asignacion_personal_trabajo",
+                "ix_scm_asignacion_personal_asignada_por",
+                "ix_scm_asignacion_personal_finalizada_por",
+            } == set(indexes)
+            assert "where (trabajo_ot_id is not null)" in indexes[
+                "uq_scm_asignacion_plan_trabajo"
+            ]
+            assert "where (trabajo_ot_id is null)" in indexes[
+                "uq_scm_asignacion_plan_ot_legacy"
+            ]
+            header_index = indexes[
+                "uq_registro_ot_fabricacion_recurso_turno_activa"
+            ]
+            assert "codigo_ot_sintetico" in header_index
+            assert "false" in header_index
+            assert "estado" in header_index
+            assert "'anulada'" in header_index
+            assert "orden_id is null" in header_index
+            assert "orden_operacion_id is null" in header_index
+            assert "corrida_fabricacion_id is null" in header_index
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM pg_constraint
+                WHERE conrelid = 'scm_asignacion_plan_manga_ot'::regclass
+                  AND conname = 'uq_scm_asignacion_plan_ot'
+            """)).scalar_one() == 0
+            rls_enabled = dict(connection.execute(text("""
+                SELECT class.relname, class.relrowsecurity
+                FROM pg_class AS class
+                JOIN pg_namespace AS namespace
+                  ON namespace.oid = class.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND class.relname IN (
+                    'scm_trabajo_ot',
+                    'scm_trabajo_color',
+                    'scm_asignacion_personal_trabajo_ot'
+                  )
+            """)).tuples().all())
+            assert rls_enabled == {
+                "scm_trabajo_ot": True,
+                "scm_trabajo_color": True,
+                "scm_asignacion_personal_trabajo_ot": True,
+            }
+
+        new_work_id = uuid4()
+        with schema_engine.begin() as connection:
+            new_header_id = connection.execute(text("""
+                INSERT INTO registro_diario_produccion (
+                    public_id, codigo_ot, codigo_ot_sintetico, estado,
+                    tipo_ot, fecha, turno, maquina_id
+                )
+                VALUES (
+                    :public_id, 'OT-CABECERA-001', false, 'PLANIFICADA',
+                    'FABRICACION', DATE '2026-08-09', 'NOCHE', :machine_id
+                )
+                RETURNING id
+            """), {
+                "public_id": uuid4(),
+                "machine_id": machine_id,
+            }).scalar_one()
+            connection.execute(text("""
+                INSERT INTO scm_trabajo_ot (
+                    id, orden_trabajo_id, codigo, tipo, secuencia, estado,
+                    orden_operacion_id, cantidad_objetivo_un,
+                    cantidad_confirmada_un, created_by_id
+                )
+                VALUES (
+                    :work_id, :header_id, 'OT-CABECERA-001-TC01',
+                    'COLOR', 1, 'PLANIFICADO', :order_id, 0, 0, :worker_id
+                )
+            """), {
+                "work_id": new_work_id,
+                "header_id": new_header_id,
+                "order_id": order_id,
+                "worker_id": worker_id,
+            })
+            connection.execute(text("""
+                INSERT INTO scm_trabajo_color (
+                    trabajo_ot_id, corrida_fabricacion_id
+                )
+                VALUES (:work_id, :run_id)
+            """), {"work_id": new_work_id, "run_id": run_id})
+        with pytest.raises(IntegrityError):
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    INSERT INTO registro_diario_produccion (
+                        public_id, codigo_ot, codigo_ot_sintetico, estado,
+                        tipo_ot, fecha, turno, maquina_id
+                    )
+                    VALUES (
+                        :public_id, 'OT-CABECERA-002', false, 'BORRADOR',
+                        'FABRICACION', DATE '2026-08-09', 'NOCHE', :machine_id
+                    )
+                """), {"public_id": uuid4(), "machine_id": machine_id})
+
+        failed_downgrade = _run_flask_db_failure(
+            schema_url, "downgrade", "f77e6f1b4c98"
+        )
+        assert "SCM_TRABAJO_COLOR_DOWNGRADE_BLOCKED" in (
+            failed_downgrade.stdout + failed_downgrade.stderr
+        )
+        with schema_engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == WORK_COLOR_REVISION
+        with schema_engine.begin() as connection:
+            connection.execute(text("""
+                DELETE FROM scm_trabajo_color
+                WHERE trabajo_ot_id = :work_id
+            """), {"work_id": new_work_id})
+            connection.execute(text("""
+                DELETE FROM scm_trabajo_ot
+                WHERE id = :work_id
+            """), {"work_id": new_work_id})
+            connection.execute(text("""
+                DELETE FROM registro_diario_produccion
+                WHERE id = :header_id
+            """), {"header_id": new_header_id})
+
+        _run_flask_db(schema_url, "downgrade", "f77e6f1b4c98")
+        downgraded = inspect(schema_engine)
+        assert {
+            "scm_trabajo_ot",
+            "scm_trabajo_color",
+            "scm_asignacion_personal_trabajo_ot",
+        }.isdisjoint(downgraded.get_table_names())
+        assert "trabajo_ot_id" not in {
+            column["name"]
+            for column in downgraded.get_columns(
+                "scm_asignacion_plan_manga_ot"
+            )
+        }
+        assert {
+            constraint["name"]
+            for constraint in downgraded.get_unique_constraints(
+                "scm_asignacion_plan_manga_ot"
+            )
+        } >= {"uq_scm_asignacion_plan_ot"}
+
+        _run_flask_db(schema_url, "upgrade", WORK_COLOR_REVISION)
+        with schema_engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == WORK_COLOR_REVISION
+            assert connection.execute(
+                text("SELECT count(*) FROM scm_trabajo_ot")
+            ).scalar_one() == 2
+            assert connection.execute(text("""
+                SELECT trabajo_color_contexto_id IS NOT NULL
+                FROM registro_diario_produccion
+                WHERE id = :assembly_ot_id
+            """), {
+                "assembly_ot_id": assembly_ot_id,
+            }).scalar_one() is True
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_inicio_concurrente_trabajo_color_serializa_por_maquina():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url, pool_size=4, max_overflow=0)
+    order_id = uuid4()
+    run_id = uuid4()
+    work_ids = (uuid4(), uuid4())
+    try:
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        with schema_engine.begin() as connection:
+            worker_id = connection.execute(text("""
+                INSERT INTO trabajador (
+                    codigo, nombres, apellidos, activo
+                )
+                VALUES ('TR-TC-CONC', 'Rosa', 'Concurrente', true)
+                RETURNING id
+            """)).scalar_one()
+            machine_type_id = connection.execute(text("""
+                INSERT INTO tipo_maquina (
+                    codigo, nombre, proceso, activo, version
+                )
+                VALUES (
+                    'TM-TC-CONC', 'Tipo concurrencia',
+                    'INYECCION', true, 1
+                )
+                RETURNING id
+            """)).scalar_one()
+            machine_id = connection.execute(text("""
+                INSERT INTO maquina (
+                    codigo, nombre, tipo_maquina_id, estado, activo
+                )
+                VALUES (
+                    'MAQ-TC-CONC', 'Maquina concurrencia',
+                    :machine_type_id, 'OPERATIVA', true
+                )
+                RETURNING id
+            """), {"machine_type_id": machine_type_id}).scalar_one()
+            connection.execute(text("""
+                INSERT INTO scm_orden_operacion (
+                    id, codigo, tipo, origen_demanda, estado, version,
+                    created_by_id
+                )
+                VALUES (
+                    :order_id, 'OF-TC-CONC', 'FABRICACION', 'MANUAL',
+                    'PROGRAMADA', 1, :worker_id
+                )
+            """), {"order_id": order_id, "worker_id": worker_id})
+            connection.execute(text("""
+                INSERT INTO scm_orden_fabricacion (orden_operacion_id)
+                VALUES (:order_id)
+            """), {"order_id": order_id})
+            connection.execute(text("""
+                INSERT INTO scm_corrida_fabricacion (
+                    id, orden_fabricacion_id, codigo, secuencia, estado
+                )
+                VALUES (
+                    :run_id, :order_id, 'COR-TC-CONC', 1, 'LIBERADA'
+                )
+            """), {"run_id": run_id, "order_id": order_id})
+            ot_ids = tuple(connection.execute(text("""
+                INSERT INTO registro_diario_produccion (
+                    public_id, codigo_ot, codigo_ot_sintetico, estado,
+                    tipo_ot, fecha, turno, maquina_id,
+                    orden_operacion_id, corrida_fabricacion_id,
+                    cantidad_objetivo, cantidad_confirmada,
+                    created_by_id, maquinista_previsto_id,
+                    secuencia_siguiente_trabajo
+                )
+                VALUES
+                    (
+                        :public_id_a, 'OT-TC-CONC-A', false,
+                        'PLANIFICADA', 'FABRICACION', DATE '2026-08-10',
+                        'DIA', :machine_id, :order_id, :run_id,
+                        100, 0, :worker_id, :worker_id, 2
+                    ),
+                    (
+                        :public_id_b, 'OT-TC-CONC-B', false,
+                        'PLANIFICADA', 'FABRICACION', DATE '2026-08-10',
+                        'DIA', :machine_id, :order_id, :run_id,
+                        100, 0, :worker_id, :worker_id, 2
+                    )
+                RETURNING id
+            """), {
+                "public_id_a": uuid4(),
+                "public_id_b": uuid4(),
+                "machine_id": machine_id,
+                "order_id": order_id,
+                "run_id": run_id,
+                "worker_id": worker_id,
+            }).scalars())
+            for sequence, (ot_id, work_id) in enumerate(
+                zip(ot_ids, work_ids), start=1
+            ):
+                connection.execute(text("""
+                    INSERT INTO scm_trabajo_ot (
+                        id, orden_trabajo_id, codigo, tipo, secuencia,
+                        estado, orden_operacion_id, cantidad_objetivo_un,
+                        cantidad_confirmada_un, created_by_id
+                    )
+                    VALUES (
+                        :work_id, :ot_id, :code, 'COLOR', 1,
+                        'PLANIFICADO', :order_id, 100, 0, :worker_id
+                    )
+                """), {
+                    "work_id": work_id,
+                    "ot_id": ot_id,
+                    "code": f"OT-TC-CONC-{sequence}-TC01",
+                    "order_id": order_id,
+                    "worker_id": worker_id,
+                })
+                connection.execute(text("""
+                    INSERT INTO scm_trabajo_color (
+                        trabajo_ot_id, corrida_fabricacion_id
+                    )
+                    VALUES (:work_id, :run_id)
+                """), {"work_id": work_id, "run_id": run_id})
+
+        def try_start(work_id):
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    SELECT id
+                    FROM maquina
+                    WHERE id = :machine_id
+                    FOR UPDATE
+                """), {"machine_id": machine_id}).scalar_one()
+                active_work_id = connection.execute(text("""
+                    SELECT trabajo.id
+                    FROM scm_trabajo_ot AS trabajo
+                    JOIN registro_diario_produccion AS ot
+                      ON ot.id = trabajo.orden_trabajo_id
+                    WHERE ot.maquina_id = :machine_id
+                      AND trabajo.estado = 'EN_EJECUCION'
+                      AND trabajo.id <> :work_id
+                    LIMIT 1
+                """), {
+                    "machine_id": machine_id,
+                    "work_id": work_id,
+                }).scalar_one_or_none()
+                if active_work_id is not None:
+                    return "MACHINE_BUSY"
+                connection.execute(text("""
+                    UPDATE scm_trabajo_ot
+                    SET estado = 'EN_EJECUCION',
+                        iniciada_at = now(),
+                        version = version + 1
+                    WHERE id = :work_id
+                """), {"work_id": work_id})
+                return "started"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(try_start, work_ids))
+
+        assert sorted(outcomes) == ["MACHINE_BUSY", "started"]
+        with schema_engine.connect() as connection:
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_trabajo_ot AS trabajo
+                JOIN registro_diario_produccion AS ot
+                  ON ot.id = trabajo.orden_trabajo_id
+                WHERE ot.maquina_id = :machine_id
+                  AND trabajo.estado = 'EN_EJECUCION'
+            """), {"machine_id": machine_id}).scalar_one() == 1
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_trabajo_ot
+                WHERE id IN (:work_id_a, :work_id_b)
+                  AND estado = 'PLANIFICADO'
+            """), {
+                "work_id_a": work_ids[0],
+                "work_id_b": work_ids[1],
+            }).scalar_one() == 1
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def _run_color_work_concurrency_scenario(*, include_weighing_annulment):
+    from app.services.scm_ot_service import (
+        add_work_mangas,
+        assign_color_work_worker,
+    )
+    from app.services.scm_service_support import ScmServiceError
+    from app.services.scm_weighing_service import annul_manga_weighing
+
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url, pool_size=4, max_overflow=0)
+    order_id = uuid4()
+    run_id = uuid4()
+    output_id = uuid4()
+    work_id = uuid4()
+    operation_ids = (uuid4(), uuid4())
+    try:
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        with schema_engine.begin() as connection:
+            actors = {
+                row.codigo: row.id
+                for row in connection.execute(text("""
+                    INSERT INTO trabajador (
+                        codigo, nombres, apellidos, activo
+                    )
+                    VALUES
+                        ('TR-TC-M3-ACTOR', 'Jefa', 'M3', true),
+                        ('TR-TC-M3-REL-A', 'Relevo', 'M3 A', true),
+                        ('TR-TC-M3-REL-B', 'Relevo', 'M3 B', true)
+                    RETURNING id, codigo
+                """))
+            }
+            connection.execute(text("""
+                INSERT INTO trabajador_rol (trabajador_id, rol_operativo_id)
+                SELECT :actor_id, id
+                FROM rol_operativo
+                WHERE codigo IN ('SUPERVISOR', 'JEFE_PRODUCCION')
+                UNION ALL
+                SELECT worker.id, rol.id
+                FROM trabajador AS worker
+                JOIN rol_operativo AS rol ON rol.codigo = 'MAQUINISTA'
+                WHERE worker.id IN (
+                    :actor_id, :relief_a_id, :relief_b_id
+                )
+            """), {
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+                "relief_a_id": actors["TR-TC-M3-REL-A"],
+                "relief_b_id": actors["TR-TC-M3-REL-B"],
+            })
+            machine_type_id = connection.execute(text("""
+                INSERT INTO tipo_maquina (
+                    codigo, nombre, proceso, activo, version
+                )
+                VALUES (
+                    'TM-TC-M3', 'Tipo relevo concurrente',
+                    'INYECCION', true, 1
+                )
+                RETURNING id
+            """)).scalar_one()
+            machine_id = connection.execute(text("""
+                INSERT INTO maquina (
+                    codigo, nombre, tipo_maquina_id, estado, activo
+                )
+                VALUES (
+                    'MAQ-TC-M3', 'Maquina relevo concurrente',
+                    :machine_type_id, 'OPERATIVA', true
+                )
+                RETURNING id
+            """), {"machine_type_id": machine_type_id}).scalar_one()
+            connection.execute(text("""
+                INSERT INTO scm_orden_operacion (
+                    id, codigo, tipo, origen_demanda, estado, version,
+                    created_by_id
+                )
+                VALUES (
+                    :order_id, 'OF-TC-M3', 'FABRICACION', 'MANUAL',
+                    'EN_EJECUCION', 1, :actor_id
+                )
+            """), {
+                "order_id": order_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+            })
+            connection.execute(text("""
+                INSERT INTO scm_orden_fabricacion (orden_operacion_id)
+                VALUES (:order_id)
+            """), {"order_id": order_id})
+            connection.execute(text("""
+                INSERT INTO scm_corrida_fabricacion (
+                    id, orden_fabricacion_id, codigo, secuencia, estado
+                )
+                VALUES (
+                    :run_id, :order_id, 'COR-TC-M3', 1, 'EN_EJECUCION'
+                )
+            """), {"run_id": run_id, "order_id": order_id})
+
+            article_id = connection.execute(text("""
+                INSERT INTO scm_articulo (
+                    public_id, codigo, nombre, clase
+                )
+                VALUES (
+                    :public_id, 'WIP-TC-M3', 'WIP relevo concurrente',
+                    'SUBENSAMBLE_WIP'
+                )
+                RETURNING id
+            """), {"public_id": uuid4()}).scalar_one()
+            connection.execute(text("""
+                INSERT INTO scm_definicion_wip (articulo_id, descripcion)
+                VALUES (:article_id, 'Fixture PostgreSQL M3-02')
+            """), {"article_id": article_id})
+            connection.execute(text("""
+                INSERT INTO scm_orden_operacion_salida (
+                    id, orden_operacion_id, corrida_fabricacion_id,
+                    articulo_scm_id, cantidad_por_ciclo_snapshot,
+                    peso_unitario_snapshot_g, cantidad_objetivo
+                )
+                VALUES (
+                    :output_id, :order_id, :run_id, :article_id,
+                    1, 100, 100
+                )
+            """), {
+                "output_id": output_id,
+                "order_id": order_id,
+                "run_id": run_id,
+                "article_id": article_id,
+            })
+            lot_id = connection.execute(text("""
+                INSERT INTO scm_lote_articulo (
+                    public_id, codigo, articulo_id, clase,
+                    orden_operacion_salida_id, cantidad_acreditada,
+                    estado_calidad, actor_id
+                )
+                VALUES (
+                    :public_id, 'LOT-TC-M3', :article_id,
+                    'SALIDA_ORDEN_OPERACION', :output_id, 0,
+                    'PLANIFICADO', :actor_id
+                )
+                RETURNING id
+            """), {
+                "public_id": uuid4(),
+                "article_id": article_id,
+                "output_id": output_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+            }).scalar_one()
+            profile_id = connection.execute(text("""
+                INSERT INTO scm_perfil_empacable (codigo, nombre)
+                VALUES ('PEM-TC-M3', 'Perfil relevo concurrente')
+                RETURNING id
+            """)).scalar_one()
+            container_id = connection.execute(text("""
+                INSERT INTO scm_tipo_contenedor (
+                    codigo, clase, nombre, tara_nominal_g,
+                    tolerancia_tara_g, peso_bruto_max_kg
+                )
+                VALUES (
+                    'TCO-TC-M3', 'MANGA', 'Manga relevo concurrente',
+                    100, 10, 100
+                )
+                RETURNING id
+            """)).scalar_one()
+            rule_id = connection.execute(text("""
+                INSERT INTO scm_regla_empaque (
+                    perfil_empacable_id, tipo_contenedor_id
+                )
+                VALUES (:profile_id, :container_id)
+                RETURNING id
+            """), {
+                "profile_id": profile_id,
+                "container_id": container_id,
+            }).scalar_one()
+            rule_revision_id = connection.execute(text("""
+                INSERT INTO scm_regla_empaque_revision (
+                    regla_id, numero_revision, estado,
+                    medicion_fisica_probada, cantidad_objetivo_un,
+                    cantidad_maxima_probada_un,
+                    peso_neto_operativo_max_kg, margen_seguridad_kg,
+                    tolerancia_peso_abs_g, tolerancia_peso_pct,
+                    tara_nominal_g_snapshot,
+                    tolerancia_tara_g_snapshot,
+                    peso_bruto_max_kg_snapshot, content_hash,
+                    creada_por_id, aprobada_por_id, aprobada_at
+                )
+                VALUES (
+                    :rule_id, 1, 'APROBADA', true, 100, 100,
+                    99, 0, 20, 1, 100, 10, 100, :content_hash,
+                    :actor_id, :actor_id, CURRENT_TIMESTAMP
+                )
+                RETURNING id
+            """), {
+                "rule_id": rule_id,
+                "content_hash": "3" * 64,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+            }).scalar_one()
+            plan_operation_id = uuid4()
+            connection.execute(text("""
+                INSERT INTO scm_operacion (
+                    operation_id, endpoint, actor_id, request_sha256,
+                    estado_http, response_json
+                )
+                VALUES (
+                    :operation_id, '/fixture/m3-plan', :actor_id,
+                    :request_hash, 201, CAST('{}' AS JSON)
+                )
+            """), {
+                "operation_id": plan_operation_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+                "request_hash": "4" * 64,
+            })
+            plan_id = connection.execute(text("""
+                INSERT INTO scm_plan_manga_op (
+                    orden_operacion_id, revision, estado,
+                    calculado_por_id, operation_id, content_hash
+                )
+                VALUES (
+                    :order_id, 1, 'ACTIVO', :actor_id,
+                    :operation_id, :content_hash
+                )
+                RETURNING id
+            """), {
+                "order_id": order_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+                "operation_id": plan_operation_id,
+                "content_hash": "5" * 64,
+            }).scalar_one()
+            plan_line_id = connection.execute(text("""
+                INSERT INTO scm_plan_manga_op_linea (
+                    plan_id, orden_operacion_salida_id,
+                    lote_articulo_id, perfil_empacable_id,
+                    regla_revision_id, tipo_contenedor_id,
+                    cantidad_objetivo_un, capacidad_efectiva_un,
+                    mangas_propuestas, peso_unitario_snapshot_g,
+                    articulo_codigo_snapshot, articulo_nombre_snapshot,
+                    color_snapshot, regla_hash_snapshot,
+                    tara_nominal_g_snapshot,
+                    tolerancia_tara_g_snapshot,
+                    peso_bruto_max_kg_snapshot
+                )
+                VALUES (
+                    :plan_id, :output_id, :lot_id, :profile_id,
+                    :rule_revision_id, :container_id, 100, 100, 1, 100,
+                    'WIP-TC-M3', 'WIP relevo concurrente', 'AZUL',
+                    :rule_hash, 100, 10, 100
+                )
+                RETURNING id
+            """), {
+                "plan_id": plan_id,
+                "output_id": output_id,
+                "lot_id": lot_id,
+                "profile_id": profile_id,
+                "rule_revision_id": rule_revision_id,
+                "container_id": container_id,
+                "rule_hash": "6" * 64,
+            }).scalar_one()
+
+            ot_id = connection.execute(text("""
+                INSERT INTO registro_diario_produccion (
+                    public_id, codigo_ot, codigo_ot_sintetico, estado,
+                    tipo_ot, fecha, turno, maquina_id,
+                    cantidad_objetivo, cantidad_confirmada,
+                    created_by_id, maquinista_previsto_id,
+                    secuencia_siguiente_trabajo, iniciada_at
+                )
+                VALUES (
+                    :public_id, 'OT-TC-M3', false, 'EN_EJECUCION',
+                    'FABRICACION', DATE '2026-08-08', 'DIA', :machine_id,
+                    100, 0, :actor_id, :actor_id, 2, CURRENT_TIMESTAMP
+                )
+                RETURNING id
+            """), {
+                "public_id": uuid4(),
+                "machine_id": machine_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+            }).scalar_one()
+            connection.execute(text("""
+                INSERT INTO scm_trabajo_ot (
+                    id, orden_trabajo_id, codigo, tipo, secuencia,
+                    estado, orden_operacion_id, cantidad_objetivo_un,
+                    cantidad_confirmada_un, iniciada_at, created_by_id
+                )
+                VALUES (
+                    :work_id, :ot_id, 'OT-TC-M3-TC01', 'COLOR', 1,
+                    'EN_EJECUCION', :order_id, 100, 0,
+                    CURRENT_TIMESTAMP, :actor_id
+                )
+            """), {
+                "work_id": work_id,
+                "ot_id": ot_id,
+                "order_id": order_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+            })
+            connection.execute(text("""
+                INSERT INTO scm_trabajo_color (
+                    trabajo_ot_id, corrida_fabricacion_id,
+                    color_nombre_snapshot
+                )
+                VALUES (:work_id, :run_id, 'AZUL')
+            """), {"work_id": work_id, "run_id": run_id})
+            plan_assignment_id = connection.execute(text("""
+                INSERT INTO scm_asignacion_plan_manga_ot (
+                    plan_linea_id, ot_id, trabajo_ot_id,
+                    cantidad_asignada_un, mangas_asignadas,
+                    asignada_por_id
+                )
+                VALUES (
+                    :plan_line_id, :ot_id, :work_id, 100, 1, :actor_id
+                )
+                RETURNING id
+            """), {
+                "plan_line_id": plan_line_id,
+                "ot_id": ot_id,
+                "work_id": work_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+            }).scalar_one()
+            initial_assignment_id = connection.execute(text("""
+                INSERT INTO scm_asignacion_personal_trabajo_ot (
+                    id, trabajo_ot_id, trabajador_id, estado,
+                    iniciada_at, asignada_por_id, motivo
+                )
+                VALUES (
+                    :assignment_id, :work_id, :actor_id, 'ACTIVA',
+                    CURRENT_TIMESTAMP, :actor_id, 'Inicio de turno'
+                )
+                RETURNING id
+            """), {
+                "assignment_id": uuid4(),
+                "work_id": work_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+            }).scalar_one()
+            seeded_manga = connection.execute(text("""
+                INSERT INTO scm_manga (
+                    public_id, codigo, ot_id, trabajo_ot_id,
+                    asignacion_personal_trabajo_id, plan_linea_id,
+                    asignacion_id, lote_articulo_id, secuencia_ot,
+                    tipo, estado, cantidad_planificada_un,
+                    cantidad_asignada_un, maquinista_previsto_id,
+                    articulo_codigo_snapshot, articulo_nombre_snapshot,
+                    color_snapshot, regla_revision_id_snapshot,
+                    regla_hash_snapshot, tipo_contenedor_codigo_snapshot,
+                    tipo_contenedor_nombre_snapshot,
+                    peso_unitario_snapshot_g, tara_nominal_g_snapshot,
+                    tolerancia_tara_g_snapshot,
+                    peso_bruto_max_kg_snapshot, created_by_id
+                )
+                VALUES (
+                    :public_id, 'OT-TC-M3-M001', :ot_id, :work_id,
+                    :personal_assignment_id, :plan_line_id,
+                    :plan_assignment_id, :lot_id, 1, 'NORMAL',
+                    'PLANIFICADA', 100, 100, :actor_id,
+                    'WIP-TC-M3', 'WIP relevo concurrente', 'AZUL',
+                    :rule_revision_id, :rule_hash, 'TCO-TC-M3',
+                    'Manga relevo concurrente', 100, 100, 10, 100,
+                    :actor_id
+                )
+                RETURNING id, public_id
+            """), {
+                "public_id": uuid4(),
+                "ot_id": ot_id,
+                "work_id": work_id,
+                "personal_assignment_id": initial_assignment_id,
+                "plan_line_id": plan_line_id,
+                "plan_assignment_id": plan_assignment_id,
+                "lot_id": lot_id,
+                "actor_id": actors["TR-TC-M3-ACTOR"],
+                "rule_revision_id": rule_revision_id,
+                "rule_hash": "6" * 64,
+            }).one()
+
+        payloads = (
+            {
+                "trabajador_id": actors["TR-TC-M3-REL-A"],
+                "motivo": "Relevo concurrente A",
+                "version": 1,
+            },
+            {
+                "trabajador_id": actors["TR-TC-M3-REL-B"],
+                "motivo": "Relevo concurrente B",
+                "version": 1,
+            },
+        )
+
+        def assign_candidate(candidate):
+            operation_id, payload = candidate
+            with Session(schema_engine, expire_on_commit=False) as session:
+                try:
+                    result = assign_color_work_worker(
+                        session,
+                        actor_id=actors["TR-TC-M3-ACTOR"],
+                        work_id=work_id,
+                        operation_id=operation_id,
+                        data=payload,
+                    )
+                    return ("assigned", operation_id, payload, result)
+                except ScmServiceError as error:
+                    return (error.code, operation_id, payload, None)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(
+                assign_candidate,
+                zip(operation_ids, payloads),
+            ))
+
+        assert sorted(item[0] for item in outcomes) == [
+            "VERSION_CONFLICT",
+            "assigned",
+        ]
+        winner = next(item for item in outcomes if item[0] == "assigned")
+        with Session(schema_engine, expire_on_commit=False) as session:
+            replay = assign_color_work_worker(
+                session,
+                actor_id=actors["TR-TC-M3-ACTOR"],
+                work_id=work_id,
+                operation_id=winner[1],
+                data=winner[2],
+            )
+        assert replay == winner[3]
+
+        with schema_engine.connect() as connection:
+            active_index = connection.execute(text("""
+                SELECT lower(indexdef)
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND tablename = 'scm_asignacion_personal_trabajo_ot'
+                  AND indexname = 'uq_scm_asignacion_personal_activa'
+            """)).scalar_one()
+            assert "create unique index" in active_index
+            assert "where" in active_index
+            assert "'activa'" in active_index
+            active = connection.execute(text("""
+                SELECT id, trabajador_id
+                FROM scm_asignacion_personal_trabajo_ot
+                WHERE trabajo_ot_id = :work_id
+                  AND estado = 'ACTIVA'
+            """), {"work_id": work_id}).one()
+            assert active.trabajador_id == winner[2]["trabajador_id"]
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_asignacion_personal_trabajo_ot
+                WHERE trabajo_ot_id = :work_id
+            """), {"work_id": work_id}).scalar_one() == 2
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_asignacion_personal_trabajo_ot
+                WHERE trabajo_ot_id = :work_id
+                  AND estado = 'CERRADA'
+            """), {"work_id": work_id}).scalar_one() == 1
+            assert connection.execute(text("""
+                SELECT asignacion_personal_trabajo_id
+                FROM scm_manga
+                WHERE trabajo_ot_id = :work_id
+            """), {"work_id": work_id}).scalar_one() == active.id
+            assert connection.execute(text("""
+                SELECT version
+                FROM scm_trabajo_ot
+                WHERE id = :work_id
+            """), {"work_id": work_id}).scalar_one() == 2
+            assert connection.execute(text("""
+                SELECT count(*)
+                FROM scm_operacion
+                WHERE operation_id IN (:operation_a, :operation_b)
+                  AND response_json IS NOT NULL
+            """), {
+                "operation_a": operation_ids[0],
+                "operation_b": operation_ids[1],
+            }).scalar_one() == 1
+
+        if include_weighing_annulment:
+            weighing_public_id = uuid4()
+            weighing_operation_id = uuid4()
+            station_id = str(uuid4())
+            with schema_engine.begin() as connection:
+                active_assignment_id = connection.execute(text("""
+                    SELECT id
+                    FROM scm_asignacion_personal_trabajo_ot
+                    WHERE trabajo_ot_id = :work_id
+                      AND estado = 'ACTIVA'
+                """), {"work_id": work_id}).scalar_one()
+                connection.execute(text("""
+                    UPDATE scm_manga
+                    SET estado = 'PESADA',
+                        cantidad_confirmada_un = 100,
+                        cantidad_contenida_un = 100
+                    WHERE id = :manga_id
+                """), {"manga_id": seeded_manga.id})
+                connection.execute(text("""
+                    UPDATE scm_trabajo_ot
+                    SET cantidad_confirmada_un = 100
+                    WHERE id = :work_id
+                """), {"work_id": work_id})
+                connection.execute(text("""
+                    UPDATE registro_diario_produccion
+                    SET secuencia_siguiente_manga = 2
+                    WHERE id = :ot_id
+                """), {"ot_id": ot_id})
+                connection.execute(text("""
+                    INSERT INTO estacion_pesaje (
+                        station_id, codigo, nombre, ubicacion,
+                        estado_admin, token_hash, created_at_utc
+                    )
+                    VALUES (
+                        :station_id, 'PESAJE-TC-M2',
+                        'Balanza anulacion concurrente', 'Piloto',
+                        'ACTIVA', :token_hash, CURRENT_TIMESTAMP
+                    )
+                """), {
+                    "station_id": station_id,
+                    "token_hash": "7" * 64,
+                })
+                connection.execute(text("""
+                    INSERT INTO scm_operacion (
+                        operation_id, endpoint, actor_id,
+                        request_sha256, estado_http, response_json
+                    )
+                    VALUES (
+                        :operation_id,
+                        '/integration/v1/manga-weighings',
+                        :actor_id, :request_hash, 201,
+                        CAST('{"fixture":"M2-02"}' AS JSON)
+                    )
+                """), {
+                    "operation_id": weighing_operation_id,
+                    "actor_id": actors["TR-TC-M3-ACTOR"],
+                    "request_hash": "8" * 64,
+                })
+                weighing_id = connection.execute(text("""
+                    INSERT INTO scm_pesaje_manga (
+                        public_id, manga_id, operation_id,
+                        source_system, station_id, capture_id,
+                        peso_bruto_kg, tara_kg, peso_fisico_neto_kg,
+                        tara_fuente, cantidad_confirmada,
+                        fuente_cantidad, kg_produccion_ot, pesada_at,
+                        timezone_snapshot, fecha_local_pesaje,
+                        dias_desfase_operativo, alerta_fecha,
+                        pesado_por_id,
+                        asignacion_personal_trabajo_id,
+                        snapshots_json
+                    )
+                    VALUES (
+                        :public_id, :manga_id, :operation_id,
+                        'SCM_STATION', :station_id, :capture_id,
+                        10.100, 0.100, 10.000, 'TIPO_MANGA', 100,
+                        'PLAN_CONFIRMADO_POR_PESAJE', 10,
+                        TIMESTAMPTZ '2026-08-08 15:00:00+00',
+                        'America/Lima', DATE '2026-08-08', 0, false,
+                        :actor_id, :personal_assignment_id,
+                        CAST('{"fixture":"M2-02"}' AS JSON)
+                    )
+                    RETURNING id
+                """), {
+                    "public_id": weighing_public_id,
+                    "manga_id": seeded_manga.id,
+                    "operation_id": weighing_operation_id,
+                    "station_id": station_id,
+                    "capture_id": uuid4(),
+                    "actor_id": actors["TR-TC-M3-ACTOR"],
+                    "personal_assignment_id": active_assignment_id,
+                }).scalar_one()
+                original_fact = connection.execute(text("""
+                    SELECT
+                        public_id, manga_id, operation_id,
+                        source_system, station_id, capture_id,
+                        peso_bruto_kg, tara_kg, peso_fisico_neto_kg,
+                        tara_fuente, cantidad_confirmada,
+                        fuente_cantidad, kg_produccion_ot, pesada_at,
+                        timezone_snapshot, fecha_local_pesaje,
+                        dias_desfase_operativo, alerta_fecha,
+                        pesado_por_id,
+                        asignacion_personal_trabajo_id,
+                        snapshots_json, created_at
+                    FROM scm_pesaje_manga
+                    WHERE id = :weighing_id
+                """), {"weighing_id": weighing_id}).one()
+
+            annul_operation_ids = (uuid4(), uuid4())
+            annul_command = {
+                "motivo": "Manga descartada en control concurrente M2-02",
+            }
+            start_barrier = Barrier(2)
+
+            def annul_candidate(operation_id):
+                with Session(
+                    schema_engine, expire_on_commit=False
+                ) as session:
+                    start_barrier.wait(timeout=10)
+                    try:
+                        result = annul_manga_weighing(
+                            session,
+                            actor_id=actors["TR-TC-M3-ACTOR"],
+                            weighing_id=weighing_public_id,
+                            operation_id=operation_id,
+                            data=annul_command,
+                        )
+                        return ("annulled", operation_id, result)
+                    except ScmServiceError as error:
+                        return (error.code, operation_id, None)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                annul_outcomes = list(executor.map(
+                    annul_candidate,
+                    annul_operation_ids,
+                ))
+
+            assert sorted(item[0] for item in annul_outcomes) == [
+                "WEIGHING_ALREADY_ANNULLED",
+                "annulled",
+            ]
+            annul_winner = next(
+                item for item in annul_outcomes
+                if item[0] == "annulled"
+            )
+            assert annul_winner[2]["plan"] == {
+                "cantidad_devuelta_un": "100.000",
+                "cantidad_asignada_un": "0.000",
+                "mangas_asignadas": 0,
+            }
+
+            with schema_engine.connect() as connection:
+                assert connection.execute(text("""
+                    SELECT
+                        public_id, manga_id, operation_id,
+                        source_system, station_id, capture_id,
+                        peso_bruto_kg, tara_kg, peso_fisico_neto_kg,
+                        tara_fuente, cantidad_confirmada,
+                        fuente_cantidad, kg_produccion_ot, pesada_at,
+                        timezone_snapshot, fecha_local_pesaje,
+                        dias_desfase_operativo, alerta_fecha,
+                        pesado_por_id,
+                        asignacion_personal_trabajo_id,
+                        snapshots_json, created_at
+                    FROM scm_pesaje_manga
+                    WHERE id = :weighing_id
+                """), {"weighing_id": weighing_id}).one() == original_fact
+                assert connection.execute(text("""
+                    SELECT cantidad_asignada_un, mangas_asignadas
+                    FROM scm_asignacion_plan_manga_ot
+                    WHERE id = :assignment_id
+                """), {
+                    "assignment_id": plan_assignment_id,
+                }).one() == (Decimal("0.000"), 0)
+                assert connection.execute(text("""
+                    SELECT cantidad_objetivo_un, cantidad_confirmada_un
+                    FROM scm_trabajo_ot
+                    WHERE id = :work_id
+                """), {"work_id": work_id}).one() == (
+                    Decimal("0.000"), Decimal("0.000"),
+                )
+                assert connection.execute(text("""
+                    SELECT estado
+                    FROM scm_manga
+                    WHERE id = :manga_id
+                """), {
+                    "manga_id": seeded_manga.id,
+                }).scalar_one() == "ANULADA"
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_pesaje_manga
+                    WHERE id = :weighing_id
+                """), {"weighing_id": weighing_id}).scalar_one() == 1
+                annulment = connection.execute(text("""
+                    SELECT operation_id, cantidad_devuelta_plan_un
+                    FROM scm_anulacion_pesaje_manga
+                    WHERE pesaje_id = :weighing_id
+                """), {"weighing_id": weighing_id}).one()
+                assert annulment == (
+                    annul_winner[1], Decimal("100.000"),
+                )
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_evento
+                    WHERE aggregate_type = 'PESAJE_MANGA'
+                      AND aggregate_id = :aggregate_id
+                      AND tipo = 'MANGA_WEIGHING_ANNULLED'
+                """), {
+                    "aggregate_id": str(weighing_id),
+                }).scalar_one() == 1
+                completed_annul_operations = connection.execute(text("""
+                    SELECT operation_id
+                    FROM scm_operacion
+                    WHERE operation_id IN (
+                        :operation_a, :operation_b
+                    )
+                      AND response_json IS NOT NULL
+                """), {
+                    "operation_a": annul_operation_ids[0],
+                    "operation_b": annul_operation_ids[1],
+                }).scalars().all()
+                assert completed_annul_operations == [annul_winner[1]]
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_operacion
+                    WHERE operation_id IN (
+                        :operation_a, :operation_b
+                    )
+                """), {
+                    "operation_a": annul_operation_ids[0],
+                    "operation_b": annul_operation_ids[1],
+                }).scalar_one() == 1
+
+            with Session(schema_engine, expire_on_commit=False) as session:
+                replacement = add_work_mangas(
+                    session,
+                    actor_id=actors["TR-TC-M3-ACTOR"],
+                    work_id=work_id,
+                    operation_id=uuid4(),
+                    data={
+                        "plan_linea_id": plan_line_id,
+                        "cantidad_un": 100,
+                    },
+                )
+            assert len(replacement["mangas"]) == 1
+            assert replacement["mangas"][0]["tipo"] == "NORMAL"
+            assert replacement["mangas"][0]["estado"] == "PLANIFICADA"
+
+            with schema_engine.connect() as connection:
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_manga
+                    WHERE trabajo_ot_id = :work_id
+                      AND tipo = 'NORMAL'
+                      AND estado = 'ANULADA'
+                """), {"work_id": work_id}).scalar_one() == 1
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_manga
+                    WHERE trabajo_ot_id = :work_id
+                      AND tipo = 'NORMAL'
+                      AND estado = 'PLANIFICADA'
+                """), {"work_id": work_id}).scalar_one() == 1
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_manga
+                    WHERE trabajo_ot_id = :work_id
+                      AND tipo = 'NORMAL'
+                """), {"work_id": work_id}).scalar_one() == 2
+                assert connection.execute(text("""
+                    SELECT cantidad_asignada_un, mangas_asignadas
+                    FROM scm_asignacion_plan_manga_ot
+                    WHERE id = :assignment_id
+                """), {
+                    "assignment_id": plan_assignment_id,
+                }).one() == (Decimal("100.000"), 1)
+                assert connection.execute(text("""
+                    SELECT cantidad_objetivo_un, cantidad_confirmada_un
+                    FROM scm_trabajo_ot
+                    WHERE id = :work_id
+                """), {"work_id": work_id}).one() == (
+                    Decimal("100.000"), Decimal("0.000"),
+                )
+                assert connection.execute(text("""
+                    SELECT
+                        public_id, manga_id, operation_id,
+                        source_system, station_id, capture_id,
+                        peso_bruto_kg, tara_kg, peso_fisico_neto_kg,
+                        tara_fuente, cantidad_confirmada,
+                        fuente_cantidad, kg_produccion_ot, pesada_at,
+                        timezone_snapshot, fecha_local_pesaje,
+                        dias_desfase_operativo, alerta_fecha,
+                        pesado_por_id,
+                        asignacion_personal_trabajo_id,
+                        snapshots_json, created_at
+                    FROM scm_pesaje_manga
+                    WHERE id = :weighing_id
+                """), {"weighing_id": weighing_id}).one() == original_fact
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_relevo_concurrente_trabajo_color_conserva_un_responsable_activo():
+    _run_color_work_concurrency_scenario(
+        include_weighing_annulment=False
+    )
+
+
+def test_anulacion_concurrente_pesaje_devuelve_cupo_una_sola_vez():
+    _run_color_work_concurrency_scenario(
+        include_weighing_annulment=True
+    )
 
 
 def test_catalog_counter_migration_uses_existing_numeric_suffixes():

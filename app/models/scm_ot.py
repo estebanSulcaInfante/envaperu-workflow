@@ -404,6 +404,323 @@ class ScmPlanMangaOpLinea(db.Model):
     )
 
 
+class ScmTrabajoOt(db.Model):
+    """Unidad ejecutable dentro de una OT de maquina/turno."""
+
+    __tablename__ = "scm_trabajo_ot"
+    __table_args__ = (
+        db.CheckConstraint(
+            "tipo IN ('COLOR')",
+            name="ck_scm_trabajo_ot_tipo",
+        ),
+        db.CheckConstraint(
+            "estado IN ('PLANIFICADO', 'EN_EJECUCION', 'PAUSADO', "
+            "'COMPLETADO', 'ANULADO')",
+            name="ck_scm_trabajo_ot_estado",
+        ),
+        db.CheckConstraint(
+            "secuencia > 0",
+            name="ck_scm_trabajo_ot_secuencia",
+        ),
+        db.CheckConstraint(
+            "cantidad_objetivo_un >= 0 AND cantidad_confirmada_un >= 0",
+            name="ck_scm_trabajo_ot_cantidades",
+        ),
+        db.CheckConstraint(
+            "version > 0",
+            name="ck_scm_trabajo_ot_version",
+        ),
+        db.UniqueConstraint(
+            "orden_trabajo_id",
+            "secuencia",
+            name="uq_scm_trabajo_ot_orden_secuencia",
+        ),
+        db.UniqueConstraint(
+            "id",
+            "orden_trabajo_id",
+            name="uq_scm_trabajo_ot_id_orden",
+        ),
+        db.UniqueConstraint("codigo", name="uq_scm_trabajo_ot_codigo"),
+        db.UniqueConstraint(
+            "continua_de_id",
+            name="uq_scm_trabajo_ot_continuacion",
+        ),
+        db.Index(
+            "ix_scm_trabajo_ot_orden_trabajo",
+            "orden_trabajo_id",
+        ),
+        db.Index(
+            "ix_scm_trabajo_ot_orden_operacion",
+            "orden_operacion_id",
+        ),
+        db.Index("ix_scm_trabajo_ot_created_by", "created_by_id"),
+        db.Index("ix_scm_trabajo_ot_anulada_por", "anulada_por_id"),
+        db.Index(
+            "uq_scm_trabajo_ot_activo",
+            "orden_trabajo_id",
+            unique=True,
+            postgresql_where=db.text("estado = 'EN_EJECUCION'"),
+            sqlite_where=db.text("estado = 'EN_EJECUCION'"),
+        ),
+    )
+
+    id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    orden_trabajo_id = db.Column(
+        db.Integer,
+        db.ForeignKey(
+            "registro_diario_produccion.id",
+            name="fk_scm_trabajo_ot_orden_trabajo",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    codigo = db.Column(db.String(64), nullable=False)
+    tipo = db.Column(
+        db.String(20), nullable=False, default="COLOR", server_default="COLOR"
+    )
+    secuencia = db.Column(db.Integer, nullable=False)
+    estado = db.Column(
+        db.String(24),
+        nullable=False,
+        default="PLANIFICADO",
+        server_default="PLANIFICADO",
+    )
+    orden_operacion_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey(
+            "scm_orden_operacion.id",
+            name="fk_scm_trabajo_ot_orden_operacion",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    continua_de_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey(
+            "scm_trabajo_ot.id",
+            name="fk_scm_trabajo_ot_continua_de",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    cantidad_objetivo_un = db.Column(
+        db.Numeric(15, 3), nullable=False, default=0, server_default="0"
+    )
+    cantidad_confirmada_un = db.Column(
+        db.Numeric(15, 3), nullable=False, default=0, server_default="0"
+    )
+    iniciada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    pausada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    completada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    anulada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    motivo_pausa = db.Column(db.String(500), nullable=True)
+    motivo_anulacion = db.Column(db.String(500), nullable=True)
+    created_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    anulada_por_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        server_default=db.func.now(),
+    )
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=db.func.now(),
+    )
+    version = db.Column(db.Integer, nullable=False, default=1, server_default="1")
+
+    orden_trabajo = db.relationship(
+        "RegistroDiarioProduccion",
+        back_populates="trabajos_ot",
+        foreign_keys=[orden_trabajo_id],
+    )
+    orden_operacion = db.relationship("ScmOrdenOperacion")
+    continua_de = db.relationship(
+        "ScmTrabajoOt",
+        remote_side=[id],
+        foreign_keys=[continua_de_id],
+        uselist=False,
+    )
+    trabajo_color = db.relationship(
+        "ScmTrabajoColor",
+        back_populates="trabajo",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    asignaciones_personal = db.relationship(
+        "ScmAsignacionPersonalTrabajoOt",
+        back_populates="trabajo",
+        lazy="selectin",
+        order_by="ScmAsignacionPersonalTrabajoOt.asignada_at",
+    )
+    mangas = db.relationship(
+        "ScmManga",
+        back_populates="trabajo",
+        lazy="selectin",
+        order_by="ScmManga.secuencia_ot",
+    )
+    created_by = db.relationship("Trabajador", foreign_keys=[created_by_id])
+    anulada_por = db.relationship("Trabajador", foreign_keys=[anulada_por_id])
+
+
+class ScmTrabajoColor(db.Model):
+    """Especializacion de Fabricacion para una corrida/color homogeneos."""
+
+    __tablename__ = "scm_trabajo_color"
+    __table_args__ = (
+        db.Index("ix_scm_trabajo_color_corrida", "corrida_fabricacion_id"),
+        db.CheckConstraint(
+            "cavidades_snapshot IS NULL OR cavidades_snapshot > 0",
+            name="ck_scm_trabajo_color_cavidades",
+        ),
+        db.CheckConstraint(
+            "peso_neto_snapshot_g IS NULL OR peso_neto_snapshot_g >= 0",
+            name="ck_scm_trabajo_color_peso_neto",
+        ),
+        db.CheckConstraint(
+            "peso_colada_snapshot_g IS NULL OR peso_colada_snapshot_g >= 0",
+            name="ck_scm_trabajo_color_peso_colada",
+        ),
+    )
+
+    trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_trabajo_ot.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    corrida_fabricacion_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_corrida_fabricacion.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    molde_codigo_snapshot = db.Column(db.String(50), nullable=True)
+    color_id_snapshot = db.Column(db.Integer, nullable=True)
+    color_nombre_snapshot = db.Column(db.String(120), nullable=True)
+    receta_revision_id_snapshot = db.Column(db.Integer, nullable=True)
+    receta_hash_snapshot = db.Column(db.String(64), nullable=True)
+    cavidades_snapshot = db.Column(db.Integer, nullable=True)
+    peso_neto_snapshot_g = db.Column(db.Numeric(15, 4), nullable=True)
+    peso_colada_snapshot_g = db.Column(db.Numeric(15, 4), nullable=True)
+    colada_inicial = db.Column(db.Integer, nullable=True)
+    colada_final = db.Column(db.Integer, nullable=True)
+
+    trabajo = db.relationship("ScmTrabajoOt", back_populates="trabajo_color")
+    corrida = db.relationship("ScmCorridaFabricacion")
+
+
+class ScmAsignacionPersonalTrabajoOt(db.Model):
+    """Asignacion auditada por intervalo; un relevo no cambia de trabajo."""
+
+    __tablename__ = "scm_asignacion_personal_trabajo_ot"
+    __table_args__ = (
+        db.CheckConstraint(
+            "estado IN ('PREVISTA', 'ACTIVA', 'CERRADA', 'CANCELADA')",
+            name="ck_scm_asignacion_personal_estado",
+        ),
+        db.CheckConstraint(
+            "version > 0",
+            name="ck_scm_asignacion_personal_version",
+        ),
+        db.CheckConstraint(
+            "(estado IN ('PREVISTA', 'ACTIVA') AND finalizada_at IS NULL) OR "
+            "(estado IN ('CERRADA', 'CANCELADA') AND finalizada_at IS NOT NULL)",
+            name="ck_scm_asignacion_personal_intervalo",
+        ),
+        db.Index(
+            "uq_scm_asignacion_personal_activa",
+            "trabajo_ot_id",
+            unique=True,
+            postgresql_where=db.text("estado = 'ACTIVA'"),
+            sqlite_where=db.text("estado = 'ACTIVA'"),
+        ),
+        db.Index(
+            "ix_scm_asignacion_personal_trabajador",
+            "trabajador_id",
+        ),
+        db.Index(
+            "ix_scm_asignacion_personal_trabajo",
+            "trabajo_ot_id",
+        ),
+        db.Index(
+            "ix_scm_asignacion_personal_asignada_por",
+            "asignada_por_id",
+        ),
+        db.Index(
+            "ix_scm_asignacion_personal_finalizada_por",
+            "finalizada_por_id",
+        ),
+        db.UniqueConstraint(
+            "id",
+            "trabajo_ot_id",
+            name="uq_scm_asignacion_personal_id_trabajo",
+        ),
+    )
+
+    id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_trabajo_ot.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    trabajador_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    estado = db.Column(
+        db.String(20),
+        nullable=False,
+        default="PREVISTA",
+        server_default="PREVISTA",
+    )
+    asignada_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now,
+        server_default=db.func.now(),
+    )
+    iniciada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    finalizada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    asignada_por_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    finalizada_por_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    motivo = db.Column(db.String(500), nullable=True)
+    version = db.Column(db.Integer, nullable=False, default=1, server_default="1")
+
+    trabajo = db.relationship("ScmTrabajoOt", back_populates="asignaciones_personal")
+    trabajador = db.relationship("Trabajador", foreign_keys=[trabajador_id])
+    asignada_por = db.relationship("Trabajador", foreign_keys=[asignada_por_id])
+    finalizada_por = db.relationship(
+        "Trabajador", foreign_keys=[finalizada_por_id]
+    )
+    mangas = db.relationship(
+        "ScmManga",
+        back_populates="asignacion_personal_trabajo",
+        foreign_keys="ScmManga.asignacion_personal_trabajo_id",
+    )
+    pesajes = db.relationship(
+        "ScmPesajeManga",
+        back_populates="asignacion_personal_trabajo",
+        foreign_keys="ScmPesajeManga.asignacion_personal_trabajo_id",
+    )
+
+
 class ScmAsignacionPlanMangaOt(db.Model):
     __tablename__ = "scm_asignacion_plan_manga_ot"
     __table_args__ = (
@@ -415,10 +732,31 @@ class ScmAsignacionPlanMangaOt(db.Model):
             "mangas_asignadas >= 0",
             name="ck_scm_asignacion_plan_mangas",
         ),
-        db.UniqueConstraint(
+        db.Index(
+            "uq_scm_asignacion_plan_trabajo",
+            "plan_linea_id",
+            "trabajo_ot_id",
+            unique=True,
+            postgresql_where=db.text("trabajo_ot_id IS NOT NULL"),
+            sqlite_where=db.text("trabajo_ot_id IS NOT NULL"),
+        ),
+        db.Index(
+            "uq_scm_asignacion_plan_ot_legacy",
             "plan_linea_id",
             "ot_id",
-            name="uq_scm_asignacion_plan_ot",
+            unique=True,
+            postgresql_where=db.text("trabajo_ot_id IS NULL"),
+            sqlite_where=db.text("trabajo_ot_id IS NULL"),
+        ),
+        db.Index(
+            "ix_scm_asignacion_plan_trabajo",
+            "trabajo_ot_id",
+        ),
+        db.ForeignKeyConstraint(
+            ["trabajo_ot_id", "ot_id"],
+            ["scm_trabajo_ot.id", "scm_trabajo_ot.orden_trabajo_id"],
+            name="fk_scm_asignacion_plan_trabajo_ot",
+            ondelete="RESTRICT",
         ),
     )
 
@@ -440,6 +778,10 @@ class ScmAsignacionPlanMangaOt(db.Model):
             ondelete="RESTRICT",
         ),
         nullable=False,
+    )
+    trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True),
+        nullable=True,
     )
     cantidad_asignada_un = db.Column(db.Numeric(15, 3), nullable=False)
     mangas_asignadas = db.Column(db.Integer, nullable=False)
@@ -463,7 +805,8 @@ class ScmAsignacionPlanMangaOt(db.Model):
         "ScmPlanMangaOpLinea",
         back_populates="asignaciones",
     )
-    ot = db.relationship("RegistroDiarioProduccion")
+    ot = db.relationship("RegistroDiarioProduccion", overlaps="trabajo")
+    trabajo = db.relationship("ScmTrabajoOt", overlaps="ot")
     asignada_por = db.relationship("Trabajador")
 
 
@@ -496,6 +839,26 @@ class ScmManga(db.Model):
             "secuencia_ot",
             name="uq_scm_manga_ot_secuencia",
         ),
+        db.Index("ix_scm_manga_trabajo", "trabajo_ot_id"),
+        db.Index(
+            "ix_scm_manga_asignacion_personal",
+            "asignacion_personal_trabajo_id",
+        ),
+        db.ForeignKeyConstraint(
+            ["trabajo_ot_id", "ot_id"],
+            ["scm_trabajo_ot.id", "scm_trabajo_ot.orden_trabajo_id"],
+            name="fk_scm_manga_trabajo_ot",
+            ondelete="RESTRICT",
+        ),
+        db.ForeignKeyConstraint(
+            ["asignacion_personal_trabajo_id", "trabajo_ot_id"],
+            [
+                "scm_asignacion_personal_trabajo_ot.id",
+                "scm_asignacion_personal_trabajo_ot.trabajo_ot_id",
+            ],
+            name="fk_scm_manga_asignacion_personal_trabajo",
+            ondelete="RESTRICT",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -513,6 +876,14 @@ class ScmManga(db.Model):
             ondelete="RESTRICT",
         ),
         nullable=False,
+    )
+    trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True),
+        nullable=True,
+    )
+    asignacion_personal_trabajo_id = db.Column(
+        Uuid(as_uuid=True),
+        nullable=True,
     )
     plan_linea_id = db.Column(
         db.Integer,
@@ -634,7 +1005,17 @@ class ScmManga(db.Model):
         server_default="1",
     )
 
-    ot = db.relationship("RegistroDiarioProduccion")
+    ot = db.relationship("RegistroDiarioProduccion", overlaps="mangas,trabajo")
+    trabajo = db.relationship(
+        "ScmTrabajoOt",
+        back_populates="mangas",
+        foreign_keys=[trabajo_ot_id],
+    )
+    asignacion_personal_trabajo = db.relationship(
+        "ScmAsignacionPersonalTrabajoOt",
+        back_populates="mangas",
+        foreign_keys=[asignacion_personal_trabajo_id],
+    )
     plan_linea = db.relationship("ScmPlanMangaOpLinea")
     asignacion = db.relationship("ScmAsignacionPlanMangaOt")
     lote_articulo = db.relationship("ScmLoteArticulo")
@@ -674,6 +1055,13 @@ class ScmSolicitudMangaExtra(db.Model):
             "version > 0",
             name="ck_scm_solicitud_manga_extra_version",
         ),
+        db.Index("ix_scm_solicitud_extra_trabajo", "trabajo_ot_id"),
+        db.ForeignKeyConstraint(
+            ["trabajo_ot_id", "ot_id"],
+            ["scm_trabajo_ot.id", "scm_trabajo_ot.orden_trabajo_id"],
+            name="fk_scm_solicitud_extra_trabajo_ot",
+            ondelete="RESTRICT",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -691,6 +1079,10 @@ class ScmSolicitudMangaExtra(db.Model):
             ondelete="RESTRICT",
         ),
         nullable=False,
+    )
+    trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True),
+        nullable=True,
     )
     plan_linea_id = db.Column(
         db.Integer,
@@ -742,6 +1134,7 @@ class ScmSolicitudMangaExtra(db.Model):
     )
 
     ot = db.relationship("RegistroDiarioProduccion")
+    trabajo = db.relationship("ScmTrabajoOt", foreign_keys=[trabajo_ot_id])
     plan_linea = db.relationship("ScmPlanMangaOpLinea")
     solicitada_por = db.relationship(
         "Trabajador",
@@ -977,6 +1370,10 @@ class ScmPesajeManga(db.Model):
             "source_system", "capture_id",
             name="uq_scm_pesaje_manga_capture",
         ),
+        db.Index(
+            "ix_scm_pesaje_asignacion_personal",
+            "asignacion_personal_trabajo_id",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -1025,6 +1422,15 @@ class ScmPesajeManga(db.Model):
         db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    asignacion_personal_trabajo_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey(
+            "scm_asignacion_personal_trabajo_ot.id",
+            name="fk_scm_pesaje_asignacion_personal",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
     snapshots_json = db.Column(db.JSON, nullable=False)
     created_at = db.Column(
         db.DateTime(timezone=True),
@@ -1035,6 +1441,10 @@ class ScmPesajeManga(db.Model):
 
     manga = db.relationship("ScmManga")
     pesado_por = db.relationship("Trabajador")
+    asignacion_personal_trabajo = db.relationship(
+        "ScmAsignacionPersonalTrabajoOt",
+        back_populates="pesajes",
+    )
     anulacion = db.relationship(
         "ScmAnulacionPesajeManga",
         back_populates="pesaje",
@@ -1059,6 +1469,18 @@ class ScmPesajeManga(db.Model):
             "fecha_local_pesaje": self.fecha_local_pesaje.isoformat(),
             "dias_desfase_operativo": self.dias_desfase_operativo,
             "alerta_fecha": self.alerta_fecha,
+            "asignacion_personal_trabajo_id": (
+                str(self.asignacion_personal_trabajo_id)
+                if self.asignacion_personal_trabajo_id else None
+            ),
+            "trabajo_color_id": (
+                str(self.manga.trabajo_ot_id)
+                if self.manga and self.manga.trabajo_ot_id else None
+            ),
+            "trabajo_color_codigo": (
+                self.manga.trabajo.codigo
+                if self.manga and self.manga.trabajo else None
+            ),
             "estado_manga": self.manga.estado if self.manga else None,
             "estado_inventario": "NO_INGRESADA",
             "ubicacion_id": None,
