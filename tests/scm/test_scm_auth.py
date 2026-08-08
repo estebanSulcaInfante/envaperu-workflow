@@ -3,6 +3,8 @@ from uuid import uuid4
 import jwt
 
 from app.extensions import db
+from app.models.scm_auditoria import ScmEvento
+from app.models.scm_catalogos import ScmCapacidad
 from app.models.trabajador import RolOperativo, Trabajador
 
 
@@ -136,3 +138,80 @@ def test_salud_e_imagenes_no_exigen_sesion(app, client):
         "code": "AUTH_REQUIRED",
         "message": "Inicia sesión para continuar.",
     }
+
+
+def test_supabase_non_admin_is_denied_on_authorization_catalog_prefixes(
+    app,
+    client,
+):
+    auth_user_id = uuid4()
+    with app.app_context():
+        actor = Trabajador.query.filter_by(codigo="TRB-01").one()
+        actor.auth_user_id = auth_user_id
+        role_id = actor.roles[0].id
+        db.session.commit()
+
+    enable_auth(app, FakeVerifier({"sub": str(auth_user_id)}))
+    headers = {"Authorization": "Bearer valido"}
+
+    responses = (
+        client.get("/api/catalogo/capacidades", headers=headers),
+        client.get("/api/catalogo/roles-operativos", headers=headers),
+        client.put(
+            f"/api/catalogo/roles-operativos/{role_id}",
+            headers=headers,
+            json={"nombre": "No autorizado", "expected_version": 1},
+        ),
+    )
+    for response in responses:
+        assert response.status_code == 403
+        assert response.get_json()["error"]["code"] == (
+            "CAPABILITY_REQUIRED"
+        )
+
+
+def test_supabase_primary_role_ignores_spoofed_actor_header(app, client):
+    auth_user_id = uuid4()
+    with app.app_context():
+        admin = Trabajador.query.filter_by(codigo="TRB-01").one()
+        admin.auth_user_id = auth_user_id
+        capability = ScmCapacidad(
+            codigo="AUTORIZACION_SCM_ADMINISTRAR",
+            nombre="Administrar autorizaciones SCM",
+        )
+        admin.roles[0].capacidades.append(capability)
+        target_role = RolOperativo(
+            codigo="TARGET_ROLE",
+            nombre="Rol objetivo",
+        )
+        target = Trabajador(
+            codigo="TRB-TARGET",
+            nombres="Target",
+            apellidos="Worker",
+            roles=[target_role],
+        )
+        db.session.add_all([capability, target])
+        db.session.commit()
+        admin_id = admin.id
+        target_id = target.id
+        target_role_id = target_role.id
+
+    enable_auth(app, FakeVerifier({"sub": str(auth_user_id)}))
+    response = client.patch(
+        f"/api/catalogo/trabajadores/{target_id}/rol-principal",
+        headers={
+            "Authorization": "Bearer valido",
+            "X-Actor-Id": str(target_id),
+        },
+        json={"rol_operativo_id": target_role_id},
+    )
+
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["rol_principal"]["id"] == target_role_id
+    with app.app_context():
+        event = ScmEvento.query.filter_by(
+            aggregate_type="TRABAJADOR_ROL_PRINCIPAL",
+            aggregate_id=str(target_id),
+        ).one()
+        assert event.actor_id == admin_id
+        assert event.actor_id != target_id

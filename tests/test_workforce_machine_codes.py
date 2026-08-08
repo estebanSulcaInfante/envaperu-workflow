@@ -1,17 +1,33 @@
 from app.extensions import db
 from app.models.maquina import TipoMaquina
+from app.models.scm_catalogos import ScmCapacidad
+from app.models.trabajador import Trabajador
 
 
-def test_trabajador_code_is_automatic_and_immutable(client):
+def _admin_headers(app):
+    with app.app_context():
+        actor = Trabajador.query.filter_by(codigo='TRB-01').one()
+        capability = ScmCapacidad(
+            codigo='AUTORIZACION_SCM_ADMINISTRAR',
+            nombre='Administrar autorizaciones SCM',
+        )
+        actor.roles[0].capacidades.append(capability)
+        db.session.add(capability)
+        db.session.commit()
+        return {'X-Actor-Id': str(actor.id)}
+
+
+def test_trabajador_code_is_automatic_and_immutable(client, app):
+    headers = _admin_headers(app)
     created = client.post('/api/catalogo/trabajadores', json={
         'nombres': 'Ana',
         'apellidos': 'Prueba',
-    })
+    }, headers=headers)
     assert created.status_code == 201, created.get_json()
     worker = created.get_json()
     assert worker['codigo'] == 'TRB-000001'
 
-    manual = client.post('/api/catalogo/trabajadores', json={
+    manual = client.post('/api/catalogo/trabajadores', headers=headers, json={
         'codigo': 'TRB-MANUAL',
         'nombres': 'Manual',
         'apellidos': 'No permitido',
@@ -22,6 +38,7 @@ def test_trabajador_code_is_automatic_and_immutable(client):
     changed = client.put(
         f"/api/catalogo/trabajadores/{worker['id']}",
         json={'codigo': 'TRB-999999'},
+        headers=headers,
     )
     assert changed.status_code == 400
     assert changed.get_json()['codigo'] == 'CODIGO_INMUTABLE'

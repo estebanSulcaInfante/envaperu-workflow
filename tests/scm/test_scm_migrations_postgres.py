@@ -28,7 +28,8 @@ CATALOG_COUNTER_REVISION = "b31f9a2c7d04"
 LINEA_FAMILIA_REVISION = "c42d8e6f1a03"
 LEGACY_ADOPTION_TARGET = LINEA_FAMILIA_REVISION
 WORK_COLOR_REVISION = "f78a7b3c9d20"
-HEAD_REVISION = WORK_COLOR_REVISION
+WORKSPACE_ROLE_REVISION = "f79b8c4d0e31"
+HEAD_REVISION = WORKSPACE_ROLE_REVISION
 
 
 def _isolated_postgres_url():
@@ -195,6 +196,7 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 "scm_trabajo_ot",
                 "scm_trabajo_color",
                 "scm_asignacion_personal_trabajo_ot",
+                "scm_rol_workspace_preferencia",
             } <= tables
             assert "inventario_manga" not in tables
             assert "movimiento_kardex" not in tables

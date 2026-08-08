@@ -112,9 +112,10 @@ def _authorize_request(actor):
     path = request.path
     method = request.method
 
-    if path == "/api/catalogo/roles-operativos" and not actor.tiene_capacidad(
-        "AUTORIZACION_SCM_ADMINISTRAR"
-    ):
+    if path.startswith((
+        "/api/catalogo/roles-operativos",
+        "/api/catalogo/capacidades",
+    )) and not actor.tiene_capacidad("AUTORIZACION_SCM_ADMINISTRAR"):
         return _error(
             "CAPABILITY_REQUIRED",
             "Esta acción requiere administrar autorizaciones SCM.",

@@ -4,6 +4,7 @@ import os
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 import pytest
+from sqlalchemy import text
 from app import create_app, db
 
 @pytest.fixture
@@ -50,6 +51,12 @@ def app():
         db.session.commit()
 
         yield app
+        # One contract test enables SQLite FK enforcement on the shared
+        # in-memory connection. Disable it before dropping the full metadata;
+        # the production schema contains an intentional cyclic FK between OT
+        # header/context tables that SQLite cannot topologically drop.
+        db.session.execute(text("PRAGMA foreign_keys = OFF"))
+        db.session.commit()
         db.session.remove()
         db.drop_all()
 
