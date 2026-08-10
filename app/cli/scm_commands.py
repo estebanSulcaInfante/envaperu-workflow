@@ -1,6 +1,16 @@
-import click
+from datetime import date
+import json
 
+import click
+from flask import current_app
+from sqlalchemy import text
+
+from app.extensions import db
 from app.services.scm_configuration import ensure_initial_scm_configuration
+from app.services.scm_demo_seed_service import (
+    LocalDemoSeedError,
+    seed_alcancia_pablo_demo,
+)
 
 
 def register_scm_commands(app):
@@ -15,3 +25,44 @@ def register_scm_commands(app):
             f"categorias={result.categorias_creadas} "
             f"relaciones={result.relaciones_creadas}"
         )
+
+    @app.cli.command("seed-demo-alcancia-pablo")
+    @click.option(
+        "--confirm-local",
+        is_flag=True,
+        help="Confirma que el destino es una base UAT local descartable.",
+    )
+    @click.option(
+        "--fecha-operativa",
+        type=click.DateTime(formats=["%Y-%m-%d"]),
+        default=None,
+        help="Fecha de la OT mock en formato AAAA-MM-DD.",
+    )
+    def seed_demo_alcancia_pablo(confirm_local, fecha_operativa):
+        """Crea el escenario local Alcancia Pablo sin datos de pesaje."""
+        if not confirm_local:
+            raise click.ClickException(
+                "Use --confirm-local; este comando solo admite una base UAT local."
+            )
+        try:
+            connection_database = db.session.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+            migration_revision = db.session.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            result = seed_alcancia_pablo_demo(
+                db.session,
+                database_url=current_app.config["SQLALCHEMY_DATABASE_URI"],
+                connection_database=connection_database,
+                migration_revision=migration_revision,
+                operational_date=(
+                    fecha_operativa.date() if fecha_operativa else date.today()
+                ),
+            )
+        except LocalDemoSeedError as error:
+            raise click.ClickException(str(error)) from error
+        click.echo(json.dumps({
+            "status": "SCM_DEMO_ALCANCIA_OK",
+            **result,
+        }, ensure_ascii=False, sort_keys=True))

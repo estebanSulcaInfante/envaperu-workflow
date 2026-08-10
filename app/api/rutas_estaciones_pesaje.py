@@ -36,7 +36,9 @@ from app.services.legacy_continuity import (
 )
 from app.services.scm_ot_service import (
     acknowledge_station_print_job,
+    claim_station_print_job,
     get_station_print_job,
+    list_station_print_jobs,
 )
 from app.services.scm_service_support import ScmServiceError
 from app.services.scm_weighing_service import (
@@ -320,6 +322,26 @@ def manga_label_print_payload(label_id):
 
 
 @integration_station_bp.get(
+    "/stations/<station_id>/print-jobs"
+)
+@require_station_auth
+def station_print_jobs(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(list_station_print_jobs(
+            db.session,
+            station_id=station_id,
+            status=request.args.get("status", "PENDING"),
+            limit=request.args.get("limit", 20),
+        ))
+    except ScmServiceError as exc:
+        db.session.rollback()
+        return jsonify({"error": exc.to_dict()}), exc.status_code
+
+
+@integration_station_bp.get(
     "/stations/<station_id>/print-jobs/<uuid:print_job_id>"
 )
 @require_station_auth
@@ -329,6 +351,25 @@ def station_print_job(station_id, print_job_id):
         return error
     try:
         return jsonify(get_station_print_job(
+            db.session,
+            station_id=station_id,
+            print_job_id=print_job_id,
+        ))
+    except ScmServiceError as exc:
+        db.session.rollback()
+        return jsonify({"error": exc.to_dict()}), exc.status_code
+
+
+@integration_station_bp.post(
+    "/stations/<station_id>/print-jobs/<uuid:print_job_id>/claim"
+)
+@require_station_auth
+def station_print_job_claim(station_id, print_job_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(claim_station_print_job(
             db.session,
             station_id=station_id,
             print_job_id=print_job_id,

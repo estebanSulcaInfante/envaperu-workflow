@@ -6,6 +6,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.models.registro import RegistroDiarioProduccion
 from app.models.scm_auditoria import ScmEvento
@@ -29,7 +30,12 @@ from app.models.scm_rutas import ScmCentroTrabajo, ScmOperacionRuta
 from app.models.scm_warehouse import ScmExistenciaManga
 from app.models.trabajador import Trabajador
 from app.services.catalog_code_generator import generar_codigo_catalogo
-from app.services.scm_ot_service import _complete_operation, _reserve_operation
+from app.services.scm_ot_service import (
+    _batch_ot_serialization_context,
+    _complete_operation,
+    _reserve_operation,
+    _serialize_ot,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -216,13 +222,10 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
                     "La operación de ruta no permite ejecución concurrente.",
                     status_code=422,
                 )
-            if not (
-                command["ot_fabricacion_contexto_id"]
-                or command["trabajo_color_contexto_id"]
-            ):
+            if not command["trabajo_color_contexto_id"]:
                 raise ScmServiceError(
-                    "ASSEMBLY_FABRICATION_CONTEXT_REQUIRED",
-                    "Selecciona la OT de fabricación con la que se ejecutará el prearmado.",
+                    "ASSEMBLY_COLOR_WORK_CONTEXT_REQUIRED",
+                    "Selecciona el Trabajo de color exacto para el prearmado.",
                     status_code=422,
                 )
             if command["trabajo_color_contexto_id"]:
@@ -247,6 +250,16 @@ def create_assembly_ot(session, *, actor_id, order_id, operation_id, data):
                     raise ScmServiceError(
                         "ASSEMBLY_COLOR_WORK_CONTEXT_INVALID",
                         "Selecciona un trabajo de color activo.",
+                        status_code=422,
+                    )
+                if (
+                    color_work_context.orden_operacion is None
+                    or color_work_context.orden_operacion.tipo
+                    != "FABRICACION"
+                ):
+                    raise ScmServiceError(
+                        "ASSEMBLY_COLOR_WORK_NOT_FABRICATION",
+                        "El Trabajo de color debe pertenecer a una OF.",
                         status_code=422,
                     )
                 if (
@@ -397,13 +410,45 @@ def list_assembly_ots(session, *, actor_id, order_id):
     order = _load_assembly_order(session, order_id)
     items = session.scalars(
         select(RegistroDiarioProduccion)
+        .options(
+            selectinload(RegistroDiarioProduccion.detalles),
+            selectinload(
+                RegistroDiarioProduccion.ot_fabricacion_contexto
+            ),
+        )
         .where(
             RegistroDiarioProduccion.orden_operacion_id == order.id,
             RegistroDiarioProduccion.tipo_ot == "ENSAMBLE",
         )
         .order_by(RegistroDiarioProduccion.fecha.desc(), RegistroDiarioProduccion.id.desc())
     ).all()
-    return {"items": [item.to_dict() for item in items]}
+    mangas_by_ot = {item.id: [] for item in items}
+    if mangas_by_ot:
+        for manga in session.scalars(
+            select(ScmManga)
+            .where(ScmManga.ot_id.in_(mangas_by_ot))
+            .order_by(ScmManga.ot_id, ScmManga.secuencia_ot)
+        ).all():
+            mangas_by_ot[manga.ot_id].append(manga)
+    serialization_context = _batch_ot_serialization_context(session, items)
+    return {
+        "items": [
+            _serialize_ot(
+                item,
+                mangas=mangas_by_ot[item.id],
+                assembly_context=serialization_context[
+                    "assembly_by_ot"
+                ][item.id],
+                color_context=serialization_context[
+                    "color_context_by_ot"
+                ].get(item.id),
+                output_articles_by_work=serialization_context[
+                    "output_articles_by_work"
+                ],
+            )
+            for item in items
+        ]
+    }
 
 
 def create_supply_request(session, *, actor_id, ot_id, operation_id):

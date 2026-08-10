@@ -110,6 +110,7 @@ from app.services.scm_ot_service import (
     get_fabrication_manga_plan,
     get_ot,
     list_extra_manga_requests,
+    list_control_print_jobs,
     list_ots,
     recalculate_manga_plan,
     recalculate_fabrication_manga_plan,
@@ -133,6 +134,7 @@ from app.services.scm_production_order_service import (
     get_production_plan,
     get_production_order,
     list_production_orders,
+    refresh_production_order_routes,
 )
 from app.services.scm_fabrication_order_service import (
     create_exceptional_fabrication_order,
@@ -193,6 +195,12 @@ from app.services.scm_assembly_execution_service import (
     get_assembly_manga_plan,
     request_assembly_quantity_correction,
     recalculate_assembly_manga_plan,
+)
+from app.services.scm_production_observability_service import (
+    get_production_ot_observability,
+    list_production_manga_observability,
+    list_production_ot_observability,
+    summarize_production_ot_observability,
 )
 
 
@@ -878,6 +886,18 @@ def ots_of_crear(order_id):
     )), 201
 
 
+@scm_bp.post("/ordenes-produccion/<uuid:order_id>/actualizar-rutas")
+def orden_produccion_rutas_actualizar(order_id):
+    payload = _json_body()
+    return jsonify(refresh_production_order_routes(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        order_id=order_id,
+        expected_resource_version=payload.get("version"),
+    ))
+
+
 @scm_bp.post("/ots/fabricacion")
 def ots_fabricacion_cabecera_crear():
     return jsonify(create_fabrication_ot_header(
@@ -956,6 +976,54 @@ def ots_listar():
         machine_id=request.args.get("maquina_id"),
         machine=request.args.get("maquina"),
         shift=request.args.get("turno"),
+    ))
+
+
+@scm_bp.get("/observabilidad/mangas")
+def observabilidad_mangas_listar():
+    return jsonify(list_production_manga_observability(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+
+
+@scm_bp.get("/observabilidad/trabajos-impresion")
+def observabilidad_trabajos_impresion_listar():
+    return jsonify(list_control_print_jobs(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+@scm_bp.get("/observabilidad/ots")
+def observabilidad_ots_listar():
+    return jsonify(list_production_ot_observability(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+
+@scm_bp.get("/observabilidad/ots/<uuid:public_id>")
+def observabilidad_ots_detalle(public_id):
+    return jsonify(get_production_ot_observability(
+        db.session,
+        actor_id=_actor_id(),
+        public_id=public_id,
+    ))
+
+
+@scm_bp.get("/observabilidad/resumen")
+def observabilidad_resumen():
+    filters = request.args.to_dict(flat=True)
+    granularity = filters.pop("granularidad", "DIA")
+    return jsonify(summarize_production_ot_observability(
+        db.session,
+        actor_id=_actor_id(),
+        filters=filters,
+        granularity=granularity,
     ))
 
 

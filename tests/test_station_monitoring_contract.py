@@ -258,6 +258,78 @@ def test_token_is_bound_to_one_station(client, app, provisioned_station):
     assert response.get_json()["code"] == "STATION_ID_MISMATCH"
 
 
+def test_print_job_inbox_and_claim_routes_keep_preview_read_only(
+    client,
+    provisioned_station,
+    monkeypatch,
+):
+    print_job_id = uuid.uuid4()
+    calls = []
+
+    def fake_list(_session, *, station_id, status, limit):
+        calls.append(("list", station_id, status, limit))
+        return {"print_jobs": [], "count": 0}
+
+    def fake_get(_session, *, station_id, print_job_id):
+        calls.append(("get", station_id, str(print_job_id)))
+        return {
+            "print_job_id": str(print_job_id),
+            "status": "PENDING",
+            "estado": "GENERADO",
+            "station_id": None,
+            "labels": [],
+        }
+
+    def fake_claim(_session, *, station_id, print_job_id):
+        calls.append(("claim", station_id, str(print_job_id)))
+        return {
+            "print_job_id": str(print_job_id),
+            "status": "PENDING",
+            "estado": "GENERADO",
+            "station_id": station_id,
+            "labels": [],
+        }
+
+    monkeypatch.setattr(
+        "app.api.rutas_estaciones_pesaje.list_station_print_jobs",
+        fake_list,
+    )
+    monkeypatch.setattr(
+        "app.api.rutas_estaciones_pesaje.get_station_print_job",
+        fake_get,
+    )
+    monkeypatch.setattr(
+        "app.api.rutas_estaciones_pesaje.claim_station_print_job",
+        fake_claim,
+    )
+
+    inbox = client.get(
+        f"/api/integration/v1/stations/{provisioned_station}/print-jobs"
+        "?status=PENDING&limit=20",
+        headers=_auth_headers(),
+    )
+    preview = client.get(
+        f"/api/integration/v1/stations/{provisioned_station}/print-jobs/"
+        f"{print_job_id}",
+        headers=_auth_headers(),
+    )
+
+    assert inbox.status_code == 200
+    assert inbox.get_json() == {"print_jobs": [], "count": 0}
+    assert preview.status_code == 200
+    assert preview.get_json()["station_id"] is None
+    assert [item[0] for item in calls] == ["list", "get"]
+
+    claimed = client.post(
+        f"/api/integration/v1/stations/{provisioned_station}/print-jobs/"
+        f"{print_job_id}/claim",
+        headers=_auth_headers(),
+    )
+    assert claimed.status_code == 200
+    assert claimed.get_json()["station_id"] == provisioned_station
+    assert calls[-1][0] == "claim"
+
+
 def test_late_sequence_is_recorded_without_replacing_current_state(
     client,
     app,

@@ -9,15 +9,16 @@ import uuid
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, func, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 
 from app.models.lote import LoteSalidaPiezaColor
 from app.models.maquina import Maquina
 from app.models.orden import OrdenProduccion
 from app.models.registro import RegistroDiarioProduccion
 from app.models.producto import ColorProduccion
-from app.models.scm_articulos import ScmArticuloPiezaColor
+from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
 from app.models.scm_empaque import (
     ScmArticuloPerfil,
@@ -39,12 +40,15 @@ from app.models.scm_ot import (
     ScmTrabajoOt,
     utc_now,
 )
+from app.models.scm_internal_supply import ScmSolicitudAbastecimiento
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
     ScmOrdenOperacion,
+    ScmOrdenOperacionSalida,
 )
 from app.models.trabajador import Trabajador
 from app.services.catalog_code_generator import generar_codigo_catalogo
+from app.services.scm_color_identity import serialize_color_identity
 from app.services.scm_packaging_service import calculate_packaging_capacity
 from app.services.scm_service_support import (
     ScmServiceError,
@@ -164,6 +168,9 @@ def _parse_date(value):
 def _compact_number(value):
     number = Decimal(value)
     return format(number.normalize(), "f")
+
+
+_SERIALIZATION_CONTEXT_UNSET = object()
 
 
 def _manga_code(op_number, ot_code, sequence):
@@ -330,8 +337,61 @@ def _serialize_person_assignment(item):
     }
 
 
-def _serialize_color_work(work):
+def _serialize_article_summary(article):
+    if article is None:
+        return None
+    return {
+        "id": article.id,
+        "codigo": article.codigo,
+        "nombre": article.nombre,
+        "clase": article.clase,
+        "unidad": article.unidad_base,
+    }
+
+
+def _deduplicated_output_articles(outputs):
+    articles = []
+    seen = set()
+    for output in outputs:
+        article = output.articulo
+        if article is None or article.id in seen:
+            continue
+        seen.add(article.id)
+        articles.append(_serialize_article_summary(article))
+    return articles
+
+
+def _work_output_articles(work):
     color = work.trabajo_color
+    run_outputs = (
+        list(color.corrida.salidas)
+        if color is not None and color.corrida is not None
+        else []
+    )
+    if run_outputs:
+        return _deduplicated_output_articles(run_outputs)
+    operation_outputs = (
+        list(work.orden_operacion.salidas)
+        if work.orden_operacion is not None
+        else []
+    )
+    return _deduplicated_output_articles(operation_outputs)
+
+
+def _serialize_color_work(work, *, output_articles=None):
+    color = work.trabajo_color
+    catalog_color = (
+        color.corrida.color_produccion
+        if color and color.corrida else None
+    )
+    color_identity = serialize_color_identity(
+        catalog_color,
+        color_id=color.color_id_snapshot if color else None,
+        name_snapshot=color.color_nombre_snapshot if color else None,
+    )
+    color_name = color_identity["nombre"] if color_identity else None
+    active_assignment = _active_work_assignment(work)
+    current_assignment = _current_or_planned_work_assignment(work)
     return {
         "id": str(work.id),
         "codigo": work.codigo,
@@ -353,7 +413,15 @@ def _serialize_color_work(work):
         "corrida_codigo": (
             color.corrida.codigo if color and color.corrida else None
         ),
-        "color": color.color_nombre_snapshot if color else None,
+        "color": color_name,
+        "color_nombre": color_name,
+        "color_hex": color_identity["hex"] if color_identity else None,
+        "color_identidad": color_identity,
+        "articulos_salida": (
+            output_articles
+            if output_articles is not None
+            else _work_output_articles(work)
+        ),
         "cantidad_objetivo_un": _compact_number(
             work.cantidad_objetivo_un
         ),
@@ -371,28 +439,223 @@ def _serialize_color_work(work):
             for item in work.asignaciones_personal
         ],
         "asignacion_activa": (
-            _serialize_person_assignment(_active_work_assignment(work))
-            if _active_work_assignment(work) else None
+            _serialize_person_assignment(active_assignment)
+            if active_assignment else None
+        ),
+        "asignacion_vigente": (
+            _serialize_person_assignment(current_assignment)
+            if current_assignment else None
         ),
         "mangas": [_serialize_manga(item) for item in work.mangas],
     }
 
 
-def _serialize_ot(ot, *, mangas=None):
+def _serialize_assembly_order_context(order):
+    if order is None:
+        return None
+    output = order.salidas[0] if order.salidas else None
+    return {
+        "id": str(order.id),
+        "codigo": order.codigo,
+        "salida": (
+            {
+                "articulo": _serialize_article_summary(output.articulo),
+                "cantidad_objetivo": _compact_number(
+                    output.cantidad_objetivo
+                ),
+            }
+            if output is not None
+            else None
+        ),
+    }
+
+
+def _serialize_supply_summary(request):
+    if request is None:
+        return None
+    return {
+        "codigo": request.codigo,
+        "estado": request.estado,
+    }
+
+
+def _batch_work_output_articles(session, works):
+    works_by_id = {work.id: work for work in works if work is not None}
+    if not works_by_id:
+        return {}
+    metadata = session.execute(
+        select(
+            ScmTrabajoOt.id,
+            ScmTrabajoOt.orden_operacion_id,
+            ScmTrabajoColor.corrida_fabricacion_id,
+        )
+        .outerjoin(
+            ScmTrabajoColor,
+            ScmTrabajoColor.trabajo_ot_id == ScmTrabajoOt.id,
+        )
+        .where(ScmTrabajoOt.id.in_(works_by_id))
+    ).all()
+    run_ids = {
+        row.corrida_fabricacion_id
+        for row in metadata
+        if row.corrida_fabricacion_id is not None
+    }
+    operation_ids = {row.orden_operacion_id for row in metadata}
+    filters = []
+    if run_ids:
+        filters.append(
+            ScmOrdenOperacionSalida.corrida_fabricacion_id.in_(run_ids)
+        )
+    if operation_ids:
+        filters.append(
+            ScmOrdenOperacionSalida.orden_operacion_id.in_(operation_ids)
+        )
+    outputs = session.scalars(
+        select(ScmOrdenOperacionSalida)
+        .options(selectinload(ScmOrdenOperacionSalida.articulo))
+        .where(or_(*filters))
+        .order_by(ScmOrdenOperacionSalida.id)
+    ).all() if filters else []
+    by_run = {}
+    by_operation = {}
+    for output in outputs:
+        by_operation.setdefault(output.orden_operacion_id, []).append(output)
+        if output.corrida_fabricacion_id is not None:
+            by_run.setdefault(output.corrida_fabricacion_id, []).append(output)
+    return {
+        row.id: _deduplicated_output_articles(
+            by_run.get(row.corrida_fabricacion_id)
+            or by_operation.get(row.orden_operacion_id, [])
+        )
+        for row in metadata
+    }
+
+
+def _batch_ot_serialization_context(session, items):
+    assembly_items = [item for item in items if item.tipo_ot == "ENSAMBLE"]
+    order_ids = {
+        item.orden_operacion_id
+        for item in assembly_items
+        if item.orden_operacion_id is not None
+    }
+    orders_by_id = {}
+    if order_ids:
+        orders = session.scalars(
+            select(ScmOrdenOperacion)
+            .options(
+                selectinload(ScmOrdenOperacion.salidas).selectinload(
+                    ScmOrdenOperacionSalida.articulo
+                )
+            )
+            .where(ScmOrdenOperacion.id.in_(order_ids))
+        ).all()
+        orders_by_id = {order.id: order for order in orders}
+    requests_by_ot = {}
+    assembly_ot_ids = {item.id for item in assembly_items}
+    if assembly_ot_ids:
+        requests = session.scalars(
+            select(ScmSolicitudAbastecimiento).where(
+                ScmSolicitudAbastecimiento.orden_trabajo_id.in_(
+                    assembly_ot_ids
+                )
+            )
+        ).all()
+        requests_by_ot = {
+            request.orden_trabajo_id: request for request in requests
+        }
+    assembly_by_ot = {
+        item.id: (
+            orders_by_id.get(item.orden_operacion_id),
+            requests_by_ot.get(item.id),
+        )
+        for item in assembly_items
+    }
+
+    context_ids = {
+        item.trabajo_color_contexto_id
+        for item in items
+        if item.trabajo_color_contexto_id is not None
+    }
+    context_works = session.scalars(
+        select(ScmTrabajoOt).where(ScmTrabajoOt.id.in_(context_ids))
+    ).all() if context_ids else []
+    context_by_id = {work.id: work for work in context_works}
+    color_context_by_ot = {
+        item.id: context_by_id.get(item.trabajo_color_contexto_id)
+        for item in items
+    }
+    all_works = {
+        work.id: work
+        for item in items
+        for work in item.trabajos_ot
+        if work.tipo == "COLOR"
+    }
+    all_works.update(context_by_id)
+    return {
+        "assembly_by_ot": assembly_by_ot,
+        "color_context_by_ot": color_context_by_ot,
+        "output_articles_by_work": _batch_work_output_articles(
+            session, all_works.values()
+        ),
+    }
+
+
+def _serialize_ot(
+    ot,
+    *,
+    mangas=None,
+    assembly_context=_SERIALIZATION_CONTEXT_UNSET,
+    color_context=_SERIALIZATION_CONTEXT_UNSET,
+    output_articles_by_work=None,
+):
     if mangas is None:
         mangas = ScmManga.query.filter_by(ot_id=ot.id).order_by(
             ScmManga.secuencia_ot
         ).all()
     payload = ot.to_dict()
     payload["orden_id"] = ot.orden_id
+    contextual_work = (
+        ot.trabajo_color_contexto
+        if color_context is _SERIALIZATION_CONTEXT_UNSET
+        else color_context
+    )
+    payload["trabajo_color_contexto"] = (
+        _serialize_color_work(
+            contextual_work,
+            output_articles=(
+                output_articles_by_work.get(contextual_work.id, [])
+                if output_articles_by_work is not None
+                else None
+            ),
+        )
+        if contextual_work is not None
+        else None
+    )
     payload["mangas"] = [_serialize_manga(manga) for manga in mangas]
     color_works = [
         item for item in ot.trabajos_ot if item.tipo == "COLOR"
     ]
     payload["trabajos_color"] = [
-        _serialize_color_work(item)
+        _serialize_color_work(
+            item,
+            output_articles=(
+                output_articles_by_work.get(item.id, [])
+                if output_articles_by_work is not None
+                else None
+            ),
+        )
         for item in color_works
     ]
+    if ot.tipo_ot == "ENSAMBLE":
+        if assembly_context is _SERIALIZATION_CONTEXT_UNSET:
+            order = ot.orden_operacion
+            request = ScmSolicitudAbastecimiento.query.filter_by(
+                orden_trabajo_id=ot.id
+            ).one_or_none()
+        else:
+            order, request = assembly_context
+        payload["orden_armado"] = _serialize_assembly_order_context(order)
+        payload["abastecimiento"] = _serialize_supply_summary(request)
     if color_works:
         objective = sum(
             (Decimal(item.cantidad_objetivo_un or 0) for item in color_works),
@@ -428,42 +691,142 @@ def _serialize_label(label):
     }
 
 
-def _approved_manga_rule(session, article_id):
-    profiles = session.scalars(
-        select(ScmArticuloPerfil).where(
-            ScmArticuloPerfil.articulo_id == article_id,
-            ScmArticuloPerfil.activo.is_(True),
-            ScmArticuloPerfil.es_predeterminado.is_(True),
-        )
+def _packaging_rule_diagnostic(session, article_id):
+    article = session.get(ScmArticulo, article_id)
+    profile_links = session.scalars(
+        select(ScmArticuloPerfil)
+        .options(selectinload(ScmArticuloPerfil.perfil))
+        .where(ScmArticuloPerfil.articulo_id == article_id)
+        .order_by(ScmArticuloPerfil.id)
     ).all()
+    active_links = [
+        item
+        for item in profile_links
+        if item.activo and item.perfil is not None and item.perfil.activo
+    ]
+    default_links = [
+        item for item in active_links if item.es_predeterminado
+    ]
+    active_profile_ids = {
+        item.perfil_empacable_id for item in active_links
+    }
+    approved_rules = (
+        session.scalars(
+            select(ScmReglaEmpaqueRevision)
+            .join(ScmReglaEmpaque)
+            .join(ScmTipoContenedor)
+            .where(
+                ScmReglaEmpaque.perfil_empacable_id.in_(
+                    active_profile_ids
+                ),
+                ScmTipoContenedor.clase == "MANGA",
+                ScmTipoContenedor.activo.is_(True),
+                ScmReglaEmpaqueRevision.estado == "APROBADA",
+                ScmReglaEmpaqueRevision.medicion_fisica_probada.is_(True),
+            )
+            .order_by(ScmReglaEmpaqueRevision.id)
+        ).all()
+        if active_profile_ids
+        else []
+    )
+    default_profile_ids = {
+        item.perfil_empacable_id for item in default_links
+    }
+    default_rules = [
+        item
+        for item in approved_rules
+        if item.regla.perfil_empacable_id in default_profile_ids
+    ]
+    article_payload = {
+        "id": article_id,
+        "codigo": article.codigo if article is not None else None,
+        "nombre": article.nombre if article is not None else None,
+        "clase": article.clase if article is not None else None,
+    }
+    article_label = (
+        article.codigo if article is not None else f"Articulo #{article_id}"
+    )
+    return {
+        "article": article,
+        "article_label": article_label,
+        "profile_links": profile_links,
+        "default_links": default_links,
+        "default_rules": default_rules,
+        "details": {
+            # ``articulo_id`` y ``approved_rules`` se conservan para clientes
+            # anteriores; los bloques estructurados permiten explicar el
+            # bloqueo sin pedir al usuario que inspeccione la base de datos.
+            "articulo_id": article_id,
+            "approved_rules": len(default_rules),
+            "articulo": article_payload,
+            "perfiles": {
+                "asignados": len(profile_links),
+                "activos": len(active_links),
+                "predeterminados_activos": len(default_links),
+                "items": [
+                    {
+                        "perfil_empacable_id": item.perfil_empacable_id,
+                        "codigo": (
+                            item.perfil.codigo
+                            if item.perfil is not None else None
+                        ),
+                        "nombre": (
+                            item.perfil.nombre
+                            if item.perfil is not None else None
+                        ),
+                        "asignacion_activa": item.activo,
+                        "perfil_activo": bool(
+                            item.perfil is not None and item.perfil.activo
+                        ),
+                        "es_predeterminado": item.es_predeterminado,
+                    }
+                    for item in profile_links
+                ],
+            },
+            "reglas": {
+                "manga_aprobadas_para_perfiles_activos": len(
+                    approved_rules
+                ),
+                "manga_aprobadas_para_predeterminado": len(
+                    default_rules
+                ),
+                "medicion_fisica_requerida": True,
+            },
+            "accion": {
+                "etiqueta": f"Revisar empaque de {article_label}",
+                "ruta": (
+                    "/datos-maestros/ingenieria-scm"
+                    f"?tab=empaque&articulo={article_id}"
+                ),
+                "requiere_validacion_fisica": True,
+            },
+        },
+    }
+
+
+def _approved_manga_rule(session, article_id):
+    diagnostic = _packaging_rule_diagnostic(session, article_id)
+    profiles = diagnostic["default_links"]
     if len(profiles) != 1:
         raise ScmServiceError(
             "PACKAGING_RULE_MISSING",
-            "La salida requiere exactamente un perfil de empaque predeterminado.",
+            (
+                f"{diagnostic['article_label']} requiere exactamente un "
+                "perfil de empaque activo y predeterminado."
+            ),
             status_code=422,
-            details={"articulo_id": article_id},
+            details=diagnostic["details"],
         )
-    rules = session.scalars(
-        select(ScmReglaEmpaqueRevision)
-        .join(ScmReglaEmpaque)
-        .join(ScmTipoContenedor)
-        .where(
-            ScmReglaEmpaque.perfil_empacable_id
-            == profiles[0].perfil_empacable_id,
-            ScmTipoContenedor.clase == "MANGA",
-            ScmTipoContenedor.activo.is_(True),
-            ScmReglaEmpaqueRevision.estado == "APROBADA",
-        )
-    ).all()
+    rules = diagnostic["default_rules"]
     if len(rules) != 1:
         raise ScmServiceError(
             "PACKAGING_RULE_MISSING",
-            "La salida requiere exactamente una regla MANGA aprobada.",
+            (
+                f"{diagnostic['article_label']} requiere exactamente una "
+                "regla MANGA aprobada y validada fisicamente."
+            ),
             status_code=422,
-            details={
-                "articulo_id": article_id,
-                "approved_rules": len(rules),
-            },
+            details=diagnostic["details"],
         )
     return profiles[0], rules[0]
 
@@ -1457,7 +1820,10 @@ def add_color_work(
         run = session.scalar(
             select(ScmCorridaFabricacion)
             .where(ScmCorridaFabricacion.id == run_id)
-            .with_for_update()
+            # ColorProduccion usa eager LEFT JOIN. PostgreSQL no permite
+            # FOR UPDATE sobre el lado nullable de ese join; el agregado que
+            # se modifica y debe bloquearse es exclusivamente la corrida.
+            .with_for_update(of=ScmCorridaFabricacion)
         )
         if run is None or run.estado not in ("LIBERADA", "EN_EJECUCION"):
             raise ScmServiceError(
@@ -2727,8 +3093,15 @@ def list_ots(
     shift=None,
 ):
     load_actor(session, actor_id, capability="OT_VER")
-    statement = select(RegistroDiarioProduccion).where(
-        RegistroDiarioProduccion.codigo_ot_sintetico.is_(False)
+    statement = (
+        select(RegistroDiarioProduccion)
+        .options(
+            selectinload(RegistroDiarioProduccion.detalles),
+            selectinload(
+                RegistroDiarioProduccion.ot_fabricacion_contexto
+            ),
+        )
+        .where(RegistroDiarioProduccion.codigo_ot_sintetico.is_(False))
     )
     normalized_type = str(tipo_ot or "").strip().upper()
     if normalized_type and normalized_type not in ("FABRICACION", "ENSAMBLE"):
@@ -2815,9 +3188,22 @@ def list_ots(
             .order_by(ScmManga.ot_id, ScmManga.secuencia_ot)
         ).all():
             mangas_by_ot[manga.ot_id].append(manga)
+    serialization_context = _batch_ot_serialization_context(session, items)
     return {
         "items": [
-            _serialize_ot(item, mangas=mangas_by_ot[item.id])
+            _serialize_ot(
+                item,
+                mangas=mangas_by_ot[item.id],
+                assembly_context=serialization_context[
+                    "assembly_by_ot"
+                ].get(item.id, (None, None)),
+                color_context=serialization_context[
+                    "color_context_by_ot"
+                ].get(item.id),
+                output_articles_by_work=serialization_context[
+                    "output_articles_by_work"
+                ],
+            )
             for item in items
         ]
     }
@@ -3626,8 +4012,202 @@ def replace_prelabel(
         raise
 
 
+def _print_job_status(job):
+    return {
+        "GENERADO": "PENDING",
+        "PARCIAL": "PARTIAL",
+        "PROCESADO": "PRINTED",
+        "FALLIDO": "FAILED",
+    }.get(job.estado, "FAILED")
+
+
+def _serialize_print_job(job):
+    return {
+        "print_job_id": str(job.public_id),
+        "status": _print_job_status(job),
+        "estado": job.estado,
+        "station_id": job.station_id,
+        "plantilla_version": job.plantilla_version,
+        "payload_hash": job.payload_hash,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "processed_at": (
+            job.processed_at.isoformat() if job.processed_at else None
+        ),
+        "labels": [_serialize_label(label) for label in job.etiquetas],
+    }
+
+
+def list_control_print_jobs(session, *, actor_id, filters=None):
+    """Read-only central outbox for production supervisors.
+
+    Unlike the station inbox this view never claims a job and does not hide
+    jobs already assigned to another station.
+    """
+    load_actor(session, actor_id, capability="OT_VER")
+    filters = filters or {}
+    normalized_status = str(filters.get("status") or "PENDING").strip().upper()
+    normalized_type = str(filters.get("tipo") or "ALL").strip().upper()
+    allowed_statuses = {"PENDING", "PARTIAL", "PRINTED", "FAILED", "ALL"}
+    if normalized_status not in allowed_statuses:
+        raise ScmServiceError(
+            "INVALID_PRINT_JOB_STATUS",
+            "El estado de impresion no es valido.",
+            status_code=400,
+        )
+    if normalized_type not in {"PREPESAJE", "POSTPESAJE", "ALL"}:
+        raise ScmServiceError(
+            "INVALID_PRINT_JOB_TYPE",
+            "El tipo de etiqueta no es valido.",
+            status_code=400,
+        )
+    try:
+        limit = int(filters.get("limit") or 50)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "INVALID_LIMIT", "El limite debe ser numerico.", status_code=400,
+        ) from error
+    if not 1 <= limit <= 100:
+        raise ScmServiceError(
+            "INVALID_LIMIT", "El limite debe estar entre 1 y 100.", status_code=400,
+        )
+
+    query = (
+        select(ScmTrabajoImpresionManga)
+        .options(
+            selectinload(ScmTrabajoImpresionManga.etiquetas)
+            .selectinload(ScmEtiquetaManga.manga)
+        )
+        .order_by(
+            ScmTrabajoImpresionManga.created_at.desc(),
+            ScmTrabajoImpresionManga.public_id.desc(),
+        )
+        .limit(limit)
+    )
+    if normalized_status == "PENDING":
+        query = query.where(
+            ScmTrabajoImpresionManga.estado.in_(("GENERADO", "PARCIAL", "FALLIDO"))
+        )
+    elif normalized_status != "ALL":
+        query = query.where(
+            ScmTrabajoImpresionManga.estado
+            == {"PARTIAL": "PARCIAL", "PRINTED": "PROCESADO", "FAILED": "FALLIDO"}[
+                normalized_status
+            ]
+        )
+    if normalized_type != "ALL":
+        query = query.where(
+            ScmTrabajoImpresionManga.etiquetas.any(
+                ScmEtiquetaManga.tipo == normalized_type
+            )
+        )
+    search = str(filters.get("q") or "").strip()
+    if search:
+        like = f"%{search}%"
+        query = query.where(
+            or_(
+                ScmTrabajoImpresionManga.etiquetas.any(
+                    ScmEtiquetaManga.manga.has(ScmManga.codigo.ilike(like))
+                ),
+                ScmTrabajoImpresionManga.etiquetas.any(
+                    ScmEtiquetaManga.public_id.cast(String).ilike(like)
+                ),
+            )
+        )
+    jobs = session.scalars(query).all()
+    items = [_serialize_print_job(job) for job in jobs]
+    return {
+        "items": items,
+        "count": len(items),
+        "as_of": utc_now().isoformat(),
+    }
+
+def list_station_print_jobs(
+    session, *, station_id, status="PENDING", limit=20
+):
+    """List PREPESAJE jobs visible to one station without claiming them.
+
+    ``PENDING`` is an actionable inbox: it includes never-printed, partial and
+    failed jobs while excluding fully printed jobs. Exact status filters remain
+    available for diagnostics and history.
+    """
+    normalized_status = str(status or "PENDING").strip().upper()
+    allowed_statuses = {"PENDING", "PARTIAL", "PRINTED", "FAILED", "ALL"}
+    if normalized_status not in allowed_statuses:
+        raise ScmServiceError(
+            "INVALID_PRINT_JOB_STATUS",
+            "El estado de bandeja de impresion no es valido.",
+            status_code=400,
+        )
+    try:
+        effective_limit = int(limit)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "INVALID_LIMIT",
+
+
+            "El limite de la bandeja debe ser numerico.",
+            status_code=400,
+        ) from error
+    if not 1 <= effective_limit <= 100:
+        raise ScmServiceError(
+            "INVALID_LIMIT",
+            "El limite de la bandeja debe estar entre 1 y 100.",
+            status_code=400,
+        )
+
+    query = (
+        select(ScmTrabajoImpresionManga)
+        .where(
+            ScmTrabajoImpresionManga.etiquetas.any(
+                ScmEtiquetaManga.tipo == "PREPESAJE"
+            ),
+            or_(
+                ScmTrabajoImpresionManga.station_id.is_(None),
+                ScmTrabajoImpresionManga.station_id == station_id,
+            ),
+        )
+        .options(
+            selectinload(
+                ScmTrabajoImpresionManga.etiquetas
+            ).selectinload(ScmEtiquetaManga.manga)
+        )
+        .order_by(
+            ScmTrabajoImpresionManga.created_at.desc(),
+            ScmTrabajoImpresionManga.public_id.desc(),
+        )
+        .limit(effective_limit)
+    )
+    if normalized_status == "PENDING":
+        query = query.where(
+            ScmTrabajoImpresionManga.estado.in_(
+                ("GENERADO", "PARCIAL", "FALLIDO")
+            )
+        )
+    elif normalized_status != "ALL":
+        query = query.where(
+            ScmTrabajoImpresionManga.estado
+            == {
+                "PARTIAL": "PARCIAL",
+                "PRINTED": "PROCESADO",
+                "FAILED": "FALLIDO",
+            }[normalized_status]
+        )
+    jobs = session.scalars(query).all()
+    serialized = [_serialize_print_job(job) for job in jobs]
+    return {"print_jobs": serialized, "count": len(serialized)}
+
+
 def get_station_print_job(session, *, station_id, print_job_id):
-    job = session.get(ScmTrabajoImpresionManga, print_job_id)
+    """Return preview data. This read must never reserve the print job."""
+    job = session.scalar(
+        select(ScmTrabajoImpresionManga)
+        .where(ScmTrabajoImpresionManga.public_id == print_job_id)
+        .options(
+            selectinload(
+                ScmTrabajoImpresionManga.etiquetas
+            ).selectinload(ScmEtiquetaManga.manga)
+        )
+    )
     if job is None:
         raise ScmServiceError(
             "PRINT_JOB_NOT_FOUND",
@@ -3640,23 +4220,48 @@ def get_station_print_job(session, *, station_id, print_job_id):
             "El trabajo pertenece a otra estacion.",
             status_code=403,
         )
+    return _serialize_print_job(job)
+
+
+def claim_station_print_job(session, *, station_id, print_job_id):
+    """Atomically reserve a job immediately before physical printing."""
+    job = session.scalar(
+        select(ScmTrabajoImpresionManga)
+        .where(ScmTrabajoImpresionManga.public_id == print_job_id)
+        .with_for_update()
+    )
+    if job is None:
+        raise ScmServiceError(
+            "PRINT_JOB_NOT_FOUND",
+            "El trabajo de impresion no existe.",
+            status_code=404,
+        )
+    if job.station_id not in (None, station_id):
+        raise ScmServiceError(
+            "PRINT_JOB_ALREADY_CLAIMED",
+            "El trabajo ya fue reservado por otra estacion.",
+            status_code=409,
+        )
+    if job.estado == "PROCESADO":
+        raise ScmServiceError(
+            "PRINT_JOB_ALREADY_PROCESSED",
+            "El trabajo ya fue impreso completamente.",
+            status_code=409,
+        )
     if job.station_id is None:
         job.station_id = station_id
         session.commit()
-    labels = [_serialize_label(label) for label in job.etiquetas]
-    return {
-        "print_job_id": str(job.public_id),
-        "estado": job.estado,
-        "plantilla_version": job.plantilla_version,
-        "payload_hash": job.payload_hash,
-        "labels": labels,
-    }
+    return _serialize_print_job(job)
 
 
 def acknowledge_station_print_job(
     session, *, station_id, print_job_id, data
 ):
-    job = session.get(ScmTrabajoImpresionManga, print_job_id)
+    job = session.scalar(
+        select(ScmTrabajoImpresionManga)
+        .where(ScmTrabajoImpresionManga.public_id == print_job_id)
+        .with_for_update()
+    )
     if job is None:
         raise ScmServiceError(
             "PRINT_JOB_NOT_FOUND",

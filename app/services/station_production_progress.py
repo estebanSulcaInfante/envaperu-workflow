@@ -12,6 +12,7 @@ from flask import current_app
 from jsonschema import Draft202012Validator, FormatChecker
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import load_only
 
 from app.extensions import db
 from app.models.estacion_pesaje import (
@@ -383,7 +384,21 @@ def _monthly_progress_summary(
         .all()
     )
 
-    capture_query = EstacionPesajeLegacy.query.filter(
+    capture_query = EstacionPesajeLegacy.query.options(
+        load_only(
+            EstacionPesajeLegacy.station_id,
+            EstacionPesajeLegacy.op_normalized,
+            EstacionPesajeLegacy.ot_normalized,
+            EstacionPesajeLegacy.mold_normalized,
+            EstacionPesajeLegacy.color_normalized,
+            EstacionPesajeLegacy.machine_normalized,
+            EstacionPesajeLegacy.shift_normalized,
+            EstacionPesajeLegacy.weight_kg,
+            EstacionPesajeLegacy.captured_at_utc,
+            EstacionPesajeLegacy.operational_date,
+            EstacionPesajeLegacy.imported_at_utc,
+        )
+    ).filter(
         EstacionPesajeLegacy.operational_date.between(period_start, period_end),
         EstacionPesajeLegacy.is_deleted.is_(False),
     )
@@ -495,7 +510,21 @@ def production_progress_dashboard(
         .distinct()
         .all()
     )
-    capture_query = EstacionPesajeLegacy.query.filter(
+    capture_query = EstacionPesajeLegacy.query.options(
+        load_only(
+            EstacionPesajeLegacy.station_id,
+            EstacionPesajeLegacy.op_normalized,
+            EstacionPesajeLegacy.ot_normalized,
+            EstacionPesajeLegacy.mold_normalized,
+            EstacionPesajeLegacy.color_normalized,
+            EstacionPesajeLegacy.machine_normalized,
+            EstacionPesajeLegacy.shift_normalized,
+            EstacionPesajeLegacy.weight_kg,
+            EstacionPesajeLegacy.captured_at_utc,
+            EstacionPesajeLegacy.operational_date,
+            EstacionPesajeLegacy.imported_at_utc,
+        )
+    ).filter(
         EstacionPesajeLegacy.operational_date.between(period_start, period_end),
         EstacionPesajeLegacy.is_deleted.is_(False),
     )

@@ -30,6 +30,7 @@ from app.models.scm_ot import (
     ScmEtiquetaManga,
     ScmManga,
     ScmTrabajoColor,
+    ScmTrabajoImpresionManga,
     ScmTrabajoOt,
 )
 from app.models.scm_production_orders import (
@@ -48,6 +49,7 @@ from app.models.scm_inventory import (
 from app.models.scm_warehouse import ScmExistenciaManga
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_configuration import ensure_initial_scm_configuration
+from app.services.scm_fabrication_order_service import list_fabrication_orders
 from app.services.scm_ot_service import (
     add_color_work,
     add_work_mangas,
@@ -59,7 +61,11 @@ from app.services.scm_ot_service import (
     create_fabrication_ot,
     create_ot,
     generate_prelabels,
+    get_station_print_job,
+    claim_station_print_job,
+    list_station_print_jobs,
     list_ots,
+    list_control_print_jobs,
     list_extra_manga_requests,
     recalculate_manga_plan,
     recalculate_fabrication_manga_plan,
@@ -82,6 +88,7 @@ from app.services.scm_internal_supply_service import (
     dispatch_supply,
     dispatch_supply_return,
     mark_supply_ready,
+    list_assembly_ots,
     receive_supply,
     receive_supply_return,
     request_supply_return,
@@ -324,6 +331,221 @@ def _seed_fabrication_order():
     db.session.add_all([operation, fabrication, run, canonical_output])
     db.session.commit()
     return creator, approver, operation, run, canonical_output
+
+
+def test_plan_of_sin_perfil_explica_articulo_conteos_y_accion_segura(
+    app,
+    client,
+):
+    with app.app_context():
+        creator, _approver, order, _run, output = (
+            _seed_fabrication_order()
+        )
+        article = output.articulo
+        link = ScmArticuloPerfil.query.filter_by(
+            articulo_id=article.id,
+        ).one()
+        db.session.delete(link)
+        db.session.commit()
+        actor_id = creator.id
+        order_id = order.id
+        article_id = article.id
+        article_code = article.codigo
+        article_name = article.nombre
+
+    response = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/plan-mangas/recalcular",
+        json={},
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+    )
+
+    assert response.status_code == 422
+    error = response.get_json()["error"]
+    assert error["code"] == "PACKAGING_RULE_MISSING"
+    assert article_code in error["message"]
+    assert error["details"]["articulo"] == {
+        "id": article_id,
+        "codigo": article_code,
+        "nombre": article_name,
+        "clase": "PIEZA_COLOR",
+    }
+    assert error["details"]["perfiles"] == {
+        "asignados": 0,
+        "activos": 0,
+        "predeterminados_activos": 0,
+        "items": [],
+    }
+    assert error["details"]["reglas"][
+        "manga_aprobadas_para_perfiles_activos"
+    ] == 0
+    assert error["details"]["accion"] == {
+        "etiqueta": f"Revisar empaque de {article_code}",
+        "ruta": (
+            "/datos-maestros/ingenieria-scm"
+            f"?tab=empaque&articulo={article_id}"
+        ),
+        "requiere_validacion_fisica": True,
+    }
+
+
+def test_plan_of_distingue_perfil_activo_sin_predeterminado(
+    app,
+    client,
+):
+    with app.app_context():
+        creator, _approver, order, _run, output = (
+            _seed_fabrication_order()
+        )
+        link = ScmArticuloPerfil.query.filter_by(
+            articulo_id=output.articulo_scm_id,
+        ).one()
+        link.es_predeterminado = False
+        db.session.commit()
+        actor_id = creator.id
+        order_id = order.id
+
+    response = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/plan-mangas/recalcular",
+        json={},
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+    )
+
+    assert response.status_code == 422
+    details = response.get_json()["error"]["details"]
+    assert details["perfiles"]["asignados"] == 1
+    assert details["perfiles"]["activos"] == 1
+    assert details["perfiles"]["predeterminados_activos"] == 0
+    assert details["reglas"][
+        "manga_aprobadas_para_perfiles_activos"
+    ] == 1
+
+
+def test_of_corrida_expone_identidad_humana_de_color_sin_codigo_inventado(
+    app,
+    client,
+):
+    with app.app_context():
+        creator, _approver, order, run, _output = _seed_fabrication_order()
+        color = db.session.get(ColorProduccion, run.color_produccion_id)
+        actor_id = creator.id
+        run_id = str(run.id)
+
+        response = client.get(
+            "/api/scm/v1/ordenes-fabricacion",
+            headers={"X-Actor-Id": str(actor_id)},
+        )
+        assert response.status_code == 200
+        payload = response.get_json()["items"]
+        serialized_run = next(
+            item
+            for item in payload[0]["corridas"]
+            if item["id"] == run_id
+        )
+
+        assert serialized_run["color"] == "FUCSIA C SOLIDO C"
+        assert serialized_run["color_nombre"] == "FUCSIA C SOLIDO C"
+        assert serialized_run["color_hex"] == "#E91E63"
+        assert serialized_run["color_identidad"] == {
+            "id": color.id,
+            "nombre": "FUCSIA C SOLIDO C",
+            "base": {
+                "id": color.color_base_id,
+                "nombre": "FUCSIA C",
+            },
+            "familia": {
+                "id": color.familia_color_id,
+                "nombre": "SOLIDO C",
+            },
+            "hex": "#E91E63",
+        }
+        assert "codigo" not in serialized_run["color_identidad"]
+
+        run.color_produccion_id = None
+        db.session.commit()
+        response = client.get(
+            "/api/scm/v1/ordenes-fabricacion",
+            headers={"X-Actor-Id": str(actor_id)},
+        )
+        assert response.status_code == 200
+        without_color = response.get_json()["items"][0]["corridas"][0]
+        assert without_color["color"] is None
+        assert without_color["color_nombre"] is None
+        assert without_color["color_hex"] is None
+        assert without_color["color_identidad"] is None
+
+
+def test_tablero_ot_filtrado_expone_trabajo_asignacion_vigente_y_mangas(
+    app,
+    client,
+):
+    with app.app_context():
+        creator, _approver, order, run, _output = _seed_fabrication_order()
+        plan = recalculate_fabrication_manga_plan(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={},
+        )["plan"]
+        line = plan["lineas"][0]
+        created = create_fabrication_ot(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={
+                "corrida_fabricacion_id": str(run.id),
+                "fecha_operativa": "2026-08-09",
+                "turno": "DIA",
+                "maquinista_id": creator.id,
+                "asignaciones": [{
+                    "plan_linea_id": line["id"],
+                    "cantidad_un": 150,
+                }],
+            },
+        )
+
+        response = client.get(
+            "/api/scm/v1/ots",
+            query_string={
+                "tipo_ot": "FABRICACION",
+                "fecha_operativa": "2026-08-09",
+                "turno": "DIA",
+            },
+            headers={"X-Actor-Id": str(creator.id)},
+        )
+        assert response.status_code == 200
+        listed = response.get_json()["items"]
+
+        assert [item["public_id"] for item in listed] == [
+            created["ot"]["public_id"]
+        ]
+        assert listed[0]["maquina_id"] == (
+            order.fabricacion.maquina_prevista_id
+        )
+        assert listed[0]["maquina_codigo"] == "MQ-01"
+        work = listed[0]["trabajos_color"][0]
+        assert work["asignacion_activa"] is None
+        assert work["asignacion_vigente"]["estado"] == "PREVISTA"
+        assert work["asignacion_vigente"]["trabajador_id"] == creator.id
+        assert work["color"] == "FUCSIA C SOLIDO C"
+        assert work["color_identidad"]["id"] == run.color_produccion_id
+        assert work["cantidad_objetivo_un"] == "150"
+        assert work["cantidad_confirmada_un"] == "0"
+        assert [item["estado"] for item in work["mangas"]] == [
+            "PLANIFICADA",
+            "PLANIFICADA",
+        ]
+        assert sum(
+            Decimal(item["cantidad_asignada_un"])
+            for item in work["mangas"]
+        ) == Decimal("150")
 
 
 def test_of_corrida_ot_mangas_y_etiqueta_usen_identidad_canonica(app):
@@ -722,6 +944,209 @@ def test_ot_maquina_contiene_varios_trabajos_color_y_ejecucion_exclusiva(app):
         assert first["estado"] == "PAUSADO"
 
 
+def test_listado_global_ot_armado_expone_contexto_concurrente_y_trabajos(
+    app,
+    client,
+):
+    with app.app_context():
+        creator, approver, order, run, output = _seed_fabrication_order()
+        plan = recalculate_fabrication_manga_plan(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={},
+        )["plan"]
+        line = plan["lineas"][0]
+        header = create_fabrication_ot_header(
+            db.session,
+            actor_id=creator.id,
+            operation_id=uuid4(),
+            data={
+                "maquina_id": order.fabricacion.maquina_prevista_id,
+                "fecha_operativa": "2026-08-10",
+                "turno": "DIA",
+                "maquinista_predeterminado_id": creator.id,
+            },
+        )["ot"]
+        work = add_color_work(
+            db.session,
+            actor_id=creator.id,
+            ot_id=UUID(header["public_id"]),
+            operation_id=uuid4(),
+            data={
+                "corrida_fabricacion_id": str(run.id),
+                "maquinista_id": creator.id,
+                "asignaciones": [{
+                    "plan_linea_id": line["id"],
+                    "cantidad_un": 100,
+                }],
+            },
+        )["trabajo_color"]
+        projected_order = list_fabrication_orders(
+            db.session,
+            actor_id=creator.id,
+        )["items"][0]
+        assert projected_order["rango_fechas_ot"] == {
+            "desde": "2026-08-10",
+            "hasta": "2026-08-10",
+            "cantidad": 1,
+        }
+        assert projected_order["programacion_estado"] == "PROGRAMADA"
+
+        finished_article = ScmArticulo(
+            codigo="PT-CONTEXTO-ARMADO",
+            nombre="Salida prearmada concurrente",
+            clase="PRODUCTO_TERMINADO",
+        )
+        center = ScmCentroTrabajo(
+            codigo="CTR-CONTEXTO-ARMADO",
+            nombre="Mesa concurrente",
+            tipo="PREARMADO",
+        )
+        structure = ScmEstructuraRevision(
+            articulo_resultado=finished_article,
+            numero_revision=1,
+            estado="APROBADA",
+            content_hash="8" * 64,
+            creada_por_id=creator.id,
+            aprobada_por_id=approver.id,
+            componentes=[ScmEstructuraComponente(
+                secuencia=1,
+                articulo_componente_id=output.articulo_scm_id,
+                cantidad=1,
+                unidad="UN",
+            )],
+        )
+        route = ScmRutaRevision(
+            articulo_objetivo=finished_article,
+            numero_revision=1,
+            estado="APROBADA",
+            content_hash="9" * 64,
+            creada_por_id=creator.id,
+            aprobada_por_id=approver.id,
+        )
+        db.session.add_all([finished_article, center, structure, route])
+        db.session.flush()
+        route_operation = ScmOperacionRuta(
+            ruta=route,
+            clave="PREARMAR_CONTEXTO",
+            secuencia_visible=1,
+            nombre="Prearmar junto a maquina",
+            tipo="PREARMADO",
+            executor_kind="ORDEN_OPERACION",
+            centro_trabajo=center,
+            articulo_salida=finished_article,
+            estructura_revision=structure,
+            permite_concurrente=True,
+        )
+        assembly_order = ScmOrdenOperacion(
+            codigo="OA-CONTEXTO-001",
+            tipo="ENSAMBLE",
+            origen_demanda="ORDEN_PRODUCCION",
+            estado="LIBERADA",
+            operacion_ruta_revision=route_operation,
+            operacion_ruta_hash=route.content_hash,
+            created_by_id=creator.id,
+            released_by_id=approver.id,
+            salidas=[ScmOrdenOperacionSalida(
+                articulo=finished_article,
+                cantidad_objetivo=100,
+            )],
+        )
+        db.session.add_all([route_operation, assembly_order])
+        db.session.commit()
+
+        assembly_ot = create_assembly_ot(
+            db.session,
+            actor_id=creator.id,
+            order_id=assembly_order.id,
+            operation_id=uuid4(),
+            data={
+                "fecha_operativa": "2026-08-10",
+                "turno": "DIA",
+                "centro_trabajo_id": center.id,
+                "responsable_id": creator.id,
+                "cantidad_objetivo": 100,
+                "modo_ejecucion": "CONCURRENTE",
+                "trabajo_color_contexto_id": work["id"],
+            },
+        )["ot"]
+
+        fabrication_items = list_ots(
+            db.session,
+            actor_id=creator.id,
+            tipo_ot="FABRICACION",
+            operational_date="2026-08-10",
+            shift="DIA",
+        )["items"]
+        assert fabrication_items[0]["trabajos_color"][0]["id"] == work["id"]
+        assert fabrication_items[0]["trabajos_color"][0][
+            "orden_fabricacion_codigo"
+        ] == order.codigo
+        assert fabrication_items[0]["trabajos_color"][0][
+            "articulos_salida"
+        ] == [{
+            "id": output.articulo.id,
+            "codigo": output.articulo.codigo,
+            "nombre": output.articulo.nombre,
+            "clase": output.articulo.clase,
+            "unidad": output.articulo.unidad_base,
+        }]
+
+        assembly_items = list_ots(
+            db.session,
+            actor_id=creator.id,
+            tipo_ot="ENSAMBLE",
+            operational_date="2026-08-10",
+            shift="DIA",
+        )["items"]
+        assert len(assembly_items) == 1
+        item = assembly_items[0]
+        assert item["public_id"] == assembly_ot["public_id"]
+        assert item["fecha_operativa"] == "2026-08-10"
+        assert item["turno"] == "DIA"
+        assert item["modo_ejecucion_armado"] == "CONCURRENTE"
+        assert item["centro_trabajo"]["id"] == center.id
+        assert item["responsable_id"] == creator.id
+        assert item["ot_fabricacion_contexto"]["public_id"] == header["public_id"]
+        assert item["trabajo_color_contexto_id"] == work["id"]
+        assert item["trabajo_color_contexto"]["id"] == work["id"]
+        assert item["trabajo_color_contexto"]["color"] == work["color"]
+        assert item["trabajo_color_contexto"][
+            "orden_fabricacion_codigo"
+        ] == order.codigo
+        assert item["orden_armado"] == {
+            "id": str(assembly_order.id),
+            "codigo": assembly_order.codigo,
+            "salida": {
+                "articulo": {
+                    "id": finished_article.id,
+                    "codigo": finished_article.codigo,
+                    "nombre": finished_article.nombre,
+                    "clase": finished_article.clase,
+                    "unidad": finished_article.unidad_base,
+                },
+                "cantidad_objetivo": "100",
+            },
+        }
+        assert item["abastecimiento"] is None
+
+        response = client.get(
+            "/api/scm/v1/ots",
+            query_string={
+                "tipo_ot": "ENSAMBLE",
+                "fecha_operativa": "2026-08-10",
+                "turno": "DIA",
+            },
+            headers={"X-Actor-Id": str(creator.id)},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["items"][0]["trabajo_color_contexto"][
+            "id"
+        ] == work["id"]
+
+
 def test_anular_manga_normal_prepesaje_devuelve_cupo_al_trabajo(app):
     with app.app_context():
         creator, approver, order, run, _output = _seed_fabrication_order()
@@ -962,6 +1387,131 @@ def test_trabajo_dos_up_conserva_dos_identidades(app):
         )
         assert annulled["manga"]["estado"] == "ANULADA"
         assert annulled["manga"]["etiqueta_vigente"] is None
+
+
+def test_bandeja_preview_no_reclama_y_claim_es_explicito_e_idempotente(app):
+    with app.app_context():
+        creator, _approver, order, _output = _seed_normalized_order()
+        plan = recalculate_manga_plan(
+            db.session,
+            actor_id=creator.id,
+            op_number=order.numero_op,
+            operation_id=uuid4(),
+            data={},
+        )
+        ot = create_ot(
+            db.session,
+            actor_id=creator.id,
+            op_number=order.numero_op,
+            operation_id=uuid4(),
+            data={
+                "fecha_operativa": "2026-07-28",
+                "turno": "DIA",
+                "maquinista_id": creator.id,
+                "asignaciones": [{
+                    "plan_linea_id": plan["plan"]["lineas"][0]["id"],
+                    "cantidad_un": 100,
+                }],
+            },
+        )["ot"]
+        generated = generate_prelabels(
+            db.session,
+            actor_id=creator.id,
+            manga_id=UUID(ot["mangas"][0]["public_id"]),
+            operation_id=uuid4(),
+            data={},
+        )
+        station_a = str(uuid4())
+        station_b = str(uuid4())
+        db.session.add_all([
+            EstacionPesaje(
+                station_id=station_a,
+                codigo="PESAJE-PREVIEW-A",
+                nombre="Balanza preview A",
+                ubicacion="Piloto",
+                token_hash="a" * 64,
+            ),
+            EstacionPesaje(
+                station_id=station_b,
+                codigo="PESAJE-PREVIEW-B",
+                nombre="Balanza preview B",
+                ubicacion="Piloto",
+                token_hash="b" * 64,
+            ),
+        ])
+        db.session.commit()
+        job_id = UUID(generated["print_job_id"])
+
+        listed = list_station_print_jobs(
+            db.session,
+            station_id=station_a,
+            status="PENDING",
+            limit=20,
+        )
+        assert listed["count"] == 1
+        assert listed["print_jobs"][0]["status"] == "PENDING"
+        assert listed["print_jobs"][0]["estado"] == "GENERADO"
+        assert listed["print_jobs"][0]["labels"][0]["estado"] == "GENERADA"
+        control = list_control_print_jobs(
+            db.session,
+            actor_id=creator.id,
+            filters={"status": "PENDING", "tipo": "PREPESAJE"},
+        )
+        assert control["count"] == 1
+        assert control["items"][0]["print_job_id"] == str(job_id)
+        assert control["items"][0]["labels"][0]["manga_codigo"]
+        assert control["items"][0]["station_id"] is None
+        assert control["as_of"]
+        searched = list_control_print_jobs(
+            db.session, actor_id=creator.id,
+            filters={"q": control["items"][0]["labels"][0]["manga_codigo"]},
+        )
+        assert searched["count"] == 1
+
+        first_preview = get_station_print_job(
+            db.session,
+            station_id=station_a,
+            print_job_id=job_id,
+        )
+        second_preview = get_station_print_job(
+            db.session,
+            station_id=station_b,
+            print_job_id=job_id,
+        )
+        assert first_preview == second_preview
+        assert first_preview["station_id"] is None
+        assert first_preview["status"] == "PENDING"
+        assert db.session.get(
+            ScmTrabajoImpresionManga, job_id
+        ).station_id is None
+
+        claimed = claim_station_print_job(
+            db.session,
+            station_id=station_a,
+            print_job_id=job_id,
+        )
+        replay = claim_station_print_job(
+            db.session,
+            station_id=station_a,
+            print_job_id=job_id,
+        )
+        assert claimed == replay
+        assert claimed["station_id"] == station_a
+
+        with pytest.raises(ScmServiceError) as conflict:
+            claim_station_print_job(
+                db.session,
+                station_id=station_b,
+                print_job_id=job_id,
+            )
+        assert conflict.value.code == "PRINT_JOB_ALREADY_CLAIMED"
+
+        assert list_station_print_jobs(
+            db.session,
+            station_id=station_b,
+            status="PENDING",
+            limit=20,
+        )["count"] == 0
 
 
 def test_extra_requiere_otro_actor_y_queda_listable(app):
@@ -1460,6 +2010,33 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
             data={"version": assembly_ot["version"]},
         )
         output_manga = assigned_output["mangas"][0]
+        listed = list_assembly_ots(
+            db.session,
+            actor_id=creator.id,
+            order_id=assembly_order.id,
+        )["items"]
+        listed_ot = next(
+            item for item in listed
+            if item["public_id"] == assembly_ot["public_id"]
+        )
+        assert [item["public_id"] for item in listed_ot["mangas"]] == [
+            output_manga["public_id"]
+        ]
+        assert listed_ot["orden_armado"] == {
+            "id": str(assembly_order.id),
+            "codigo": assembly_order.codigo,
+            "salida": {
+                "articulo": {
+                    "id": finished_article.id,
+                    "codigo": finished_article.codigo,
+                    "nombre": finished_article.nombre,
+                    "clase": finished_article.clase,
+                    "unidad": finished_article.unidad_base,
+                },
+                "cantidad_objetivo": "10",
+            },
+        }
+        assert listed_ot["abastecimiento"] is None
         supply = create_supply_request(
             db.session,
             actor_id=creator.id,
@@ -1522,6 +2099,18 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
                 "printer_name": "TSC",
             }]},
         )
+        listed_after_prelabel = list_assembly_ots(
+            db.session,
+            actor_id=creator.id,
+            order_id=assembly_order.id,
+        )["items"]
+        assert listed_after_prelabel[0]["mangas"][0]["estado"] == (
+            "PREETIQUETADA"
+        )
+        assert listed_after_prelabel[0]["abastecimiento"] == {
+            "codigo": supply["codigo"],
+            "estado": "RECIBIDA",
+        }
         started_ot = transition_ot(
             db.session,
             actor_id=creator.id,
@@ -1552,6 +2141,14 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
         assert ScmConfirmacionMangaArmado.query.count() == 1
         assert format(existence.cantidad_fisica, "f") == "87.000"
         assert ScmPesajeManga.query.count() == 1
+        listed_after_close = list_assembly_ots(
+            db.session,
+            actor_id=creator.id,
+            order_id=assembly_order.id,
+        )["items"]
+        assert listed_after_close[0]["mangas"][0]["estado"] == (
+            "CERRADA_ARMADO_PENDIENTE_PESAJE"
+        )
 
         correction = request_assembly_quantity_correction(
             db.session,

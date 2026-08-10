@@ -2,6 +2,8 @@ from datetime import date
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
+
 from app import db
 from app.models.scm_production_orders import (
     ScmAsignacionDemandaSuministro,
@@ -18,12 +20,15 @@ from app.services.scm_production_order_service import (
     confirm_production_plan,
 )
 from app.services.scm_fabrication_order_service import (
+    list_fabrication_orders,
     release_fabrication_order,
     update_fabrication_order,
 )
 from app.services.scm_assembly_order_service import (
+    list_assembly_orders,
     transition_assembly_order,
 )
+from app.services.scm_service_support import ScmServiceError
 
 
 def test_demand_order_can_be_covered_by_fabrication_output(app):
@@ -235,6 +240,25 @@ def test_create_and_release_exceptional_fabrication_order(
     assert created.status_code == 201
     body = created.get_json()
     assert body["codigo"] == "OF-000001"
+    assert body["fecha_necesidad"] is None
+    assert body["fecha_necesidad_fuente"] is None
+    assert body["rango_fechas_ot"] == {
+        "desde": None,
+        "hasta": None,
+        "cantidad": 0,
+    }
+    assert body["programacion_estado"] == "SIN_PROGRAMAR"
+    assert body["contexto_temporal"] == {
+        "fecha_necesidad_min": None,
+        "fecha_necesidad_max": None,
+        "fecha_necesidad_motivo": "SIN_DEMANDA_FECHADA",
+        "fecha_ot_primera": None,
+        "fecha_ot_ultima": None,
+        "programacion_estado": "SIN_JORNADA",
+        "cantidad_ot": 0,
+    }
+    assert body["started_at"] is None
+    assert body["closed_at"] is None
     assert body["corridas"][0]["salidas"][0]["cantidad_objetivo"] == (
         "100.000"
     )
@@ -256,6 +280,7 @@ def test_create_and_release_exceptional_fabrication_order(
 
 
 def test_calcular_y_confirmar_plan_crea_of_y_oa_en_borrador(app, scm_config):
+    from app.models.maquina import Maquina, TipoMaquina
     from app.models.molde import Molde, MoldePieza, Pieza
     from app.models.producto import (
         ColorBase,
@@ -544,6 +569,142 @@ def test_calcular_y_confirmar_plan_crea_of_y_oa_en_borrador(app, scm_config):
             calculated["plan"]["id"]
         )
         assert fabrication_order.propuesta_clave
+        # La fecha efectiva de la linea prevalece sobre la cabecera OP y debe
+        # propagarse tambien hacia una OF intermedia del plan multinivel.
+        demand_line.fecha_necesidad = date(2026, 8, 12)
+        from app.models.registro import RegistroDiarioProduccion
+
+        db.session.add_all([
+            RegistroDiarioProduccion(
+                codigo_ot="OT-PROJ-OF-01",
+                codigo_ot_sintetico=False,
+                estado="CERRADA",
+                tipo_ot="FABRICACION",
+                orden_operacion_id=fabrication_order.id,
+                maquina_id=1,
+                fecha=date(2026, 8, 8),
+                turno="DIA",
+                created_by_id=planner.id,
+            ),
+            RegistroDiarioProduccion(
+                codigo_ot="OT-PROJ-OF-02",
+                codigo_ot_sintetico=False,
+                estado="PLANIFICADA",
+                tipo_ot="FABRICACION",
+                orden_operacion_id=fabrication_order.id,
+                maquina_id=1,
+                fecha=date(2026, 8, 9),
+                turno="DIA",
+                created_by_id=planner.id,
+            ),
+            # Las anuladas no forman parte de la ventana programada vigente.
+            RegistroDiarioProduccion(
+                codigo_ot="OT-PROJ-OF-ANU",
+                codigo_ot_sintetico=False,
+                estado="ANULADA",
+                tipo_ot="FABRICACION",
+                orden_operacion_id=fabrication_order.id,
+                maquina_id=1,
+                fecha=date(2026, 8, 7),
+                turno="DIA",
+                created_by_id=planner.id,
+            ),
+        ])
+        db.session.commit()
+        serialized_of = list_fabrication_orders(
+            db.session,
+            actor_id=planner.id,
+        )["items"][0]
+        assert serialized_of["fecha_necesidad"] == "2026-08-12"
+        assert serialized_of["fecha_necesidad_fuente"] == {
+            "tipo": "OP",
+            "id": str(order.id),
+            "codigo": "OP-000900",
+        }
+        assert serialized_of["rango_fechas_ot"] == {
+            "desde": "2026-08-08",
+            "hasta": "2026-08-09",
+            "cantidad": 2,
+        }
+        assert serialized_of["programacion_estado"] == "PROGRAMADA"
+        assert serialized_of["contexto_temporal"] == {
+            "fecha_necesidad_min": "2026-08-12",
+            "fecha_necesidad_max": "2026-08-12",
+            "fecha_necesidad_motivo": None,
+            "fecha_ot_primera": "2026-08-08",
+            "fecha_ot_ultima": "2026-08-09",
+            "programacion_estado": "PROGRAMADA",
+            "cantidad_ot": 2,
+        }
+        planned_ot = RegistroDiarioProduccion.query.filter_by(
+            codigo_ot="OT-PROJ-OF-02",
+        ).one()
+        planned_ot.estado = "EN_EJECUCION"
+        db.session.commit()
+        assert list_fabrication_orders(
+            db.session,
+            actor_id=planner.id,
+        )["items"][0]["contexto_temporal"]["programacion_estado"] == (
+            "EN_EJECUCION"
+        )
+        planned_ot.estado = "CERRADA"
+        db.session.commit()
+        assert list_fabrication_orders(
+            db.session,
+            actor_id=planner.id,
+        )["items"][0]["contexto_temporal"]["programacion_estado"] == (
+            "CERRADA"
+        )
+        assert "started_at" in serialized_of
+        assert "closed_at" in serialized_of
+        assert serialized_of["proceso_requerido"] == "INYECCION"
+        assert serialized_of["corridas"][0]["salidas"][0]["articulo"][
+            "pieza_id"
+        ] == piece.id
+        run = fabrication_order.fabricacion.corridas[0]
+        output = run.salidas[0]
+
+        blowing_type = TipoMaquina(
+            codigo="SOPLADO-UAT",
+            nombre="Sopladora UAT",
+            proceso="SOPLADO",
+        )
+        db.session.add(blowing_type)
+        db.session.flush()
+        incompatible_machine = Maquina(
+            codigo="MQ-SOP-UAT",
+            nombre="Sopladora incompatible para inyeccion",
+            tipo_maquina_id=blowing_type.id,
+            estado="OPERATIVA",
+            activo=True,
+        )
+        db.session.add(incompatible_machine)
+        db.session.commit()
+
+        with pytest.raises(ScmServiceError) as incompatible:
+            update_fabrication_order(
+                db.session,
+                actor_id=planner.id,
+                operation_id=uuid4(),
+                operation_order_id=fabrication_order.id,
+                data={
+                    "version": fabrication_order.version,
+                    "molde_id": "ML-PLAN-FLOW",
+                    "maquina_prevista_id": incompatible_machine.id,
+                    "snapshot_horas_turno": 8,
+                    "corridas": [{
+                        "id": str(run.id),
+                        "salidas": [{"id": str(output.id)}],
+                    }],
+                },
+            )
+        assert incompatible.value.code == "MACHINE_PROCESS_INCOMPATIBLE"
+        assert incompatible.value.details["proceso_requerido"] == "INYECCION"
+
+        fabrication_order = db.session.get(
+            ScmOrdenOperacion,
+            fabrication_order.id,
+        )
         run = fabrication_order.fabricacion.corridas[0]
         output = run.salidas[0]
         configured = update_fabrication_order(
@@ -628,6 +789,81 @@ def test_calcular_y_confirmar_plan_crea_of_y_oa_en_borrador(app, scm_config):
             "ENSAMBLE"
         )
         assert allocation.estado == "SATISFECHA"
+        later_demand_line = ScmOrdenProduccionLinea(
+            orden_produccion=order,
+            producto_terminado_id=product.cod_sku_pt,
+            cantidad_solicitada=1,
+            fecha_necesidad=date(2026, 8, 15),
+            estructura_revision_id=structure.id,
+            estructura_hash=structure.content_hash,
+            ruta_revision_id=route.id,
+            ruta_hash=route.content_hash,
+        )
+        db.session.add(later_demand_line)
+        db.session.flush()
+        db.session.add(ScmAsignacionDemandaSuministro(
+            orden_produccion_linea=later_demand_line,
+            fuente_tipo="SALIDA_ORDEN",
+            orden_operacion_salida=assembly_order.salidas[0],
+            cantidad_planificada=1,
+            operation_id=uuid4(),
+        ))
+        db.session.add_all([
+            RegistroDiarioProduccion(
+                codigo_ot="OT-PROJ-OA-01",
+                codigo_ot_sintetico=False,
+                estado="CERRADA",
+                tipo_ot="ENSAMBLE",
+                modo_ejecucion_ensamble="MESA",
+                orden_operacion_id=assembly_order.id,
+                centro_trabajo_id=center.id,
+                responsable_id=planner.id,
+                cantidad_objetivo=5,
+                fecha=date(2026, 8, 9),
+                turno="DIA",
+                created_by_id=planner.id,
+            ),
+            RegistroDiarioProduccion(
+                codigo_ot="OT-PROJ-OA-02",
+                codigo_ot_sintetico=False,
+                estado="PLANIFICADA",
+                tipo_ot="ENSAMBLE",
+                modo_ejecucion_ensamble="MESA",
+                orden_operacion_id=assembly_order.id,
+                centro_trabajo_id=center.id,
+                responsable_id=planner.id,
+                cantidad_objetivo=5,
+                fecha=date(2026, 8, 10),
+                turno="DIA",
+                created_by_id=planner.id,
+            ),
+        ])
+        db.session.commit()
+        serialized_oa = list_assembly_orders(
+            db.session,
+            actor_id=planner.id,
+        )["items"][0]
+        assert serialized_oa["fecha_necesidad"] == "2026-08-12"
+        assert serialized_oa["fecha_necesidad_fuente"] == {
+            "tipo": "OP",
+            "id": str(order.id),
+            "codigo": "OP-000900",
+        }
+        assert serialized_oa["rango_fechas_ot"] == {
+            "desde": "2026-08-09",
+            "hasta": "2026-08-10",
+            "cantidad": 2,
+        }
+        assert serialized_oa["programacion_estado"] == "PROGRAMADA"
+        assert serialized_oa["contexto_temporal"] == {
+            "fecha_necesidad_min": "2026-08-12",
+            "fecha_necesidad_max": "2026-08-15",
+            "fecha_necesidad_motivo": None,
+            "fecha_ot_primera": "2026-08-09",
+            "fecha_ot_ultima": "2026-08-10",
+            "programacion_estado": "PROGRAMADA",
+            "cantidad_ot": 2,
+        }
         from app.models.scm_inventory import ScmReservaInventario
 
         reservation = ScmReservaInventario.query.one()

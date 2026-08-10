@@ -62,7 +62,7 @@ def _bearer_token():
 def _is_public_request():
     if request.method == "OPTIONS":
         return True
-    if request.path == "/api/health":
+    if request.path in {"/api/health", "/api/ready"}:
         return True
     if request.path.startswith("/api/integration/v1/"):
         return True

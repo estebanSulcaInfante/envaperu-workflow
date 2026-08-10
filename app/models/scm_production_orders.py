@@ -434,6 +434,10 @@ class ScmOrdenOperacion(db.Model):
     started_by = db.relationship("Trabajador", foreign_keys=[started_by_id])
     closed_by = db.relationship("Trabajador", foreign_keys=[closed_by_id])
     plan_produccion = db.relationship("ScmPlanProduccion")
+    operacion_ruta_revision = db.relationship(
+        "ScmOperacionRuta",
+        foreign_keys=[operacion_ruta_revision_id],
+    )
 
 
 class ScmOrdenFabricacion(db.Model):
@@ -573,6 +577,7 @@ class ScmCorridaFabricacion(db.Model):
         "ScmOrdenFabricacion",
         back_populates="corridas",
     )
+    color_produccion = db.relationship("ColorProduccion", lazy="joined")
     receta_revision = db.relationship("RecetaColorMaestra")
     corrida_premezclas = db.relationship(
         "ScmLotePremezcla", back_populates="corrida", lazy="selectin",

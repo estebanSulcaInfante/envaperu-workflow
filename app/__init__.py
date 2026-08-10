@@ -103,6 +103,12 @@ def create_app():
 
     @app.get('/api/health')
     def health_check():
+        # Render consulta este endpoint con alta frecuencia. Es una sonda de
+        # vida del proceso y deliberadamente no abre una conexión a PostgreSQL.
+        return jsonify({'status': 'ok'})
+
+    @app.get('/api/ready')
+    def readiness_check():
         try:
             db.session.execute(text('SELECT 1'))
         except Exception:

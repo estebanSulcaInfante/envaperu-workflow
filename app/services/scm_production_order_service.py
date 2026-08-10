@@ -26,6 +26,8 @@ from app.models.scm_production_orders import (
     utc_now,
 )
 from app.models.scm_rutas import (
+    ESTADO_RUTA_APROBADA,
+    ESTADO_RUTA_RETIRADA,
     EXECUTOR_OP_OT,
     ScmRutaRevision,
 )
@@ -601,6 +603,196 @@ def approve_production_order(
         raise
 
 
+def _route_snapshot_payload(route):
+    target_code = route.articulo_objetivo.codigo
+    return {
+        "id": route.id,
+        "codigo": f"{target_code}-R{route.numero_revision}",
+        "revision": route.numero_revision,
+        "estado": route.estado,
+        "content_hash": route.content_hash,
+    }
+
+
+def refresh_production_order_routes(
+    session,
+    *,
+    actor_id,
+    operation_id,
+    order_id,
+    expected_resource_version,
+):
+    """Explicitly accept the currently approved routes for an approved OP.
+
+    Calculation itself remains reproducible and always consumes the route
+    snapshot stored on each demand line. This governed command is the only
+    place where an already-approved OP may move those snapshots forward.
+    """
+    try:
+        actor = load_actor(
+            session,
+            actor_id,
+            capability="PLANIFICACION_CALCULAR",
+        )
+        command = {
+            "order_id": str(order_id),
+            "version": expected_version(expected_resource_version),
+        }
+        operation, replay = _reserve_operation(
+            session,
+            operation_id,
+            "POST /ordenes-produccion/{id}/actualizar-rutas",
+            actor,
+            command,
+        )
+        if replay is not None:
+            return replay
+        order = session.scalar(
+            select(ScmOrdenProduccion)
+            .where(ScmOrdenProduccion.id == order_id)
+            .with_for_update()
+        )
+        if order is None:
+            raise ScmServiceError(
+                "OP_NOT_FOUND",
+                "La orden de produccion no existe.",
+                status_code=404,
+            )
+        if order.version != command["version"]:
+            raise ScmServiceError(
+                "VERSION_CONFLICT",
+                "La OP fue modificada por otro usuario.",
+                status_code=409,
+            )
+        if order.estado != "APROBADA":
+            raise ScmServiceError(
+                "INVALID_OP_STATE",
+                "Solo una OP aprobada puede actualizar sus rutas.",
+                status_code=409,
+            )
+
+        before_version = order.version
+        changes = []
+        for line in sorted(order.lineas, key=lambda item: str(item.id)):
+            link = session.scalar(
+                select(ScmArticuloProducto).where(
+                    ScmArticuloProducto.producto_terminado_id
+                    == line.producto_terminado_id
+                )
+            )
+            frozen = session.get(ScmRutaRevision, line.ruta_revision_id)
+            if (
+                link is None
+                or frozen is None
+                or frozen.articulo_objetivo_id != link.articulo_id
+                or frozen.content_hash != line.ruta_hash
+                or not frozen.content_hash
+            ):
+                raise ScmServiceError(
+                    "PLANNING_SNAPSHOT_DRIFT",
+                    "El snapshot de ruta de la OP ya no es verificable.",
+                    status_code=409,
+                    details={"linea_id": str(line.id)},
+                )
+            current = session.scalar(
+                select(ScmRutaRevision)
+                .where(
+                    ScmRutaRevision.articulo_objetivo_id == link.articulo_id,
+                    ScmRutaRevision.estado == ESTADO_RUTA_APROBADA,
+                )
+                .order_by(ScmRutaRevision.numero_revision.desc())
+            )
+            if current is None or not current.content_hash:
+                raise ScmServiceError(
+                    "APPROVED_ROUTE_REQUIRED",
+                    "Cada PT requiere una ruta aprobada vigente.",
+                    status_code=422,
+                    details={
+                        "linea_id": str(line.id),
+                        "producto_terminado_id": line.producto_terminado_id,
+                    },
+                )
+            if current.id == frozen.id:
+                continue
+            if (
+                frozen.estado != ESTADO_RUTA_RETIRADA
+                or current.numero_revision <= frozen.numero_revision
+            ):
+                raise ScmServiceError(
+                    "ROUTE_SUCCESSOR_INVALID",
+                    "La ruta aprobada no es una sucesora valida del snapshot.",
+                    status_code=409,
+                    details={
+                        "linea_id": str(line.id),
+                        "ruta_revision_id": frozen.id,
+                        "ruta_aprobada_id": current.id,
+                    },
+                )
+            previous_payload = _route_snapshot_payload(frozen)
+            next_payload = _route_snapshot_payload(current)
+            line.ruta_revision_id = current.id
+            line.ruta_hash = current.content_hash
+            line.version += 1
+            changes.append({
+                "linea_id": str(line.id),
+                "producto_terminado_id": line.producto_terminado_id,
+                "ruta_anterior": previous_payload,
+                "ruta_nueva": next_payload,
+            })
+
+        superseded_plan_ids = []
+        if changes:
+            calculated_plans = session.scalars(
+                select(ScmPlanProduccion)
+                .where(
+                    ScmPlanProduccion.orden_produccion_id == order.id,
+                    ScmPlanProduccion.estado == "CALCULADO",
+                )
+                .order_by(ScmPlanProduccion.revision)
+                .with_for_update()
+            ).all()
+            for plan in calculated_plans:
+                plan.estado = "SUPERADO"
+                superseded_plan_ids.append(str(plan.id))
+            order.version += 1
+        session.flush()
+
+        response = {
+            "orden": _serialize(order),
+            "cambios": changes,
+            "planes_superados": superseded_plan_ids,
+        }
+        operation.response_json = copy.deepcopy(response)
+        operation.estado_http = 200
+        session.add(ScmEvento(
+            aggregate_type="ORDEN_PRODUCCION",
+            aggregate_id=str(order.id),
+            tipo="PRODUCTION_ORDER_ROUTES_REFRESHED",
+            actor_id=actor.id,
+            actor_snapshot=actor_snapshot(actor),
+            before_json={
+                "version": before_version,
+                "rutas": [
+                    {
+                        "linea_id": item["linea_id"],
+                        "producto_terminado_id": item[
+                            "producto_terminado_id"
+                        ],
+                        "ruta": item["ruta_anterior"],
+                    }
+                    for item in changes
+                ],
+            },
+            after_json=response,
+            operation_id=operation.operation_id,
+        ))
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+
 def _ceil_units(value):
     return Decimal(value).to_integral_value(rounding=ROUND_CEILING)
 
@@ -831,9 +1023,21 @@ def _build_plan_proposal(session, order):
             blockers.append({
                 "codigo": "ROUTE_OUTPUT_MISSING",
                 "linea_id": str(line.id),
+                "producto_terminado_id": line.producto_terminado_id,
+                "ruta_revision_id": route.id,
                 "articulo_id": article_id,
                 "articulo_codigo": article.codigo if article else None,
+                "articulo": {
+                    "codigo": article.codigo,
+                    "nombre": article.nombre,
+                    "clase": article.clase,
+                } if article else None,
                 "cantidad": format(requirements[article_id], "f"),
+                "motivo_codigo": "SIN_OPERACION_DE_RUTA",
+                "motivo": (
+                    "La BOM requiere este articulo, pero la ruta aprobada no "
+                    "incluye una operacion cuya salida sea este articulo."
+                ),
             })
         for route_operation in operations:
             quantity = requirements.get(
@@ -1220,15 +1424,22 @@ def calculate_production_plan(
         proposal = _build_plan_proposal(session, order)
         input_hash = _json_hash(proposal["inputs"])
         content_hash = _json_hash(proposal)
-        previous = session.scalar(
+        previous_plans = session.scalars(
             select(ScmPlanProduccion)
             .where(
                 ScmPlanProduccion.orden_produccion_id == order.id,
-                ScmPlanProduccion.estado == "CALCULADO",
             )
+            .order_by(ScmPlanProduccion.revision.desc())
             .with_for_update()
+        ).all()
+        previous = next(
+            (
+                item for item in previous_plans
+                if item.estado == "CALCULADO"
+            ),
+            None,
         )
-        revision = previous.revision + 1 if previous else 1
+        revision = previous_plans[0].revision + 1 if previous_plans else 1
         if previous is not None:
             previous.estado = "SUPERADO"
         plan = ScmPlanProduccion(

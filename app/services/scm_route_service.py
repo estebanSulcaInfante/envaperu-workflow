@@ -35,6 +35,7 @@ from app.services.scm_service_support import (
     actor_snapshot,
     expected_version,
     load_actor,
+    load_actor_any,
     positive_integer,
     reject_unknown_fields,
     required_text,
@@ -618,7 +619,11 @@ def _content_hash(route):
 
 
 def list_work_centers(session, *, actor_id, active=None):
-    load_actor(session, actor_id, capability="RUTA_VER")
+    load_actor_any(
+        session,
+        actor_id,
+        capabilities=("RUTA_VER", "OT_VER", "PLAN_MANGA_VER"),
+    )
     statement = select(ScmCentroTrabajo)
     if active is not None:
         statement = statement.where(ScmCentroTrabajo.activo == active)

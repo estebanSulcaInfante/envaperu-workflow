@@ -18,6 +18,11 @@ from app.models.scm_production_orders import (
     utc_now,
 )
 from app.services.catalog_code_generator import generar_codigo_catalogo
+from app.services.scm_color_identity import serialize_color_identity
+from app.services.scm_operation_schedule_projection import (
+    operation_schedule_projection,
+    operation_schedule_projections,
+)
 from app.services.scm_production_order_service import (
     _iso,
     _reserve_operation,
@@ -65,6 +70,9 @@ def _decimal_text(value, scale):
 
 
 def _serialize_output(output):
+    piece_id = None
+    if output.articulo and output.articulo.pieza_color is not None:
+        piece_id = output.articulo.pieza_color.pieza_color.pieza_id
     return {
         "id": str(output.id),
         "articulo_scm_id": output.articulo_scm_id,
@@ -72,6 +80,7 @@ def _serialize_output(output):
             "codigo": output.articulo.codigo,
             "nombre": output.articulo.nombre,
             "clase": output.articulo.clase,
+            "pieza_id": piece_id,
         } if output.articulo else None,
         "cantidad_por_ciclo_snapshot": (
             _decimal_text(output.cantidad_por_ciclo_snapshot, 4)
@@ -95,11 +104,22 @@ def _serialize_output(output):
 
 
 def _serialize_run(run):
+    color_identity = serialize_color_identity(
+        run.color_produccion,
+        color_id=run.color_produccion_id,
+    )
+    color_name = color_identity["nombre"] if color_identity else None
     return {
         "id": str(run.id),
         "codigo": run.codigo,
         "secuencia": run.secuencia,
         "color_produccion_id": run.color_produccion_id,
+        # ``color`` and the flat aliases keep existing UI clients simple;
+        # ``color_identidad`` is the canonical human-readable projection.
+        "color": color_name,
+        "color_nombre": color_name,
+        "color_hex": color_identity["hex"] if color_identity else None,
+        "color_identidad": color_identity,
         "receta_revision_id": run.receta_revision_id,
         "receta_hash": run.receta_hash,
         "ciclos_objetivo": run.ciclos_objetivo,
@@ -114,9 +134,15 @@ def _serialize_run(run):
     }
 
 
-def _serialize(operation):
+def _serialize(session, operation, *, schedule_projection=None):
     fabrication = operation.fabricacion
+    route_operation = operation.operacion_ruta_revision
     return {
+        **(
+            schedule_projection
+            if schedule_projection is not None
+            else operation_schedule_projection(session, operation)
+        ),
         "id": str(operation.id),
         "codigo": operation.codigo,
         "tipo": operation.tipo,
@@ -129,9 +155,16 @@ def _serialize(operation):
             if operation.plan_produccion_id else None
         ),
         "propuesta_clave": operation.propuesta_clave,
+        "proceso_requerido": (
+            route_operation.tipo if route_operation is not None else None
+        ),
         "created_by_id": operation.created_by_id,
         "released_by_id": operation.released_by_id,
         "released_at": _iso(operation.released_at),
+        "started_by_id": operation.started_by_id,
+        "started_at": _iso(operation.started_at),
+        "closed_by_id": operation.closed_by_id,
+        "closed_at": _iso(operation.closed_at),
         "created_at": _iso(operation.created_at),
         "updated_at": _iso(operation.updated_at),
         "molde_id": fabrication.molde_id,
@@ -156,6 +189,52 @@ def _serialize(operation):
     }
 
 
+def _normalized_process(value):
+    return str(value or "").strip().upper()
+
+
+def _machine_processes(machine):
+    machine_type = machine.tipo_maquina
+    return {
+        _normalized_process(value)
+        for value in (
+            machine_type.proceso if machine_type else None,
+            machine_type.codigo if machine_type else None,
+            machine_type.nombre if machine_type else None,
+            machine.tipo,
+        )
+        if _normalized_process(value)
+    }
+
+
+def _validate_machine_for_operation(machine, operation):
+    if machine.estado != "OPERATIVA":
+        raise ScmServiceError(
+            "MACHINE_NOT_AVAILABLE",
+            "La maquina prevista no se encuentra OPERATIVA.",
+            status_code=422,
+            details={
+                "maquina_id": machine.id,
+                "estado": machine.estado,
+            },
+        )
+    route_operation = operation.operacion_ruta_revision
+    required_process = _normalized_process(
+        route_operation.tipo if route_operation is not None else None
+    )
+    if required_process and required_process not in _machine_processes(machine):
+        raise ScmServiceError(
+            "MACHINE_PROCESS_INCOMPATIBLE",
+            "La maquina prevista no corresponde al proceso de la OF.",
+            status_code=422,
+            details={
+                "maquina_id": machine.id,
+                "proceso_requerido": required_process,
+                "procesos_maquina": sorted(_machine_processes(machine)),
+            },
+        )
+
+
 def _load_fabrication(session, operation_id):
     operation = session.get(ScmOrdenOperacion, operation_id)
     if (
@@ -178,12 +257,22 @@ def list_fabrication_orders(session, *, actor_id):
         .where(ScmOrdenOperacion.tipo == "FABRICACION")
         .order_by(ScmOrdenOperacion.created_at.desc())
     ).all()
-    return {"items": [_serialize(operation) for operation in operations]}
+    projections = operation_schedule_projections(session, operations)
+    return {
+        "items": [
+            _serialize(
+                session,
+                operation,
+                schedule_projection=projections[operation.id],
+            )
+            for operation in operations
+        ]
+    }
 
 
 def get_fabrication_order(session, *, actor_id, operation_id):
     load_actor(session, actor_id, capability="OF_VER")
-    return _serialize(_load_fabrication(session, operation_id))
+    return _serialize(session, _load_fabrication(session, operation_id))
 
 
 def create_exceptional_fabrication_order(
@@ -401,7 +490,7 @@ def create_exceptional_fabrication_order(
                 seen_articles.add(article_id)
         session.add(order)
         session.flush()
-        response = _serialize(order)
+        response = _serialize(session, order)
         operation.response_json = copy.deepcopy(response)
         operation.estado_http = 201
         session.add(ScmEvento(
@@ -504,6 +593,7 @@ def update_fabrication_order(
                 "La máquina prevista no existe o está inactiva.",
                 status_code=422,
             )
+        _validate_machine_for_operation(machine, order)
         fabrication = order.fabricacion
         fabrication.molde_id = mold.codigo
         fabrication.maquina_prevista_id = machine.id
@@ -677,7 +767,7 @@ def update_fabrication_order(
                 )
         order.version += 1
         session.flush()
-        response = _serialize(order)
+        response = _serialize(session, order)
         audit.response_json = copy.deepcopy(response)
         audit.estado_http = 200
         session.add(ScmEvento(
@@ -781,7 +871,7 @@ def release_fabrication_order(
         order.released_at = utc_now()
         order.version += 1
         session.flush()
-        response = _serialize(order)
+        response = _serialize(session, order)
         operation.response_json = copy.deepcopy(response)
         operation.estado_http = 200
         session.add(ScmEvento(

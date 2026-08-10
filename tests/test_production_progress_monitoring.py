@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from app.extensions import db
 from app.models.control_peso import ControlPeso
@@ -258,6 +258,37 @@ def test_month_dashboard_groups_color_and_exposes_all_shifts(
     assert detail["shift"] is None
     assert detail["shifts"] == ["DIURNO", "NOCTURNO"]
     assert detail["operational_dates"] == ["2026-07-02", "2026-07-17"]
+
+
+def test_month_dashboard_does_not_download_raw_legacy_payloads(
+    client,
+    app,
+    progress_station,
+):
+    assert _put(client, progress_station, _load_example()).status_code == 200
+    statements = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+
+    with app.app_context():
+        engine = db.engine
+        event.listen(engine, "before_cursor_execute", record_statement)
+        try:
+            response = client.get(
+                "/api/monitoring/v1/production-progress?period=month&month=2026-07"
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert response.status_code == 200
+    capture_selects = [
+        statement
+        for statement in statements
+        if "from estacion_pesaje_legacy" in statement
+    ]
+    assert capture_selects
+    assert all("raw_payload_json" not in statement for statement in capture_selects)
 
 
 def test_month_dashboard_rejects_an_invalid_month(client):

@@ -17,6 +17,7 @@ from app.services.scm_route_service import (
     approve_route,
     create_route,
     create_work_center,
+    list_work_centers,
     publish_route_directly,
     retire_route,
     update_route,
@@ -117,6 +118,48 @@ def test_centro_trabajo_genera_codigo_automatico(app):
         assert len(first["codigo"]) == 9
         assert second["codigo"].startswith("CT-")
         assert first["codigo"] != second["codigo"]
+
+
+def test_actor_con_ot_ver_puede_consultar_centros_sin_administrarlos(
+    app,
+    client,
+):
+    with app.app_context():
+        creator, _approver = _actors()
+        center = _center(creator, "TABLERO-OT")
+        operator = Trabajador(
+            codigo="TRB-R3-OT",
+            nombres="Oscar",
+            apellidos="Turno",
+            activo=True,
+            roles=[RolOperativo.query.filter_by(codigo="MAQUINISTA").one()],
+        )
+        db.session.add(operator)
+        db.session.commit()
+
+        listed = list_work_centers(
+            db.session,
+            actor_id=operator.id,
+            active=True,
+        )["items"]
+        assert center["id"] in {item["id"] for item in listed}
+        response = client.get(
+            "/api/scm/v1/centros-trabajo",
+            query_string={"activo": "true"},
+            headers={"X-Actor-Id": str(operator.id)},
+        )
+        assert response.status_code == 200
+        assert center["id"] in {
+            item["id"] for item in response.get_json()["items"]
+        }
+
+        with pytest.raises(ScmServiceError) as error:
+            create_work_center(
+                db.session,
+                actor_id=operator.id,
+                data={"nombre": "No autorizado", "tipo": "INYECCION"},
+            )
+        assert error.value.code == "CAPABILITY_REQUIRED"
 
 
 def test_soplado_es_operacion_de_fabricacion_valida(app):

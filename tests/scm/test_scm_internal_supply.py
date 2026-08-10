@@ -1,8 +1,11 @@
 from datetime import date
+from collections import Counter
 from decimal import Decimal
+import re
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import event
 
 from app import db
 from app.models.maquina import Maquina
@@ -26,9 +29,42 @@ from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_internal_supply_service import (
     create_assembly_ot,
     create_supply_request,
+    list_assembly_ots,
 )
 from app.services.scm_assembly_order_service import transition_assembly_order
 from app.services.scm_service_support import ScmServiceError
+
+
+def _count_selects(callback):
+    statements = []
+
+    def before_cursor_execute(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(db.engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        result = callback()
+    finally:
+        event.remove(
+            db.engine, "before_cursor_execute", before_cursor_execute
+        )
+    return result, statements
+
+
+def _statement_tables(statements):
+    tables = []
+    for statement in statements:
+        match = re.search(r"\bFROM\s+([^\s]+)", statement, re.IGNORECASE)
+        tables.append(match.group(1) if match else statement.splitlines()[0])
+    return Counter(tables)
 
 
 def _assembly_order():
@@ -137,6 +173,71 @@ def test_assembly_ot_and_supply_request_derive_bom_by_daily_quota(app, scm_confi
         assert request["lineas"][0]["cantidad_requerida"] == "10.000"
 
 
+def test_assembly_ot_listing_enrichment_uses_bounded_queries(app, scm_config):
+    with app.app_context():
+        actor, order, center = _assembly_order()
+        first = create_assembly_ot(
+            db.session,
+            actor_id=actor.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={
+                "fecha_operativa": "2026-08-04",
+                "turno": "DIA",
+                "centro_trabajo_id": center.id,
+                "responsable_id": actor.id,
+                "cantidad_objetivo": 4,
+            },
+        )["ot"]
+        create_supply_request(
+            db.session,
+            actor_id=actor.id,
+            ot_id=first["public_id"],
+            operation_id=uuid4(),
+        )
+        db.session.expire_all()
+        first_items, first_statements = _count_selects(
+            lambda: list_assembly_ots(
+                db.session,
+                actor_id=actor.id,
+                order_id=order.id,
+            )["items"]
+        )
+        assert len(first_items) == 1
+
+        create_assembly_ot(
+            db.session,
+            actor_id=actor.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={
+                "fecha_operativa": "2026-08-05",
+                "turno": "DIA",
+                "centro_trabajo_id": center.id,
+                "responsable_id": actor.id,
+                "cantidad_objetivo": 6,
+            },
+        )
+        db.session.expire_all()
+        second_items, second_statements = _count_selects(
+            lambda: list_assembly_ots(
+                db.session,
+                actor_id=actor.id,
+                order_id=order.id,
+            )["items"]
+        )
+
+        assert len(second_items) == 2
+        assert len(second_statements) <= len(first_statements) + 1, (
+            _statement_tables(second_statements)
+            - _statement_tables(first_statements),
+        )
+        assert {item["abastecimiento"] is None for item in second_items} == {
+            True,
+            False,
+        }
+
+
 def test_assembly_ot_quota_cannot_exceed_order_target(app, scm_config):
     with app.app_context():
         actor, order, center = _assembly_order()
@@ -188,7 +289,7 @@ def test_concurrent_assembly_ot_requires_allowed_route_and_fabrication_context(
         assert error.value.code == "ASSEMBLY_CONCURRENT_NOT_ALLOWED"
 
 
-def test_concurrent_assembly_ot_stores_fabrication_context(app, scm_config):
+def test_concurrent_assembly_ot_requires_exact_color_work(app, scm_config):
     with app.app_context():
         actor, order, center = _assembly_order()
         operation = db.session.get(ScmOperacionRuta, order.operacion_ruta_revision_id)
@@ -207,25 +308,26 @@ def test_concurrent_assembly_ot_stores_fabrication_context(app, scm_config):
         db.session.add(fabrication_ot)
         db.session.commit()
 
-        created = create_assembly_ot(
-            db.session,
-            actor_id=actor.id,
-            order_id=order.id,
-            operation_id=uuid4(),
-            data={
-                "fecha_operativa": "2026-08-04",
-                "turno": "DIA",
-                "centro_trabajo_id": center.id,
-                "responsable_id": actor.id,
-                "cantidad_objetivo": 5,
-                "modo_ejecucion": "CONCURRENTE",
-                "ot_fabricacion_contexto_id": str(fabrication_ot.public_id),
-            },
-        )["ot"]
+        with pytest.raises(ScmServiceError) as error:
+            create_assembly_ot(
+                db.session,
+                actor_id=actor.id,
+                order_id=order.id,
+                operation_id=uuid4(),
+                data={
+                    "fecha_operativa": "2026-08-04",
+                    "turno": "DIA",
+                    "centro_trabajo_id": center.id,
+                    "responsable_id": actor.id,
+                    "cantidad_objetivo": 5,
+                    "modo_ejecucion": "CONCURRENTE",
+                    "ot_fabricacion_contexto_id": str(
+                        fabrication_ot.public_id
+                    ),
+                },
+            )
 
-        assert created["modo_ejecucion_ensamble"] == "CONCURRENTE"
-        assert created["ot_fabricacion_contexto_id"] == str(fabrication_ot.public_id)
-        assert created["ot_fabricacion_contexto"]["codigo_ot"] == fabrication_ot.codigo_ot
+        assert error.value.code == "ASSEMBLY_COLOR_WORK_CONTEXT_REQUIRED"
 
 
 def test_concurrent_assembly_ot_accepts_color_work_adapter(app, scm_config):
@@ -247,13 +349,22 @@ def test_concurrent_assembly_ot_accepts_color_work_adapter(app, scm_config):
         )
         db.session.add(fabrication_ot)
         db.session.flush()
+        fabrication_order = ScmOrdenOperacion(
+            codigo=f"OF-H-{uuid4().hex[:8].upper()}",
+            tipo="FABRICACION",
+            origen_demanda="ORDEN_PRODUCCION",
+            estado="LIBERADA",
+            created_by_id=actor.id,
+        )
+        db.session.add(fabrication_order)
+        db.session.flush()
         color_work = ScmTrabajoOt(
             orden_trabajo_id=fabrication_ot.id,
             codigo=f"{fabrication_ot.codigo_ot}-TC01",
             tipo="COLOR",
             secuencia=1,
             estado="EN_EJECUCION",
-            orden_operacion_id=order.id,
+            orden_operacion_id=fabrication_order.id,
             cantidad_objetivo_un=5,
             cantidad_confirmada_un=0,
             created_by_id=actor.id,
@@ -279,6 +390,78 @@ def test_concurrent_assembly_ot_accepts_color_work_adapter(app, scm_config):
 
         assert created["ot_fabricacion_contexto_id"] == str(fabrication_ot.public_id)
         assert created["trabajo_color_contexto_id"] == str(color_work.id)
+
+        listed = list_assembly_ots(
+            db.session,
+            actor_id=actor.id,
+            order_id=order.id,
+        )["items"]
+        listed_ot = next(
+            item for item in listed
+            if item["public_id"] == created["public_id"]
+        )
+        assert listed_ot["ot_fabricacion_contexto"]["codigo_ot"] == (
+            fabrication_ot.codigo_ot
+        )
+        assert listed_ot["trabajo_color_contexto"]["id"] == str(color_work.id)
+        assert listed_ot["trabajo_color_contexto"]["estado"] == "EN_EJECUCION"
+
+
+def test_concurrent_assembly_ot_rejects_color_work_linked_to_assembly_order(
+    app, scm_config
+):
+    with app.app_context():
+        actor, order, center = _assembly_order()
+        operation = db.session.get(
+            ScmOperacionRuta, order.operacion_ruta_revision_id
+        )
+        operation.permite_concurrente = True
+        machine = Maquina.query.first()
+        fabrication_ot = RegistroDiarioProduccion(
+            codigo_ot=f"OT-FAB-{uuid4().hex[:8].upper()}",
+            codigo_ot_sintetico=False,
+            estado="EN_EJECUCION",
+            tipo_ot="FABRICACION",
+            maquina_id=machine.id,
+            fecha=date(2026, 8, 4),
+            turno="DIA",
+            created_by_id=actor.id,
+            secuencia_siguiente_trabajo=2,
+        )
+        db.session.add(fabrication_ot)
+        db.session.flush()
+        invalid_work = ScmTrabajoOt(
+            orden_trabajo_id=fabrication_ot.id,
+            codigo=f"{fabrication_ot.codigo_ot}-TC01",
+            tipo="COLOR",
+            secuencia=1,
+            estado="EN_EJECUCION",
+            orden_operacion_id=order.id,
+            cantidad_objetivo_un=5,
+            cantidad_confirmada_un=0,
+            created_by_id=actor.id,
+        )
+        db.session.add(invalid_work)
+        db.session.commit()
+
+        with pytest.raises(ScmServiceError) as error:
+            create_assembly_ot(
+                db.session,
+                actor_id=actor.id,
+                order_id=order.id,
+                operation_id=uuid4(),
+                data={
+                    "fecha_operativa": "2026-08-04",
+                    "turno": "DIA",
+                    "centro_trabajo_id": center.id,
+                    "responsable_id": actor.id,
+                    "cantidad_objetivo": 5,
+                    "modo_ejecucion": "CONCURRENTE",
+                    "trabajo_color_contexto_id": str(invalid_work.id),
+                },
+            )
+
+        assert error.value.code == "ASSEMBLY_COLOR_WORK_NOT_FABRICATION"
 
 
 def test_legacy_close_is_blocked_when_assembly_order_has_traceable_ot(

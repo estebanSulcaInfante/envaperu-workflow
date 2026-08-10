@@ -17,6 +17,10 @@ from app.services.scm_production_order_service import (
     _iso,
     _reserve_operation,
 )
+from app.services.scm_operation_schedule_projection import (
+    operation_schedule_projection,
+    operation_schedule_projections,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -125,13 +129,18 @@ def _planned_inputs(operation, target):
     return items
 
 
-def _serialize(session, order):
+def _serialize(session, order, *, schedule_projection=None):
     output = order.salidas[0]
     operation = _operation_snapshot(session, order)
     lot = session.scalar(select(ScmLoteArticulo).where(
         ScmLoteArticulo.orden_operacion_salida_id == output.id,
     ))
     return {
+        **(
+            schedule_projection
+            if schedule_projection is not None
+            else operation_schedule_projection(session, order)
+        ),
         "id": str(order.id),
         "codigo": order.codigo,
         "tipo": order.tipo,
@@ -194,7 +203,17 @@ def list_assembly_orders(session, *, actor_id):
         .where(ScmOrdenOperacion.tipo == "ENSAMBLE")
         .order_by(ScmOrdenOperacion.created_at.desc())
     ).all()
-    return {"items": [_serialize(session, order) for order in orders]}
+    projections = operation_schedule_projections(session, orders)
+    return {
+        "items": [
+            _serialize(
+                session,
+                order,
+                schedule_projection=projections[order.id],
+            )
+            for order in orders
+        ]
+    }
 
 
 def get_assembly_order(session, *, actor_id, order_id):
