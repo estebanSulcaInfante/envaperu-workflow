@@ -412,6 +412,8 @@ def _json_object(value, *, field, required=False):
 def _optional_text(value, *, field, max_length):
     if value is None:
         return None
+    if isinstance(value, str) and not value.strip():
+        return None
     return required_text(value, field=field, max_length=max_length)
 
 

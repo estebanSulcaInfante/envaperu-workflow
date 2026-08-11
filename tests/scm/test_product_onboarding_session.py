@@ -189,6 +189,40 @@ def test_session_create_resume_list_and_idempotency(app, client):
         assert events[0].operation_id == operation_id
 
 
+def test_revision_draft_allows_blank_optional_notes_for_save_and_exit(
+    app, client
+):
+    actor_id = _catalog_admin(app)
+    onboarding = _create_session(client, actor_id, data={})
+
+    response = client.put(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/REVISION",
+        headers=_headers(actor_id, uuid4()),
+        json={
+            "expected_version": onboarding["version"],
+            "data": {
+                "confirmaciones": {
+                    "datos_fuente_revisados": False,
+                    "entiende_que_no_crea_op": False,
+                    "pendientes_aceptados": False,
+                },
+                "pasos_revisados": STEP_CODES[:-1],
+                "revisiones_revisadas": [],
+                "notas": "",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.get_json()
+    saved = response.get_json()
+    revision = next(
+        step for step in saved["pasos"] if step["codigo"] == "REVISION"
+    )
+    assert revision["estado"] == "EN_PROGRESO"
+    assert revision["data"]["notas"] == ""
+
+
 def test_step_save_is_opaque_versioned_and_invalidates_descendants(app, client):
     actor_id = _catalog_admin(app)
     with app.app_context():
