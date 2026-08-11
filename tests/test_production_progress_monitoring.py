@@ -147,6 +147,36 @@ def test_snapshot_replay_separates_orders_and_never_creates_inventory(
     assert op_1402["target_status"] == "OP_NOT_FOUND"
 
 
+def test_snapshot_replay_does_not_download_the_stored_payload(
+    client,
+    app,
+    progress_station,
+):
+    payload = _load_example()
+    assert _put(client, progress_station, payload).status_code == 200
+    statements = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+
+    with app.app_context():
+        engine = db.engine
+        event.listen(engine, "before_cursor_execute", record_statement)
+        try:
+            replay = _put(client, progress_station, payload)
+        finally:
+            event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert replay.status_code == 200
+    receipt_selects = [
+        statement
+        for statement in statements
+        if "from estacion_reporte_avance_recepcion" in statement
+    ]
+    assert receipt_selects
+    assert all("payload_json" not in statement for statement in receipt_selects)
+
+
 def test_progress_persists_parent_before_rows_with_foreign_keys_enabled(
     client,
     app,
@@ -260,7 +290,7 @@ def test_month_dashboard_groups_color_and_exposes_all_shifts(
     assert detail["operational_dates"] == ["2026-07-02", "2026-07-17"]
 
 
-def test_month_dashboard_does_not_download_raw_legacy_payloads(
+def test_month_dashboard_reads_the_aggregated_view(
     client,
     app,
     progress_station,
@@ -282,13 +312,13 @@ def test_month_dashboard_does_not_download_raw_legacy_payloads(
             event.remove(engine, "before_cursor_execute", record_statement)
 
     assert response.status_code == 200
-    capture_selects = [
+    progress_selects = [
         statement
         for statement in statements
-        if "from estacion_pesaje_legacy" in statement
+        if "from v_avance_produccion" in statement
     ]
-    assert capture_selects
-    assert all("raw_payload_json" not in statement for statement in capture_selects)
+    assert progress_selects
+    assert all("raw_payload_json" not in statement for statement in progress_selects)
 
 
 def test_month_dashboard_rejects_an_invalid_month(client):

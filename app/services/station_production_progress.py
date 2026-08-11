@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from flask import current_app
 from jsonschema import Draft202012Validator, FormatChecker
-from sqlalchemy import func
+from sqlalchemy import Date, DateTime, Integer, Numeric, String, func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import load_only
 
@@ -251,6 +251,25 @@ def _ack(receipt):
     }
 
 
+def _receipt_by_report_id(report_id):
+    """Load only the receipt fields required for idempotency and the ACK."""
+    return (
+        EstacionReporteAvanceRecepcion.query.options(
+            load_only(
+                EstacionReporteAvanceRecepcion.report_id,
+                EstacionReporteAvanceRecepcion.payload_hash,
+                EstacionReporteAvanceRecepcion.station_id,
+                EstacionReporteAvanceRecepcion.received_at_utc,
+                EstacionReporteAvanceRecepcion.window_start_date,
+                EstacionReporteAvanceRecepcion.window_end_date,
+                EstacionReporteAvanceRecepcion.rows_count,
+            )
+        )
+        .filter_by(report_id=report_id)
+        .one_or_none()
+    )
+
+
 def process_production_progress(
     station,
     payload,
@@ -272,9 +291,7 @@ def process_production_progress(
     payload_json = _canonical_json(normalized_payload)
     digest = _payload_hash(payload_json)
 
-    existing = EstacionReporteAvanceRecepcion.query.filter_by(
-        report_id=payload_id
-    ).one_or_none()
+    existing = _receipt_by_report_id(payload_id)
     if existing is not None:
         if existing.station_id != station.station_id or existing.payload_hash != digest:
             raise ProgressIdempotencyConflict(payload_id)
@@ -335,9 +352,7 @@ def process_production_progress(
             station.station_id,
         )
         db.session.rollback()
-        concurrent = EstacionReporteAvanceRecepcion.query.filter_by(
-            report_id=payload_id
-        ).one_or_none()
+        concurrent = _receipt_by_report_id(payload_id)
         if (
             concurrent is None
             or concurrent.station_id != station.station_id
@@ -366,15 +381,68 @@ def _month_bounds(operational_date):
     return period_start, next_month - timedelta(days=1)
 
 
-def _monthly_progress_summary(
-    operational_date,
+def _production_progress_view_rows(
+    period_start,
+    period_end,
     *,
     op=None,
     machine_code=None,
     shift=None,
 ):
-    period_start, period_end = _month_bounds(operational_date)
-    detailed_station_dates = set(
+    conditions = ["operational_date BETWEEN :period_start AND :period_end"]
+    parameters = {
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+    for column, value in (
+        ("op", op),
+        ("machine_code", machine_code),
+        ("shift", shift),
+    ):
+        if value:
+            conditions.append(f"{column} = :{column}")
+            parameters[column] = _dimension(value)
+
+    statement = text(f"""
+        SELECT
+            station_id,
+            operational_date,
+            op,
+            ot,
+            mold,
+            color,
+            machine_code,
+            shift,
+            bags,
+            weight_kg,
+            first_capture_at_utc,
+            last_capture_at_utc,
+            last_received_at_utc
+        FROM v_avance_produccion
+        WHERE {' AND '.join(conditions)}
+        ORDER BY op, ot, machine_code, shift, operational_date
+    """).columns(
+        station_id=String(),
+        operational_date=Date(),
+        op=String(),
+        ot=String(),
+        mold=String(),
+        color=String(),
+        machine_code=String(),
+        shift=String(),
+        bags=Integer(),
+        weight_kg=Numeric(14, 3),
+        first_capture_at_utc=DateTime(timezone=True),
+        last_capture_at_utc=DateTime(timezone=True),
+        last_received_at_utc=DateTime(timezone=True),
+    )
+    return db.session.execute(statement, parameters).all()
+
+
+def _detailed_station_dates(period_start, period_end):
+    # Deleted rows still establish detailed-history authority for that date, so
+    # an obsolete snapshot cannot reappear after every detailed row is voided.
+    return set(
         db.session.query(
             EstacionPesajeLegacy.station_id,
             EstacionPesajeLegacy.operational_date,
@@ -384,37 +452,23 @@ def _monthly_progress_summary(
         .all()
     )
 
-    capture_query = EstacionPesajeLegacy.query.options(
-        load_only(
-            EstacionPesajeLegacy.station_id,
-            EstacionPesajeLegacy.op_normalized,
-            EstacionPesajeLegacy.ot_normalized,
-            EstacionPesajeLegacy.mold_normalized,
-            EstacionPesajeLegacy.color_normalized,
-            EstacionPesajeLegacy.machine_normalized,
-            EstacionPesajeLegacy.shift_normalized,
-            EstacionPesajeLegacy.weight_kg,
-            EstacionPesajeLegacy.captured_at_utc,
-            EstacionPesajeLegacy.operational_date,
-            EstacionPesajeLegacy.imported_at_utc,
-        )
-    ).filter(
-        EstacionPesajeLegacy.operational_date.between(period_start, period_end),
-        EstacionPesajeLegacy.is_deleted.is_(False),
+
+def _monthly_progress_summary(
+    operational_date,
+    *,
+    op=None,
+    machine_code=None,
+    shift=None,
+):
+    period_start, period_end = _month_bounds(operational_date)
+    detailed_station_dates = _detailed_station_dates(period_start, period_end)
+    captures = _production_progress_view_rows(
+        period_start,
+        period_end,
+        op=op,
+        machine_code=machine_code,
+        shift=shift,
     )
-    if op:
-        capture_query = capture_query.filter(
-            EstacionPesajeLegacy.op_normalized == _dimension(op)
-        )
-    if machine_code:
-        capture_query = capture_query.filter(
-            EstacionPesajeLegacy.machine_normalized == _dimension(machine_code)
-        )
-    if shift:
-        capture_query = capture_query.filter(
-            EstacionPesajeLegacy.shift_normalized == _dimension(shift)
-        )
-    captures = capture_query.all()
 
     aggregate_query = EstacionAvanceProduccion.query.filter(
         EstacionAvanceProduccion.operational_date.between(period_start, period_end)
@@ -448,7 +502,7 @@ def _monthly_progress_summary(
         row.operational_date for row in aggregate_rows
     }
     production_orders = {
-        row.op_normalized for row in captures if row.op_normalized
+        row.op for row in captures if row.op
     } | {row.op for row in aggregate_rows if row.op}
     daily_average = (
         total_weight / len(production_days)
@@ -459,7 +513,7 @@ def _monthly_progress_summary(
         "month": period_start.strftime("%Y-%m"),
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
-        "bags": len(captures) + sum(row.bags for row in aggregate_rows),
+        "bags": sum(row.bags for row in captures) + sum(row.bags for row in aggregate_rows),
         "weight_kg": _format_kg(total_weight),
         "production_orders": len(production_orders),
         "production_days": len(production_days),
@@ -501,46 +555,14 @@ def production_progress_dashboard(
         EstacionAvanceProduccion.shift,
     ).all()
 
-    detailed_station_dates = set(
-        db.session.query(
-            EstacionPesajeLegacy.station_id,
-            EstacionPesajeLegacy.operational_date,
-        )
-        .filter(EstacionPesajeLegacy.operational_date.between(period_start, period_end))
-        .distinct()
-        .all()
+    detailed_station_dates = _detailed_station_dates(period_start, period_end)
+    captures = _production_progress_view_rows(
+        period_start,
+        period_end,
+        op=op,
+        machine_code=machine_code,
+        shift=shift,
     )
-    capture_query = EstacionPesajeLegacy.query.options(
-        load_only(
-            EstacionPesajeLegacy.station_id,
-            EstacionPesajeLegacy.op_normalized,
-            EstacionPesajeLegacy.ot_normalized,
-            EstacionPesajeLegacy.mold_normalized,
-            EstacionPesajeLegacy.color_normalized,
-            EstacionPesajeLegacy.machine_normalized,
-            EstacionPesajeLegacy.shift_normalized,
-            EstacionPesajeLegacy.weight_kg,
-            EstacionPesajeLegacy.captured_at_utc,
-            EstacionPesajeLegacy.operational_date,
-            EstacionPesajeLegacy.imported_at_utc,
-        )
-    ).filter(
-        EstacionPesajeLegacy.operational_date.between(period_start, period_end),
-        EstacionPesajeLegacy.is_deleted.is_(False),
-    )
-    if op:
-        capture_query = capture_query.filter(
-            EstacionPesajeLegacy.op_normalized == _dimension(op)
-        )
-    if machine_code:
-        capture_query = capture_query.filter(
-            EstacionPesajeLegacy.machine_normalized == _dimension(machine_code)
-        )
-    if shift:
-        capture_query = capture_query.filter(
-            EstacionPesajeLegacy.shift_normalized == _dimension(shift)
-        )
-    captures = capture_query.all()
     aggregate_rows = [
         row
         for row in aggregate_rows
@@ -578,27 +600,39 @@ def production_progress_dashboard(
     for capture in captures:
         key = (
             capture.station_id,
-            capture.op_normalized,
-            capture.ot_normalized,
-            capture.mold_normalized,
-            capture.color_normalized,
-            capture.machine_normalized,
-            capture.shift_normalized,
+            capture.op,
+            capture.ot,
+            capture.mold,
+            capture.color,
+            capture.machine_code,
+            capture.shift,
         )
         bucket = detailed_groups[key]
-        bucket["bags"] += 1
+        bucket["bags"] += capture.bags
         bucket["weight_kg"] += Decimal(capture.weight_kg)
         bucket["operational_dates"].add(capture.operational_date)
         bucket["first_capture_at_utc"] = min(
-            filter(None, (bucket["first_capture_at_utc"], _utc(capture.captured_at_utc))),
+            filter(
+                None,
+                (
+                    bucket["first_capture_at_utc"],
+                    _utc(capture.first_capture_at_utc),
+                ),
+            ),
             default=None,
         )
         bucket["last_capture_at_utc"] = max(
-            filter(None, (bucket["last_capture_at_utc"], _utc(capture.captured_at_utc))),
+            filter(
+                None,
+                (
+                    bucket["last_capture_at_utc"],
+                    _utc(capture.last_capture_at_utc),
+                ),
+            ),
             default=None,
         )
         bucket["received_at_utc"] = max(
-            filter(None, (bucket["received_at_utc"], _utc(capture.imported_at_utc))),
+            filter(None, (bucket["received_at_utc"], _utc(capture.last_received_at_utc))),
             default=None,
         )
     for key, bucket in detailed_groups.items():
