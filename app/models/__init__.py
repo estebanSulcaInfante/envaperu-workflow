@@ -13,6 +13,7 @@ from app.models.scm_compras import (
     ScmOrdenCompraRevision,
 )
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
+from app.models.scm_product_onboarding import ScmAltaProductoSesion
 from app.models.scm_articulos import (
     ScmArticulo,
     ScmArticuloPiezaColor,

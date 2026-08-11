@@ -2,6 +2,7 @@
 
 from app.extensions import db
 from app.models.molde import MoldePieza, Pieza
+from app.models.producto import PiezaColor
 
 
 def _crear_molde(client, nombre, peso_tiro):
@@ -142,3 +143,51 @@ def test_pieza_global_se_asocia_a_dos_moldes_y_se_desvincula_sin_borrarla(
             molde_a: False,
             molde_b: True,
         }
+
+
+def test_habilitar_color_en_pieza_sin_clasificacion_tecnica(client, app):
+    pieza_response = client.post(
+        "/api/piezas",
+        json={
+            "nombre": "Tapa reutilizable sin clasificacion",
+            "peso_nominal_gr": 18.5,
+        },
+    )
+    assert pieza_response.status_code == 201, pieza_response.get_json()
+    pieza = pieza_response.get_json()
+    assert pieza["linea_id"] is None
+    assert pieza["familia_id"] is None
+
+    molde = _crear_molde(client, "Molde sin clasificacion tecnica", 80.0)
+    composicion_response = client.post(
+        f"/api/moldes/{molde}/formas",
+        json={
+            "pieza_id": pieza["id"],
+            "cavidades": 4,
+            "peso_unitario_gr": 18.5,
+        },
+    )
+    assert composicion_response.status_code == 201
+    color_response = client.post(
+        "/api/colores",
+        json={"nombre": "TRANSPARENTE SIN CLASIFICACION"},
+    )
+    assert color_response.status_code == 201, color_response.get_json()
+
+    habilitada = client.post(
+        f"/api/moldes/{molde}/colores",
+        json={"color_id": color_response.get_json()["id"]},
+    )
+
+    assert habilitada.status_code == 201, habilitada.get_json()
+    variante = habilitada.get_json()["variantes"][0]
+    assert variante["pieza_id"] == pieza["id"]
+    assert variante["linea_id"] is None
+    assert variante["familia_id"] is None
+    with app.app_context():
+        persisted = PiezaColor.query.filter_by(
+            pieza_id=pieza["id"],
+            color_produccion_id=color_response.get_json()["id"],
+        ).one()
+        assert persisted.linea_id is None
+        assert persisted.familia_id is None

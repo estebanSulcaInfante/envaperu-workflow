@@ -780,7 +780,9 @@ def get_route(session, *, actor_id, route_id):
     return serialize_route(route)
 
 
-def create_route(session, *, actor_id, product_id, data):
+def create_route(
+    session, *, actor_id, product_id, data, commit=True
+):
     try:
         actor = load_actor(
             session,
@@ -820,13 +822,16 @@ def create_route(session, *, actor_id, product_id, data):
         session.flush()
         _replace_content(session, route, data)
         session.add(_event(route, actor, "ROUTE_CREATED"))
-        session.commit()
+        if commit:
+            session.commit()
         return serialize_route(route)
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "ROUTE_CONFLICT",
             "La ruta entra en conflicto con otro registro.",
@@ -834,7 +839,9 @@ def create_route(session, *, actor_id, product_id, data):
         ) from error
 
 
-def update_route(session, *, actor_id, route_id, data):
+def update_route(
+    session, *, actor_id, route_id, data, commit=True
+):
     try:
         actor = load_actor(
             session,
@@ -864,13 +871,16 @@ def update_route(session, *, actor_id, route_id, data):
         session.add(
             _event(route, actor, "ROUTE_UPDATED", before=before)
         )
-        session.commit()
+        if commit:
+            session.commit()
         return serialize_route(route)
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "ROUTE_CONFLICT",
             "No se pudo actualizar la ruta.",
@@ -987,6 +997,7 @@ def publish_route_directly(
     route_id,
     operation_id,
     data,
+    commit=True,
 ):
     endpoint = f"/rutas/{route_id}/publicar"
     try:
@@ -1004,7 +1015,8 @@ def publish_route_directly(
             payload=data,
         )
         if replay is not None:
-            session.rollback()
+            if commit:
+                session.rollback()
             return replay
         if session.get_bind().dialect.name == "postgresql":
             session.execute(text(
@@ -1062,13 +1074,16 @@ def publish_route_directly(
         response = serialize_route(route)
         operation.estado_http = 200
         operation.response_json = response
-        session.commit()
+        if commit:
+            session.commit()
         return response
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "ROUTE_CONFLICT",
             "No se pudo publicar la ruta.",

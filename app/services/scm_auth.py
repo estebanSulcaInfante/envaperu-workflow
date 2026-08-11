@@ -87,9 +87,11 @@ ARTICLE_MASTER_PREFIXES = (
     "/api/catalogo/ingredientes-receta-color",
     "/api/configurar-producto",
     "/api/importar",
+    "/api/scm/v1/altas-producto",
 )
 
 GESTOR_SCM_WRITE_PREFIXES = (
+    "/api/scm/v1/altas-producto",
     "/api/scm/v1/articulos",
     "/api/scm/v1/estructuras",
     "/api/scm/v1/centros-trabajo",

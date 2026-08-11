@@ -3,10 +3,20 @@
 import io
 
 import pytest
+from PIL import Image
 
 from app.extensions import db
 from app.models.molde import Molde, Pieza
 from app.models.producto import PiezaColor, ProductoTerminado
+
+
+def _png_bytes():
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(24, 96, 160)).save(
+        output,
+        format="PNG",
+    )
+    return output.getvalue()
 
 
 @pytest.mark.parametrize("entity", ["pieza_color", "producto"])
@@ -27,7 +37,7 @@ def test_imagen_opcional_catalogo_se_guarda_consulta_y_elimina(client, entity):
         created = client.post("/api/productos", json={"producto": "Balde foto", "linea_id": 1, "familia_id": 1}).get_json()
         path = f"/api/productos/{created['cod_sku_pt']}/imagen"
 
-    content = b"\x89PNG\r\n\x1a\nsmall-test-image"
+    content = _png_bytes()
     uploaded = client.put(path, data={"imagen": (io.BytesIO(content), "foto.png")}, content_type="multipart/form-data")
     assert uploaded.status_code == 200, uploaded.get_json()
     assert uploaded.get_json()["imagen_url"] == path

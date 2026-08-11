@@ -30,7 +30,10 @@ LEGACY_ADOPTION_TARGET = LINEA_FAMILIA_REVISION
 WORK_COLOR_REVISION = "f78a7b3c9d20"
 WORKSPACE_ROLE_REVISION = "f79b8c4d0e31"
 WORKSPACE_CATALOG_TEXT_REVISION = "f80c9d5e1a42"
-HEAD_REVISION = WORKSPACE_CATALOG_TEXT_REVISION
+PRODUCT_ONBOARDING_REVISION = "f81d0e6f2b53"
+UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
+PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
+HEAD_REVISION = PRODUCTION_PROGRESS_VIEW_REVISION
 
 
 def _isolated_postgres_url():
@@ -198,14 +201,21 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 "scm_trabajo_color",
                 "scm_asignacion_personal_trabajo_ot",
                 "scm_rol_workspace_preferencia",
+                "scm_alta_producto_sesion",
             } <= tables
             assert "inventario_manga" not in tables
             assert "movimiento_kardex" not in tables
             assert "pieza_componente" not in tables
-            assert "tipo" not in {
-                column["name"]
+            assert "v_avance_produccion" in set(
+                inspect(schema_engine).get_view_names()
+            )
+            pieza_color_columns = {
+                column["name"]: column
                 for column in inspect(schema_engine).get_columns("pieza_color")
             }
+            assert "tipo" not in pieza_color_columns
+            assert pieza_color_columns["linea_id"]["nullable"] is True
+            assert pieza_color_columns["familia_id"]["nullable"] is True
             with schema_engine.connect() as connection:
                 assert connection.execute(
                     text("SELECT current_schema()")
@@ -223,6 +233,49 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 assert connection.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one() == HEAD_REVISION
+                assert connection.execute(text("""
+                    SELECT relrowsecurity
+                    FROM pg_class
+                    WHERE oid = 'scm_alta_producto_sesion'::regclass
+                """)).scalar_one() is True
+                table_owner, connection_role = connection.execute(text("""
+                    SELECT pg_get_userbyid(relowner), current_user
+                    FROM pg_class
+                    WHERE oid = 'scm_alta_producto_sesion'::regclass
+                """)).one()
+                assert table_owner == connection_role
+                assert connection.execute(text(
+                    "SELECT count(*) FROM scm_alta_producto_sesion"
+                )).scalar_one() == 0
+                exposed_roles = set(connection.execute(text("""
+                    SELECT rolname
+                    FROM pg_roles
+                    WHERE rolname IN ('anon', 'authenticated')
+                """)).scalars())
+                for exposed_role in exposed_roles:
+                    assert connection.execute(text("""
+                        SELECT
+                          has_table_privilege(
+                            :role,
+                            'scm_alta_producto_sesion',
+                            'SELECT'
+                          ) OR
+                          has_table_privilege(
+                            :role,
+                            'scm_alta_producto_sesion',
+                            'INSERT'
+                          ) OR
+                          has_table_privilege(
+                            :role,
+                            'scm_alta_producto_sesion',
+                            'UPDATE'
+                          ) OR
+                          has_table_privilege(
+                            :role,
+                            'scm_alta_producto_sesion',
+                            'DELETE'
+                          )
+                    """), {"role": exposed_role}).scalar_one() is False
                 capacidades = set(connection.execute(
                     text("SELECT codigo FROM scm_capacidad")
                 ).scalars())
@@ -890,6 +943,68 @@ def test_trabajo_color_backfill_enlaza_ot_canonica_y_preserva_legacy():
             """), {
                 "assembly_ot_id": assembly_ot_id,
             }).scalar_one() is True
+    finally:
+        schema_engine.dispose()
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_f82_preserves_piece_color_acl_rls_owner_and_roundtrips():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = create_engine(schema_url)
+    try:
+        _run_flask_db(schema_url, "upgrade", PRODUCT_ONBOARDING_REVISION)
+        with schema_engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT current_schema()")
+            ).scalar_one() == schema
+            before = connection.execute(text("""
+                SELECT relrowsecurity,
+                       relforcerowsecurity,
+                       relacl::text,
+                       pg_get_userbyid(relowner)
+                FROM pg_class
+                WHERE oid = 'pieza_color'::regclass
+            """)).one()
+        previous_columns = {
+            column["name"]: column
+            for column in inspect(schema_engine).get_columns("pieza_color")
+        }
+        assert previous_columns["linea_id"]["nullable"] is False
+        assert previous_columns["familia_id"]["nullable"] is False
+
+        _run_flask_db(schema_url, "upgrade", UNCLASSIFIED_PIECE_COLOR_REVISION)
+        expanded_columns = {
+            column["name"]: column
+            for column in inspect(schema_engine).get_columns("pieza_color")
+        }
+        assert expanded_columns["linea_id"]["nullable"] is True
+        assert expanded_columns["familia_id"]["nullable"] is True
+        with schema_engine.connect() as connection:
+            after = connection.execute(text("""
+                SELECT relrowsecurity,
+                       relforcerowsecurity,
+                       relacl::text,
+                       pg_get_userbyid(relowner)
+                FROM pg_class
+                WHERE oid = 'pieza_color'::regclass
+            """)).one()
+            assert after == before
+
+        _run_flask_db(schema_url, "downgrade", PRODUCT_ONBOARDING_REVISION)
+        contracted_columns = {
+            column["name"]: column
+            for column in inspect(schema_engine).get_columns("pieza_color")
+        }
+        assert contracted_columns["linea_id"]["nullable"] is False
+        assert contracted_columns["familia_id"]["nullable"] is False
+
+        _run_flask_db(schema_url, "upgrade", UNCLASSIFIED_PIECE_COLOR_REVISION)
+        reexpanded_columns = {
+            column["name"]: column
+            for column in inspect(schema_engine).get_columns("pieza_color")
+        }
+        assert reexpanded_columns["linea_id"]["nullable"] is True
+        assert reexpanded_columns["familia_id"]["nullable"] is True
     finally:
         schema_engine.dispose()
         _drop_isolated_schema(admin_engine, schema)

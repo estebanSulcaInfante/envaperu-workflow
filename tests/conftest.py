@@ -17,6 +17,34 @@ def app():
 
     with app.app_context():
         db.create_all()
+        db.session.execute(text("""
+            CREATE VIEW v_avance_produccion AS
+            SELECT
+                station_id,
+                operational_date,
+                op_normalized AS op,
+                ot_normalized AS ot,
+                mold_normalized AS mold,
+                color_normalized AS color,
+                machine_normalized AS machine_code,
+                shift_normalized AS shift,
+                COUNT(*) AS bags,
+                SUM(weight_kg) AS weight_kg,
+                MIN(captured_at_utc) AS first_capture_at_utc,
+                MAX(captured_at_utc) AS last_capture_at_utc,
+                MAX(imported_at_utc) AS last_received_at_utc
+            FROM estacion_pesaje_legacy
+            WHERE is_deleted = false
+            GROUP BY
+                station_id,
+                operational_date,
+                op_normalized,
+                ot_normalized,
+                mold_normalized,
+                color_normalized,
+                machine_normalized,
+                shift_normalized
+        """))
         
         from app.models.producto import Familia, Linea, LineaFamilia
         default_linea = Linea(codigo=1, nombre='INDUSTRIAL')
@@ -56,6 +84,7 @@ def app():
         # the production schema contains an intentional cyclic FK between OT
         # header/context tables that SQLite cannot topologically drop.
         db.session.execute(text("PRAGMA foreign_keys = OFF"))
+        db.session.execute(text("DROP VIEW IF EXISTS v_avance_produccion"))
         db.session.commit()
         db.session.remove()
         db.drop_all()

@@ -329,11 +329,11 @@ class PiezaColor(db.Model):
     sku = db.Column(db.String(50), primary_key=True)
     
     # Relación normalizada con Linea (REFACTORIZADO - eliminados campos legacy)
-    linea_id = db.Column(db.Integer, db.ForeignKey('linea.id'), nullable=False)
+    linea_id = db.Column(db.Integer, db.ForeignKey('linea.id'), nullable=True)
     linea_rel = db.relationship('Linea', backref='piezas')
     
     # Relación normalizada con Familia (REFACTORIZADO - eliminados campos legacy)
-    familia_id = db.Column(db.Integer, db.ForeignKey('familia.id'), nullable=False)
+    familia_id = db.Column(db.Integer, db.ForeignKey('familia.id'), nullable=True)
     familia_rel = db.relationship('Familia', backref='piezas')
     
     # --- RELACIÓN CON EL MAESTRO GLOBAL DE PIEZAS ---
@@ -380,14 +380,39 @@ class PiezaColor(db.Model):
         """Lista de productos que usan esta pieza."""
         return [ep.producto_terminado for ep in self.en_productos]
 
+    @property
+    def clasificacion_linea_id(self):
+        """Clasificacion efectiva con fallback para filas legacy."""
+        if self.pieza_rel and self.pieza_rel.linea_id is not None:
+            return self.pieza_rel.linea_id
+        return self.linea_id
+
+    @property
+    def clasificacion_familia_id(self):
+        if self.pieza_rel and self.pieza_rel.familia_id is not None:
+            return self.pieza_rel.familia_id
+        return self.familia_id
+
+    @property
+    def clasificacion_linea_rel(self):
+        if self.pieza_rel and self.pieza_rel.linea_id is not None:
+            return db.session.get(Linea, self.pieza_rel.linea_id)
+        return self.linea_rel
+
+    @property
+    def clasificacion_familia_rel(self):
+        if self.pieza_rel and self.pieza_rel.familia_id is not None:
+            return db.session.get(Familia, self.pieza_rel.familia_id)
+        return self.familia_rel
+
     def to_dict(self):
         """Representación del SKU; no expone cavidades como dato operativo."""
         return {
             'sku': self.sku,
             'nombre': self.piezas,
             'pieza_id': self.pieza_id,
-            'linea_id': self.linea_id,
-            'familia_id': self.familia_id,
+            'linea_id': self.clasificacion_linea_id,
+            'familia_id': self.clasificacion_familia_id,
             'color_produccion_id': self.color_produccion_id,
             'color': (
                 self.color_produccion_rel.nombre

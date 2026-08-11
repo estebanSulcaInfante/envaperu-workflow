@@ -58,7 +58,7 @@ def create_app():
     # --- IMPORTAR MODELOS ---
     # Es crucial importar los modelos aquí para que SQLAlchemy los registre
     # antes de que cualquier blueprint intente usarlos.
-    from app.models import correlativo_catalogo, orden, lote, materiales, recetas, producto, registro, control_peso, scm_catalogos, scm_recepcion, scm_ot, scm_inventory, scm_warehouse, scm_internal_supply, scm_assembly_execution, scm_reproceso, trabajador, maquina, estacion_pesaje, legacy_pesaje
+    from app.models import correlativo_catalogo, orden, lote, materiales, recetas, producto, registro, control_peso, scm_catalogos, scm_recepcion, scm_ot, scm_inventory, scm_warehouse, scm_internal_supply, scm_assembly_execution, scm_reproceso, scm_product_onboarding, trabajador, maquina, estacion_pesaje, legacy_pesaje
 
     # --- REGISTRO DE RUTAS ---
     from app.api.rutas_produccion import produccion_bp

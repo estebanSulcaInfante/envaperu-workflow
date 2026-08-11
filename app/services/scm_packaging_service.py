@@ -534,7 +534,7 @@ def list_packable_profiles(session, *, actor_id, active=None):
     return {"items": [item.to_dict() for item in items]}
 
 
-def create_packable_profile(session, *, actor_id, data):
+def create_packable_profile(session, *, actor_id, data, commit=True):
     try:
         actor = load_actor(
             session,
@@ -570,13 +570,16 @@ def create_packable_profile(session, *, actor_id, data):
             "PACKABLE_PROFILE_CREATED",
             after=profile.to_dict(),
         ))
-        session.commit()
+        if commit:
+            session.commit()
         return profile.to_dict()
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "PACKABLE_PROFILE_CONFLICT",
             "El perfil empacable entra en conflicto.",
@@ -584,7 +587,9 @@ def create_packable_profile(session, *, actor_id, data):
         ) from error
 
 
-def update_packable_profile(session, *, actor_id, profile_id, data):
+def update_packable_profile(
+    session, *, actor_id, profile_id, data, commit=True
+):
     try:
         actor = load_actor(
             session,
@@ -646,13 +651,16 @@ def update_packable_profile(session, *, actor_id, profile_id, data):
             before=before,
             after=profile.to_dict(),
         ))
-        session.commit()
+        if commit:
+            session.commit()
         return profile.to_dict()
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "PACKABLE_PROFILE_CONFLICT",
             "No se pudo actualizar el perfil.",
@@ -676,6 +684,7 @@ def assign_article_profiles(
     actor_id,
     article_id,
     data,
+    commit=True,
 ):
     try:
         actor = load_actor(
@@ -788,13 +797,16 @@ def assign_article_profiles(
             "ARTICLE_PACKAGING_PROFILES_ASSIGNED",
             after=response,
         ))
-        session.commit()
+        if commit:
+            session.commit()
         return response
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "ARTICLE_PROFILE_CONFLICT",
             "No se pudieron asignar los perfiles.",
@@ -910,7 +922,7 @@ def get_packaging_rule(session, *, actor_id, revision_id):
     return _serialize_rule(revision)
 
 
-def create_packaging_rule(session, *, actor_id, data):
+def create_packaging_rule(session, *, actor_id, data, commit=True):
     try:
         actor = load_actor(
             session,
@@ -997,13 +1009,16 @@ def create_packaging_rule(session, *, actor_id, data):
             "PACKAGING_RULE_CREATED",
             after=response,
         ))
-        session.commit()
+        if commit:
+            session.commit()
         return response
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "PACKAGING_RULE_CONFLICT",
             "La regla entra en conflicto con otro registro.",
@@ -1017,6 +1032,7 @@ def update_packaging_rule(
     actor_id,
     revision_id,
     data,
+    commit=True,
 ):
     try:
         actor = load_actor(
@@ -1077,13 +1093,16 @@ def update_packaging_rule(
             before=before,
             after=response,
         ))
-        session.commit()
+        if commit:
+            session.commit()
         return response
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "PACKAGING_RULE_CONFLICT",
             "No se pudo actualizar la regla.",
@@ -1294,6 +1313,7 @@ def publish_packaging_rule_directly(
     revision_id,
     operation_id,
     data,
+    commit=True,
 ):
     endpoint = f"/reglas-empaque/{revision_id}/publicar"
     try:
@@ -1311,7 +1331,8 @@ def publish_packaging_rule_directly(
             payload=data,
         )
         if replay is not None:
-            session.rollback()
+            if commit:
+                session.rollback()
             return replay
         revision = session.scalar(
             select(ScmReglaEmpaqueRevision)
@@ -1378,13 +1399,16 @@ def publish_packaging_rule_directly(
         ))
         operation.estado_http = 200
         operation.response_json = response
-        session.commit()
+        if commit:
+            session.commit()
         return response
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "PACKAGING_RULE_CONFLICT",
             "No se pudo publicar la regla.",

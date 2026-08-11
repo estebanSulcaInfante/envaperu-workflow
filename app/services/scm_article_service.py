@@ -180,7 +180,7 @@ def get_article(session, *, actor_id, article_id):
     return article.to_dict()
 
 
-def create_wip_article(session, *, actor_id, data):
+def create_wip_article(session, *, actor_id, data, commit=True):
     try:
         actor = load_actor(
             session,
@@ -237,13 +237,16 @@ def create_wip_article(session, *, actor_id, data):
             actor_snapshot=actor_snapshot(actor),
             after_json=article.to_dict(),
         ))
-        session.commit()
+        if commit:
+            session.commit()
         return article.to_dict()
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "ARTICLE_CONFLICT",
             "El articulo entra en conflicto con otro registro.",

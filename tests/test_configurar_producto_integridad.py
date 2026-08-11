@@ -194,7 +194,7 @@ def test_kit_legacy_y_molde_nuevo_sin_composicion_se_rechazan(client):
     assert sin_composicion.get_json()['codigo'] == 'COMPOSICION_REQUERIDA'
 
 
-def test_variante_requiere_que_la_pieza_ya_este_clasificada(client):
+def test_variante_permite_pieza_sin_clasificacion_tecnica(client, app):
     pieza_response = client.post(
         '/api/piezas',
         json={'nombre': 'Pieza legacy sin clasificar', 'peso_nominal_gr': 12},
@@ -209,5 +209,8 @@ def test_variante_requiere_que_la_pieza_ya_este_clasificada(client):
         json={'color_id': color['id']},
     )
 
-    assert response.status_code == 409
-    assert response.get_json()['codigo'] == 'PIEZA_SIN_CLASIFICACION'
+    assert response.status_code == 201, response.get_json()
+    with app.app_context():
+        variant = db.session.get(PiezaColor, response.get_json()['sku'])
+        assert variant.linea_id is None
+        assert variant.familia_id is None

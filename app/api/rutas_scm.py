@@ -202,6 +202,17 @@ from app.services.scm_production_observability_service import (
     list_production_ot_observability,
     summarize_production_ot_observability,
 )
+from app.services.scm_product_onboarding_service import (
+    apply_onboarding_image,
+    apply_onboarding_step,
+    create_onboarding_session,
+    finalize_onboarding_session,
+    get_onboarding_session,
+    list_onboarding_sessions,
+    update_onboarding_step,
+    validate_onboarding_session,
+)
+from app.services.catalog_image_storage import MAX_CATALOG_IMAGE_BYTES
 
 
 scm_bp = Blueprint("scm", __name__)
@@ -246,6 +257,20 @@ def _idempotency_key():
         ) from error
 
 
+def _optional_idempotency_key():
+    raw_value = request.headers.get("Idempotency-Key")
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        return UUID(raw_value.strip())
+    except (TypeError, ValueError, AttributeError) as error:
+        raise ScmServiceError(
+            "INVALID_IDEMPOTENCY_KEY",
+            "Idempotency-Key debe contener un UUID valido.",
+            status_code=400,
+        ) from error
+
+
 def _optional_active_filter():
     raw_value = request.args.get("activo")
     if raw_value is None:
@@ -260,6 +285,120 @@ def _optional_active_filter():
         "El filtro activo debe ser true o false.",
         status_code=400,
     )
+
+
+@scm_bp.get("/altas-producto")
+def altas_producto_listar():
+    return jsonify(list_onboarding_sessions(
+        db.session,
+        actor_id=_actor_id(),
+        state=request.args.get("estado"),
+    ))
+
+
+@scm_bp.post("/altas-producto")
+def alta_producto_crear():
+    return jsonify(create_onboarding_session(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.get("/altas-producto/<uuid:session_id>")
+def alta_producto_detalle(session_id):
+    return jsonify(get_onboarding_session(
+        db.session,
+        actor_id=_actor_id(),
+        session_id=session_id,
+    ))
+
+
+@scm_bp.put("/altas-producto/<uuid:session_id>/pasos/<step_code>")
+def alta_producto_paso_guardar(session_id, step_code):
+    return jsonify(update_onboarding_step(
+        db.session,
+        actor_id=_actor_id(),
+        session_id=session_id,
+        step_code=step_code,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/altas-producto/<uuid:session_id>/pasos/<step_code>/aplicar"
+)
+def alta_producto_paso_aplicar(session_id, step_code):
+    return jsonify(apply_onboarding_step(
+        db.session,
+        actor_id=_actor_id(),
+        session_id=session_id,
+        step_code=step_code,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/altas-producto/<uuid:session_id>/imagenes/"
+    "<entity_type>/<entity_id>"
+)
+def alta_producto_imagen_aplicar(session_id, entity_type, entity_id):
+    image = request.files.get("imagen")
+    if image is None or not image.filename:
+        raise ScmServiceError(
+            "IMAGE_FILE_REQUIRED",
+            "Seleccione una imagen para asociar.",
+            status_code=400,
+        )
+    raw_version = request.form.get("expected_version")
+    try:
+        parsed_version = int(raw_version)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "VERSION_REQUIRED",
+            "expected_version debe ser un entero positivo.",
+            status_code=400,
+        ) from error
+    content = image.stream.read(MAX_CATALOG_IMAGE_BYTES + 1)
+    return jsonify(apply_onboarding_image(
+        db.session,
+        actor_id=_actor_id(),
+        session_id=session_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        operation_id=_idempotency_key(),
+        data={
+            "expected_version": parsed_version,
+            "application_key": request.form.get("application_key"),
+        },
+        mime_type=image.mimetype,
+        content=content,
+    ))
+
+
+@scm_bp.post("/altas-producto/<uuid:session_id>/validar")
+def alta_producto_validar(session_id):
+    return jsonify(validate_onboarding_session(
+        db.session,
+        actor_id=_actor_id(),
+        session_id=session_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post("/altas-producto/<uuid:session_id>/finalizar")
+def alta_producto_finalizar(session_id):
+    return jsonify(finalize_onboarding_session(
+        db.session,
+        actor_id=_actor_id(),
+        session_id=session_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    ))
 
 
 @scm_bp.get("/presentaciones-comerciales")

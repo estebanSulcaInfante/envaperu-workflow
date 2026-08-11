@@ -18,6 +18,10 @@ from app.services.catalog_code_generator import (
     generar_codigo_catalogo,
     generar_numero_catalogo,
 )
+from app.services.catalog_product_service import (
+    CatalogProductError,
+    create_finished_product,
+)
 from app.services.color_recipe_service import (
     ColorRecipeError,
     create_recipe,
@@ -35,46 +39,30 @@ from app.services.order_integrity_service import (
     validate_order_prerequisites,
 )
 from app.services.catalog_image_storage import (
+    CatalogImageValidationError,
     CatalogImageStorageError,
+    MAX_CATALOG_IMAGE_BYTES,
     get_catalog_image_storage,
     has_catalog_image,
+    validate_catalog_image_content,
 )
 from sqlalchemy import or_
 
 catalogo_bp = Blueprint('catalogo', __name__)
-
-IMAGE_MIME_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
-MAX_CATALOG_IMAGE_BYTES = 2 * 1024 * 1024
-
 
 def _read_catalog_image():
     image = request.files.get('imagen')
     if image is None or not image.filename:
         return None, (jsonify({'error': 'Selecciona una imagen.'}), 400)
     mime = str(image.mimetype or '').lower()
-    if mime not in IMAGE_MIME_TYPES:
-        return None, (jsonify({
-            'error': 'Formato no permitido. Usa JPG, PNG o WebP.',
-            'codigo': 'IMAGEN_FORMATO_INVALIDO',
-        }), 415)
     content = image.stream.read(MAX_CATALOG_IMAGE_BYTES + 1)
-    if not content:
-        return None, (jsonify({'error': 'La imagen esta vacia.'}), 400)
-    if len(content) > MAX_CATALOG_IMAGE_BYTES:
+    try:
+        validate_catalog_image_content(mime, content)
+    except CatalogImageValidationError as exc:
         return None, (jsonify({
-            'error': 'La imagen supera el limite de 2 MB.',
-            'codigo': 'IMAGEN_DEMASIADO_GRANDE',
-        }), 413)
-    signatures = {
-        'image/png': content.startswith(b'\x89PNG\r\n\x1a\n'),
-        'image/jpeg': content.startswith(b'\xff\xd8\xff'),
-        'image/webp': content.startswith(b'RIFF') and content[8:12] == b'WEBP',
-    }
-    if not signatures[mime]:
-        return None, (jsonify({
-            'error': 'El contenido no coincide con el formato declarado.',
-            'codigo': 'IMAGEN_CONTENIDO_INVALIDO',
-        }), 415)
+            'error': exc.message,
+            'codigo': exc.code,
+        }), exc.status_code)
     return (mime, content), None
 
 
@@ -406,9 +394,6 @@ def actualizar_pieza_maestra(pieza_id):
     pieza.peso_nominal_gr = peso_nominal
     pieza.linea_id = linea.id if linea else None
     pieza.familia_id = familia.id if familia else None
-    for variante in pieza.variantes:
-        variante.linea_id = pieza.linea_id
-        variante.familia_id = pieza.familia_id
     pieza.activo = nuevo_activo
     pieza.version += 1
     try:
@@ -543,63 +528,28 @@ def crear_producto():
     if not data:
         return jsonify({'error': 'Payload JSON requerido'}), 400
 
-    if str(data.get('cod_sku_pt') or '').strip():
-        return _manual_identifier_error('cod_sku_pt')
-    if not str(data.get('producto') or '').strip():
-        return jsonify({'error': 'producto es obligatorio'}), 400
-    numeric_error = _normalize_product_numeric_fields(data)
-    if numeric_error:
-        return numeric_error
     try:
-        linea, familia, _ = validate_linea_familia(
-            linea_id=data.get('linea_id'),
-            familia_id=data.get('familia_id'),
-        )
-    except ClassificationError as exc:
-        return _classification_error_response(exc)
-    
-    try:
-        producto = ProductoTerminado(
-            cod_sku_pt=generar_codigo_catalogo('PRODUCTO_TERMINADO'),
-            producto=str(data['producto']).strip(),
-            linea_id=linea.id,
-            familia_id=familia.id,
-            peso_g=data.get('peso_g'),
-            precio_estimado=data.get('precio_estimado'),
-            precio_sin_igv=data.get('precio_sin_igv'),
-            doc_x_paq=data.get('doc_x_paq'),
-            doc_x_bulto=data.get('doc_x_bulto'),
-            status=data.get('status', 'Activo'),
-            codigo_barra=data.get('codigo_barra'),
-            marca=data.get('marca'),
-            um=data.get('um', 'Unidad')
-        )
-        db.session.add(producto)
-        db.session.flush()
-        db.session.add(ScmPresentacionComercial(
-            codigo=generar_codigo_catalogo('PRESENTACION_COMERCIAL'),
-            producto_terminado_id=producto.cod_sku_pt,
-            nombre='Unidad',
-            unidades_base=1,
-            codigo_barra=data.get('codigo_barra'),
-            predeterminada=True,
-        ))
-
-        # Adaptador transitorio para consumidores legacy. El frontend nuevo no
-        # envía esta colección; las BOM nuevas viven en Ingeniería SCM.
-        for pieza_data in data.get('piezas', []):
-            db.session.add(ProductoPieza(
-                producto_terminado_id=producto.cod_sku_pt,
-                pieza_sku=pieza_data['pieza_sku'],
-                cantidad=pieza_data.get('cantidad', 1),
-            ))
-
+        producto = create_finished_product(db.session, data)
         db.session.commit()
-        return jsonify({'cod_sku_pt': producto.cod_sku_pt, 'producto': producto.producto}), 201
-    except Exception as e:
+        return jsonify({
+            'cod_sku_pt': producto.cod_sku_pt,
+            'producto': producto.producto,
+        }), 201
+    except CatalogProductError as exc:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 400
-
+        if exc.code == 'CODIGO_MANUAL_NO_PERMITIDO':
+            return _manual_identifier_error(exc.details.get('field'))
+        payload = {'error': exc.message, 'codigo': exc.code}
+        if exc.code == 'VALOR_INVALIDO' and exc.details.get('field'):
+            payload['campo'] = exc.details['field']
+        if exc.details:
+            payload['details'] = exc.details
+        if exc.code == 'PRODUCTO_INVALIDO':
+            payload['error'] = payload['error'].rstrip('.')
+        return jsonify(payload), exc.status
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 400
 
 @catalogo_bp.route('/productos/<cod_sku_pt>', methods=['PUT'])
 def actualizar_producto(cod_sku_pt):
@@ -732,8 +682,8 @@ def _pieza_color_to_dict(pieza):
         'peso': pieza.peso,
         'cavidad': pieza.cavidad,
         'cavidad_legacy': pieza.cavidad,
-        'linea_id': pieza.linea_id,
-        'familia_id': pieza.familia_id,
+        'linea_id': pieza.clasificacion_linea_id,
+        'familia_id': pieza.clasificacion_familia_id,
         'color_produccion_id': pieza.color_produccion_id,
         'color': pieza.color_produccion_rel.nombre if pieza.color_produccion_rel else None,
         'color_hex': pieza.color_produccion_rel.hex_referencia if pieza.color_produccion_rel else None,
@@ -774,6 +724,39 @@ def _resolve_pieza_color_classification(data, current=None):
                 'PIEZA_NO_ENCONTRADA',
                 404,
             )
+        supplied_linea = data.get('linea_id')
+        supplied_familia = data.get('familia_id')
+        has_linea = pieza_maestra.linea_id is not None
+        has_familia = pieza_maestra.familia_id is not None
+        if has_linea != has_familia:
+            raise ClassificationError(
+                'La pieza maestra tiene una clasificacion incompleta',
+                'CLASIFICACION_INCOMPLETA',
+                409,
+            )
+        if has_linea:
+            validate_linea_familia(
+                linea_id=pieza_maestra.linea_id,
+                familia_id=pieza_maestra.familia_id,
+            )
+        if supplied_linea not in (None, '') or supplied_familia not in (None, ''):
+            try:
+                matches_master = (
+                    has_linea
+                    and int(supplied_linea) == pieza_maestra.linea_id
+                    and int(supplied_familia) == pieza_maestra.familia_id
+                )
+            except (TypeError, ValueError):
+                matches_master = False
+            if not matches_master:
+                raise ClassificationError(
+                    'La variante ligada no admite clasificacion propia',
+                    'CLASIFICACION_PIEZA_DIVERGENTE',
+                    409,
+                )
+        # En el contrato nuevo PiezaColor ligada no duplica Linea/Familia.
+        return pieza_maestra, None, None
+
         supplied_linea = data.get('linea_id')
         supplied_familia = data.get('familia_id')
         if pieza_maestra.linea_id is None or pieza_maestra.familia_id is None:
@@ -1238,8 +1221,8 @@ def _ensure_mold_color_variants(molde, color):
                 piezas=f"{pieza_maestra.nombre} {color.nombre}",
                 peso=pieza_maestra.peso_nominal_gr,
                 cavidad=None,
-                linea_id=linea.id,
-                familia_id=familia.id,
+                linea_id=linea.id if linea else None,
+                familia_id=familia.id if familia else None,
                 color_produccion_id=color.id,
                 pieza_id=pieza_maestra.id,
                 estado_revision='EN_REVISION',
@@ -1359,8 +1342,14 @@ def obtener_pieza_color(sku):
         return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
     payload = _pieza_color_to_dict(pieza)
-    payload['linea'] = pieza.linea_rel.nombre if pieza.linea_rel else None
-    payload['familia'] = pieza.familia_rel.nombre if pieza.familia_rel else None
+    payload['linea'] = (
+        pieza.clasificacion_linea_rel.nombre
+        if pieza.clasificacion_linea_rel else None
+    )
+    payload['familia'] = (
+        pieza.clasificacion_familia_rel.nombre
+        if pieza.clasificacion_familia_rel else None
+    )
     return jsonify(payload), 200
 
 
@@ -1435,8 +1424,8 @@ def crear_pieza_color():
             cavidad=data.get('cavidad'),  # legado, no gobierna el molde
             color_produccion_id=data.get('color_produccion_id'),
             cod_pieza=data.get('cod_pieza'),
-            linea_id=linea.id,
-            familia_id=familia.id,
+            linea_id=linea.id if linea else None,
+            familia_id=familia.id if familia else None,
             pieza_id=pieza_maestra.id if pieza_maestra else None,
             cod_extru=data.get('cod_extru'),
             tipo_extruccion=data.get('tipo_extruccion'),
@@ -1491,8 +1480,8 @@ def actualizar_pieza_color(sku):
             pieza.color_produccion_id,
         )
         pieza.cod_pieza = data.get('cod_pieza', pieza.cod_pieza)
-        pieza.linea_id = linea.id
-        pieza.familia_id = familia.id
+        pieza.linea_id = linea.id if linea else None
+        pieza.familia_id = familia.id if familia else None
         pieza.pieza_id = pieza_maestra.id if pieza_maestra else None
         pieza.cod_extru = data.get('cod_extru', pieza.cod_extru)
         pieza.tipo_extruccion = data.get(
@@ -2187,8 +2176,10 @@ def configurar_producto_cascada():
                         piezas=nombre_coloreado,
                         peso=forma.peso_unitario_gr,
                         cavidad=None,
-                        linea_id=forma_linea.id,
-                        familia_id=forma_familia.id,
+                        linea_id=forma_linea.id if forma_linea else None,
+                        familia_id=(
+                            forma_familia.id if forma_familia else None
+                        ),
                         color_produccion_id=color.id,
                         pieza_id=forma.pieza_id,
                     )
@@ -2249,8 +2240,12 @@ def configurar_producto_cascada():
                             piezas=f"{forma.nombre} (Genérico)",
                             peso=forma.peso_unitario_gr,
                             cavidad=None,
-                            linea_id=forma_linea.id,
-                            familia_id=forma_familia.id,
+                            linea_id=(
+                                forma_linea.id if forma_linea else None
+                            ),
+                            familia_id=(
+                                forma_familia.id if forma_familia else None
+                            ),
                             pieza_id=forma.pieza_id
                             # Sin color
                         )
@@ -3607,14 +3602,31 @@ def asociar_familia_a_linea(linea_id):
                 'error': 'La familia creada en contexto debe iniciar activa',
                 'codigo': 'CATALOGO_INACTIVO',
             }), 409
-        if _catalog_duplicate(Familia, codigo=codigo, nombre=nombre):
+        duplicate = _catalog_duplicate(
+            Familia,
+            codigo=codigo,
+            nombre=nombre,
+        )
+        exact_inactive = bool(
+            duplicate is not None
+            and not duplicate.activo
+            and duplicate.codigo == codigo
+            and duplicate.nombre.strip().casefold()
+            == nombre.strip().casefold()
+        )
+        if duplicate is not None and not exact_inactive:
             return jsonify({
                 'error': 'Ya existe otra familia con ese código o nombre',
                 'codigo': 'CATALOGO_DUPLICADO',
             }), 409
-        familia = Familia(codigo=codigo, nombre=nombre, activo=True)
-        db.session.add(familia)
-        db.session.flush()
+        if exact_inactive:
+            familia = duplicate
+            familia.activo = True
+            familia.version += 1
+        else:
+            familia = Familia(codigo=codigo, nombre=nombre, activo=True)
+            db.session.add(familia)
+            db.session.flush()
     else:
         try:
             familia_id = int(familia_id_raw)
@@ -3633,10 +3645,11 @@ def asociar_familia_a_linea(linea_id):
             return jsonify({'error': 'Familia no encontrada'}), 404
 
     if not familia.activo:
-        return jsonify({
-            'error': 'Solo se pueden asociar familias activas',
-            'codigo': 'CATALOGO_INACTIVO',
-        }), 409
+        # Este endpoint contextual posee ambas mutaciones. Reactivar y asociar
+        # en la misma transaccion evita el callejon sin salida de intentar
+        # crear un homonimo mientras el maestro inactivo conserva la unicidad.
+        familia.activo = True
+        familia.version += 1
 
     relacion = LineaFamilia.query.filter_by(
         linea_id=linea_id,

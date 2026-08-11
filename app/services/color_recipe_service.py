@@ -321,13 +321,20 @@ def create_recipe(session, data, *, forced_revision=None, commit=True):
     _apply_lines(recipe, lines)
     if is_default:
         _clear_scope_default(session, color_id=color_id, product_scope=product_scope)
-    session.add(recipe)
     try:
-        session.flush()
         if commit:
+            session.add(recipe)
+            session.flush()
             session.commit()
+        else:
+            # Savepoint: a conflict must not erase units already applied by
+            # the resumable product-onboarding command.
+            with session.begin_nested():
+                session.add(recipe)
+                session.flush()
     except IntegrityError as exc:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ColorRecipeError(
             "La revisión o receta predeterminada entra en conflicto con otra existente.",
             code="RECETA_CONFLICTO",

@@ -262,6 +262,65 @@ def test_alta_en_contexto_crea_familia_y_asociacion_en_una_transaccion(client, a
         ).count() == 1
 
 
+def test_alta_contextual_reactiva_familia_existente_sin_duplicarla(client, app):
+    linea = _crear_linea(client, 92, 'Cocina')
+    familia = _crear_familia(client, 904, 'Escurridores')
+    inactiva = client.delete(
+        f"/api/catalogo/familias/{familia['id']}?version={familia['version']}"
+    )
+    assert inactiva.status_code == 200
+
+    response = client.post(
+        f"/api/catalogo/lineas/{linea['id']}/familias",
+        json={
+            'familia': {
+                'codigo': familia['codigo'],
+                'nombre': familia['nombre'],
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.get_json()
+    payload = response.get_json()
+    assert payload['familia']['id'] == familia['id']
+    assert payload['familia']['activo'] is True
+    assert payload['familia']['version'] == (
+        inactiva.get_json()['version'] + 1
+    )
+    with app.app_context():
+        assert Familia.query.filter_by(nombre='Escurridores').count() == 1
+        assert LineaFamilia.query.filter_by(
+            linea_id=linea['id'],
+            familia_id=familia['id'],
+            activo=True,
+        ).count() == 1
+
+
+def test_asociacion_contextual_por_id_reactiva_familia_inactiva(client, app):
+    linea = _crear_linea(client, 93, 'Organizacion')
+    familia = _crear_familia(client, 905, 'Canastas')
+    inactiva = client.delete(
+        f"/api/catalogo/familias/{familia['id']}?version={familia['version']}"
+    )
+    assert inactiva.status_code == 200
+
+    response = client.post(
+        f"/api/catalogo/lineas/{linea['id']}/familias",
+        json={'familia_id': familia['id']},
+    )
+
+    assert response.status_code == 201, response.get_json()
+    assert response.get_json()['familia']['id'] == familia['id']
+    assert response.get_json()['familia']['activo'] is True
+    with app.app_context():
+        assert Familia.query.filter_by(id=familia['id']).count() == 1
+        assert LineaFamilia.query.filter_by(
+            linea_id=linea['id'],
+            familia_id=familia['id'],
+            activo=True,
+        ).count() == 1
+
+
 def test_alta_en_contexto_no_deja_familia_huerfana_si_linea_no_existe(client, app):
     response = client.post(
         '/api/catalogo/lineas/999999/familias',
@@ -277,3 +336,23 @@ def test_alta_en_contexto_no_deja_familia_huerfana_si_linea_no_existe(client, ap
     with app.app_context():
         assert Familia.query.filter_by(codigo=902).count() == 0
         assert Familia.query.filter_by(nombre='No debe persistir').count() == 0
+
+
+def test_alta_generica_de_familia_no_inventa_asociacion_con_linea(client, app):
+    linea = _crear_linea(client, 91, 'Escolar')
+
+    familia = _crear_familia(client, 903, 'Loncheras')
+
+    with app.app_context():
+        assert Familia.query.filter_by(id=familia['id']).count() == 1
+        assert LineaFamilia.query.filter_by(
+            linea_id=linea['id'],
+            familia_id=familia['id'],
+        ).count() == 0
+
+    contextual = client.post(
+        f"/api/catalogo/lineas/{linea['id']}/familias",
+        json={'familia_id': familia['id']},
+    )
+    assert contextual.status_code == 201, contextual.get_json()
+    assert contextual.get_json()['familia']['id'] == familia['id']

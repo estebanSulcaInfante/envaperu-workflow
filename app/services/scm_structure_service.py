@@ -490,7 +490,9 @@ def get_structure(session, *, actor_id, structure_id):
     return serialize_structure(revision)
 
 
-def create_structure(session, *, actor_id, article_id, data):
+def create_structure(
+    session, *, actor_id, article_id, data, commit=True
+):
     try:
         actor = load_actor(
             session,
@@ -566,13 +568,16 @@ def create_structure(session, *, actor_id, article_id, data):
         session.add(revision)
         session.flush()
         session.add(_event(revision, actor, "STRUCTURE_CREATED"))
-        session.commit()
+        if commit:
+            session.commit()
         return serialize_structure(revision)
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "STRUCTURE_CONFLICT",
             "La estructura entra en conflicto con otro registro.",
@@ -580,7 +585,9 @@ def create_structure(session, *, actor_id, article_id, data):
         ) from error
 
 
-def update_structure(session, *, actor_id, structure_id, data):
+def update_structure(
+    session, *, actor_id, structure_id, data, commit=True
+):
     try:
         actor = load_actor(
             session,
@@ -624,13 +631,16 @@ def update_structure(session, *, actor_id, structure_id, data):
                 before=before,
             )
         )
-        session.commit()
+        if commit:
+            session.commit()
         return serialize_structure(revision)
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "STRUCTURE_CONFLICT",
             "No se pudo actualizar la estructura.",
@@ -645,6 +655,7 @@ def send_structure_for_approval(
     structure_id,
     operation_id,
     data,
+    commit=True,
 ):
     endpoint = f"/estructuras/{structure_id}/enviar"
     try:
@@ -662,7 +673,8 @@ def send_structure_for_approval(
             payload=data,
         )
         if replay is not None:
-            session.rollback()
+            if commit:
+                session.rollback()
             return replay
         revision = _locked_structure(session, structure_id)
         _check_version(revision, data.get("version"))
@@ -693,13 +705,16 @@ def send_structure_for_approval(
         response = serialize_structure(revision)
         operation.estado_http = 200
         operation.response_json = response
-        session.commit()
+        if commit:
+            session.commit()
         return response
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "STRUCTURE_CONFLICT",
             "No se pudo enviar la estructura.",
@@ -775,6 +790,7 @@ def publish_structure_directly(
     structure_id,
     operation_id,
     data,
+    commit=True,
 ):
     endpoint = f"/estructuras/{structure_id}/publicar"
     try:
@@ -792,7 +808,8 @@ def publish_structure_directly(
             payload=data,
         )
         if replay is not None:
-            session.rollback()
+            if commit:
+                session.rollback()
             return replay
         if session.get_bind().dialect.name == "postgresql":
             session.execute(text(
@@ -817,13 +834,16 @@ def publish_structure_directly(
         response = serialize_structure(revision)
         operation.estado_http = 200
         operation.response_json = response
-        session.commit()
+        if commit:
+            session.commit()
         return response
     except ScmServiceError:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
     except IntegrityError as error:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise ScmServiceError(
             "STRUCTURE_CONFLICT",
             "No se pudo publicar la estructura.",

@@ -1,11 +1,15 @@
 import hashlib
+import io
 
 import pytest
+from PIL import Image
 
 from app.services.catalog_image_storage import (
     CatalogImageStorage,
     CatalogImageStorageError,
+    CatalogImageValidationError,
     has_catalog_image,
+    validate_catalog_image_content,
     validate_catalog_image_storage_config,
 )
 
@@ -62,6 +66,56 @@ def s3_config(**overrides):
     return config
 
 
+def _image_bytes(image_format):
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(24, 96, 160)).save(
+        output,
+        format=image_format,
+    )
+    return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "image_format"),
+    [
+        ("image/png", "PNG"),
+        ("image/jpeg", "JPEG"),
+        ("image/webp", "WEBP"),
+    ],
+)
+def test_image_validator_decodes_real_supported_images(
+    mime_type, image_format
+):
+    validate_catalog_image_content(
+        mime_type,
+        _image_bytes(image_format),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "content"),
+    [
+        ("image/png", b"\x89PNG\r\n\x1a\n"),
+        (
+            "image/png",
+            _image_bytes("PNG") + b"<script>polyglot</script>",
+        ),
+        (
+            "image/jpeg",
+            _image_bytes("JPEG")
+            + b"<script>polyglot</script>"
+            + b"\xff\xd9",
+        ),
+    ],
+)
+def test_image_validator_rejects_truncated_and_trailing_polyglot(
+    mime_type, content
+):
+    with pytest.raises(CatalogImageValidationError) as caught:
+        validate_catalog_image_content(mime_type, content)
+    assert caught.value.code == "IMAGEN_CONTENIDO_INVALIDO"
+
+
 def test_database_mode_preserves_legacy_behavior():
     entity = ImageEntity()
     storage = CatalogImageStorage({"CATALOG_IMAGE_STORAGE": "database"})
@@ -97,7 +151,11 @@ def test_supabase_s3_mode_writes_reads_and_deletes_private_object():
         content=b"webp-content",
     )
 
-    assert key == "catalog/producto-terminado/PT-000001/image"
+    digest = hashlib.sha256(b"webp-content").hexdigest()
+    assert key == (
+        "catalog/producto-terminado/PT-000001/"
+        f"sha256-{digest}"
+    )
     assert entity.imagen_data is None
     assert entity.imagen_storage_key == key
     assert storage.load(entity).content == b"webp-content"

@@ -124,49 +124,68 @@ def _nonnegative_float(value, field_name):
 
 def _validate_classification(*, pieza, pieza_color=None, session=None):
     active_session = session if session is not None else db.session
-    if pieza.linea_id is None or pieza.familia_id is None:
+    has_linea = pieza.linea_id is not None
+    has_familia = pieza.familia_id is not None
+    if has_linea != has_familia:
         _error(
-            f"La pieza {pieza.codigo} no tiene Linea y Familia completas",
-            "PIEZA_SIN_CLASIFICACION",
+            f"La pieza {pieza.codigo} tiene una clasificacion incompleta",
+            "CLASIFICACION_INCOMPLETA",
             409,
             pieza_id=pieza.id,
             pieza_codigo=pieza.codigo,
         )
-    try:
-        validate_linea_familia(
-            linea_id=pieza.linea_id,
-            familia_id=pieza.familia_id,
-            session=active_session,
-        )
-    except ClassificationError as exc:
-        raise OrderIntegrityError(
-            exc.message,
-            exc.code,
-            exc.status,
-            {"pieza_id": pieza.id, "pieza_codigo": pieza.codigo},
-        ) from exc
+    if has_linea:
+        try:
+            validate_linea_familia(
+                linea_id=pieza.linea_id,
+                familia_id=pieza.familia_id,
+                session=active_session,
+            )
+        except ClassificationError as exc:
+            raise OrderIntegrityError(
+                exc.message,
+                exc.code,
+                exc.status,
+                {"pieza_id": pieza.id, "pieza_codigo": pieza.codigo},
+            ) from exc
 
-    if pieza_color is not None and (
+    if pieza_color is None:
+        return
+    variant_has_linea = pieza_color.linea_id is not None
+    variant_has_familia = pieza_color.familia_id is not None
+    if variant_has_linea != variant_has_familia:
+        _error(
+            f"El SKU {pieza_color.sku} tiene clasificacion legacy incompleta",
+            "CLASIFICACION_INCOMPLETA",
+            409,
+            pieza_sku=pieza_color.sku,
+        )
+    if variant_has_linea and not has_linea:
+        try:
+            validate_linea_familia(
+                linea_id=pieza_color.linea_id,
+                familia_id=pieza_color.familia_id,
+                session=active_session,
+            )
+        except ClassificationError as exc:
+            raise OrderIntegrityError(
+                exc.message,
+                exc.code,
+                exc.status,
+                {"pieza_sku": pieza_color.sku},
+            ) from exc
+    # NULL/NULL is the canonical linked representation. A complete duplicate
+    # is accepted only for expand/contract compatibility with legacy rows.
+    if variant_has_linea and has_linea and (
         pieza_color.linea_id != pieza.linea_id
         or pieza_color.familia_id != pieza.familia_id
     ):
         _error(
-            (
-                f"El SKU {pieza_color.sku} contradice la clasificacion "
-                f"de su pieza maestra {pieza.codigo}"
-            ),
+            f"El SKU {pieza_color.sku} contradice su pieza maestra",
             "CLASIFICACION_PIEZA_DIVERGENTE",
             409,
             pieza_sku=pieza_color.sku,
             pieza_id=pieza.id,
-            clasificacion_pieza={
-                "linea_id": pieza.linea_id,
-                "familia_id": pieza.familia_id,
-            },
-            clasificacion_sku={
-                "linea_id": pieza_color.linea_id,
-                "familia_id": pieza_color.familia_id,
-            },
         )
 
 
@@ -283,8 +302,8 @@ def _resolve_variant(
                         ),
                         piezas=f"{pieza.nombre} {color.nombre}",
                         pieza_id=pieza.id,
-                        linea_id=pieza.linea_id,
-                        familia_id=pieza.familia_id,
+                        linea_id=None,
+                        familia_id=None,
                         color_produccion_id=color_id,
                         peso=pieza.peso_nominal_gr,
                         estado_revision="EN_REVISION",
