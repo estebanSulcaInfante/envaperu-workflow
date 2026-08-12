@@ -32,10 +32,13 @@ from app.models.scm_ot import (
     ScmTrabajoOt,
 )
 from app.models.scm_production_orders import (
+    ScmOrdenFabricacion,
     ScmOrdenOperacion,
+    ScmOrdenOperacionSalida,
     ScmOrdenProduccion,
     ScmPlanProduccion,
 )
+from app.models.scm_articulos import ScmArticulo
 from app.models.scm_reproceso import ScmAlertaOperativa
 from app.models.scm_rutas import ScmCentroTrabajo
 from app.models.scm_warehouse import ScmExistenciaManga
@@ -1759,6 +1762,188 @@ def _authorize(session, *, actor_id, filters):
             details={"capability": "RECEPCION_MANGA_VER"},
         )
     return actor
+
+
+def list_pending_production_documents(session, *, actor_id, filters=None):
+    """Lista OF/OA liberadas que todavía no tienen una OT operativa.
+
+    Estos documentos no pertenecen al read model por OT porque aún no poseen
+    fecha operativa ni jornada. Se exponen por separado para no ocultar trabajo
+    liberado ni inflar los KPI de ejecución.
+    """
+
+    normalized = _normalize_filters(filters)
+    _authorize(session, actor_id=actor_id, filters=normalized)
+    as_of = utc_now()
+    if any((
+        normalized["estado_operativo"],
+        normalized["turno"],
+        normalized["responsable"],
+        normalized["ot"],
+        normalized["color"],
+        normalized["quick"],
+        normalized["pendientes_pesaje"],
+        normalized["pendientes_almacen"],
+        normalized["alertas"],
+    )):
+        return {"items": [], "count": 0, "as_of": _iso(as_of)}
+    event_at = func.coalesce(
+        ScmOrdenOperacion.released_at,
+        ScmOrdenOperacion.created_at,
+    )
+    statement = (
+        select(
+            ScmOrdenOperacion,
+            ScmOrdenFabricacion,
+            ScmPlanProduccion,
+            ScmOrdenProduccion,
+            Maquina,
+        )
+        .outerjoin(
+            ScmOrdenFabricacion,
+            ScmOrdenFabricacion.orden_operacion_id == ScmOrdenOperacion.id,
+        )
+        .outerjoin(
+            Maquina,
+            Maquina.id == ScmOrdenFabricacion.maquina_prevista_id,
+        )
+        .outerjoin(
+            ScmPlanProduccion,
+            ScmPlanProduccion.id == ScmOrdenOperacion.plan_produccion_id,
+        )
+        .outerjoin(
+            ScmOrdenProduccion,
+            ScmOrdenProduccion.id == ScmPlanProduccion.orden_produccion_id,
+        )
+        .where(
+            ScmOrdenOperacion.estado.in_(("LIBERADA", "PROGRAMADA")),
+            ScmOrdenOperacion.created_at <= as_of,
+            ~exists(
+                select(RegistroDiarioProduccion.id).where(
+                    RegistroDiarioProduccion.orden_operacion_id
+                    == ScmOrdenOperacion.id
+                )
+            ),
+        )
+    )
+    if normalized["fecha_desde"]:
+        statement = statement.where(
+            func.date(event_at) >= normalized["fecha_desde"]
+        )
+    if normalized["fecha_hasta"]:
+        statement = statement.where(
+            func.date(event_at) <= normalized["fecha_hasta"]
+        )
+    if normalized["tipo_ot"]:
+        statement = statement.where(
+            ScmOrdenOperacion.tipo == normalized["tipo_ot"]
+        )
+    if normalized["estado_documental"]:
+        statement = statement.where(
+            ScmOrdenOperacion.estado == normalized["estado_documental"]
+        )
+    if normalized["orden"]:
+        statement = statement.where(
+            ScmOrdenOperacion.codigo.ilike(f"%{normalized['orden']}%")
+        )
+    if normalized["op"]:
+        statement = statement.where(
+            ScmOrdenProduccion.codigo.ilike(f"%{normalized['op']}%")
+        )
+    if normalized["recurso"]:
+        resource_term = f"%{normalized['recurso']}%"
+        statement = statement.where(or_(
+            ScmOrdenFabricacion.molde_id.ilike(resource_term),
+            Maquina.codigo.ilike(resource_term),
+            Maquina.nombre.ilike(resource_term),
+        ))
+    if normalized["q"]:
+        term = f"%{normalized['q']}%"
+        output_match = exists(
+            select(ScmOrdenOperacionSalida.id)
+            .join(
+                ScmArticulo,
+                ScmArticulo.id == ScmOrdenOperacionSalida.articulo_scm_id,
+            )
+            .where(
+                ScmOrdenOperacionSalida.orden_operacion_id
+                == ScmOrdenOperacion.id,
+                or_(
+                    ScmArticulo.codigo.ilike(term),
+                    ScmArticulo.nombre.ilike(term),
+                ),
+            )
+        )
+        statement = statement.where(or_(
+            ScmOrdenOperacion.codigo.ilike(term),
+            ScmOrdenOperacion.motivo.ilike(term),
+            ScmOrdenProduccion.codigo.ilike(term),
+            ScmOrdenFabricacion.molde_id.ilike(term),
+            Maquina.codigo.ilike(term),
+            Maquina.nombre.ilike(term),
+            output_match,
+        ))
+    rows = session.execute(
+        statement.order_by(event_at.desc(), ScmOrdenOperacion.codigo.desc())
+        .limit(normalized["limit"])
+    ).all()
+    order_ids = [row[0].id for row in rows]
+    outputs_by_order = defaultdict(list)
+    if order_ids:
+        output_rows = session.execute(
+            select(ScmOrdenOperacionSalida, ScmArticulo)
+            .join(
+                ScmArticulo,
+                ScmArticulo.id == ScmOrdenOperacionSalida.articulo_scm_id,
+            )
+            .where(ScmOrdenOperacionSalida.orden_operacion_id.in_(order_ids))
+            .order_by(
+                ScmOrdenOperacionSalida.orden_operacion_id,
+                ScmArticulo.codigo,
+            )
+        ).all()
+        for output, article in output_rows:
+            outputs_by_order[output.orden_operacion_id].append({
+                "articulo": {
+                    "id": article.id,
+                    "codigo": article.codigo,
+                    "nombre": article.nombre,
+                    "clase": article.clase,
+                },
+                "cantidad_objetivo": _number(output.cantidad_objetivo),
+                "unidad": article.unidad_base,
+            })
+    items = []
+    for order, fabrication, _plan, production_order, machine in rows:
+        outputs = outputs_by_order.get(order.id, [])
+        items.append({
+            "id": str(order.id),
+            "codigo": order.codigo,
+            "tipo": "ARMADO" if order.tipo == "ENSAMBLE" else order.tipo,
+            "estado": order.estado,
+            "origen": order.origen_demanda,
+            "motivo": order.motivo,
+            "created_at": _iso(order.created_at),
+            "released_at": _iso(order.released_at),
+            "op": ({"codigo": production_order.codigo}
+                   if production_order else None),
+            "recurso": {
+                "molde_codigo": fabrication.molde_id if fabrication else None,
+                "maquina_codigo": machine.codigo if machine else None,
+                "maquina_nombre": machine.nombre if machine else None,
+            },
+            "salidas": outputs,
+            "cantidad_objetivo": sum(
+                item["cantidad_objetivo"] for item in outputs
+            ),
+            "siguiente_accion": "PROGRAMAR_OT",
+            "situacion": "SIN_OT",
+        })
+    return {
+        "items": items,
+        "count": len(items),
+        "as_of": _iso(as_of),
+    }
 
 
 def _execute_list(session, *, actor_id, filters, paginate, detail=False):

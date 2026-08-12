@@ -23,6 +23,7 @@ from app.services.scm_service_support import (
     reject_unknown_fields,
     required_text,
 )
+from app.services.scm_warehouse_scope_service import allowed_location_ids
 
 
 def _hash(value):
@@ -123,18 +124,34 @@ def _balance_payload(item):
 
 def list_inventory_balances(session, *, actor_id):
     load_actor(session, actor_id, capability="INVENTARIO_VER")
-    items = session.scalars(
+    location_ids, scope = allowed_location_ids(session, actor_id=actor_id)
+    article_query = (
         select(ScmSaldoInventario)
         .join(ScmSaldoInventario.articulo)
         .join(ScmSaldoInventario.ubicacion)
         .order_by(ScmArticulo.codigo, ScmUbicacionInventario.codigo)
-    ).all()
-    material_items = session.scalars(
+    )
+    material_query = (
         select(ScmSaldoMaterialInventario)
         .join(ScmSaldoMaterialInventario.material)
         .join(ScmSaldoMaterialInventario.ubicacion)
         .order_by(ScmSaldoMaterialInventario.material_id, ScmUbicacionInventario.codigo)
-    ).all()
+    )
+    if location_ids is not None:
+        article_query = article_query.where(ScmSaldoInventario.ubicacion_id.in_(location_ids))
+        material_query = material_query.where(ScmSaldoMaterialInventario.ubicacion_id.in_(location_ids))
+    items = session.scalars(article_query).all()
+    material_items = session.scalars(material_query).all()
+    if scope["configured"] and not scope["transversal"]:
+        allowed_by_warehouse = scope["classes"]
+        items = [
+            item for item in items
+            if item.articulo.clase in allowed_by_warehouse.get(item.ubicacion.almacen_id, set())
+        ]
+        material_items = [
+            item for item in material_items
+            if item.material.clase in allowed_by_warehouse.get(item.ubicacion.almacen_id, set())
+        ]
     return {
         "items": [_balance_payload(item) for item in items],
         "materiales": [_material_balance_payload(item) for item in material_items],
@@ -170,17 +187,28 @@ def _material_balance_payload(item):
 
 def list_inventory_movements(session, *, actor_id, limit=100):
     load_actor(session, actor_id, capability="INVENTARIO_VER")
+    location_ids, scope = allowed_location_ids(session, actor_id=actor_id)
     safe_limit = min(max(int(limit or 100), 1), 500)
-    items = session.scalars(
+    article_query = (
         select(ScmMovimientoInventario)
+        .join(ScmMovimientoInventario.saldo)
         .order_by(ScmMovimientoInventario.created_at.desc())
         .limit(safe_limit)
-    ).all()
-    material_items = session.scalars(
+    )
+    material_query = (
         select(ScmMovimientoMaterialInventario)
+        .join(ScmMovimientoMaterialInventario.saldo)
         .order_by(ScmMovimientoMaterialInventario.created_at.desc())
         .limit(safe_limit)
-    ).all()
+    )
+    if location_ids is not None:
+        article_query = article_query.where(ScmSaldoInventario.ubicacion_id.in_(location_ids))
+        material_query = material_query.where(ScmSaldoMaterialInventario.ubicacion_id.in_(location_ids))
+    items = session.scalars(article_query).all()
+    material_items = session.scalars(material_query).all()
+    if scope["configured"] and not scope["transversal"]:
+        items = [item for item in items if item.saldo.articulo.clase in scope["classes"].get(item.saldo.ubicacion.almacen_id, set())]
+        material_items = [item for item in material_items if item.saldo.material.clase in scope["classes"].get(item.saldo.ubicacion.almacen_id, set())]
     return {
         "items": [{
             "id": str(item.id),

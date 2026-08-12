@@ -19,6 +19,21 @@ class ScmUbicacionInventario(db.Model):
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    almacen_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_almacen.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    parent_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_ubicacion_inventario.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    tipo = db.Column(db.String(24), nullable=True)
+    permite_saldo_libre = db.Column(
+        db.Boolean, nullable=False, default=True, server_default=db.true()
+    )
+    version = db.Column(db.Integer, nullable=False, default=1, server_default="1")
     codigo = db.Column(db.String(40), nullable=False)
     nombre = db.Column(db.String(120), nullable=False)
     clases_articulo_json = db.Column(
@@ -40,6 +55,9 @@ class ScmUbicacionInventario(db.Model):
         server_default=db.func.now(),
     )
 
+    almacen = db.relationship("ScmAlmacen", back_populates="ubicaciones")
+    parent = db.relationship("ScmUbicacionInventario", remote_side=[id])
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -47,6 +65,11 @@ class ScmUbicacionInventario(db.Model):
             "nombre": self.nombre,
             "activo": self.activo,
             "clases_articulo": list(self.clases_articulo_json or []),
+            "almacen_id": str(self.almacen_id) if self.almacen_id else None,
+            "tipo": self.tipo,
+            "parent_id": self.parent_id,
+            "permite_saldo_libre": self.permite_saldo_libre,
+            "version": self.version,
         }
 
 

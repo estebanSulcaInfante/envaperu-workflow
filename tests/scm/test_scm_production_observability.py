@@ -451,6 +451,59 @@ def test_list_observability_unifies_fabrication_multicolor_and_assembly(
         assert fabrication["upstream"]["orden"]["codigo"] == "OF-OBS-001"
 
 
+def test_pending_documents_exposes_released_order_without_ot(
+    app, client, scm_config
+):
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        actor = seeded["base"]
+        pending = ScmOrdenOperacion(
+            codigo="OF-OBS-PENDING",
+            tipo="FABRICACION",
+            origen_demanda="EXCEPCIONAL",
+            motivo="Reposicion de asas",
+            estado="LIBERADA",
+            created_by_id=actor.id,
+            released_by_id=actor.id,
+            released_at=NOW,
+            created_at=NOW,
+        )
+        db.session.add(pending)
+        db.session.commit()
+
+        response = _get(
+            client,
+            "/api/scm/v1/observabilidad/documentos-pendientes"
+            "?fecha_desde=2026-08-01&fecha_hasta=2026-08-31"
+            "&q=OF-OBS-PENDING",
+            actor,
+        )
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["count"] == 1
+        assert payload["items"][0] == {
+            "id": str(pending.id),
+            "codigo": "OF-OBS-PENDING",
+            "tipo": "FABRICACION",
+            "estado": "LIBERADA",
+            "origen": "EXCEPCIONAL",
+            "motivo": "Reposicion de asas",
+            "created_at": NOW.isoformat(),
+            "released_at": NOW.isoformat(),
+            "op": None,
+            "recurso": {
+                "molde_codigo": None,
+                "maquina_codigo": None,
+                "maquina_nombre": None,
+            },
+            "salidas": [],
+            "cantidad_objetivo": 0,
+            "siguiente_accion": "PROGRAMAR_OT",
+            "situacion": "SIN_OT",
+        }
+
+
 def test_observability_detail_respects_permissions_and_effective_facts(
     app, client, scm_config
 ):

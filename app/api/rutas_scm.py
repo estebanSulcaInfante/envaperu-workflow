@@ -198,6 +198,7 @@ from app.services.scm_assembly_execution_service import (
 )
 from app.services.scm_production_observability_service import (
     get_production_ot_observability,
+    list_pending_production_documents,
     list_production_manga_observability,
     list_production_ot_observability,
     summarize_production_ot_observability,
@@ -1139,6 +1140,15 @@ def observabilidad_trabajos_impresion_listar():
 @scm_bp.get("/observabilidad/ots")
 def observabilidad_ots_listar():
     return jsonify(list_production_ot_observability(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+
+@scm_bp.get("/observabilidad/documentos-pendientes")
+def observabilidad_documentos_pendientes_listar():
+    return jsonify(list_pending_production_documents(
         db.session,
         actor_id=_actor_id(),
         filters=request.args.to_dict(flat=True),

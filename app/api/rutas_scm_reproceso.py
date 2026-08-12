@@ -12,6 +12,7 @@ from app.services.scm_alert_service import (
     list_alert_rules,
     list_alerts,
     transition_alert,
+    evaluate_inventory_alerts,
 )
 from app.services.scm_reprocessing_service import (
     add_grinding_input,
@@ -179,6 +180,11 @@ def alerts_list():
         db.session, actor_id=_actor_id(), state=request.args.get("estado"),
         severity=request.args.get("severidad"), alert_type=request.args.get("tipo"),
     ))
+
+
+@scm_reprocessing_bp.post("/alertas/evaluar-inventario")
+def alerts_evaluate_inventory():
+    return jsonify(evaluate_inventory_alerts(db.session, actor_id=_actor_id()))
 
 
 @scm_reprocessing_bp.get("/alertas/reglas")

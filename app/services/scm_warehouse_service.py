@@ -248,6 +248,10 @@ def _candidate_payload(session, manga, label, resolution):
 
 def list_warehouse_receiving(session, *, actor_id):
     load_actor(session, actor_id, capability="RECEPCION_MANGA_VER")
+    from app.services.scm_warehouse_scope_service import (
+        allowed_location_ids, assert_article_class_scope,
+    )
+    location_ids, scope = allowed_location_ids(session, actor_id=actor_id)
     pending = session.scalars(
         select(ScmManga)
         .where(ScmManga.estado == "PENDIENTE_RECEPCION_ALMACEN")
@@ -256,11 +260,19 @@ def list_warehouse_receiving(session, *, actor_id):
     pending_items = []
     for manga in pending:
         label = _active_final_label(session, manga.id)
-        if label is not None:
+        article_class = manga.lote_articulo.articulo.clase
+        in_scope = (
+            not scope["configured"] or scope["transversal"]
+            or any(article_class in values for values in scope["classes"].values())
+        )
+        if label is not None and in_scope:
             pending_items.append(_candidate_payload(session, manga, label, "QR_FINAL"))
-    existences = session.scalars(
-        select(ScmExistenciaManga).order_by(ScmExistenciaManga.recibida_at.desc())
-    ).all()
+    existence_query = select(ScmExistenciaManga).order_by(ScmExistenciaManga.recibida_at.desc())
+    location_query = select(ScmUbicacionInventario).where(ScmUbicacionInventario.activo.is_(True)).order_by(ScmUbicacionInventario.codigo)
+    if location_ids is not None:
+        existence_query = existence_query.where(ScmExistenciaManga.ubicacion_id.in_(location_ids))
+        location_query = location_query.where(ScmUbicacionInventario.id.in_(location_ids))
+    existences = session.scalars(existence_query).all()
     rejections = session.scalars(
         select(ScmRechazoRecepcionManga)
         .order_by(ScmRechazoRecepcionManga.created_at.desc())
@@ -271,11 +283,7 @@ def list_warehouse_receiving(session, *, actor_id):
         .order_by(ScmReversionRecepcionManga.solicitada_at.desc())
         .limit(100)
     ).all()
-    locations = session.scalars(
-        select(ScmUbicacionInventario)
-        .where(ScmUbicacionInventario.activo.is_(True))
-        .order_by(ScmUbicacionInventario.codigo)
-    ).all()
+    locations = session.scalars(location_query).all()
     return {
         "pendientes": pending_items,
         "existencias": [item.to_dict() for item in existences],
@@ -288,6 +296,11 @@ def list_warehouse_receiving(session, *, actor_id):
 def resolve_receiving_label(session, *, actor_id, label_id):
     load_actor(session, actor_id, capability="RECEPCION_MANGA_VER")
     manga, label, resolution = _resolve_label(session, label_id)
+    from app.services.scm_warehouse_scope_service import assert_article_class_scope
+    assert_article_class_scope(
+        session, actor_id=actor_id,
+        article_class=manga.lote_articulo.articulo.clase,
+    )
     return _candidate_payload(session, manga, label, resolution)
 
 
@@ -295,6 +308,11 @@ def resolve_receiving_code(session, *, actor_id, code):
     load_actor(session, actor_id, capability="RECEPCION_MANGA_BUSCAR_MANUAL")
     normalized = required_text(code, field="codigo", max_length=80).upper()
     manga, label, resolution = _resolve_code(session, normalized)
+    from app.services.scm_warehouse_scope_service import assert_article_class_scope
+    assert_article_class_scope(
+        session, actor_id=actor_id,
+        article_class=manga.lote_articulo.articulo.clase,
+    )
     return _candidate_payload(session, manga, label, resolution)
 
 
@@ -457,6 +475,11 @@ def receive_manga(session, *, actor_id, operation_id, data):
             raise ScmServiceError(
                 "UBICACION_INCOMPATIBLE", "La ubicación no existe o está inactiva.", status_code=422
             )
+        from app.services.scm_warehouse_scope_service import assert_location_scope
+        assert_location_scope(
+            session, actor_id=actor.id, location=location,
+            article_class=article.clase,
+        )
         allowed_classes = set(location.clases_articulo_json or [])
         if allowed_classes and article.clase not in allowed_classes:
             raise ScmServiceError(

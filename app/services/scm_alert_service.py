@@ -1,7 +1,7 @@
 """Bandeja y reglas versionadas de alertas operativas SCM."""
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -12,6 +12,8 @@ from app.models.scm_reproceso import (
     ScmReglaAlerta,
     ScmReglaAlertaRevision,
 )
+from app.models.scm_ot import ScmManga, ScmPesajeManga
+from app.models.scm_warehouse import ScmExistenciaManga
 from app.services.scm_service_support import (
     ScmServiceError,
     load_actor,
@@ -143,6 +145,42 @@ def upsert_operational_alert(
         detalle={"regla_revision_id": revision.id},
     ))
     return alert
+
+
+def evaluate_inventory_alerts(session, *, actor_id, now=None):
+    """Evalua reglas de inventario; nunca mueve saldos ni custodia."""
+    load_actor(session, actor_id, capability="ALERTA_GESTIONAR")
+    current = now or utc_now()
+    rule = current_alert_rule(session, "MANGA_PESADA_SIN_RECEPCION")
+    created = []
+    if rule is not None:
+        cutoff = current - timedelta(hours=float(rule.umbral))
+        rows = session.execute(
+            select(ScmManga, ScmPesajeManga)
+            .join(ScmPesajeManga, ScmPesajeManga.manga_id == ScmManga.id)
+            .outerjoin(ScmExistenciaManga, ScmExistenciaManga.manga_id == ScmManga.id)
+            .where(
+                ScmPesajeManga.pesada_at < cutoff,
+                ScmExistenciaManga.id.is_(None),
+                ScmManga.estado == "PENDIENTE_RECEPCION_ALMACEN",
+            )
+        ).all()
+        for manga, weighing in rows:
+            alert = upsert_operational_alert(
+                session, rule_code="MANGA_PESADA_SIN_RECEPCION",
+                aggregate_type="MANGA", aggregate_id=manga.public_id,
+                condition_key=f"pesaje:{weighing.public_id}",
+                summary=f"{manga.codigo} sigue sin recepcion de almacen",
+                detail={
+                    "manga_codigo": manga.codigo,
+                    "pesada_at": weighing.pesada_at.isoformat(),
+                    "umbral_horas": format(rule.umbral, "f"),
+                }, actor_id=actor_id,
+            )
+            if alert is not None:
+                created.append(alert)
+    session.commit()
+    return {"evaluadas_at": current.isoformat(), "alertas": [item.to_dict() for item in created]}
 
 
 def list_alerts(session, *, actor_id, state=None, severity=None, alert_type=None):

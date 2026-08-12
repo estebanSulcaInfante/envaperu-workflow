@@ -74,6 +74,14 @@ from app.models.scm_inventory import (
     ScmSaldoMaterialInventario,
     ScmUbicacionInventario,
 )
+from app.models.scm_inventory_operations import (
+    ScmAlmacen,
+    ScmAlmacenTrabajador,
+    ScmSesionOperacionAlmacen,
+    ScmSesionOperacionItem,
+    ScmTransferenciaInventario,
+    ScmTransferenciaItem,
+)
 from app.models.scm_warehouse import (
     ScmExistenciaManga,
     ScmRechazoRecepcionManga,
