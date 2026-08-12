@@ -650,6 +650,7 @@ def test_apply_identity_materializes_product_atomically_and_replays(
     )
     assert replay.status_code == 200
     assert replay.get_json() == applied
+
     with app.app_context():
         assert ProductoTerminado.query.filter_by(
             producto="PORTAVAJILLAS PREMIUM"
@@ -767,6 +768,193 @@ def test_apply_components_creates_unclassified_pieces_and_mold_links(
     with app.app_context():
         assert Molde.query.count() == 1
         assert Pieza.query.count() == 1
+
+
+def test_apply_components_supports_multiple_molds_in_one_product(app, client):
+    actor_id = _catalog_admin(app)
+    onboarding = _materialize_identity(
+        client, actor_id, _create_session(client, actor_id, data={})
+    )
+    payload = {
+        "expected_version": onboarding["version"],
+        "application_key": "components-portavajilla-multimolde-v1",
+        "data": {
+            "moldes": [
+                {
+                    "client_id": "molde-tapa",
+                    "molde": {
+                        "modo": "NUEVO",
+                        "nombre": "MOLDE TAPA PORTAVAJILLA",
+                        "peso_tiro_gr": 390,
+                    },
+                    "piezas": [{
+                        "client_id": "pieza-tapa",
+                        "modo": "NUEVA",
+                        "nombre": "TAPA PORTAVAJILLA",
+                        "cavidades": 1,
+                        "peso_unitario_gr": 380,
+                    }],
+                },
+                {
+                    "client_id": "molde-base",
+                    "molde": {
+                        "modo": "NUEVO",
+                        "nombre": "MOLDE BASE PORTAVAJILLA",
+                        "peso_tiro_gr": 395,
+                    },
+                    "piezas": [{
+                        "client_id": "pieza-base",
+                        "modo": "NUEVA",
+                        "nombre": "BASE PORTAVAJILLA",
+                        "cavidades": 1,
+                        "peso_unitario_gr": 380,
+                    }],
+                },
+            ],
+        },
+    }
+    operation_id = uuid4()
+    response = client.post(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/COMPONENTES/aplicar",
+        headers=_headers(actor_id, operation_id),
+        json=payload,
+    )
+    assert response.status_code == 200, response.get_json()
+    applied = response.get_json()
+    refs = applied["application_results"]["resolved_references"]
+    assert "molde_ref" not in refs
+    assert {item["client_id"] for item in refs["moldes"]} == {
+        "molde-tapa", "molde-base"
+    }
+    assert len(refs["piezas"]) == 2
+    assert {item["molde_client_id"] for item in refs["piezas"]} == {
+        "molde-tapa", "molde-base"
+    }
+    with app.app_context():
+        assert Molde.query.count() == 2
+        assert Pieza.query.count() == 2
+        assert MoldePieza.query.count() == 2
+
+    replay = client.post(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/COMPONENTES/aplicar",
+        headers=_headers(actor_id, operation_id),
+        json=payload,
+    )
+    assert replay.status_code == 200
+    assert replay.get_json() == applied
+
+    with app.app_context():
+        family = FamiliaColor(codigo=9921, nombre="TRANSPARENTE MULTIMOLDE")
+        db.session.add(family)
+        db.session.commit()
+        family_id = family.id
+    colors = client.post(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/COLORES/aplicar",
+        headers=_headers(actor_id, uuid4()),
+        json={
+            "expected_version": applied["version"],
+            "application_key": "colors-portavajilla-multimolde-v1",
+            "data": {
+                "colores": [{
+                    "client_id": "transparente",
+                    "modo": "NUEVO",
+                    "nombre": "TRANSPARENTE PORTAVAJILLA",
+                    "familia_color_id": family_id,
+                    "hex": "#FFFFFF",
+                }],
+                "matriz": [{
+                    "pieza_client_id": piece_client_id,
+                    "color_client_id": "transparente",
+                    "seleccionada": True,
+                } for piece_client_id in ("pieza-tapa", "pieza-base")],
+                "formulaciones": [{
+                    "color_client_id": "transparente",
+                    "tipo": "PENDIENTE",
+                    "motivo_pendiente": "Receta por validar",
+                }],
+            },
+        },
+    )
+    assert colors.status_code == 200, colors.get_json()
+    matrix = colors.get_json()["application_results"][
+        "resolved_references"
+    ]["matriz"]
+    assert {item["pieza_ref"] for item in matrix} == {
+        item["pieza_ref"] for item in refs["piezas"]
+    }
+
+
+def test_applied_legacy_components_can_add_a_second_mold_explicitly(app, client):
+    actor_id = _catalog_admin(app)
+    onboarding = _materialize_identity(
+        client, actor_id, _create_session(client, actor_id, data={})
+    )
+    first_key = "components-legacy-one-mold-v1"
+    first = client.post(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/COMPONENTES/aplicar",
+        headers=_headers(actor_id, uuid4()),
+        json={
+            "expected_version": onboarding["version"],
+            "application_key": first_key,
+            "data": {
+                "molde": {
+                    "modo": "NUEVO", "nombre": "MOLDE TAPA LEGACY",
+                    "peso_tiro_gr": 390,
+                },
+                "piezas": [{
+                    "client_id": "pieza-tapa", "modo": "NUEVA",
+                    "nombre": "TAPA LEGACY", "cavidades": 1,
+                    "peso_unitario_gr": 380,
+                }],
+            },
+        },
+    ).get_json()
+    first_refs = first["referencias"]["COMPONENTES"]
+    second = client.post(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/COMPONENTES/aplicar",
+        headers=_headers(actor_id, uuid4()),
+        json={
+            "expected_version": first["version"],
+            "application_key": "components-add-base-v2",
+            "supersedes_application_key": first_key,
+            "data": {
+                "moldes": [{
+                    "client_id": "molde-inicial",
+                    "molde": {"modo": "REUTILIZAR", "ref": first_refs["molde_ref"]},
+                    "piezas": [{
+                        "client_id": "pieza-tapa", "modo": "REUTILIZAR",
+                        "ref": first_refs["piezas"][0]["pieza_ref"],
+                        "cavidades": 1, "peso_unitario_gr": 380,
+                    }],
+                }, {
+                    "client_id": "molde-base",
+                    "molde": {
+                        "modo": "NUEVO", "nombre": "MOLDE BASE AGREGADO",
+                        "peso_tiro_gr": 395,
+                    },
+                    "piezas": [{
+                        "client_id": "pieza-base", "modo": "NUEVA",
+                        "nombre": "BASE AGREGADA", "cavidades": 1,
+                        "peso_unitario_gr": 380,
+                    }],
+                }],
+            },
+        },
+    )
+    assert second.status_code == 200, second.get_json()
+    refs = second.get_json()["referencias"]["COMPONENTES"]
+    assert len(refs["moldes"]) == 2
+    assert {item["client_id"] for item in refs["piezas"]} == {
+        "pieza-tapa", "pieza-base"
+    }
+    with app.app_context():
+        assert Molde.query.count() == 2
+        assert Pieza.query.count() == 2
 
 
 def test_apply_steps_require_materialized_predecessors_without_side_effects(

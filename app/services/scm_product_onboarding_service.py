@@ -2052,37 +2052,81 @@ def _assert_checkpointed_retry_compatible(
     resolved = result.get("resolved_references") or {}
     changed = []
     if code == "COMPONENTES":
-        before_mold = previous_payload.get("molde") or {}
-        after_mold = new_payload.get("molde") or {}
-        mold_reconciled = (
-            str(after_mold.get("modo") or "").upper() == "REUTILIZAR"
-            and _reference_matches(
-                after_mold.get("ref"), resolved.get("molde_ref")
-            )
-        )
-        if before_mold != after_mold and not mold_reconciled:
-            changed.append("molde")
-        before = _items_by_client_id(previous_payload, "piezas")
-        after = _items_by_client_id(new_payload, "piezas")
-        for item in resolved.get("piezas") or []:
-            client_id = item.get("client_id") if isinstance(item, dict) else None
-            before_item = before.get(client_id)
-            after_item = after.get(client_id)
-            reconciled = bool(
-                after_item
-                and str(after_item.get("modo") or "").upper()
-                == "REUTILIZAR"
-                and _reference_matches(
-                    after_item.get("ref"), item.get("pieza_ref")
+        if previous_payload.get("moldes") is not None or new_payload.get("moldes") is not None:
+            before_groups = {
+                item.get("client_id"): item
+                for item in (previous_payload.get("moldes") or [])
+                if isinstance(item, dict)
+            }
+            after_groups = {
+                item.get("client_id"): item
+                for item in (new_payload.get("moldes") or [])
+                if isinstance(item, dict)
+            }
+            for resolved_group in resolved.get("moldes") or []:
+                group_id = resolved_group.get("client_id")
+                before_group = before_groups.get(group_id)
+                after_group = after_groups.get(group_id)
+                before_mold = (before_group or {}).get("molde") or {}
+                after_mold = (after_group or {}).get("molde") or {}
+                mold_reconciled = (
+                    str(after_mold.get("modo") or "").upper() == "REUTILIZAR"
+                    and _reference_matches(
+                        after_mold.get("ref"), resolved_group.get("molde_ref")
+                    )
                 )
-                and before_item is not None
-                and before_item.get("cavidades")
-                == after_item.get("cavidades")
-                and before_item.get("peso_unitario_gr")
-                == after_item.get("peso_unitario_gr")
+                if before_mold != after_mold and not mold_reconciled:
+                    changed.append(f"moldes:{group_id}")
+                before_pieces = _items_by_client_id(before_group or {}, "piezas")
+                after_pieces = _items_by_client_id(after_group or {}, "piezas")
+                for item in resolved_group.get("piezas") or []:
+                    client_id = item.get("client_id")
+                    before_item = before_pieces.get(client_id)
+                    after_item = after_pieces.get(client_id)
+                    reconciled = bool(
+                        after_item
+                        and str(after_item.get("modo") or "").upper() == "REUTILIZAR"
+                        and _reference_matches(
+                            after_item.get("ref"), item.get("pieza_ref")
+                        )
+                        and before_item is not None
+                        and before_item.get("cavidades") == after_item.get("cavidades")
+                        and before_item.get("peso_unitario_gr") == after_item.get("peso_unitario_gr")
+                    )
+                    if before_item != after_item and not reconciled:
+                        changed.append(f"piezas:{client_id}")
+        else:
+            before_mold = previous_payload.get("molde") or {}
+            after_mold = new_payload.get("molde") or {}
+            mold_reconciled = (
+                str(after_mold.get("modo") or "").upper() == "REUTILIZAR"
+                and _reference_matches(
+                    after_mold.get("ref"), resolved.get("molde_ref")
+                )
             )
-            if before_item != after_item and not reconciled:
-                changed.append(f"piezas:{client_id}")
+            if before_mold != after_mold and not mold_reconciled:
+                changed.append("molde")
+            before = _items_by_client_id(previous_payload, "piezas")
+            after = _items_by_client_id(new_payload, "piezas")
+            for item in resolved.get("piezas") or []:
+                client_id = item.get("client_id") if isinstance(item, dict) else None
+                before_item = before.get(client_id)
+                after_item = after.get(client_id)
+                reconciled = bool(
+                    after_item
+                    and str(after_item.get("modo") or "").upper()
+                    == "REUTILIZAR"
+                    and _reference_matches(
+                        after_item.get("ref"), item.get("pieza_ref")
+                    )
+                    and before_item is not None
+                    and before_item.get("cavidades")
+                    == after_item.get("cavidades")
+                    and before_item.get("peso_unitario_gr")
+                    == after_item.get("peso_unitario_gr")
+                )
+                if before_item != after_item and not reconciled:
+                    changed.append(f"piezas:{client_id}")
     elif code == "COLORES":
         before_colors = _items_by_client_id(previous_payload, "colores")
         after_colors = _items_by_client_id(new_payload, "colores")
@@ -2210,7 +2254,10 @@ def _require_application_prerequisite(onboarding, *, code):
         ) or {}
         if (
             not _step_has_applied_journal(onboarding, "COMPONENTES")
-            or not component_refs.get("molde_ref")
+            or not (
+                component_refs.get("molde_ref")
+                or component_refs.get("moldes")
+            )
             or not component_refs.get("piezas")
         ):
             required = "COMPONENTES"
@@ -2381,213 +2428,313 @@ def _apply_components(
     result,
     checkpoint,
 ):
-    mold_data = step_payload.get("molde")
-    pieces_data = step_payload.get("piezas")
-    if not isinstance(mold_data, dict):
+    raw_groups = step_payload.get("moldes")
+    legacy = raw_groups is None
+    if legacy:
+        raw_groups = [{
+            "client_id": "molde-inicial",
+            "molde": step_payload.get("molde"),
+            "piezas": step_payload.get("piezas"),
+        }]
+    elif step_payload.get("molde") is not None or step_payload.get("piezas") is not None:
         raise ScmServiceError(
-            "MOLD_DATA_REQUIRED",
-            "data.molde debe ser un objeto.",
+            "AMBIGUOUS_COMPONENT_GROUPS",
+            "Use data.moldes o el formato historico molde/piezas, no ambos.",
             status_code=422,
         )
-    if not isinstance(pieces_data, list) or not pieces_data:
+    if not isinstance(raw_groups, list) or not raw_groups:
         raise ScmServiceError(
-            "PIECES_REQUIRED",
-            "data.piezas debe contener al menos una pieza.",
+            "MOLD_GROUPS_REQUIRED",
+            "data.moldes debe contener al menos un grupo Molde-Piezas.",
             status_code=422,
         )
-    client_ids = []
-    for index, item in enumerate(pieces_data):
-        if not isinstance(item, dict):
+
+    groups = []
+    all_piece_client_ids = []
+    for group_index, raw_group in enumerate(raw_groups):
+        if not isinstance(raw_group, dict):
             raise ScmServiceError(
-                "INVALID_PIECE_DATA",
-                "Cada pieza debe ser un objeto.",
+                "INVALID_MOLD_GROUP", "Cada grupo de molde debe ser un objeto.",
                 status_code=422,
             )
-        client_ids.append(_client_id(
-            item.get("client_id"), field=f"data.piezas[{index}].client_id"
-        ))
-    if len(client_ids) != len(set(client_ids)):
+        group_client_id = _client_id(
+            raw_group.get("client_id"),
+            field=f"data.moldes[{group_index}].client_id",
+        )
+        mold_data = raw_group.get("molde")
+        pieces_data = raw_group.get("piezas")
+        if not isinstance(mold_data, dict):
+            raise ScmServiceError(
+                "MOLD_DATA_REQUIRED",
+                f"data.moldes[{group_index}].molde debe ser un objeto.",
+                status_code=422,
+            )
+        if not isinstance(pieces_data, list) or not pieces_data:
+            raise ScmServiceError(
+                "PIECES_REQUIRED",
+                f"data.moldes[{group_index}].piezas requiere al menos una pieza.",
+                status_code=422,
+            )
+        piece_client_ids = []
+        for piece_index, item in enumerate(pieces_data):
+            if not isinstance(item, dict):
+                raise ScmServiceError(
+                    "INVALID_PIECE_DATA", "Cada pieza debe ser un objeto.",
+                    status_code=422,
+                )
+            piece_client_ids.append(_client_id(
+                item.get("client_id"),
+                field=(
+                    f"data.moldes[{group_index}].piezas[{piece_index}]"
+                    ".client_id"
+                ),
+            ))
+        all_piece_client_ids.extend(piece_client_ids)
+        groups.append((group_client_id, mold_data, pieces_data, piece_client_ids))
+    group_ids = [item[0] for item in groups]
+    if len(group_ids) != len(set(group_ids)) or len(all_piece_client_ids) != len(set(all_piece_client_ids)):
         raise ScmServiceError(
             "DUPLICATE_CLIENT_ID",
-            "Los client_id de piezas no pueden repetirse.",
+            "Los client_id de moldes y piezas no pueden repetirse.",
             status_code=422,
         )
 
     resolved = result.setdefault("resolved_references", {})
     resolved_pieces = resolved.setdefault("piezas", [])
-    mold_ref = resolved.get("molde_ref")
-    mold = session.get(Molde, mold_ref) if mold_ref else None
-    if mold is None:
-        mold_mode = _mode(
-            mold_data.get("modo"),
-            field="data.molde.modo",
-            allowed={"NUEVO", "REUTILIZAR"},
-        )
-        if mold_mode == "REUTILIZAR":
-            mold_ref = required_text(
-                mold_data.get("ref"), field="data.molde.ref", max_length=50
-            )
-            mold = session.get(Molde, mold_ref)
-            if mold is None or not mold.activo:
-                raise ScmServiceError(
-                    "MOLD_NOT_FOUND",
-                    "El molde reutilizable no existe o esta inactivo.",
-                    status_code=404,
-                    details={"molde_ref": mold_ref},
-                )
-            result["reused"].append({"type": "MOLDE", "id": mold.codigo})
-        else:
-            name = required_text(
-                mold_data.get("nombre"),
-                field="data.molde.nombre",
-                max_length=100,
-            )
-            shot_weight = _positive_number(
-                mold_data.get("peso_tiro_gr"),
-                field="data.molde.peso_tiro_gr",
-            )
-            cycle = _positive_number(
-                mold_data.get("tiempo_ciclo_std", 30),
-                field="data.molde.tiempo_ciclo_std",
-            )
-            mold = Molde(
-                codigo=generar_codigo_catalogo("MOLDE", session=session),
-                nombre=name,
-                peso_tiro_gr=shot_weight,
-                tiempo_ciclo_std=cycle,
-                activo=True,
-            )
-            session.add(mold)
-            session.flush()
-            result["created"].append({"type": "MOLDE", "id": mold.codigo})
-        resolved["molde_ref"] = mold.codigo
-        checkpoint(result)
-
-    by_client_id = {
-        item["client_id"]: item for item in resolved_pieces
+    resolved_groups = resolved.setdefault("moldes", [])
+    if not resolved_groups and resolved.get("molde_ref"):
+        resolved_groups.append({
+            "client_id": group_ids[0],
+            "molde_ref": resolved["molde_ref"],
+            "piezas": list(resolved_pieces),
+        })
+    groups_by_client = {
+        item.get("client_id"): item for item in resolved_groups
+        if isinstance(item, dict)
     }
-    for index, item in enumerate(pieces_data):
-        client_id = client_ids[index]
-        if client_id in by_client_id:
-            continue
-        piece_mode = _mode(
-            item.get("modo"),
-            field=f"data.piezas[{index}].modo",
-            allowed={"NUEVA", "REUTILIZAR"},
-        )
-        cavities = _positive_number(
-            item.get("cavidades"),
-            field=f"data.piezas[{index}].cavidades",
-            integer=True,
-        )
-        unit_weight = _positive_number(
-            item.get("peso_unitario_gr"),
-            field=f"data.piezas[{index}].peso_unitario_gr",
-        )
-        if piece_mode == "REUTILIZAR":
-            try:
-                piece_id = int(item.get("ref"))
-            except (TypeError, ValueError) as error:
-                raise ScmServiceError(
-                    "PIECE_REFERENCE_REQUIRED",
-                    "REUTILIZAR requiere ref de Pieza.",
-                    status_code=422,
-                    details={"client_id": client_id},
-                ) from error
-            piece = session.get(Pieza, piece_id)
-            if piece is None or not piece.activo:
-                raise ScmServiceError(
-                    "PIECE_NOT_FOUND",
-                    "La Pieza reutilizable no existe o esta inactiva.",
-                    status_code=404,
-                    details={"client_id": client_id, "pieza_ref": piece_id},
-                )
-            result["reused"].append({
-                "type": "PIEZA", "id": piece.id, "client_id": client_id
-            })
-        else:
-            name = required_text(
-                item.get("nombre"),
-                field=f"data.piezas[{index}].nombre",
-                max_length=200,
-            )
-            try:
-                linea, familia, _ = validate_linea_familia(
-                    linea_id=item.get("linea_id"),
-                    familia_id=item.get("familia_id"),
-                    allow_unclassified=True,
-                    session=session,
-                )
-            except ClassificationError as error:
-                raise ScmServiceError(
-                    error.code,
-                    str(error),
-                    status_code=error.status,
-                    details={"client_id": client_id},
-                ) from error
-            piece = Pieza(
-                codigo=generar_codigo_catalogo("PIEZA", session=session),
-                nombre=name,
-                linea_id=linea.id if linea else None,
-                familia_id=familia.id if familia else None,
-                peso_nominal_gr=unit_weight,
-                activo=True,
-            )
-            session.add(piece)
-            session.flush()
-            result["created"].append({
-                "type": "PIEZA", "id": piece.id, "client_id": client_id
-            })
+    used_molds = set()
 
-        composition = session.scalar(select(MoldePieza).where(
-            MoldePieza.molde_id == mold.codigo,
-            MoldePieza.pieza_id == piece.id,
-        ))
-        if composition is None:
-            composition = MoldePieza(
-                molde_id=mold.codigo,
-                pieza_id=piece.id,
-                cavidades=cavities,
-                peso_unitario_gr=unit_weight,
-                activo=True,
+    for group_index, (group_client_id, mold_data, pieces_data, client_ids) in enumerate(groups):
+        resolved_group = groups_by_client.get(group_client_id)
+        if resolved_group is None:
+            resolved_group = {
+                "client_id": group_client_id,
+                "molde_ref": None,
+                "piezas": [],
+            }
+            resolved_groups.append(resolved_group)
+            groups_by_client[group_client_id] = resolved_group
+        mold_ref = resolved_group.get("molde_ref")
+        mold = session.get(Molde, mold_ref) if mold_ref else None
+        if mold is None:
+            mold_mode = _mode(
+                mold_data.get("modo"),
+                field=f"data.moldes[{group_index}].molde.modo",
+                allowed={"NUEVO", "REUTILIZAR"},
             )
-            session.add(composition)
-            session.flush()
-            result["created"].append({
-                "type": "MOLDE_PIEZA",
-                "id": composition.id,
-                "client_id": client_id,
-            })
-        elif composition.activo and (
-            composition.cavidades != cavities
-            or float(composition.peso_unitario_gr) != unit_weight
-        ):
+            if mold_mode == "REUTILIZAR":
+                mold_ref = required_text(
+                    mold_data.get("ref"),
+                    field=f"data.moldes[{group_index}].molde.ref",
+                    max_length=50,
+                )
+                mold = session.get(Molde, mold_ref)
+                if mold is None or not mold.activo:
+                    raise ScmServiceError(
+                        "MOLD_NOT_FOUND",
+                        "El molde reutilizable no existe o esta inactivo.",
+                        status_code=404,
+                        details={"molde_ref": mold_ref, "client_id": group_client_id},
+                    )
+                result["reused"].append({
+                    "type": "MOLDE", "id": mold.codigo,
+                    "client_id": group_client_id,
+                })
+            else:
+                name = required_text(
+                    mold_data.get("nombre"),
+                    field=f"data.moldes[{group_index}].molde.nombre",
+                    max_length=100,
+                )
+                shot_weight = _positive_number(
+                    mold_data.get("peso_tiro_gr"),
+                    field=f"data.moldes[{group_index}].molde.peso_tiro_gr",
+                )
+                cycle = _positive_number(
+                    mold_data.get("tiempo_ciclo_std", 30),
+                    field=f"data.moldes[{group_index}].molde.tiempo_ciclo_std",
+                )
+                mold = Molde(
+                    codigo=generar_codigo_catalogo("MOLDE", session=session),
+                    nombre=name,
+                    peso_tiro_gr=shot_weight,
+                    tiempo_ciclo_std=cycle,
+                    activo=True,
+                )
+                session.add(mold)
+                session.flush()
+                result["created"].append({
+                    "type": "MOLDE", "id": mold.codigo,
+                    "client_id": group_client_id,
+                })
+            resolved_group["molde_ref"] = mold.codigo
+            if legacy:
+                resolved["molde_ref"] = mold.codigo
+            checkpoint(result)
+        if mold.codigo in used_molds:
             raise ScmServiceError(
-                "MOLD_PIECE_CONFIG_CONFLICT",
-                "La pieza ya pertenece al molde con otra configuracion.",
-                status_code=409,
-                details={"client_id": client_id, "molde_pieza_ref": composition.id},
+                "DUPLICATE_MOLD_GROUP",
+                "Un molde no puede repetirse en dos grupos de la misma fase.",
+                status_code=422,
+                details={"molde_ref": mold.codigo},
             )
-        else:
-            if not composition.activo:
-                composition.activo = True
-                composition.cavidades = cavities
-                composition.peso_unitario_gr = unit_weight
-                composition.version += 1
-            result["reused"].append({
-                "type": "MOLDE_PIEZA",
-                "id": composition.id,
-                "client_id": client_id,
-            })
+        used_molds.add(mold.codigo)
 
-        resolved_item = {
-            "client_id": client_id,
-            "pieza_ref": piece.id,
-            "molde_pieza_ref": composition.id,
+        group_pieces = resolved_group.setdefault("piezas", [])
+        by_client_id = {
+            item["client_id"]: item for item in group_pieces
         }
-        resolved_pieces.append(resolved_item)
-        by_client_id[client_id] = resolved_item
-        checkpoint(result)
+        for piece_index, item in enumerate(pieces_data):
+            client_id = client_ids[piece_index]
+            if client_id in by_client_id:
+                continue
+            piece_mode = _mode(
+                item.get("modo"),
+                field=(
+                    f"data.moldes[{group_index}].piezas[{piece_index}].modo"
+                ),
+                allowed={"NUEVA", "REUTILIZAR"},
+            )
+            cavities = _positive_number(
+                item.get("cavidades"),
+                field=(
+                    f"data.moldes[{group_index}].piezas[{piece_index}]"
+                    ".cavidades"
+                ),
+                integer=True,
+            )
+            unit_weight = _positive_number(
+                item.get("peso_unitario_gr"),
+                field=(
+                    f"data.moldes[{group_index}].piezas[{piece_index}]"
+                    ".peso_unitario_gr"
+                ),
+            )
+            if piece_mode == "REUTILIZAR":
+                try:
+                    piece_id = int(item.get("ref"))
+                except (TypeError, ValueError) as error:
+                    raise ScmServiceError(
+                        "PIECE_REFERENCE_REQUIRED",
+                        "REUTILIZAR requiere ref de Pieza.",
+                        status_code=422,
+                        details={"client_id": client_id},
+                    ) from error
+                piece = session.get(Pieza, piece_id)
+                if piece is None or not piece.activo:
+                    raise ScmServiceError(
+                        "PIECE_NOT_FOUND",
+                        "La Pieza reutilizable no existe o esta inactiva.",
+                        status_code=404,
+                        details={"client_id": client_id, "pieza_ref": piece_id},
+                    )
+                result["reused"].append({
+                    "type": "PIEZA", "id": piece.id,
+                    "client_id": client_id,
+                })
+            else:
+                name = required_text(
+                    item.get("nombre"),
+                    field=(
+                        f"data.moldes[{group_index}].piezas[{piece_index}].nombre"
+                    ),
+                    max_length=200,
+                )
+                try:
+                    linea, familia, _ = validate_linea_familia(
+                        linea_id=item.get("linea_id"),
+                        familia_id=item.get("familia_id"),
+                        allow_unclassified=True,
+                        session=session,
+                    )
+                except ClassificationError as error:
+                    raise ScmServiceError(
+                        error.code, str(error), status_code=error.status,
+                        details={"client_id": client_id},
+                    ) from error
+                piece = Pieza(
+                    codigo=generar_codigo_catalogo("PIEZA", session=session),
+                    nombre=name,
+                    linea_id=linea.id if linea else None,
+                    familia_id=familia.id if familia else None,
+                    peso_nominal_gr=unit_weight,
+                    activo=True,
+                )
+                session.add(piece)
+                session.flush()
+                result["created"].append({
+                    "type": "PIEZA", "id": piece.id,
+                    "client_id": client_id,
+                })
+
+            composition = session.scalar(select(MoldePieza).where(
+                MoldePieza.molde_id == mold.codigo,
+                MoldePieza.pieza_id == piece.id,
+            ))
+            if composition is None:
+                composition = MoldePieza(
+                    molde_id=mold.codigo,
+                    pieza_id=piece.id,
+                    cavidades=cavities,
+                    peso_unitario_gr=unit_weight,
+                    activo=True,
+                )
+                session.add(composition)
+                session.flush()
+                result["created"].append({
+                    "type": "MOLDE_PIEZA", "id": composition.id,
+                    "client_id": client_id,
+                })
+            elif composition.activo and (
+                composition.cavidades != cavities
+                or float(composition.peso_unitario_gr) != unit_weight
+            ):
+                raise ScmServiceError(
+                    "MOLD_PIECE_CONFIG_CONFLICT",
+                    "La pieza ya pertenece al molde con otra configuracion.",
+                    status_code=409,
+                    details={
+                        "client_id": client_id,
+                        "molde_pieza_ref": composition.id,
+                    },
+                )
+            else:
+                if not composition.activo:
+                    composition.activo = True
+                    composition.cavidades = cavities
+                    composition.peso_unitario_gr = unit_weight
+                    composition.version += 1
+                result["reused"].append({
+                    "type": "MOLDE_PIEZA", "id": composition.id,
+                    "client_id": client_id,
+                })
+
+            resolved_item = {
+                "client_id": client_id,
+                "pieza_ref": piece.id,
+                "molde_pieza_ref": composition.id,
+                "molde_client_id": group_client_id,
+                "molde_ref": mold.codigo,
+            }
+            group_pieces.append(resolved_item)
+            resolved_pieces.append(resolved_item)
+            by_client_id[client_id] = resolved_item
+            checkpoint(result)
+
+    if len(resolved_groups) == 1:
+        resolved["molde_ref"] = resolved_groups[0]["molde_ref"]
+    else:
+        resolved.pop("molde_ref", None)
     return result
 
 
@@ -2659,41 +2806,57 @@ def _apply_colors(
     component_refs = (onboarding.referencias_json or {}).get(
         "COMPONENTES", {}
     )
-    mold_ref = component_refs.get("molde_ref")
-    if not mold_ref:
+    component_pieces = [
+        item for item in (component_refs.get("piezas") or [])
+        if isinstance(item, dict) and item.get("pieza_ref")
+    ]
+    mold_refs = {
+        item.get("molde_ref")
+        for item in (component_refs.get("moldes") or [])
+        if isinstance(item, dict) and item.get("molde_ref")
+    }
+    if component_refs.get("molde_ref"):
+        mold_refs.add(component_refs["molde_ref"])
+    if not component_pieces or not mold_refs:
         raise ScmServiceError(
             "COMPONENT_REFERENCES_REQUIRED",
             "Aplique COMPONENTES antes de COLORES.",
             status_code=409,
         )
     requested_mold = step_payload.get("color_molde_ref")
-    if requested_mold not in (None, "", mold_ref):
+    if requested_mold not in (None, "") and requested_mold not in mold_refs:
         raise ScmServiceError(
             "MOLD_REFERENCE_CONFLICT",
             "color_molde_ref no coincide con COMPONENTES.",
             status_code=409,
         )
-    mold = session.get(Molde, mold_ref)
-    if mold is None or not mold.activo:
-        raise ScmServiceError(
-            "MOLD_NOT_FOUND",
-            "El molde de COMPONENTES no existe o esta inactivo.",
-            status_code=404,
-        )
-    compositions = session.scalars(select(MoldePieza).where(
-        MoldePieza.molde_id == mold.codigo,
-        MoldePieza.activo.is_(True),
-    ).order_by(MoldePieza.id)).all()
-    if not compositions:
-        raise ScmServiceError(
-            "MOLD_WITHOUT_PIECES",
-            "El molde no tiene piezas activas.",
-            status_code=409,
-        )
-    mold_piece_ids = {item.pieza_id for item in compositions}
+    mold_piece_ids = set()
+    for item in component_pieces:
+        composition = session.get(MoldePieza, item.get("molde_pieza_ref"))
+        if (
+            composition is None
+            or not composition.activo
+            or composition.pieza_id != item.get("pieza_ref")
+            or composition.molde_id not in mold_refs
+        ):
+            raise ScmServiceError(
+                "MOLD_PIECE_REFERENCE_INVALID",
+                "Una pieza de COMPONENTES ya no pertenece a su molde activo.",
+                status_code=409,
+                details={"pieza_ref": item.get("pieza_ref")},
+            )
+        mold = session.get(Molde, composition.molde_id)
+        if mold is None or not mold.activo:
+            raise ScmServiceError(
+                "MOLD_NOT_FOUND",
+                "Un molde de COMPONENTES no existe o esta inactivo.",
+                status_code=404,
+                details={"molde_ref": composition.molde_id},
+            )
+        mold_piece_ids.add(composition.pieza_id)
     piece_client_refs = {
         item["client_id"]: item["pieza_ref"]
-        for item in component_refs.get("piezas", [])
+        for item in component_pieces
         if isinstance(item, dict) and item.get("client_id")
     }
 
@@ -4180,6 +4343,7 @@ def apply_onboarding_step(
             if raw_supersedes not in (None, "") else None
         )
         if supersedes_key is not None and code not in {
+            "COMPONENTES",
             "COLORES",
             "ESTRUCTURA",
             "RUTA_EMPAQUE",
