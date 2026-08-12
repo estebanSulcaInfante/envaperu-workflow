@@ -321,6 +321,10 @@ ROLES_SCM_INICIALES = (
             "MOLIENDA_REGLA_ADMINISTRAR",
             "ALERTA_VER",
             "ALERTA_CONFIGURAR",
+            "INVENTARIO_VER",
+            "ALMACEN_CONFIG_ADMINISTRAR",
+            "ALMACEN_SCOPE_ADMINISTRAR",
+            "INVENTARIO_CONTROL_TRANSVERSAL",
         ),
     ),
     (
