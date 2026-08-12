@@ -1941,6 +1941,266 @@ def update_onboarding_step(
         ) from error
 
 
+def _structure_piece_colors(session, revision, *, visited=None):
+    """Return the canonical PiezaColor rows consumed by an approved BOM tree."""
+    visited = set() if visited is None else visited
+    if revision.id in visited:
+        raise ScmServiceError(
+            "STRUCTURE_COLOR_RECOVERY_CYCLE",
+            "La estructura contiene un ciclo y no puede restaurar colores.",
+            status_code=409,
+        )
+    visited.add(revision.id)
+    variants = []
+    try:
+        for component in revision.componentes:
+            article = component.articulo_componente
+            if article.clase == CLASE_PIEZA_COLOR:
+                variant = article.pieza_color.pieza_color if article.pieza_color else None
+                if (
+                    variant is None
+                    or variant.pieza_id is None
+                    or variant.color_produccion_id is None
+                ):
+                    raise ScmServiceError(
+                        "STRUCTURE_PIECE_COLOR_INCOMPLETE",
+                        "La BOM contiene una PiezaColor sin pieza o color canonico.",
+                        status_code=409,
+                        details={"articulo_id": article.id},
+                    )
+                variants.append(variant)
+                continue
+            if article.clase == CLASE_SUBENSAMBLE_WIP:
+                nested = session.scalar(select(ScmEstructuraRevision).where(
+                    ScmEstructuraRevision.articulo_resultado_id == article.id,
+                    ScmEstructuraRevision.estado == ESTADO_ESTRUCTURA_APROBADA,
+                ))
+                if nested is None:
+                    raise ScmServiceError(
+                        "WIP_STRUCTURE_NOT_APPROVED",
+                        "Un WIP de la BOM no tiene estructura aprobada.",
+                        status_code=409,
+                        details={"articulo_id": article.id},
+                    )
+                variants.extend(_structure_piece_colors(
+                    session, nested, visited=visited,
+                ))
+                continue
+            raise ScmServiceError(
+                "STRUCTURE_COLOR_RECOVERY_UNSUPPORTED_COMPONENT",
+                "La BOM contiene un componente que no define PiezaColor.",
+                status_code=409,
+                details={"articulo_id": article.id, "clase": article.clase},
+            )
+    finally:
+        visited.remove(revision.id)
+    return variants
+
+
+def restore_onboarding_colors_from_structure(
+    session,
+    *,
+    actor_id,
+    session_id,
+    operation_id=None,
+    data,
+):
+    """Rebuild an invalidated color draft from an already-approved BOM.
+
+    This is an explicit retroactive recovery command. It never creates or
+    mutates color masters; the operator must review and apply the rebuilt
+    matrix using the normal COLORES command.
+    """
+    try:
+        actor = _load_actor(session, actor_id)
+        reject_unknown_fields(data, allowed=VERSION_COMMAND_FIELDS)
+        endpoint = (
+            f"/api/scm/v1/altas-producto/{session_id}/pasos/COLORES/"
+            "restaurar-desde-estructura:POST"
+        )
+        operation, replay = _reserve_operation(
+            session, operation_id, endpoint, actor, data,
+        )
+        if replay is not None:
+            return replay
+        onboarding = _load_session(
+            session, session_id, actor=actor, for_update=True,
+        )
+        _ensure_version(onboarding, data.get("expected_version"))
+        _ensure_mutable(onboarding)
+        _require_actor_capability(actor, "ARTICULO_ADMINISTRAR")
+        states = _step_states(onboarding)
+        if states["COMPONENTES"] != "COMPLETADO":
+            raise ScmServiceError(
+                "COMPONENTS_NOT_COMPLETED",
+                "Complete COMPONENTES antes de restaurar colores.",
+                status_code=409,
+            )
+        if states["COLORES"] != "INVALIDADO":
+            raise ScmServiceError(
+                "COLOR_RECOVERY_NOT_REQUIRED",
+                "La restauracion solo aplica a una fase COLORES invalidada.",
+                status_code=409,
+            )
+        structure_ref = (
+            (onboarding.referencias_json or {})
+            .get("ESTRUCTURA", {})
+            .get("estructura_revision_ref")
+        )
+        structure = session.get(ScmEstructuraRevision, structure_ref)
+        product_article = _product_article_for_onboarding(session, onboarding)
+        if (
+            structure is None
+            or structure.estado != ESTADO_ESTRUCTURA_APROBADA
+            or structure.articulo_resultado_id != product_article.id
+        ):
+            raise ScmServiceError(
+                "APPROVED_STRUCTURE_REQUIRED",
+                "La sesion no conserva una BOM aprobada compatible.",
+                status_code=409,
+            )
+
+        component_refs = (
+            (onboarding.referencias_json or {}).get("COMPONENTES") or {}
+        )
+        component_pieces = [
+            item for item in (component_refs.get("piezas") or [])
+            if isinstance(item, dict) and item.get("pieza_ref")
+        ]
+        piece_ids = {int(item["pieza_ref"]) for item in component_pieces}
+        variants = _structure_piece_colors(session, structure)
+        variants_by_pair = {
+            (int(item.pieza_id), int(item.color_produccion_id)): item
+            for item in variants
+            if int(item.pieza_id) in piece_ids
+        }
+        recovered_piece_ids = {piece_id for piece_id, _ in variants_by_pair}
+        if recovered_piece_ids != piece_ids:
+            raise ScmServiceError(
+                "BOM_COMPONENT_COLOR_MISMATCH",
+                "La BOM no contiene colores para todas las piezas del paso Componentes.",
+                status_code=409,
+                details={
+                    "missing_piece_refs": sorted(piece_ids - recovered_piece_ids),
+                },
+            )
+
+        colors_by_id = {
+            color_id: session.get(ColorProduccion, color_id)
+            for _piece_id, color_id in variants_by_pair
+        }
+        old_formulas = {
+            int(item["color_ref"]): item
+            for item in (
+                (onboarding.referencias_json or {})
+                .get("COLORES", {})
+                .get("formulaciones") or []
+            )
+            if isinstance(item, dict) and item.get("color_ref")
+        }
+        colors = []
+        formulas = []
+        for color_id in sorted(colors_by_id):
+            color = colors_by_id[color_id]
+            colors.append({
+                "client_id": f"bom-color-{color_id}",
+                "modo": "REUTILIZAR",
+                "color_ref": color_id,
+                "nombre": color.nombre,
+                "familia_color_id": color.familia_color_id,
+                "hex": color.hex_referencia or "",
+            })
+            recipe = None
+            old_formula = old_formulas.get(color_id) or {}
+            old_recipe_id = old_formula.get("receta_ref")
+            if old_recipe_id:
+                candidate = session.get(RecetaColorMaestra, old_recipe_id)
+                if (
+                    candidate is not None
+                    and candidate.color_produccion_id == color_id
+                    and candidate.estado != "INACTIVA"
+                ):
+                    recipe = candidate
+            if recipe is None:
+                recipe = find_default_recipe(
+                    session,
+                    color_produccion_id=color_id,
+                    producto_sku=onboarding.producto_terminado_id,
+                )
+            formulas.append({
+                "color_ref": color_id,
+                "color_client_id": f"bom-color-{color_id}",
+                **({
+                    "tipo": "EXISTENTE",
+                    "receta_ref": recipe.id,
+                } if recipe is not None else {
+                    "tipo": "PENDIENTE",
+                    "receta_ref": None,
+                    "motivo_pendiente": (
+                        "La BOM vigente usa este color, pero no se encontro "
+                        "una receta aprobada predeterminada."
+                    ),
+                }),
+            })
+
+        matrix = []
+        for piece_id in sorted(piece_ids):
+            for color_id in sorted(colors_by_id):
+                variant = variants_by_pair.get((piece_id, color_id))
+                matrix.append({
+                    "pieza_ref": piece_id,
+                    "color_ref": color_id,
+                    "seleccionada": variant is not None,
+                    **({"pieza_color_ref": variant.sku} if variant else {}),
+                })
+
+        before = serialize_onboarding(onboarding)
+        draft = _step_data(onboarding)
+        draft["COLORES"] = {
+            "colores": colors,
+            "matriz": matrix,
+            "formulaciones": formulas,
+            "recuperada_desde_estructura_ref": structure.id,
+        }
+        states["COLORES"] = "EN_PROGRESO"
+        onboarding.borrador_json = draft
+        onboarding.estados_paso_json = states
+        onboarding.paso_actual = "COLORES"
+        onboarding.estado = "BORRADOR"
+        onboarding.actualizada_por_id = actor.id
+        onboarding.updated_at = utc_now()
+        onboarding.version += 1
+        _refresh_readiness(onboarding, actor)
+        session.flush()
+        response = serialize_onboarding(onboarding)
+        response["color_recovery"] = {
+            "estructura_revision_ref": structure.id,
+            "colores": len(colors),
+            "piezas_color": len(variants_by_pair),
+        }
+        session.add(_event(
+            onboarding,
+            actor,
+            "COLORES_RESTAURADOS_DESDE_ESTRUCTURA",
+            operation,
+            before=before,
+            after=response,
+        ))
+        _complete_operation(operation, response, 200)
+        session.commit()
+        return response
+    except ScmServiceError:
+        session.rollback()
+        raise
+    except IntegrityError as error:
+        session.rollback()
+        raise ScmServiceError(
+            "COLOR_RECOVERY_CONFLICT",
+            "No se pudo restaurar la matriz por un conflicto de integridad.",
+            status_code=409,
+        ) from error
+
+
 def _application_response(onboarding, result, *, replayed=False):
     response = serialize_onboarding(onboarding)
     response["application_results"] = copy.deepcopy(result)
@@ -2831,6 +3091,7 @@ def _apply_colors(
             status_code=409,
         )
     mold_piece_ids = set()
+    mold_piece_ids_by_mold = {}
     for item in component_pieces:
         composition = session.get(MoldePieza, item.get("molde_pieza_ref"))
         if (
@@ -2854,6 +3115,9 @@ def _apply_colors(
                 details={"molde_ref": composition.molde_id},
             )
         mold_piece_ids.add(composition.pieza_id)
+        mold_piece_ids_by_mold.setdefault(composition.molde_id, set()).add(
+            composition.pieza_id
+        )
     piece_client_refs = {
         item["client_id"]: item["pieza_ref"]
         for item in component_pieces
@@ -3054,19 +3318,51 @@ def _apply_colors(
         selected_pairs.add(pair)
         matrix_rows.append((item, piece_id, color_id))
 
-    for color_id in set(color_by_client.values()):
-        covered = {
-            piece_id for piece_id, pair_color in selected_pairs
-            if pair_color == color_id
+    selected_color_ids = {color_id for _piece_id, color_id in selected_pairs}
+    unused_color_ids = set(color_by_client.values()) - selected_color_ids
+    if unused_color_ids:
+        raise ScmServiceError(
+            "UNUSED_COLOR",
+            "Cada color declarado debe asociarse al menos a una pieza.",
+            status_code=422,
+            details={"color_refs": sorted(unused_color_ids)},
+        )
+
+    uncovered_piece_ids = mold_piece_ids - {
+        piece_id for piece_id, _color_id in selected_pairs
+    }
+    if uncovered_piece_ids:
+        raise ScmServiceError(
+            "PIECE_WITHOUT_COLOR",
+            "Cada pieza debe tener al menos un color de produccion.",
+            status_code=422,
+            details={"pieza_refs": sorted(uncovered_piece_ids)},
+        )
+
+    # La uniformidad de color pertenece a un golpe de molde, no al PT entero.
+    # Si un molde multicavidad produce varias piezas en el mismo golpe, un color
+    # seleccionado para una de ellas debe cubrirlas a todas. Moldes distintos
+    # pueden tener conjuntos de colores completamente independientes.
+    for mold_ref, group_piece_ids in mold_piece_ids_by_mold.items():
+        group_color_ids = {
+            color_id for piece_id, color_id in selected_pairs
+            if piece_id in group_piece_ids
         }
-        if covered != mold_piece_ids:
+        for color_id in group_color_ids:
+            covered = {
+                piece_id for piece_id, pair_color in selected_pairs
+                if pair_color == color_id and piece_id in group_piece_ids
+            }
+            if covered == group_piece_ids:
+                continue
             raise ScmServiceError(
                 "INCOMPLETE_MOLD_COLOR_COVERAGE",
-                "Cada color debe cubrir todas las piezas activas del molde.",
+                "Un color debe cubrir todas las piezas del mismo golpe de molde.",
                 status_code=422,
                 details={
+                    "molde_ref": mold_ref,
                     "color_ref": color_id,
-                    "missing_piece_refs": sorted(mold_piece_ids - covered),
+                    "missing_piece_refs": sorted(group_piece_ids - covered),
                 },
             )
 

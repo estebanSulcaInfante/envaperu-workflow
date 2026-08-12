@@ -864,17 +864,27 @@ def test_apply_components_supports_multiple_molds_in_one_product(app, client):
                     "nombre": "TRANSPARENTE PORTAVAJILLA",
                     "familia_color_id": family_id,
                     "hex": "#FFFFFF",
+                }, {
+                    "client_id": "pastel",
+                    "modo": "NUEVO",
+                    "nombre": "PASTEL PORTAVAJILLA",
+                    "familia_color_id": family_id,
+                    "hex": "#F1D7E5",
                 }],
                 "matriz": [{
-                    "pieza_client_id": piece_client_id,
+                    "pieza_client_id": "pieza-tapa",
                     "color_client_id": "transparente",
                     "seleccionada": True,
-                } for piece_client_id in ("pieza-tapa", "pieza-base")],
+                }, {
+                    "pieza_client_id": "pieza-base",
+                    "color_client_id": "pastel",
+                    "seleccionada": True,
+                }],
                 "formulaciones": [{
-                    "color_client_id": "transparente",
+                    "color_client_id": color_client_id,
                     "tipo": "PENDIENTE",
                     "motivo_pendiente": "Receta por validar",
-                }],
+                } for color_client_id in ("transparente", "pastel")],
             },
         },
     )
@@ -885,6 +895,7 @@ def test_apply_components_supports_multiple_molds_in_one_product(app, client):
     assert {item["pieza_ref"] for item in matrix} == {
         item["pieza_ref"] for item in refs["piezas"]
     }
+    assert len({item["color_ref"] for item in matrix}) == 2
 
 
 def test_applied_legacy_components_can_add_a_second_mold_explicitly(app, client):

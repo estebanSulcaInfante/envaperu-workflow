@@ -210,6 +210,7 @@ from app.services.scm_product_onboarding_service import (
     finalize_onboarding_session,
     get_onboarding_session,
     list_onboarding_sessions,
+    restore_onboarding_colors_from_structure,
     update_onboarding_step,
     validate_onboarding_session,
 )
@@ -337,6 +338,20 @@ def alta_producto_paso_aplicar(session_id, step_code):
         actor_id=_actor_id(),
         session_id=session_id,
         step_code=step_code,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/altas-producto/<uuid:session_id>/pasos/COLORES/"
+    "restaurar-desde-estructura"
+)
+def alta_producto_colores_restaurar_desde_estructura(session_id):
+    return jsonify(restore_onboarding_colors_from_structure(
+        db.session,
+        actor_id=_actor_id(),
+        session_id=session_id,
         operation_id=_idempotency_key(),
         data=_json_body(),
     ))

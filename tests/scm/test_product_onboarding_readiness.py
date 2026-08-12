@@ -377,6 +377,58 @@ def test_validar_alta_bloquea_pt_con_ruta_borrador(app, client):
     }
 
 
+def test_restaurar_colores_desde_bom_aprobada_reconstruye_borrador_sin_crear(
+    app, client
+):
+    actor_id = _actor(app)
+    graph = _ready_graph(app, actor_id)
+    with app.app_context():
+        onboarding = db.session.get(
+            ScmAltaProductoSesion, UUID(graph["session_id"])
+        )
+        states = dict(onboarding.estados_paso_json)
+        states["COLORES"] = "INVALIDADO"
+        states["ESTRUCTURA"] = "INVALIDADO"
+        onboarding.estados_paso_json = states
+        onboarding.paso_actual = "COLORES"
+        db.session.commit()
+        version = onboarding.version
+        before_variants = PiezaColor.query.count()
+        before_recipes = RecetaColorMaestra.query.count()
+
+    response = client.post(
+        f"/api/scm/v1/altas-producto/{graph['session_id']}"
+        "/pasos/COLORES/restaurar-desde-estructura",
+        headers=_headers(actor_id, uuid4()),
+        json={"expected_version": version},
+    )
+    assert response.status_code == 200, response.get_json()
+    recovered = response.get_json()
+    color_step = next(
+        step for step in recovered["pasos"] if step["codigo"] == "COLORES"
+    )
+    assert color_step["estado"] == "EN_PROGRESO"
+    assert color_step["data"]["recuperada_desde_estructura_ref"] == (
+        graph["structure_id"]
+    )
+    assert color_step["data"]["colores"][0]["nombre"] == "COLOR READINESS FAMILIA READINESS"
+    assert color_step["data"]["matriz"] == [{
+        "pieza_ref": 1,
+        "color_ref": 1,
+        "seleccionada": True,
+        "pieza_color_ref": "PC-READINESS-001",
+    }]
+    assert color_step["data"]["formulaciones"][0]["tipo"] == "EXISTENTE"
+    assert recovered["color_recovery"] == {
+        "estructura_revision_ref": graph["structure_id"],
+        "colores": 1,
+        "piezas_color": 1,
+    }
+    with app.app_context():
+        assert PiezaColor.query.count() == before_variants
+        assert RecetaColorMaestra.query.count() == before_recipes
+
+
 def test_validar_alta_ready_y_finalizar_es_idempotente_sin_crear_op(
     app, client
 ):
