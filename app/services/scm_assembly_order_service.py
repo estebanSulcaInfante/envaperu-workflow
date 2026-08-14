@@ -21,6 +21,10 @@ from app.services.scm_operation_schedule_projection import (
     operation_schedule_projection,
     operation_schedule_projections,
 )
+from app.services.scm_fulfillment_service import (
+    credit_output_allocations,
+    project_production_orders_for_operation,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -281,78 +285,105 @@ def transition_assembly_order(
             order.started_by_id = actor.id
             order.started_at = utc_now()
         else:
-            traceable_ot_id = session.scalar(
-                select(RegistroDiarioProduccion.public_id)
+            traceable_ots = session.scalars(
+                select(RegistroDiarioProduccion)
                 .where(
                     RegistroDiarioProduccion.tipo_ot == "ENSAMBLE",
                     RegistroDiarioProduccion.orden_operacion_id == order.id,
                 )
-                .limit(1)
-            )
-            if traceable_ot_id is not None:
-                raise ScmServiceError(
-                    "OA_TRACEABLE_CLOSE_REQUIRED",
-                    "La OA tiene OT de armado y debe cerrarse desde sus mangas "
-                    "con consumo trazable de componentes.",
-                    status_code=409,
+                .with_for_update(of=RegistroDiarioProduccion)
+            ).all()
+            if traceable_ots:
+                pending_ots = [
+                    item for item in traceable_ots
+                    if item.estado not in {"CERRADA", "ANULADA"}
+                ]
+                if pending_ots:
+                    raise ScmServiceError(
+                        "OA_HAS_PENDING_OTS",
+                        "La OA conserva órdenes de trabajo sin cerrar.",
+                        status_code=409,
+                        details={
+                            "ots": [item.codigo_ot for item in pending_ots],
+                        },
+                    )
+                # Armado acredita la salida al cerrar cada manga. El cierre de
+                # OA reconcilia ese total; nunca acepta un conteo digitado que
+                # pueda contradecir la genealogía ya registrada.
+                accepted = Decimal(output.cantidad_real or 0)
+                rejected = Decimal(output.cantidad_rechazada or 0)
+            else:
+                accepted = _quantity(
+                    data.get("cantidad_real"),
+                    "cantidad_real",
+                    allow_zero=True,
                 )
-            accepted = _quantity(
-                data.get("cantidad_real"),
-                "cantidad_real",
-                allow_zero=True,
-            )
-            rejected = _quantity(
-                data.get("cantidad_rechazada", 0),
-                "cantidad_rechazada",
-                allow_zero=True,
-            )
+                rejected = _quantity(
+                    data.get("cantidad_rechazada", 0),
+                    "cantidad_rechazada",
+                    allow_zero=True,
+                )
             if accepted + rejected <= 0:
                 raise ScmServiceError(
                     "OA_EMPTY_RESULT",
                     "El cierre debe registrar produccion o rechazo.",
                     status_code=422,
                 )
+            if (
+                accepted != Decimal(output.cantidad_objetivo)
+                and not str(data.get("motivo") or "").strip()
+            ):
+                raise ScmServiceError(
+                    "OA_CLOSE_REASON_REQUIRED",
+                    "Explique la diferencia entre la producción objetivo y real.",
+                    status_code=422,
+                    details={
+                        "objetivo": format(output.cantidad_objetivo, "f"),
+                        "real": format(accepted, "f"),
+                    },
+                )
             output.cantidad_real = accepted
             output.cantidad_rechazada = rejected
             order.closed_by_id = actor.id
             order.closed_at = utc_now()
-            lot = ScmLoteArticulo(
-                codigo=f"LOT-{order.codigo}",
-                articulo_id=output.articulo_scm_id,
-                clase="SALIDA_ORDEN_OPERACION",
-                orden_operacion_salida_id=output.id,
-                cantidad_acreditada=accepted,
-                estado_calidad=(
-                    "PENDIENTE"
-                    if (
-                        output.articulo.definicion_wip is not None
-                        and output.articulo.definicion_wip.requiere_calidad
-                    ) else "LIBERADO"
-                ),
-                event_time=order.closed_at,
-                actor_id=actor.id,
-            )
-            session.add(lot)
-            remaining = accepted
-            for allocation in output.asignaciones:
-                satisfied = min(
-                    Decimal(allocation.cantidad_planificada),
-                    remaining,
+            lot = session.scalar(
+                select(ScmLoteArticulo)
+                .where(
+                    ScmLoteArticulo.orden_operacion_salida_id == output.id
                 )
-                remaining -= satisfied
-                allocation.cantidad_comprometida = satisfied
-                allocation.cantidad_satisfecha = satisfied
-                if satisfied >= allocation.cantidad_planificada:
-                    allocation.estado = "SATISFECHA"
-                elif satisfied > 0:
-                    allocation.estado = "COMPROMETIDA"
-                else:
-                    allocation.estado = "PLANIFICADA"
-                allocation.version += 1
+                .with_for_update(of=ScmLoteArticulo)
+            )
+            if lot is None:
+                lot = ScmLoteArticulo(
+                    codigo=f"LOT-{order.codigo}",
+                    articulo_id=output.articulo_scm_id,
+                    clase="SALIDA_ORDEN_OPERACION",
+                    orden_operacion_salida_id=output.id,
+                )
+                session.add(lot)
+            lot.cantidad_acreditada = accepted
+            lot.estado_calidad = (
+                "PENDIENTE"
+                if (
+                    output.articulo.definicion_wip is not None
+                    and output.articulo.definicion_wip.requiere_calidad
+                ) else "LIBERADO"
+            )
+            lot.event_time = order.closed_at
+            lot.actor_id = actor.id
+            credit_output_allocations(output, accepted)
         order.estado = next_state
         order.version += 1
+        op_projections = project_production_orders_for_operation(
+            session,
+            operation_order=order,
+            actor=actor,
+            operation=audit,
+        )
         session.flush()
         response = _serialize(session, order)
+        if op_projections:
+            response["ordenes_produccion"] = op_projections
         audit.response_json = copy.deepcopy(response)
         audit.estado_http = 200
         session.add(ScmEvento(

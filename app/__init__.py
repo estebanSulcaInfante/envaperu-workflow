@@ -96,6 +96,11 @@ def create_app():
     )
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
 
+    if app.config['SCM_DEMO_MODE'] == 'portfolio':
+        from app.api.rutas_portfolio_demo import portfolio_demo_bp
+
+        app.register_blueprint(portfolio_demo_bp, url_prefix='/api/demo')
+
     from app.cli import register_scm_commands, register_station_commands
 
     register_station_commands(app)

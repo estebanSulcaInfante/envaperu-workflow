@@ -670,6 +670,7 @@ def annul_manga_weighing(
             .where(ScmManga.id == weighing.manga_id)
             .with_for_update()
         )
+        _ensure_operational_order_mutable(manga)
         if manga.estado == "ANULADA" or weighing.anulacion is not None:
             raise ScmServiceError(
                 "WEIGHING_ALREADY_ANNULLED",
@@ -884,6 +885,25 @@ def _effective_projection(weighing):
     }
 
 
+def _ensure_operational_order_mutable(manga):
+    operation_order = (
+        manga.trabajo.orden_operacion
+        if manga.trabajo is not None
+        else manga.ot.orden_operacion
+    )
+    if operation_order is not None and operation_order.estado == "CERRADA":
+        raise ScmServiceError(
+            "OPERATION_REOPEN_REQUIRED",
+            "La orden operativa ya fue cerrada. Reábrala de forma "
+            "controlada antes de corregir o anular el pesaje.",
+            status_code=409,
+            details={
+                "orden_operacion_id": str(operation_order.id),
+                "codigo": operation_order.codigo,
+            },
+        )
+
+
 def get_manga_weighing(session, *, actor_id, manga_id):
     load_actor(session, actor_id, capability="MANGA_PESAJE_VER")
     manga = session.scalar(
@@ -950,6 +970,7 @@ def request_weighing_correction(
                 "El pesaje SCM no existe.",
                 status_code=404,
             )
+        _ensure_operational_order_mutable(weighing.manga)
         proposed = data.get("proposed")
         if weighing.anulacion is not None or weighing.manga.estado == "ANULADA":
             raise ScmServiceError(
@@ -1071,6 +1092,7 @@ def approve_weighing_correction(
             .where(ScmManga.id == weighing.manga_id)
             .with_for_update()
         )
+        _ensure_operational_order_mutable(manga)
         current = _effective_projection(weighing)
         previous_manga_quantity = Decimal(
             manga.cantidad_confirmada_un or current["cantidad_confirmada"]

@@ -60,6 +60,7 @@ class Config:
         os.getenv('SCM_RECEPCION_ENABLED', 'false').lower() == 'true'
     )
     SCM_AUTH_MODE = os.getenv('SCM_AUTH_MODE', 'local_actor').strip().lower()
+    SCM_DEMO_MODE = os.getenv('SCM_DEMO_MODE', '').strip().lower()
     SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip().rstrip('/')
     SUPABASE_JWT_AUDIENCE = os.getenv(
         'SUPABASE_JWT_AUDIENCE',

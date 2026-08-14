@@ -43,6 +43,9 @@ from app.services.scm_ot_service import (
     _serialize_plan,
 )
 from app.services.scm_packaging_service import calculate_packaging_capacity
+from app.services.scm_fulfillment_service import (
+    project_production_orders_for_operation,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -986,6 +989,12 @@ def close_assembly_manga(
             order.started_by_id = actor.id
             order.started_at = utc_now()
             order.version += 1
+        project_production_orders_for_operation(
+            session,
+            operation_order=order,
+            actor=actor,
+            operation=operation,
+        )
         session.flush()
         response = {
             "manga": _serialize_manga(manga),

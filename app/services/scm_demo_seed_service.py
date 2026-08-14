@@ -62,8 +62,8 @@ from app.services.scm_weighing_service import resolve_manga_label
 from app.services.station_auth import hash_station_token
 
 
-ALEMBIC_HEAD = "f80c9d5e1a42"
-DEMO_MARKER = "MOCK_LOCAL_ALCANCIA_PABLO_V1"
+ALEMBIC_HEAD = "f84d3a7c9e21"
+DEMO_MARKER = "PORTFOLIO_ALCANCIA_PABLO_V2"
 DEMO_OF_IDLE_CODE = "OF-DEMO-AP-SIN-OT"
 DEMO_OF_ACTIVE_CODE = "OF-DEMO-AP-PRE"
 DEMO_STATION_TOKEN = "local-demo-alcancia-pablo-token-v1"
@@ -122,11 +122,11 @@ def assert_local_demo_database(
 def _ensure_catalogs(session):
     linea = session.scalar(select(Linea).where(Linea.codigo == 9901))
     if linea is None:
-        linea = Linea(codigo=9901, nombre="[MOCK LOCAL] HOGAR ALCANCIA")
+        linea = Linea(codigo=9901, nombre="HOGAR - ALCANCIAS")
         session.add(linea)
     familia = session.scalar(select(Familia).where(Familia.codigo == 9901))
     if familia is None:
-        familia = Familia(codigo=9901, nombre="[MOCK LOCAL] ALCANCIAS")
+        familia = Familia(codigo=9901, nombre="ALCANCIAS")
         session.add(familia)
     session.flush()
     relation = session.scalar(select(LineaFamilia).where(
@@ -140,13 +140,13 @@ def _ensure_catalogs(session):
         select(FamiliaColor).where(FamiliaColor.codigo == 9901)
     )
     if color_family is None:
-        color_family = FamiliaColor(codigo=9901, nombre="SOLIDO MOCK LOCAL")
+        color_family = FamiliaColor(codigo=9901, nombre="SOLIDO")
         session.add(color_family)
     color_base = session.scalar(
-        select(ColorBase).where(ColorBase.nombre == "CARNE MOCK LOCAL")
+        select(ColorBase).where(ColorBase.nombre == "CARNE")
     )
     if color_base is None:
-        color_base = ColorBase(nombre="CARNE MOCK LOCAL")
+        color_base = ColorBase(nombre="CARNE")
         session.add(color_base)
     session.flush()
     color = session.scalar(select(ColorProduccion).where(
@@ -165,7 +165,7 @@ def _ensure_catalogs(session):
     if piece is None:
         piece = Pieza(
             codigo="PZ-DEMO-AP",
-            nombre="[MOCK LOCAL] Cuerpo Alcancia Pablo Grande",
+            nombre="Cuerpo Alcancia Pablo Grande",
             linea_id=linea.id,
             familia_id=familia.id,
             peso_nominal_gr=125,
@@ -176,7 +176,7 @@ def _ensure_catalogs(session):
     if mold is None:
         mold = Molde(
             codigo="ML-DEMO-AP",
-            nombre="[MOCK LOCAL] Molde soplado Alcancia Pablo Grande",
+            nombre="Molde soplado Alcancia Pablo Grande",
             peso_tiro_gr=130,
             tiempo_ciclo_std=30,
             activo=True,
@@ -203,7 +203,7 @@ def _ensure_catalogs(session):
             linea_id=linea.id,
             familia_id=familia.id,
             pieza_rel=piece,
-            piezas="[MOCK LOCAL] Alcancia Pablo Grande CARNE SOLIDO",
+            piezas="Alcancia Pablo Grande CARNE SOLIDO",
             color_produccion_rel=color,
             peso=125,
             tipo_extruccion="SOPLADO",
@@ -215,7 +215,7 @@ def _ensure_catalogs(session):
     if product is None:
         product = ProductoTerminado(
             cod_sku_pt="PT-DEMO-AP",
-            producto="[MOCK LOCAL] Alcancia Pablo Grande",
+            producto="Alcancia Pablo Grande",
             linea_id=linea.id,
             familia_id=familia.id,
             um="UN",
@@ -270,9 +270,9 @@ def _ensure_actor_machine_station(session):
     if actor is None:
         actor = Trabajador(
             codigo="TRB-DEMO-AP",
-            nombres="Operador",
-            apellidos="Mock Local",
-            nombre_corto="Operador UAT",
+            nombres="Diego",
+            apellidos="Ramos",
+            nombre_corto="Maquinista",
             activo=True,
             observaciones=DEMO_MARKER,
         )
@@ -286,13 +286,13 @@ def _ensure_actor_machine_station(session):
     if not {role.codigo for role in actor.roles}.issuperset(
         {"GERENTE_GENERAL", "MAQUINISTA"}
     ):
-        raise LocalDemoSeedError("Faltan roles SCM para el operador mock.")
+        raise LocalDemoSeedError("Faltan roles SCM para el operador del recorrido.")
     session.flush()
     manager_role = next(
         role for role in roles if role.codigo == "GERENTE_GENERAL"
     )
     # La relacion ORM conserva ambos roles funcionales. Esta marca explicita
-    # evita que /auth/me trate al actor mock como configuracion pendiente.
+    # evita que /auth/me trate al actor del recorrido como configuracion pendiente.
     session.execute(
         update(trabajador_rol)
         .where(trabajador_rol.c.trabajador_id == actor.id)
@@ -314,7 +314,7 @@ def _ensure_actor_machine_station(session):
     if machine_type is None:
         machine_type = TipoMaquina(
             codigo="SOPLADO-DEMO",
-            nombre="[MOCK LOCAL] Sopladora",
+            nombre="Sopladora",
             proceso="SOPLADO",
             activo=True,
         )
@@ -326,7 +326,7 @@ def _ensure_actor_machine_station(session):
     if machine is None:
         machine = Maquina(
             codigo="MAQ-DEMO-AP",
-            nombre="[MOCK LOCAL] Sopladora Alcancia Pablo",
+            nombre="Sopladora Alcancia Pablo",
             tipo_maquina_id=machine_type.id,
             estado="OPERATIVA",
             activo=True,
@@ -339,15 +339,15 @@ def _ensure_actor_machine_station(session):
         station = EstacionPesaje(
             station_id=station_id,
             codigo="BAL-DEMO-AP",
-            nombre="[MOCK LOCAL] Balanza Alcancia Pablo",
-            ubicacion="UAT local",
+            nombre="Balanza Alcancia Pablo",
+            ubicacion="Area de pesaje",
             estado_admin="ACTIVA",
             token_hash=hash_station_token(DEMO_STATION_TOKEN),
         )
         session.add(station)
     session.flush()
     if not actor.tiene_capacidad("MANGA_PESAR"):
-        raise LocalDemoSeedError("El operador mock no posee MANGA_PESAR.")
+        raise LocalDemoSeedError("El operador del recorrido no posee MANGA_PESAR.")
     return actor, machine, station
 
 
@@ -359,7 +359,7 @@ def _ensure_packaging(session, *, actor, article):
         container = ScmTipoContenedor(
             codigo="MANGA-DEMO-AP",
             clase="MANGA",
-            nombre="[MOCK LOCAL] Manga Alcancia Pablo",
+            nombre="Manga Alcancia Pablo",
             material="PE",
             tara_nominal_g=Decimal("10"),
             tolerancia_tara_g=Decimal("5"),
@@ -373,7 +373,7 @@ def _ensure_packaging(session, *, actor, article):
     if profile is None:
         profile = ScmPerfilEmpacable(
             codigo="PERFIL-DEMO-AP",
-            nombre="[MOCK LOCAL] Alcancia Pablo 67 unidades",
+            nombre="Alcancia Pablo 67 unidades",
             descripcion_fisica=DEMO_MARKER,
             activo=True,
         )
@@ -465,8 +465,8 @@ def _ensure_demand_and_orders(session, *, actor, machine, catalogs, operational_
         proposal = {
             "marker": DEMO_MARKER,
             "documentos": [
-                {"clave": "MOCK-OF-IDLE", "cantidad": 2266},
-                {"clave": "MOCK-OF-ACTIVE", "cantidad": 134},
+                {"clave": "DEMO-OF-IDLE", "cantidad": 2266},
+                {"clave": "DEMO-OF-ACTIVE", "cantidad": 134},
             ],
         }
         plan = ScmPlanProduccion(
@@ -546,9 +546,9 @@ def _ensure_demand_and_orders(session, *, actor, machine, catalogs, operational_
             ))
         return order, order.fabricacion.corridas[0]
 
-    idle, _ = ensure_of(DEMO_OF_IDLE_CODE, "MOCK-OF-IDLE", 2266)
+    idle, _ = ensure_of(DEMO_OF_IDLE_CODE, "DEMO-OF-IDLE", 2266)
     active, active_run = ensure_of(
-        DEMO_OF_ACTIVE_CODE, "MOCK-OF-ACTIVE", 134
+        DEMO_OF_ACTIVE_CODE, "DEMO-OF-ACTIVE", 134
     )
     session.commit()
     return created, demand, idle, active, active_run
@@ -586,7 +586,7 @@ def _result(session, *, created, actor, station, active_order):
         for label in labels
     ]
     if not all(item["can_weigh"] for item in resolutions):
-        raise LocalDemoSeedError("Los QR mock no quedaron habilitados para pesaje.")
+        raise LocalDemoSeedError("Los QR del recorrido no quedaron habilitados para pesaje.")
     return {
         "marker": DEMO_MARKER,
         "created": created,
@@ -612,14 +612,16 @@ def seed_alcancia_pablo_demo(
     connection_database: str,
     migration_revision: str,
     operational_date: date,
+    validate_environment: bool = True,
 ):
     """Crea dos pistas UAT enlazadas a una OP, sin registrar pesajes."""
 
-    assert_local_demo_database(
-        database_url,
-        connection_database=connection_database,
-        migration_revision=migration_revision,
-    )
+    if validate_environment:
+        assert_local_demo_database(
+            database_url,
+            connection_database=connection_database,
+            migration_revision=migration_revision,
+        )
     catalogs = _ensure_catalogs(session)
     actor, machine, station = _ensure_actor_machine_station(session)
     _ensure_packaging(session, actor=actor, article=catalogs["article"])
@@ -689,7 +691,7 @@ def seed_alcancia_pablo_demo(
         data={"results": [{
             "label_id": label["public_id"],
             "estado": "IMPRESA",
-            "printer_name": "TSC MOCK LOCAL",
+            "printer_name": "TSC_SIMULADA",
         } for label in generated["labels"]]},
     )
     transition_color_work(
@@ -708,5 +710,5 @@ def seed_alcancia_pablo_demo(
         active_order=active,
     )
     if result is None:
-        raise LocalDemoSeedError("El escenario mock quedo incompleto.")
+        raise LocalDemoSeedError("El escenario de demostracion quedo incompleto.")
     return result

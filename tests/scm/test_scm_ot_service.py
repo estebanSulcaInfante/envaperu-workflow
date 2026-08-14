@@ -2,6 +2,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from app.extensions import db
 from app.models.lote import LoteColor, LoteSalidaPiezaColor
@@ -51,6 +52,7 @@ from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_configuration import ensure_initial_scm_configuration
 from app.services.scm_fabrication_order_service import list_fabrication_orders
 from app.services.scm_ot_service import (
+    _fabrication_run_for_update_query,
     add_color_work,
     add_work_mangas,
     acknowledge_station_print_job,
@@ -74,6 +76,17 @@ from app.services.scm_ot_service import (
     transition_color_work,
     transition_ot,
 )
+
+
+def test_fabrication_run_lock_targets_only_run_on_postgresql():
+    statement = _fabrication_run_for_update_query(
+        run_id=uuid4(),
+        order_id=uuid4(),
+    )
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "LEFT OUTER JOIN color_produccion" in sql
+    assert "FOR UPDATE OF scm_corrida_fabricacion" in sql
 from app.services.scm_assembly_execution_service import (
     approve_assembly_quantity_correction,
     assign_assembly_output_mangas,
@@ -2926,6 +2939,21 @@ def test_uat_m04_m05_m06_m07_relevo_stickers_y_frontera(app):
             manga_id=printed_manga["public_id"],
             station_code="PESAJE-UAT-M-REL",
         )
+        with pytest.raises(ScmServiceError) as unconfirmed_empty:
+            assign_color_work_worker(
+                db.session, actor_id=creator.id, work_id=UUID(work["id"]),
+                operation_id=uuid4(),
+                data={
+                    "trabajador_id": luis.id,
+                    "motivo": "Intento sin confirmar manga vacia",
+                    "version": work["version"],
+                    "manga_ids": [printed_manga["public_id"]],
+                },
+            )
+        assert unconfirmed_empty.value.code == "EMPTY_STICKER_CONFIRMATION_REQUIRED"
+        assert ScmEtiquetaManga.query.filter_by(
+            public_id=UUID(old_label["public_id"])
+        ).one().estado == "IMPRESA"
         replacement = assign_color_work_worker(
             db.session, actor_id=creator.id, work_id=UUID(work["id"]),
             operation_id=uuid4(),
@@ -2934,6 +2962,7 @@ def test_uat_m04_m05_m06_m07_relevo_stickers_y_frontera(app):
                 "motivo": "Relevo despues de imprimir",
                 "version": work["version"],
                 "manga_ids": [printed_manga["public_id"]],
+                "confirmacion_stickers_vacios": True,
             },
         )
         work = replacement["trabajo_color"]
@@ -2974,71 +3003,59 @@ def test_uat_m04_m05_m06_m07_relevo_stickers_y_frontera(app):
             station_code="PESAJE-UAT-M-OPEN",
         )
         pesajes_before = ScmPesajeManga.query.count()
-        boundary = assign_color_work_worker(
-            db.session, actor_id=creator.id, work_id=UUID(work["id"]),
-            operation_id=uuid4(),
-            data={
-                "trabajador_id": renato.id,
-                "motivo": "Relevo de manga abierta al corte",
-                "version": work["version"],
-                "manga_ids": [open_manga["public_id"]],
-                "manga_abierta": True,
-                "conteo_frontera": 37,
-            },
-        )
-        transfer = boundary["transferencia_manga_abierta"]
-        assert transfer["manga_id"] == open_manga["public_id"]
-        assert transfer["conteo_frontera"] == 37
-        assert transfer["trabajo_color_id"] == work["id"]
+        with pytest.raises(ScmServiceError) as open_relief:
+            assign_color_work_worker(
+                db.session, actor_id=creator.id, work_id=UUID(work["id"]),
+                operation_id=uuid4(),
+                data={
+                    "trabajador_id": renato.id,
+                    "motivo": "Intento de transferir manga con contenido",
+                    "version": work["version"],
+                    "manga_ids": [open_manga["public_id"]],
+                    "manga_abierta": True,
+                    "conteo_frontera": 37,
+                },
+            )
+        assert open_relief.value.code == "OPEN_MANGA_RELIEF_NOT_ALLOWED"
         assert ScmPesajeManga.query.count() == pesajes_before
         assert ScmEtiquetaManga.query.filter_by(
-            manga_id=ScmManga.query.filter_by(
-                public_id=UUID(open_manga["public_id"])
-            ).one().id,
-            tipo="POSTPESAJE",
-        ).count() == 0
-        event = ScmEvento.query.filter_by(
-            aggregate_type="TRABAJO_COLOR",
-            aggregate_id=work["id"],
-            tipo="COLOR_WORK_WORKER_REASSIGNED",
-        ).order_by(ScmEvento.id.desc()).first()
-        assert event.after_json["transferencia_manga_abierta"][
-            "conteo_frontera"
-        ] == 37
-        db.session.refresh(plan_assignment)
-        assert Decimal(plan_assignment.cantidad_asignada_un) == quota_before
-        assert ScmManga.query.filter_by(trabajo_ot_id=UUID(work["id"])).count() == 10
-        assert ScmEtiquetaManga.query.filter_by(
             public_id=UUID(open_label["public_id"])
-        ).one().estado == "INVALIDADA"
+        ).one().estado == "IMPRESA"
 
-        replacement_job = boundary["trabajos_impresion_reemplazo"][0]
-        replacement_label = replacement_job["labels"][0]
-        acknowledge_station_print_job(
-            db.session,
-            station_id=open_station.station_id,
-            print_job_id=UUID(replacement_job["print_job_id"]),
-            data={"results": [{
-                "label_id": replacement_label["public_id"],
-                "estado": "IMPRESA",
-                "printer_name": "TSC",
-            }]},
-        )
         work = transition_color_work(
             db.session,
             actor_id=creator.id,
             work_id=UUID(work["id"]),
             operation_id=uuid4(),
-            data={"version": boundary["trabajo_color"]["version"]},
+            data={"version": work["version"]},
             action="iniciar",
         )["trabajo_color"]
+        personnel_only = assign_color_work_worker(
+            db.session, actor_id=creator.id, work_id=UUID(work["id"]),
+            operation_id=uuid4(),
+            data={
+                "trabajador_id": renato.id,
+                "motivo": "Cambio de turno sin stickers pendientes",
+                "version": work["version"],
+                "manga_ids": [],
+            },
+        )
+        assert personnel_only["relevo_sin_stickers"] is True
+        assert personnel_only["stickers_transferidos"] == 0
+        assert personnel_only["mangas"] == []
+        assert personnel_only["trabajos_impresion_reemplazo"] == []
+        assert personnel_only["asignacion"]["trabajador_id"] == renato.id
+        assert ScmPesajeManga.query.count() == pesajes_before
+        db.session.refresh(plan_assignment)
+        assert Decimal(plan_assignment.cantidad_asignada_un) == quota_before
+        assert ScmManga.query.filter_by(trabajo_ot_id=UUID(work["id"])).count() == 10
         final_weighing = confirm_manga_weighing(
             db.session,
             station_id=open_station.station_id,
             operation_id=uuid4(),
             actor_id=creator.id,
             data={
-                "label_id": replacement_label["public_id"],
+                "label_id": open_label["public_id"],
                 "capture_id": str(uuid4()),
                 "peso_bruto_kg": "10.100",
                 "tara_kg": "0.100",
@@ -3053,7 +3070,9 @@ def test_uat_m04_m05_m06_m07_relevo_stickers_y_frontera(app):
         final_fact = ScmPesajeManga.query.filter_by(
             public_id=UUID(final_weighing["weighing"]["public_id"])
         ).one()
-        assert final_fact.asignacion_personal_trabajo.trabajador_id == renato.id
+        # Una manga con contenido permanece atribuida al responsable
+        # saliente aunque se pese después de registrar el relevo.
+        assert final_fact.asignacion_personal_trabajo.trabajador_id == creator.id
         assert final_fact.pesado_por_id == creator.id
 
 
@@ -3441,3 +3460,252 @@ def test_uat_m09_correccion_post_recepcion_y_reversa_conservan_trabajo(app):
         assert annulled["trabajo_color_id"] == work["id"]
         assert annulled["manga"]["estado"] == "ANULADA"
         assert ScmAnulacionPesajeManga.query.count() == 1
+
+
+def test_cerrar_of_acredita_demanda_y_completa_op_sin_duplicar_kardex(app):
+    from datetime import date
+
+    from app.models.producto import ProductoTerminado
+    from app.models.scm_inventory import ScmMovimientoInventario
+    from app.models.scm_ot import ScmLoteArticulo
+    from app.models.scm_production_orders import (
+        ScmAsignacionDemandaSuministro,
+        ScmOrdenProduccion,
+        ScmOrdenProduccionLinea,
+    )
+    from app.services.scm_fabrication_order_service import (
+        close_fabrication_order,
+    )
+
+    with app.app_context():
+        (
+            creator,
+            approver,
+            order,
+            run,
+            output,
+            _line,
+            _header,
+            created,
+        ) = _seed_aggregate_color_work(quantity=250)
+        product = ProductoTerminado(
+            cod_sku_pt="PT-CIERRE-OF",
+            producto="Producto para cierre reconciliado",
+            linea_id=1,
+            familia_id=1,
+        )
+        demand = ScmOrdenProduccion(
+            codigo="OP-CIERRE-OF",
+            origen="PLANIFICACION",
+            fecha_necesidad=date(2026, 8, 14),
+            estado="PLANIFICADA",
+            created_by_id=creator.id,
+            approved_by_id=approver.id,
+        )
+        demand_line = ScmOrdenProduccionLinea(
+            producto_terminado=product,
+            cantidad_solicitada=Decimal("250"),
+        )
+        demand.lineas.append(demand_line)
+        allocation = ScmAsignacionDemandaSuministro(
+            orden_produccion_linea=demand_line,
+            fuente_tipo="SALIDA_ORDEN",
+            orden_operacion_salida=output,
+            cantidad_planificada=Decimal("250"),
+        )
+        db.session.add_all([product, demand, allocation])
+        db.session.commit()
+
+        work = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]),
+            operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]},
+            action="iniciar",
+        )["trabajo_color"]
+        db.session.refresh(demand)
+        assert demand.estado == "EN_COBERTURA"
+
+        work_model = db.session.get(ScmTrabajoOt, UUID(work["id"]))
+        for manga in work_model.mangas:
+            manga.estado = "PESADA"
+            manga.cantidad_confirmada_un = manga.cantidad_asignada_un
+        db.session.commit()
+        completed = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=work_model.id,
+            operation_id=uuid4(),
+            data={"version": work_model.version},
+            action="completar",
+        )["trabajo_color"]
+        assert completed["cantidad_confirmada_un"] == "250"
+
+        inventory_before = ScmMovimientoInventario.query.count()
+        close_operation = uuid4()
+        command = {"version": order.version}
+        closed = close_fabrication_order(
+            db.session,
+            actor_id=approver.id,
+            operation_id=close_operation,
+            operation_order_id=order.id,
+            data=command,
+        )
+        assert closed["estado"] == "CERRADA"
+        assert closed["corridas"][0]["estado"] == "COMPLETADA"
+        assert closed["corridas"][0]["salidas"][0]["cantidad_real"] == (
+            "250.000"
+        )
+        assert closed["cierre"]["ordenes_produccion"][0]["estado"] == (
+            "COMPLETADA"
+        )
+        db.session.refresh(demand)
+        db.session.refresh(demand_line)
+        db.session.refresh(allocation)
+        assert demand.estado == "COMPLETADA"
+        assert demand_line.estado == "SATISFECHA"
+        assert allocation.estado == "SATISFECHA"
+        assert Decimal(allocation.cantidad_satisfecha) == Decimal("250")
+        assert Decimal(
+            ScmLoteArticulo.query.filter_by(
+                orden_operacion_salida_id=output.id
+            ).one().cantidad_acreditada
+        ) == Decimal("250")
+        assert ScmMovimientoInventario.query.count() == inventory_before
+
+        replay = close_fabrication_order(
+            db.session,
+            actor_id=approver.id,
+            operation_id=close_operation,
+            operation_order_id=order.id,
+            data=command,
+        )
+        assert replay == closed
+        assert ScmMovimientoInventario.query.count() == inventory_before
+
+
+def test_cerrar_of_con_faltante_exige_motivo_y_no_completa_op(app):
+    from datetime import date
+
+    from app.models.producto import ProductoTerminado
+    from app.models.scm_production_orders import (
+        ScmAsignacionDemandaSuministro,
+        ScmOrdenProduccion,
+        ScmOrdenProduccionLinea,
+    )
+    from app.services.scm_fabrication_order_service import (
+        close_fabrication_order,
+    )
+
+    with app.app_context():
+        (
+            creator,
+            approver,
+            order,
+            _run,
+            output,
+            _line,
+            _header,
+            created,
+        ) = _seed_aggregate_color_work(quantity=250)
+        product = ProductoTerminado(
+            cod_sku_pt="PT-CIERRE-PARCIAL",
+            producto="Producto con cierre parcial",
+            linea_id=1,
+            familia_id=1,
+        )
+        demand = ScmOrdenProduccion(
+            codigo="OP-CIERRE-PARCIAL",
+            origen="PLANIFICACION",
+            fecha_necesidad=date(2026, 8, 14),
+            estado="PLANIFICADA",
+            created_by_id=creator.id,
+            approved_by_id=approver.id,
+        )
+        demand_line = ScmOrdenProduccionLinea(
+            producto_terminado=product,
+            cantidad_solicitada=Decimal("250"),
+        )
+        demand.lineas.append(demand_line)
+        allocation = ScmAsignacionDemandaSuministro(
+            orden_produccion_linea=demand_line,
+            fuente_tipo="SALIDA_ORDEN",
+            orden_operacion_salida=output,
+            cantidad_planificada=Decimal("250"),
+        )
+        db.session.add_all([product, demand, allocation])
+        db.session.commit()
+
+        work = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]),
+            operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]},
+            action="iniciar",
+        )["trabajo_color"]
+        with pytest.raises(ScmServiceError) as pending_work:
+            close_fabrication_order(
+                db.session,
+                actor_id=approver.id,
+                operation_id=uuid4(),
+                operation_order_id=order.id,
+                data={"version": order.version},
+            )
+        assert pending_work.value.code == "OF_HAS_PENDING_WORKS"
+        order = db.session.get(ScmOrdenOperacion, order.id)
+        work_model = db.session.get(ScmTrabajoOt, UUID(work["id"]))
+        first, *remaining = work_model.mangas
+        first.estado = "PESADA"
+        first.cantidad_confirmada_un = first.cantidad_asignada_un
+        for manga in remaining:
+            manga.estado = "ANULADA"
+        db.session.commit()
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=work_model.id,
+            operation_id=uuid4(),
+            data={"version": work_model.version},
+            action="completar",
+        )
+
+        with pytest.raises(ScmServiceError) as missing_reason:
+            close_fabrication_order(
+                db.session,
+                actor_id=approver.id,
+                operation_id=uuid4(),
+                operation_order_id=order.id,
+                data={"version": order.version},
+            )
+        assert missing_reason.value.code == "OF_CLOSE_REASON_REQUIRED"
+        db.session.refresh(order)
+        db.session.refresh(allocation)
+        assert order.estado == "EN_EJECUCION"
+        assert Decimal(allocation.cantidad_satisfecha) == Decimal("0")
+
+        closed = close_fabrication_order(
+            db.session,
+            actor_id=approver.id,
+            operation_id=uuid4(),
+            operation_order_id=order.id,
+            data={
+                "version": order.version,
+                "motivo": "Se terminó el turno con saldo pendiente",
+            },
+        )
+        assert closed["estado"] == "CERRADA"
+        assert closed["cierre"]["diferencias"] == [{
+            "salida_id": str(output.id),
+            "articulo": output.articulo.codigo,
+            "objetivo": "250.000",
+            "real": "100.000",
+        }]
+        db.session.refresh(demand)
+        db.session.refresh(demand_line)
+        db.session.refresh(allocation)
+        assert demand.estado == "EN_COBERTURA"
+        assert demand_line.estado == "ACTIVA"
+        assert allocation.estado == "COMPROMETIDA"
+        assert Decimal(allocation.cantidad_satisfecha) == Decimal("100")

@@ -78,7 +78,7 @@ def test_seed_demo_alcancia_is_idempotent_and_uses_only_mangas(app):
         demand = ScmOrdenProduccion.query.filter_by(
             referencia_origen=DEMO_MARKER
         ).one()
-        assert demand.estado == "PLANIFICADA"
+        assert demand.estado == "EN_COBERTURA"
         assert demand.fecha_necesidad == date(2026, 8, 14)
         assert len(demand.lineas) == 1
         assert demand.lineas[0].cantidad_solicitada == 2400

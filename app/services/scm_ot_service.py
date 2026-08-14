@@ -50,6 +50,9 @@ from app.models.trabajador import Trabajador
 from app.services.catalog_code_generator import generar_codigo_catalogo
 from app.services.scm_color_identity import serialize_color_identity
 from app.services.scm_packaging_service import calculate_packaging_capacity
+from app.services.scm_fulfillment_service import (
+    project_production_orders_for_operation,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -113,6 +116,23 @@ def _reserve_operation(session, operation_id, endpoint, actor, data):
 def _complete_operation(operation, response, status=201):
     operation.response_json = copy.deepcopy(response)
     operation.estado_http = status
+
+
+def _fabrication_run_for_update_query(*, run_id, order_id):
+    """Lock only the fabrication run, not its eagerly joined color row.
+
+    ``ScmCorridaFabricacion.color_produccion`` is loaded with a nullable outer
+    join. PostgreSQL rejects an unqualified ``FOR UPDATE`` on that query
+    because it would also try to lock the nullable side of the join.
+    """
+    return (
+        select(ScmCorridaFabricacion)
+        .where(
+            ScmCorridaFabricacion.id == run_id,
+            ScmCorridaFabricacion.orden_fabricacion_id == order_id,
+        )
+        .with_for_update(of=ScmCorridaFabricacion)
+    )
 
 
 def _event(aggregate_type, aggregate_id, event_type, actor, operation, after):
@@ -1943,6 +1963,12 @@ def add_color_work(
         if order.estado == "LIBERADA":
             order.estado = "PROGRAMADA"
             order.version += 1
+            project_production_orders_for_operation(
+                session,
+                operation_order=order,
+                actor=actor,
+                operation=operation,
+            )
         session.flush()
         session.expire(ot, ["trabajos_ot"])
         response = {
@@ -2295,6 +2321,13 @@ def transition_color_work(
             work.estado = target_state
         work.version += 1
         _recompute_parent_state(session, work)
+        if action in {"iniciar", "reanudar"}:
+            project_production_orders_for_operation(
+                session,
+                operation_order=work.orden_operacion,
+                actor=actor,
+                operation=operation,
+            )
         session.flush()
         after = _serialize_color_work(work)
         response = {
@@ -2514,6 +2547,7 @@ def assign_color_work_worker(
             "manga_ids",
             "manga_abierta",
             "conteo_frontera",
+            "confirmacion_stickers_vacios",
         },
     )
     try:
@@ -2541,10 +2575,10 @@ def assign_color_work_worker(
             manga for manga in work.mangas if manga.estado in eligible_states
         ]
         if raw_ids is not None:
-            if not isinstance(raw_ids, list) or not raw_ids:
+            if not isinstance(raw_ids, list):
                 raise ScmServiceError(
-                    "MANGA_SELECTION_REQUIRED",
-                    "Seleccione al menos una manga para el relevo.",
+                    "INVALID_MANGA_SELECTION",
+                    "manga_ids debe ser una lista.",
                     status_code=400,
                 )
             requested = {_uuid_value(value, field="manga_ids") for value in raw_ids}
@@ -2569,45 +2603,44 @@ def assign_color_work_worker(
                     status_code=409,
                 )
         else:
+            # Compatibilidad con clientes anteriores: omitir manga_ids
+            # conserva la transferencia de todas las mangas elegibles. Los
+            # clientes nuevos envían [] para registrar solo el intervalo de
+            # responsabilidad, sin transferir stickers.
             selected = eligible
-        if not selected:
+        active_assignment = _active_work_assignment(work)
+        if not selected and not (
+            raw_ids == []
+            and work.estado == "EN_EJECUCION"
+            and active_assignment is not None
+        ):
             raise ScmServiceError(
                 "MANGA_NOT_ELIGIBLE_FOR_REASSIGNMENT",
-                "El trabajo no tiene mangas elegibles para reasignar.",
+                "El relevo sin stickers requiere un trabajo en ejecución y una asignación activa.",
                 status_code=409,
             )
-        open_transfer = data.get("manga_abierta") is True
-        boundary_count = data.get("conteo_frontera")
-        if open_transfer:
-            if len(selected) != 1 or selected[0].estado != "PREETIQUETADA":
-                raise ScmServiceError(
-                    "OPEN_MANGA_TRANSFER_REQUIRES_ONE_MANGA",
-                    "El relevo de manga abierta requiere una preetiqueta seleccionada.",
-                    status_code=422,
-                )
-            if (
-                not isinstance(boundary_count, int)
-                or isinstance(boundary_count, bool)
-                or boundary_count < 0
-                or Decimal(boundary_count)
-                > Decimal(selected[0].cantidad_asignada_un)
-            ):
-                raise ScmServiceError(
-                    "INVALID_BOUNDARY_COUNT",
-                    "conteo_frontera debe ser un entero entre cero y la cantidad de la manga.",
-                    status_code=422,
-                )
-        elif boundary_count is not None:
+        if data.get("manga_abierta") is True or data.get("conteo_frontera") is not None:
             raise ScmServiceError(
-                "OPEN_MANGA_FLAG_REQUIRED",
-                "Marque manga_abierta para registrar un conteo de frontera.",
+                "OPEN_MANGA_RELIEF_NOT_ALLOWED",
+                "Una manga con contenido no se transfiere. Pésela con el responsable saliente y registre el relevo después.",
+                status_code=422,
+            )
+        selected_prelabels = [
+            manga for manga in selected if manga.estado == "PREETIQUETADA"
+        ]
+        if (
+            selected_prelabels
+            and data.get("confirmacion_stickers_vacios") is not True
+        ):
+            raise ScmServiceError(
+                "EMPTY_STICKER_CONFIRMATION_REQUIRED",
+                "Confirme que las mangas preetiquetadas seleccionadas están vacías y sus stickers no fueron utilizados.",
                 status_code=422,
             )
         before = {
             "trabajo_color": _serialize_color_work(work),
             "mangas": [_serialize_manga(item) for item in selected],
         }
-        active_assignment = _active_work_assignment(work)
         if active_assignment is not None:
             # A running machine has one principal operating interval. A
             # relief always closes that interval, even when only a subset of
@@ -2674,21 +2707,9 @@ def assign_color_work_worker(
             "asignacion": _serialize_person_assignment(assignment),
             "mangas": [_serialize_manga(item) for item in selected],
             "trabajos_impresion_reemplazo": replacement_jobs,
-            "transferencia_manga_abierta": (
-                {
-                    "manga_id": str(selected[0].public_id),
-                    "trabajo_color_id": str(work.id),
-                    "ot_id": str(work.orden_trabajo.public_id),
-                    "asignacion_anterior_id": (
-                        before["mangas"][0][
-                            "asignacion_personal_trabajo_id"
-                        ]
-                    ),
-                    "asignacion_nueva_id": str(assignment.id),
-                    "conteo_frontera": boundary_count,
-                }
-                if open_transfer else None
-            ),
+            "transferencia_manga_abierta": None,
+            "relevo_sin_stickers": not selected,
+            "stickers_transferidos": len(selected),
         }
         event = _event(
             "TRABAJO_COLOR",
@@ -2902,14 +2923,10 @@ def create_fabrication_ot(
                 "La OT debe indicar una corrida valida.",
                 status_code=422,
             ) from error
-        run = session.scalar(
-            select(ScmCorridaFabricacion)
-            .where(
-                ScmCorridaFabricacion.id == run_id,
-                ScmCorridaFabricacion.orden_fabricacion_id == order.id,
-            )
-            .with_for_update()
-        )
+        run = session.scalar(_fabrication_run_for_update_query(
+            run_id=run_id,
+            order_id=order.id,
+        ))
         if run is None or run.estado not in ("LIBERADA", "EN_EJECUCION"):
             raise ScmServiceError(
                 "OF_CORRIDA_REQUIRED",
@@ -3043,6 +3060,12 @@ def create_fabrication_ot(
         if order.estado == "LIBERADA":
             order.estado = "PROGRAMADA"
             order.version += 1
+            project_production_orders_for_operation(
+                session,
+                operation_order=order,
+                actor=actor,
+                operation=operation,
+            )
         session.flush()
         session.expire(ot, ["trabajos_ot"])
         response = {
