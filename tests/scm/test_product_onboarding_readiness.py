@@ -1,3 +1,4 @@
+import copy
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -391,6 +392,39 @@ def test_restaurar_colores_desde_bom_aprobada_reconstruye_borrador_sin_crear(
         states["ESTRUCTURA"] = "INVALIDADO"
         onboarding.estados_paso_json = states
         onboarding.paso_actual = "COLORES"
+        previous_references = copy.deepcopy(
+            onboarding.referencias_json["COLORES"]
+        )
+        onboarding.application_journal_json = {
+            "COMPONENTES": {
+                "components-complete-v1": {
+                    "status": "APPLIED",
+                    "session_version": onboarding.version,
+                    "recorded_at": "2026-08-20T19:00:00+00:00",
+                    "result": {
+                        "created": [],
+                        "reused": [],
+                        "pending": [],
+                        "resolved_references": copy.deepcopy(
+                            onboarding.referencias_json["COMPONENTES"]
+                        ),
+                    },
+                },
+            },
+            "COLORES": {
+                "colors-complete-before-recovery-v1": {
+                    "status": "APPLIED",
+                    "session_version": onboarding.version,
+                    "recorded_at": "2026-08-20T20:00:00+00:00",
+                    "result": {
+                        "created": [],
+                        "reused": [],
+                        "pending": [],
+                        "resolved_references": previous_references,
+                    },
+                },
+            },
+        }
         db.session.commit()
         version = onboarding.version
         before_variants = PiezaColor.query.count()
@@ -424,6 +458,30 @@ def test_restaurar_colores_desde_bom_aprobada_reconstruye_borrador_sin_crear(
         "colores": 1,
         "piezas_color": 1,
     }
+
+    reapplied_response = client.post(
+        f"/api/scm/v1/altas-producto/{graph['session_id']}"
+        "/pasos/COLORES/aplicar",
+        headers=_headers(actor_id, uuid4()),
+        json={
+            "expected_version": recovered["version"],
+            "application_key": "colors-after-recovery-v2",
+            "supersedes_application_key": (
+                "colors-complete-before-recovery-v1"
+            ),
+            "data": {
+                "colores": color_step["data"]["colores"],
+                "matriz": color_step["data"]["matriz"],
+                "formulaciones": color_step["data"]["formulaciones"],
+            },
+        },
+    )
+    assert reapplied_response.status_code == 200, (
+        reapplied_response.get_json()
+    )
+    assert reapplied_response.get_json()["pasos"][2][
+        "application_status"
+    ]["application_key"] == "colors-after-recovery-v2"
     with app.app_context():
         assert PiezaColor.query.count() == before_variants
         assert RecetaColorMaestra.query.count() == before_recipes

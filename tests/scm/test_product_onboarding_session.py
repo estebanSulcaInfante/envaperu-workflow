@@ -5,6 +5,7 @@ from app.extensions import db
 from app.models.scm_auditoria import ScmEvento
 from app.models.scm_product_onboarding import ScmAltaProductoSesion
 from app.models.producto import (
+    ColorBase,
     ColorProduccion,
     FamiliaColor,
     PiezaColor,
@@ -1239,6 +1240,134 @@ def test_apply_colors_supports_pigment_free_and_pending_without_fake_recipe(
             variant = db.session.get(PiezaColor, row["pieza_color_ref"])
             assert variant.linea_id is None
             assert variant.familia_id is None
+
+
+def test_same_color_accepts_different_recipes_per_piece_for_mining_cart(
+    app, client
+):
+    actor_id = _catalog_admin(app)
+    onboarding = _materialize_identity(
+        client,
+        actor_id,
+        _create_session(client, actor_id, data={}),
+        name="CARRO MINERO",
+    )
+    components_response = client.post(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/COMPONENTES/aplicar",
+        headers=_headers(actor_id, uuid4()),
+        json={
+            "expected_version": onboarding["version"],
+            "application_key": "components-mining-cart-v1",
+            "data": {
+                "molde": {
+                    "modo": "NUEVO",
+                    "nombre": "MOLDE CARRO MINERO",
+                    "peso_tiro_gr": 400,
+                },
+                "piezas": [
+                    {
+                        "client_id": client_id,
+                        "modo": "NUEVA",
+                        "nombre": name,
+                        "cavidades": 1,
+                        "peso_unitario_gr": 100,
+                    }
+                    for client_id, name in (
+                        ("cabina", "CABINA"),
+                        ("tolva", "TOLVA"),
+                        ("pin", "PIN"),
+                        ("compuerta", "COMPUERTA"),
+                    )
+                ],
+            },
+        },
+    )
+    assert components_response.status_code == 200
+    components = components_response.get_json()
+    piece_refs = {
+        item["client_id"]: item["pieza_ref"]
+        for item in components["referencias"]["COMPONENTES"]["piezas"]
+    }
+
+    with app.app_context():
+        finish = FamiliaColor(codigo=9920, nombre="SOLIDO MINERO")
+        base = ColorBase(nombre="VERDE MILITAR")
+        db.session.add_all([finish, base])
+        db.session.flush()
+        color = ColorProduccion(
+            color_base_id=base.id,
+            familia_color_id=finish.id,
+            hex_referencia="#556B2F",
+        )
+        db.session.add(color)
+        db.session.flush()
+        recipes = [
+            RecetaColorMaestra(
+                color_produccion_id=color.id,
+                producto_scope="*",
+                nombre_variante=name,
+                revision=1,
+                estado="APROBADA",
+                es_default=index == 0,
+                base_virgen_kg=25,
+            )
+            for index, name in enumerate((
+                "CABINA",
+                "TOLVA",
+                "PIN Y COMPUERTA",
+            ))
+        ]
+        db.session.add_all(recipes)
+        db.session.commit()
+        color_ref = color.id
+        recipe_refs = [recipe.id for recipe in recipes]
+
+    recipe_by_piece = {
+        "cabina": recipe_refs[0],
+        "tolva": recipe_refs[1],
+        "pin": recipe_refs[2],
+        "compuerta": recipe_refs[2],
+    }
+    response = client.post(
+        f"/api/scm/v1/altas-producto/{onboarding['id']}"
+        "/pasos/COLORES/aplicar",
+        headers=_headers(actor_id, uuid4()),
+        json={
+            "expected_version": components["version"],
+            "application_key": "colors-mining-cart-v1",
+            "data": {
+                "colores": [{
+                    "client_id": "verde-militar",
+                    "modo": "REUTILIZAR",
+                    "color_ref": color_ref,
+                }],
+                "matriz": [
+                    {
+                        "pieza_ref": piece_ref,
+                        "color_ref": color_ref,
+                        "seleccionada": True,
+                        "receta_ref": recipe_by_piece[client_id],
+                    }
+                    for client_id, piece_ref in piece_refs.items()
+                ],
+                "formulaciones": [{
+                    "color_ref": color_ref,
+                    "tipo": "EXISTENTE",
+                    "receta_ref": recipe_refs[0],
+                }],
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.get_json()
+    resolved = response.get_json()["referencias"]["COLORES"]["matriz"]
+    assert {
+        row["pieza_ref"]: row["receta_ref"] for row in resolved
+    } == {
+        piece_refs[client_id]: recipe_ref
+        for client_id, recipe_ref in recipe_by_piece.items()
+    }
 
 
 def test_apply_components_partial_failure_checkpoints_and_resumes_same_key(

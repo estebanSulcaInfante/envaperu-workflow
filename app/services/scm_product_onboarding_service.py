@@ -2098,6 +2098,19 @@ def restore_onboarding_colors_from_structure(
             )
             if isinstance(item, dict) and item.get("color_ref")
         }
+        old_matrix = {
+            (int(item["pieza_ref"]), int(item["color_ref"])): item
+            for item in (
+                (onboarding.referencias_json or {})
+                .get("COLORES", {})
+                .get("matriz") or []
+            )
+            if (
+                isinstance(item, dict)
+                and item.get("pieza_ref")
+                and item.get("color_ref")
+            )
+        }
         colors = []
         formulas = []
         for color_id in sorted(colors_by_id):
@@ -2152,6 +2165,16 @@ def restore_onboarding_colors_from_structure(
                     "color_ref": color_id,
                     "seleccionada": variant is not None,
                     **({"pieza_color_ref": variant.sku} if variant else {}),
+                    **({
+                        "receta_ref": old_matrix[
+                            (piece_id, color_id)
+                        ]["receta_ref"],
+                    } if (
+                        variant
+                        and old_matrix.get((piece_id, color_id), {}).get(
+                            "receta_ref"
+                        )
+                    ) else {}),
                 })
 
         before = serialize_onboarding(onboarding)
@@ -3316,7 +3339,34 @@ def _apply_colors(
                 status_code=422,
             )
         selected_pairs.add(pair)
-        matrix_rows.append((item, piece_id, color_id))
+        recipe_id = None
+        if item.get("receta_ref") not in (None, ""):
+            recipe_id = _as_reference_int(
+                item.get("receta_ref"),
+                field=f"data.matriz[{index}].receta_ref",
+            )
+            recipe = session.get(RecetaColorMaestra, recipe_id)
+            if (
+                recipe is None
+                or recipe.color_produccion_id != color_id
+                or recipe.estado == "INACTIVA"
+                or recipe.producto_scope
+                not in {"*", onboarding.producto_terminado_id}
+            ):
+                raise ScmServiceError(
+                    "PIECE_COLOR_RECIPE_NOT_FOUND",
+                    (
+                        "La receta especifica de la pieza no existe, esta "
+                        "inactiva, pertenece a otro color o a otro producto."
+                    ),
+                    status_code=422,
+                    details={
+                        "pieza_ref": piece_id,
+                        "color_ref": color_id,
+                        "receta_ref": recipe_id,
+                    },
+                )
+        matrix_rows.append((item, piece_id, color_id, recipe_id))
 
     selected_color_ids = {color_id for _piece_id, color_id in selected_pairs}
     unused_color_ids = set(color_by_client.values()) - selected_color_ids
@@ -3372,7 +3422,7 @@ def _apply_colors(
     }
     reverse_piece_clients = {value: key for key, value in piece_client_refs.items()}
     reverse_color_clients = {value: key for key, value in color_by_client.items()}
-    for _, piece_id, color_id in matrix_rows:
+    for _, piece_id, color_id, recipe_id in matrix_rows:
         if (piece_id, color_id) in resolved_pairs:
             continue
         piece = session.get(Pieza, piece_id)
@@ -3407,9 +3457,16 @@ def _apply_colors(
             "color_ref": color_id,
             "color_client_id": reverse_color_clients.get(color_id),
             "pieza_color_ref": variant.sku,
+            "receta_ref": recipe_id,
         }
         resolved_matrix.append(resolved_item)
         resolved_pairs[(piece_id, color_id)] = resolved_item
+        if recipe_id is not None:
+            result["reused"].append({
+                "type": "RECETA_COLOR",
+                "id": recipe_id,
+                "pieza_color_ref": variant.sku,
+            })
         checkpoint(result)
 
     formula_by_color = {
@@ -4707,13 +4764,16 @@ def apply_onboarding_step(
                         ),
                     },
                 )
-            if code == "COLORES" and (
-                _step_states(onboarding).get("COLORES") != "EN_PROGRESO"
-                or not current_application.get("pending")
+            if (
+                code == "COLORES"
+                and _step_states(onboarding).get("COLORES") != "EN_PROGRESO"
             ):
                 raise ScmServiceError(
                     "COLOR_SUPERSEDE_REQUIRES_PENDING_DATA",
-                    "COLORES solo puede reabrirse aqui cuando conserva datos pendientes.",
+                    (
+                        "COLORES solo puede sustituirse cuando la fase fue "
+                        "reabierta para correccion."
+                    ),
                     status_code=422,
                     details={
                         "action": (
