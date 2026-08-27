@@ -14,7 +14,9 @@
       ],
       "manga_prelabel": ["scm-manga-prelabel-v1"],
       "manga_weighing": ["scm-manga-weighing-v1"],
-      "manga_weighing_control": ["scm-manga-weighing-control-v1"]
+      "manga_weighing_control": ["scm-manga-weighing-control-v1"],
+      "inventory_opening_weighing": ["scm-inventory-opening-weighing-v1"],
+      "prepared_material_weighing": ["scm-prepared-material-weighing-v1"]
     },
     "features": {
       "monitoring": true,
@@ -24,7 +26,9 @@
       "pilot_data_commands": true,
       "scm_manga_prelabel": true,
       "scm_manga_weighing": true,
-      "scm_manga_weighing_control": true
+      "scm_manga_weighing_control": true,
+      "scm_inventory_opening_weighing": true,
+      "scm_prepared_material_weighing": true
     }
   }
 }

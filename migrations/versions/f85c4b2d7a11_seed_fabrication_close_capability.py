@@ -1,7 +1,7 @@
 """seed capability for reconciled fabrication closure
 
-Revision ID: f85e4b2d7a10
-Revises: f84d3a7c9e21
+Revision ID: f85c4b2d7a11
+Revises: f85e4b2d7a10
 Create Date: 2026-08-14
 """
 
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "f85e4b2d7a10"
-down_revision = "f84d3a7c9e21"
+revision = "f85c4b2d7a11"
+down_revision = "f85e4b2d7a10"
 branch_labels = None
 depends_on = None
 

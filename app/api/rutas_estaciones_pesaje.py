@@ -83,6 +83,12 @@ def capabilities():
                 "manga_weighing_control": [
                     "scm-manga-weighing-control-v1"
                 ],
+                "inventory_opening_weighing": [
+                    "scm-inventory-opening-weighing-v1"
+                ],
+                "prepared_material_weighing": [
+                    "scm-prepared-material-weighing-v1"
+                ],
             },
             "features": {
                 "monitoring": True,
@@ -95,6 +101,10 @@ def capabilities():
                 "scm_manga_prelabel": True,
                 "scm_manga_weighing": True,
                 "scm_manga_weighing_control": True,
+                # Contratos conocidos por la estacion pilot.4, pero fuera del
+                # alcance operativo de este piloto de pesaje de piezas.
+                "scm_inventory_opening_weighing": False,
+                "scm_prepared_material_weighing": False,
             },
         }
     )

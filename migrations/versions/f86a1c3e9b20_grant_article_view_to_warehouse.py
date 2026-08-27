@@ -1,7 +1,7 @@
 """grant article lookup to warehouse operators
 
 Revision ID: f86a1c3e9b20
-Revises: f85e4b2d7a10
+Revises: f85c4b2d7a11
 Create Date: 2026-08-14
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "f86a1c3e9b20"
-down_revision = "f85e4b2d7a10"
+down_revision = "f85c4b2d7a11"
 branch_labels = None
 depends_on = None
 
