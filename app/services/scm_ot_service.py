@@ -30,6 +30,7 @@ from app.models.scm_ot import (
     ScmAsignacionPersonalTrabajoOt,
     ScmAsignacionPlanMangaOt,
     ScmEtiquetaManga,
+    ScmControlPesoManga,
     ScmLoteArticulo,
     ScmManga,
     ScmPlanMangaOp,
@@ -38,6 +39,7 @@ from app.models.scm_ot import (
     ScmTrabajoImpresionManga,
     ScmTrabajoColor,
     ScmTrabajoOt,
+    ScmTramoMangaTrabajo,
     utc_now,
 )
 from app.models.scm_internal_supply import ScmSolicitudAbastecimiento
@@ -79,34 +81,53 @@ def _operation_hash(endpoint, actor_id, data):
     })
 
 
+def _operation_replay(existing, *, endpoint, request_hash):
+    if (
+        existing.endpoint != endpoint
+        or existing.request_sha256 != request_hash
+    ):
+        raise ScmServiceError(
+            "IDEMPOTENCY_CONFLICT",
+            "La clave idempotente ya fue usada con otra solicitud.",
+            status_code=409,
+        )
+    if existing.response_json is None:
+        raise ScmServiceError(
+            "IDEMPOTENCY_OPERATION_INCOMPLETE",
+            "La operacion previa aun no tiene resultado.",
+            status_code=409,
+        )
+    return None, copy.deepcopy(existing.response_json)
+
+
 def _reserve_operation(session, operation_id, endpoint, actor, data):
     request_hash = _operation_hash(endpoint, actor.id, data)
     existing = session.get(ScmOperacion, operation_id)
     if existing is not None:
-        if (
-            existing.endpoint != endpoint
-            or existing.request_sha256 != request_hash
-        ):
-            raise ScmServiceError(
-                "IDEMPOTENCY_CONFLICT",
-                "La clave idempotente ya fue usada con otra solicitud.",
-                status_code=409,
-            )
-        if existing.response_json is None:
-            raise ScmServiceError(
-                "IDEMPOTENCY_OPERATION_INCOMPLETE",
-                "La operacion previa aun no tiene resultado.",
-                status_code=409,
-            )
-        return None, copy.deepcopy(existing.response_json)
+        return _operation_replay(
+            existing, endpoint=endpoint, request_hash=request_hash
+        )
     operation = ScmOperacion(
         operation_id=operation_id,
         endpoint=endpoint,
         actor_id=actor.id,
         request_sha256=request_hash,
     )
-    session.add(operation)
-    session.flush()
+    try:
+        # The savepoint keeps the surrounding command usable when two
+        # stations race with the same idempotency key. PostgreSQL waits for
+        # the winner and the loser can then read the committed response.
+        with session.begin_nested():
+            session.add(operation)
+            session.flush()
+    except IntegrityError:
+        session.expire_all()
+        existing = session.get(ScmOperacion, operation_id)
+        if existing is None:
+            raise
+        return _operation_replay(
+            existing, endpoint=endpoint, request_hash=request_hash
+        )
     return operation, None
 
 
@@ -239,6 +260,21 @@ def _serialize_plan(plan):
     }
 
 
+def _latest_manga_segment(manga):
+    segments = list(getattr(manga, "tramos_trabajo", ()) or ())
+    return max(segments, key=lambda item: item.secuencia) if segments else None
+
+
+def _serialize_manga_segment(segment):
+    if segment is None:
+        return None
+    payload = segment.to_dict()
+    payload["control_peso"] = (
+        segment.control_peso.to_dict() if segment.control_peso else None
+    )
+    return payload
+
+
 def _serialize_manga(manga):
     current_label = next(
         (
@@ -246,6 +282,21 @@ def _serialize_manga(manga):
             if label.estado != "INVALIDADA"
         ),
         None,
+    )
+    current_segment = _latest_manga_segment(manga)
+    current_work = current_segment.trabajo if current_segment else manga.trabajo
+    current_assignment = (
+        current_segment.asignacion_personal_trabajo
+        if current_segment else manga.asignacion_personal_trabajo
+    )
+    latest_control = next(
+        iter(reversed(list(getattr(manga, "controles_peso", ()) or ()))),
+        None,
+    )
+    assigned = Decimal(manga.cantidad_asignada_un)
+    accumulated = (
+        Decimal(latest_control.conteo_acumulado_un)
+        if latest_control is not None else Decimal("0")
     )
     return {
         "id": manga.id,
@@ -256,6 +307,18 @@ def _serialize_manga(manga):
         ),
         "trabajo_color_codigo": (
             manga.trabajo.codigo if manga.trabajo else None
+        ),
+        "trabajo_color_origen_id": (
+            str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
+        ),
+        "trabajo_color_origen_codigo": (
+            manga.trabajo.codigo if manga.trabajo else None
+        ),
+        "trabajo_color_actual_id": (
+            str(current_work.id) if current_work else None
+        ),
+        "trabajo_color_actual_codigo": (
+            current_work.codigo if current_work else None
         ),
         "asignacion_personal_trabajo_id": (
             str(manga.asignacion_personal_trabajo_id)
@@ -283,11 +346,96 @@ def _serialize_manga(manga):
             manga.maquinista_previsto.nombre_completo
             if manga.maquinista_previsto else None
         ),
+        "maquinista_actual": (
+            current_assignment.trabajador.nombre_completo
+            if current_assignment and current_assignment.trabajador else None
+        ),
         "motivo_extra": manga.motivo_extra,
         "version": manga.version,
         "etiqueta_vigente": _serialize_label(current_label)
         if current_label else None,
+        "continuidad": {
+            "estado": (
+                "PENDIENTE_VINCULO"
+                if manga.estado == "CONTINUIDAD_PENDIENTE"
+                and (
+                    current_segment is None
+                    or current_segment.estado == "CERRADO"
+                )
+                else (
+                    current_segment.estado if current_segment else "SIN_CORTE"
+                )
+            ),
+            "conteo_acumulado_un": _compact_number(accumulated),
+            "cantidad_pendiente_un": _compact_number(
+                max(assigned - accumulated, Decimal("0"))
+            ),
+            "ultimo_control": (
+                latest_control.to_dict() if latest_control else None
+            ),
+            "tramo_actual": _serialize_manga_segment(current_segment),
+            "tramos": [
+                _serialize_manga_segment(item)
+                for item in (getattr(manga, "tramos_trabajo", ()) or ())
+            ],
+            "qr_preservado": bool(current_segment),
+        },
     }
+
+
+def _work_mangas(work):
+    """Return origin and inherited mangas once for this work context."""
+    values = list(work.mangas)
+    seen = {item.id for item in values}
+    for segment in getattr(work, "tramos_manga", ()) or ():
+        if segment.manga_id not in seen:
+            values.append(segment.manga)
+            seen.add(segment.manga_id)
+    return values
+
+
+def _manga_resolved_for_work(manga, work):
+    if manga.estado in _terminal_manga_states():
+        return True
+    segments = list(getattr(manga, "tramos_trabajo", ()) or ())
+    own = [item for item in segments if item.trabajo_ot_id == work.id]
+    if not own:
+        return False
+    latest_own = max(own, key=lambda item: item.secuencia)
+    later = [item for item in segments if item.secuencia > latest_own.secuencia]
+    return latest_own.estado == "CERRADO" and bool(later)
+
+
+def _work_confirmed_quantity(work):
+    segmented_ids = {
+        item.manga_id for item in (getattr(work, "tramos_manga", ()) or ())
+    }
+    segmented = sum(
+        (
+            Decimal(item.cantidad_atribuida_un or 0)
+            for item in (getattr(work, "tramos_manga", ()) or ())
+            if item.estado != "ANULADO"
+        ),
+        Decimal("0"),
+    )
+    direct = sum(
+        (
+            Decimal(item.cantidad_confirmada_un or 0)
+            for item in work.mangas
+            if item.id not in segmented_ids and item.estado != "ANULADA"
+        ),
+        Decimal("0"),
+    )
+    return segmented + direct
+
+
+def _serialize_manga_for_work(manga, work):
+    payload = _serialize_manga(manga)
+    payload["heredada_de_ot_anterior"] = (
+        manga.trabajo_ot_id is not None and manga.trabajo_ot_id != work.id
+    )
+    payload["resuelta_para_trabajo"] = _manga_resolved_for_work(manga, work)
+    return payload
 
 
 def _active_work_assignment(work):
@@ -446,7 +594,14 @@ def _serialize_color_work(work, *, output_articles=None):
             _serialize_person_assignment(current_assignment)
             if current_assignment else None
         ),
-        "mangas": [_serialize_manga(item) for item in work.mangas],
+        "mangas": [
+            _serialize_manga_for_work(item, work) for item in _work_mangas(work)
+        ],
+        "continuidades_heredadas": [
+            _serialize_manga_segment(item)
+            for item in (getattr(work, "tramos_manga", ()) or ())
+            if item.secuencia > 1
+        ],
     }
 
 
@@ -1689,12 +1844,14 @@ def _allocate_work_lines(
     actor,
     personal_assignment,
 ):
-    if not isinstance(allocations, list) or not allocations:
+    if not isinstance(allocations, list):
         raise ScmServiceError(
             "REQUIRED_FIELD",
-            "Se requiere al menos una asignacion del plan.",
+            "asignaciones debe ser una lista.",
             status_code=400,
         )
+    if not allocations:
+        return []
     seen = set()
     created = []
     total = Decimal("0")
@@ -1743,15 +1900,29 @@ def _allocate_work_lines(
                 details={"plan_linea_id": line.id},
             )
         count = int(math.ceil(quantity / Decimal(line.capacidad_efectiva_un)))
-        assignment = ScmAsignacionPlanMangaOt(
-            plan_linea_id=line.id,
-            ot_id=work.orden_trabajo_id,
-            trabajo_ot_id=work.id,
-            cantidad_asignada_un=quantity,
-            mangas_asignadas=count,
-            asignada_por_id=actor.id,
+        assignment = session.scalar(
+            select(ScmAsignacionPlanMangaOt)
+            .where(
+                ScmAsignacionPlanMangaOt.plan_linea_id == line.id,
+                ScmAsignacionPlanMangaOt.trabajo_ot_id == work.id,
+            )
+            .with_for_update()
         )
-        session.add(assignment)
+        if assignment is None:
+            assignment = ScmAsignacionPlanMangaOt(
+                plan_linea_id=line.id,
+                ot_id=work.orden_trabajo_id,
+                trabajo_ot_id=work.id,
+                cantidad_asignada_un=quantity,
+                mangas_asignadas=count,
+                asignada_por_id=actor.id,
+            )
+            session.add(assignment)
+        else:
+            assignment.cantidad_asignada_un = (
+                Decimal(assignment.cantidad_asignada_un) + quantity
+            )
+            assignment.mangas_asignadas += count
         session.flush()
         created.extend(_create_mangas(
             session,
@@ -1767,6 +1938,279 @@ def _allocate_work_lines(
         total += quantity
     work.cantidad_objetivo_un = Decimal(work.cantidad_objetivo_un or 0) + total
     return created
+
+
+_CONTINUITY_SHIFT_ORDER = {
+    "DIA": 10,
+    "DIURNO": 10,
+    "NOCHE": 20,
+    "NOCTURNO": 20,
+    "EXTRA": 30,
+}
+
+
+def _continuity_target_is_later(source_ot, target_ot):
+    if target_ot.fecha != source_ot.fecha:
+        return target_ot.fecha > source_ot.fecha
+    source_rank = _CONTINUITY_SHIFT_ORDER.get(
+        str(source_ot.turno or "").strip().upper()
+    )
+    target_rank = _CONTINUITY_SHIFT_ORDER.get(
+        str(target_ot.turno or "").strip().upper()
+    )
+    return (
+        source_rank is not None
+        and target_rank is not None
+        and target_rank > source_rank
+    )
+
+
+def _validate_continuity_target(*, manga, segment, target_work):
+    source_work = segment.trabajo
+    source_ot = source_work.orden_trabajo
+    target_ot = target_work.orden_trabajo
+    if source_work.id == target_work.id or source_ot.id == target_ot.id:
+        raise ScmServiceError(
+            "CONTINUITY_TARGET_SAME_OT",
+            "La continuidad requiere una OT de turno distinta.",
+            status_code=409,
+        )
+    if not _continuity_target_is_later(source_ot, target_ot):
+        raise ScmServiceError(
+            "CONTINUITY_TARGET_PRECEDES_SOURCE",
+            "La OT destino debe pertenecer a una fecha/turno posterior al corte.",
+            status_code=409,
+        )
+    if source_ot.maquina_id != target_ot.maquina_id:
+        raise ScmServiceError(
+            "CONTINUITY_MACHINE_MISMATCH",
+            "La manga debe continuar en la misma maquina durante el piloto.",
+            status_code=409,
+        )
+    source_color = source_work.trabajo_color
+    target_color = target_work.trabajo_color
+    if (
+        source_color is None
+        or target_color is None
+        or source_work.orden_operacion_id != target_work.orden_operacion_id
+        or source_color.corrida_fabricacion_id
+        != target_color.corrida_fabricacion_id
+        or source_color.color_id_snapshot != target_color.color_id_snapshot
+        or source_color.receta_revision_id_snapshot
+        != target_color.receta_revision_id_snapshot
+        or source_color.receta_hash_snapshot != target_color.receta_hash_snapshot
+        or not _plan_line_belongs_to_work(manga.plan_linea, target_work)
+    ):
+        raise ScmServiceError(
+            "CONTINUITY_CONTEXT_MISMATCH",
+            "La OT destino no conserva la misma OF, corrida, color, receta y salida.",
+            status_code=409,
+        )
+
+
+def _continuity_candidate_payload(manga):
+    segment = _latest_manga_segment(manga)
+    source_work = segment.trabajo if segment else manga.trabajo
+    source_assignment = (
+        segment.asignacion_personal_trabajo
+        if segment else manga.asignacion_personal_trabajo
+    )
+    control = segment.control_peso if segment else None
+    assigned = Decimal(manga.cantidad_asignada_un)
+    boundary = Decimal(segment.cantidad_fin_un) if segment else Decimal("0")
+    return {
+        "manga": _serialize_manga(manga),
+        "origen": {
+            "ot_id": str(source_work.orden_trabajo.public_id),
+            "ot_codigo": source_work.orden_trabajo.codigo_ot,
+            "fecha_operativa": source_work.orden_trabajo.fecha.isoformat(),
+            "turno": source_work.orden_trabajo.turno,
+            "trabajo_color_id": str(source_work.id),
+            "trabajo_color_codigo": source_work.codigo,
+            "maquinista": (
+                source_assignment.trabajador.nombre_completo
+                if source_assignment and source_assignment.trabajador else None
+            ),
+        },
+        "control_frontera": control.to_dict() if control else None,
+        "conteo_acumulado_un": _compact_number(boundary),
+        "cantidad_pendiente_un": _compact_number(assigned - boundary),
+        "qr_preservado": True,
+    }
+
+
+def list_pending_manga_continuities(
+    session, *, actor_id, ot_id, corrida_fabricacion_id
+):
+    load_actor(session, actor_id, capability="OT_VER")
+    target_ot = session.scalar(
+        select(RegistroDiarioProduccion).where(
+            RegistroDiarioProduccion.public_id == ot_id,
+            RegistroDiarioProduccion.tipo_ot == "FABRICACION",
+        )
+    )
+    if target_ot is None:
+        raise ScmServiceError(
+            "OT_NOT_FOUND", "La OT de fabricacion no existe.", status_code=404
+        )
+    if target_ot.estado not in {"PLANIFICADA", "EN_EJECUCION"}:
+        return {"items": []}
+    run_id = _uuid_value(
+        corrida_fabricacion_id, field="corrida_fabricacion_id"
+    )
+    candidates = session.scalars(
+        select(ScmManga)
+        .join(ScmTrabajoOt, ScmTrabajoOt.id == ScmManga.trabajo_ot_id)
+        .join(ScmTrabajoColor, ScmTrabajoColor.trabajo_ot_id == ScmTrabajoOt.id)
+        .join(
+            RegistroDiarioProduccion,
+            RegistroDiarioProduccion.id == ScmTrabajoOt.orden_trabajo_id,
+        )
+        .where(
+            ScmManga.estado == "CONTINUIDAD_PENDIENTE",
+            ScmTrabajoColor.corrida_fabricacion_id == run_id,
+            RegistroDiarioProduccion.maquina_id == target_ot.maquina_id,
+            RegistroDiarioProduccion.id != target_ot.id,
+            RegistroDiarioProduccion.fecha <= target_ot.fecha,
+        )
+        .order_by(ScmManga.created_at, ScmManga.id)
+    ).unique().all()
+    items = []
+    for manga in candidates:
+        segment = _latest_manga_segment(manga)
+        if (
+            segment is None
+            or segment.estado != "CERRADO"
+            or segment.control_peso is None
+            or Decimal(segment.cantidad_fin_un or 0)
+            >= Decimal(manga.cantidad_asignada_un)
+            or not _continuity_target_is_later(
+                segment.trabajo.orden_trabajo, target_ot
+            )
+        ):
+            continue
+        items.append(_continuity_candidate_payload(manga))
+    return {"items": items}
+
+
+def _attach_continuity_mangas(
+    session, *, work, personal_assignment, manga_ids, actor, operation
+):
+    if not isinstance(manga_ids, list) or not manga_ids:
+        return []
+    load_actor(session, actor.id, capability="MANGA_TRANSFERIR_OT")
+    canonical_ids = [
+        _uuid_value(value, field="continuidad_manga_ids")
+        for value in manga_ids
+    ]
+    if len(set(canonical_ids)) != len(canonical_ids):
+        raise ScmServiceError(
+            "DUPLICATE_CONTINUITY_MANGA",
+            "Una manga abierta no puede repetirse en la continuidad.",
+            status_code=422,
+        )
+    attached = []
+    for public_id in canonical_ids:
+        manga = session.scalar(
+            select(ScmManga)
+            .where(ScmManga.public_id == public_id)
+            .with_for_update()
+        )
+        if manga is None:
+            raise ScmServiceError(
+                "MANGA_NOT_FOUND", "La manga abierta no existe.", status_code=404
+            )
+        segments = session.scalars(
+            select(ScmTramoMangaTrabajo)
+            .where(ScmTramoMangaTrabajo.manga_id == manga.id)
+            .order_by(ScmTramoMangaTrabajo.secuencia)
+            .with_for_update()
+        ).all()
+        segment = segments[-1] if segments else None
+        if (
+            manga.estado != "CONTINUIDAD_PENDIENTE"
+            or segment is None
+            or segment.estado != "CERRADO"
+            or segment.control_peso is None
+        ):
+            raise ScmServiceError(
+                "MANGA_CONTINUITY_NOT_PENDING",
+                "La manga no posee un corte vigente pendiente de continuidad.",
+                status_code=409,
+            )
+        _validate_continuity_target(
+            manga=manga, segment=segment, target_work=work
+        )
+        boundary = Decimal(segment.cantidad_fin_un)
+        remaining = Decimal(manga.cantidad_asignada_un) - boundary
+        if remaining <= 0:
+            raise ScmServiceError(
+                "MANGA_ALREADY_COMPLETE",
+                "El conteo de frontera ya completo la manga.",
+                status_code=409,
+            )
+        source_plan_id = segment.asignacion_plan_id or manga.asignacion_id
+        source_plan = session.get(ScmAsignacionPlanMangaOt, source_plan_id)
+        if (
+            source_plan is None
+            or Decimal(source_plan.cantidad_asignada_un) < remaining
+            or Decimal(segment.trabajo.cantidad_objetivo_un) < remaining
+        ):
+            raise ScmServiceError(
+                "PLAN_ASSIGNMENT_INCONSISTENT",
+                "El cupo del trabajo origen no permite transferir el remanente.",
+                status_code=409,
+            )
+        target_plan = session.scalar(
+            select(ScmAsignacionPlanMangaOt)
+            .where(
+                ScmAsignacionPlanMangaOt.plan_linea_id == manga.plan_linea_id,
+                ScmAsignacionPlanMangaOt.trabajo_ot_id == work.id,
+            )
+            .with_for_update()
+        )
+        if target_plan is None:
+            target_plan = ScmAsignacionPlanMangaOt(
+                plan_linea_id=manga.plan_linea_id,
+                ot_id=work.orden_trabajo_id,
+                trabajo_ot_id=work.id,
+                cantidad_asignada_un=Decimal("0"),
+                mangas_asignadas=0,
+                asignada_por_id=actor.id,
+            )
+            session.add(target_plan)
+            session.flush()
+        source_plan.cantidad_asignada_un = (
+            Decimal(source_plan.cantidad_asignada_un) - remaining
+        )
+        target_plan.cantidad_asignada_un = (
+            Decimal(target_plan.cantidad_asignada_un) + remaining
+        )
+        segment.trabajo.cantidad_objetivo_un = (
+            Decimal(segment.trabajo.cantidad_objetivo_un) - remaining
+        )
+        segment.trabajo.version += 1
+        work.cantidad_objetivo_un = (
+            Decimal(work.cantidad_objetivo_un or 0) + remaining
+        )
+        next_segment = ScmTramoMangaTrabajo(
+            manga=manga,
+            trabajo=work,
+            asignacion_personal_trabajo=personal_assignment,
+            asignacion_plan_id=target_plan.id,
+            secuencia=segment.secuencia + 1,
+            estado="PROGRAMADO",
+            cantidad_inicio_un=boundary,
+            cantidad_atribuida_un=0,
+            created_by_id=actor.id,
+            operation_id=operation.operation_id,
+        )
+        session.add(next_segment)
+        manga.estado = "EN_LLENADO"
+        manga.version += 1
+        attached.append(manga)
+    session.flush()
+    return attached
 
 
 def add_color_work(
@@ -1791,6 +2235,7 @@ def add_color_work(
             "maquinista_id",
             "asignaciones",
             "continua_de_id",
+            "continuidad_manga_ids",
         },
     )
     try:
@@ -1932,13 +2377,39 @@ def add_color_work(
             actor=actor,
             continues_from=continues_from,
         )
+        allocations = data.get("asignaciones")
+        continuity_ids = data.get("continuidad_manga_ids")
+        if allocations is None:
+            allocations = []
+        if continuity_ids is None:
+            continuity_ids = []
+        if not isinstance(continuity_ids, list):
+            raise ScmServiceError(
+                "JSON_ARRAY_REQUIRED",
+                "continuidad_manga_ids debe ser una lista.",
+                status_code=400,
+            )
+        if not allocations and not continuity_ids:
+            raise ScmServiceError(
+                "REQUIRED_FIELD",
+                "Asigne saldo del plan o seleccione una manga abierta compatible.",
+                status_code=400,
+            )
         mangas = _allocate_work_lines(
             session,
             work=work,
             plan=plan,
-            allocations=data.get("asignaciones"),
+            allocations=allocations,
             actor=actor,
             personal_assignment=personal,
+        )
+        inherited = _attach_continuity_mangas(
+            session,
+            work=work,
+            personal_assignment=personal,
+            manga_ids=continuity_ids,
+            actor=actor,
+            operation=operation,
         )
         if order.estado == "LIBERADA":
             order.estado = "PROGRAMADA"
@@ -1948,7 +2419,12 @@ def add_color_work(
         response = {
             "ot": _serialize_ot(ot),
             "trabajo_color": _serialize_color_work(work),
-            "mangas": [_serialize_manga(item) for item in mangas],
+            "mangas": [
+                _serialize_manga(item) for item in [*mangas, *inherited]
+            ],
+            "continuidades_vinculadas": [
+                _serialize_manga(item) for item in inherited
+            ],
         }
         session.add(_event(
             "TRABAJO_COLOR",
@@ -2149,6 +2625,18 @@ def transition_color_work(
                     "Solo un trabajo planificado o pausado puede anularse.",
                     status_code=409,
                 )
+            inherited_open = [
+                item for item in (getattr(work, "tramos_manga", ()) or ())
+                if item.secuencia > 1
+                and item.estado in {"PROGRAMADO", "ACTIVO"}
+            ]
+            if inherited_open:
+                raise ScmServiceError(
+                    "WORK_HAS_OPEN_CONTINUITIES",
+                    "El trabajo posee mangas heredadas; reprograme su continuidad antes de anularlo.",
+                    status_code=409,
+                    details={"pending": len(inherited_open)},
+                )
             non_reversible = [
                 manga for manga in work.mangas
                 if manga.estado in _terminal_manga_states() - {"ANULADA"}
@@ -2239,7 +2727,17 @@ def transition_color_work(
                         status_code=409,
                         details={"trabajo_color_id": str(running_machine.id)},
                     )
-                _activate_work_assignment(session, work=work, actor=actor)
+                current_personal = _activate_work_assignment(
+                    session, work=work, actor=actor
+                )
+                for segment in getattr(work, "tramos_manga", ()) or ():
+                    if segment.estado != "PROGRAMADO":
+                        continue
+                    segment.estado = "ACTIVO"
+                    segment.iniciada_at = now
+                    segment.asignacion_personal_trabajo_id = current_personal.id
+                    segment.manga.estado = "EN_LLENADO"
+                    segment.manga.version += 1
                 work.iniciada_at = work.iniciada_at or now
                 work.pausada_at = None
                 work.orden_trabajo.iniciada_at = (
@@ -2271,8 +2769,8 @@ def transition_color_work(
                 event_type = "COLOR_WORK_PAUSED"
             else:
                 pending = [
-                    manga for manga in work.mangas
-                    if manga.estado not in _terminal_manga_states()
+                    manga for manga in _work_mangas(work)
+                    if not _manga_resolved_for_work(manga, work)
                 ]
                 if pending:
                     raise ScmServiceError(
@@ -2282,14 +2780,7 @@ def transition_color_work(
                         details={"pending": len(pending)},
                     )
                 work.completada_at = now
-                work.cantidad_confirmada_un = sum(
-                    (
-                        Decimal(manga.cantidad_confirmada_un or 0)
-                        for manga in work.mangas
-                        if manga.estado != "ANULADA"
-                    ),
-                    Decimal("0"),
-                )
+                work.cantidad_confirmada_un = _work_confirmed_quantity(work)
                 _close_work_assignment(work, actor=actor, terminal=True)
                 event_type = "COLOR_WORK_COMPLETED"
             work.estado = target_state
@@ -2514,6 +3005,7 @@ def assign_color_work_worker(
             "manga_ids",
             "manga_abierta",
             "conteo_frontera",
+            "confirmacion_stickers_vacios",
         },
     )
     try:
@@ -2541,10 +3033,10 @@ def assign_color_work_worker(
             manga for manga in work.mangas if manga.estado in eligible_states
         ]
         if raw_ids is not None:
-            if not isinstance(raw_ids, list) or not raw_ids:
+            if not isinstance(raw_ids, list):
                 raise ScmServiceError(
-                    "MANGA_SELECTION_REQUIRED",
-                    "Seleccione al menos una manga para el relevo.",
+                    "INVALID_MANGA_SELECTION",
+                    "manga_ids debe ser una lista.",
                     status_code=400,
                 )
             requested = {_uuid_value(value, field="manga_ids") for value in raw_ids}
@@ -2569,45 +3061,63 @@ def assign_color_work_worker(
                     status_code=409,
                 )
         else:
+            # Compatibilidad con clientes anteriores: omitir manga_ids
+            # conserva la transferencia de todas las mangas elegibles. Los
+            # clientes nuevos envían [] para registrar solo el intervalo de
+            # responsabilidad, sin transferir stickers.
             selected = eligible
-        if not selected:
+        active_assignment = _active_work_assignment(work)
+        same_worker_mangas = [
+            manga.codigo
+            for manga in selected
+            if (
+                manga.asignacion_personal_trabajo is not None
+                and manga.asignacion_personal_trabajo.trabajador_id == worker.id
+            )
+            or manga.maquinista_previsto_id == worker.id
+        ]
+        if (
+            active_assignment is not None
+            and active_assignment.trabajador_id == worker.id
+        ) or same_worker_mangas:
+            raise ScmServiceError(
+                "WORKER_ALREADY_ASSIGNED",
+                "El nuevo maquinista debe ser distinto del responsable actual.",
+                status_code=422,
+                details={"mangas_sin_cambio": same_worker_mangas},
+            )
+        if not selected and not (
+            raw_ids == []
+            and work.estado == "EN_EJECUCION"
+            and active_assignment is not None
+        ):
             raise ScmServiceError(
                 "MANGA_NOT_ELIGIBLE_FOR_REASSIGNMENT",
-                "El trabajo no tiene mangas elegibles para reasignar.",
+                "El relevo sin stickers requiere un trabajo en ejecución y una asignación activa.",
                 status_code=409,
             )
-        open_transfer = data.get("manga_abierta") is True
-        boundary_count = data.get("conteo_frontera")
-        if open_transfer:
-            if len(selected) != 1 or selected[0].estado != "PREETIQUETADA":
-                raise ScmServiceError(
-                    "OPEN_MANGA_TRANSFER_REQUIRES_ONE_MANGA",
-                    "El relevo de manga abierta requiere una preetiqueta seleccionada.",
-                    status_code=422,
-                )
-            if (
-                not isinstance(boundary_count, int)
-                or isinstance(boundary_count, bool)
-                or boundary_count < 0
-                or Decimal(boundary_count)
-                > Decimal(selected[0].cantidad_asignada_un)
-            ):
-                raise ScmServiceError(
-                    "INVALID_BOUNDARY_COUNT",
-                    "conteo_frontera debe ser un entero entre cero y la cantidad de la manga.",
-                    status_code=422,
-                )
-        elif boundary_count is not None:
+        if data.get("manga_abierta") is True or data.get("conteo_frontera") is not None:
             raise ScmServiceError(
-                "OPEN_MANGA_FLAG_REQUIRED",
-                "Marque manga_abierta para registrar un conteo de frontera.",
+                "OPEN_MANGA_RELIEF_NOT_ALLOWED",
+                "Una manga con contenido no se transfiere. Pésela con el responsable saliente y registre el relevo después.",
+                status_code=422,
+            )
+        selected_prelabels = [
+            manga for manga in selected if manga.estado == "PREETIQUETADA"
+        ]
+        if (
+            selected_prelabels
+            and data.get("confirmacion_stickers_vacios") is not True
+        ):
+            raise ScmServiceError(
+                "EMPTY_STICKER_CONFIRMATION_REQUIRED",
+                "Confirme que las mangas preetiquetadas seleccionadas están vacías y sus stickers no fueron utilizados.",
                 status_code=422,
             )
         before = {
             "trabajo_color": _serialize_color_work(work),
             "mangas": [_serialize_manga(item) for item in selected],
         }
-        active_assignment = _active_work_assignment(work)
         if active_assignment is not None:
             # A running machine has one principal operating interval. A
             # relief always closes that interval, even when only a subset of
@@ -2674,21 +3184,9 @@ def assign_color_work_worker(
             "asignacion": _serialize_person_assignment(assignment),
             "mangas": [_serialize_manga(item) for item in selected],
             "trabajos_impresion_reemplazo": replacement_jobs,
-            "transferencia_manga_abierta": (
-                {
-                    "manga_id": str(selected[0].public_id),
-                    "trabajo_color_id": str(work.id),
-                    "ot_id": str(work.orden_trabajo.public_id),
-                    "asignacion_anterior_id": (
-                        before["mangas"][0][
-                            "asignacion_personal_trabajo_id"
-                        ]
-                    ),
-                    "asignacion_nueva_id": str(assignment.id),
-                    "conteo_frontera": boundary_count,
-                }
-                if open_transfer else None
-            ),
+            "transferencia_manga_abierta": None,
+            "relevo_sin_stickers": not selected,
+            "stickers_transferidos": len(selected),
         }
         event = _event(
             "TRABAJO_COLOR",
@@ -3943,6 +4441,12 @@ def replace_prelabel(
             raise ScmServiceError(
                 "INVALID_STATE_TRANSITION",
                 "Una manga anulada no admite otra etiqueta.",
+                status_code=409,
+            )
+        if old.tipo == "PREPESAJE" and old.manga.tramos_trabajo:
+            raise ScmServiceError(
+                "OPEN_MANGA_QR_MUST_BE_PRESERVED",
+                "Una manga con contenido o continuidad conserva su preetiqueta y QR originales.",
                 status_code=409,
             )
         reason = required_text(

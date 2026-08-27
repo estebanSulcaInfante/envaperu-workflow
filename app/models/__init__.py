@@ -44,6 +44,8 @@ from app.models.scm_ot import (
     ScmEtiquetaManga,
     ScmLoteArticulo,
     ScmManga,
+    ScmControlPesoManga,
+    ScmTramoMangaTrabajo,
     ScmPlanMangaOp,
     ScmPlanMangaOpLinea,
     ScmSolicitudMangaExtra,

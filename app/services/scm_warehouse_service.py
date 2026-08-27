@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
 from app.models.scm_inventory import (
@@ -88,8 +89,28 @@ def _reserve_operation(session, operation_id, endpoint, actor, data):
         actor_id=actor.id,
         request_sha256=request_hash,
     )
-    session.add(operation)
-    session.flush()
+    try:
+        with session.begin_nested():
+            session.add(operation)
+            session.flush()
+    except IntegrityError:
+        session.expire_all()
+        existing = session.get(ScmOperacion, operation_id)
+        if existing is None:
+            raise
+        if existing.endpoint != endpoint or existing.request_sha256 != request_hash:
+            raise ScmServiceError(
+                "IDEMPOTENCY_CONFLICT",
+                "La clave idempotente ya fue usada con otra solicitud.",
+                status_code=409,
+            )
+        if existing.response_json is None:
+            raise ScmServiceError(
+                "IDEMPOTENCY_OPERATION_INCOMPLETE",
+                "La operación anterior aún no tiene resultado.",
+                status_code=409,
+            )
+        return None, copy.deepcopy(existing.response_json)
     return operation, None
 
 
@@ -169,16 +190,31 @@ def _candidate_payload(session, manga, label, resolution):
             "La manga todavía no posee un pesaje final confirmado.",
             status_code=409,
         )
-    if manga.trabajo is not None and (
-        manga.asignacion_personal_trabajo_id is None
-        or weighing.asignacion_personal_trabajo_id
-        != manga.asignacion_personal_trabajo_id
-    ):
-        raise ScmServiceError(
-            "ASSIGNMENT_WORK_MISMATCH",
-            "El pesaje no conserva la asignacion del trabajo de la manga.",
-            status_code=409,
+    if manga.trabajo is not None:
+        segments = list(manga.tramos_trabajo or ())
+        final_segment = segments[-1] if segments else None
+        expected_assignment_id = (
+            final_segment.asignacion_personal_trabajo_id
+            if final_segment is not None
+            else manga.asignacion_personal_trabajo_id
         )
+        invalid_final_segment = final_segment is not None and (
+            final_segment.estado != "CERRADO"
+            or final_segment.cantidad_fin_un is None
+            or Decimal(final_segment.cantidad_fin_un)
+            != Decimal(weighing.cantidad_confirmada)
+        )
+        if (
+            expected_assignment_id is None
+            or weighing.asignacion_personal_trabajo_id
+            != expected_assignment_id
+            or invalid_final_segment
+        ):
+            raise ScmServiceError(
+                "ASSIGNMENT_WORK_MISMATCH",
+                "El pesaje no conserva la asignacion final responsable de la manga.",
+                status_code=409,
+            )
     if manga.estado == "ANULADA":
         raise ScmServiceError(
             "MANGA_ANULADA", "La manga fue anulada y no puede recibirse.", status_code=409

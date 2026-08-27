@@ -46,6 +46,7 @@ from app.services.scm_weighing_service import (
     get_label_print_payload,
     get_operation_result,
     resolve_manga_label,
+    register_manga_weighing_control,
 )
 
 
@@ -79,6 +80,9 @@ def capabilities():
                 ],
                 "manga_prelabel": ["scm-manga-prelabel-v1"],
                 "manga_weighing": ["scm-manga-weighing-v1"],
+                "manga_weighing_control": [
+                    "scm-manga-weighing-control-v1"
+                ],
             },
             "features": {
                 "monitoring": True,
@@ -90,6 +94,7 @@ def capabilities():
                 "pilot_data_commands": True,
                 "scm_manga_prelabel": True,
                 "scm_manga_weighing": True,
+                "scm_manga_weighing_control": True,
             },
         }
     )
@@ -295,6 +300,37 @@ def manga_weighing_confirm():
             data=payload,
         )
         return jsonify(result)
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/manga-weighing-controls")
+@require_station_auth
+def manga_weighing_control_register():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({
+            "code": "JSON_REQUIRED",
+            "message": "Se requiere un objeto JSON.",
+        }), 415
+    try:
+        operation_id = UUID(str(request.headers.get("Idempotency-Key")))
+        actor_id = int(payload.get("pesado_por_id"))
+    except (TypeError, ValueError, AttributeError):
+        return jsonify({
+            "code": "IDENTITY_REQUIRED",
+            "message": (
+                "Idempotency-Key UUID y pesado_por_id son obligatorios."
+            ),
+        }), 400
+    try:
+        return jsonify(register_manga_weighing_control(
+            db.session,
+            station_id=g.authenticated_station.station_id,
+            operation_id=operation_id,
+            actor_id=actor_id,
+            data=payload,
+        ))
     except ScmServiceError as exc:
         return _integration_error(exc)
 

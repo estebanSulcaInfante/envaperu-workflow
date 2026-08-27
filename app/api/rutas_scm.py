@@ -110,6 +110,7 @@ from app.services.scm_ot_service import (
     get_fabrication_manga_plan,
     get_ot,
     list_extra_manga_requests,
+    list_pending_manga_continuities,
     list_control_print_jobs,
     list_ots,
     recalculate_manga_plan,
@@ -1072,6 +1073,16 @@ def trabajos_color_crear(ot_id):
         operation_id=_idempotency_key(),
         data=_json_body(),
     )), 201
+
+
+@scm_bp.get("/ots/<uuid:ot_id>/continuidades-pendientes")
+def continuidades_manga_pendientes(ot_id):
+    return jsonify(list_pending_manga_continuities(
+        db.session,
+        actor_id=_actor_id(),
+        ot_id=ot_id,
+        corrida_fabricacion_id=request.args.get("corrida_fabricacion_id"),
+    ))
 
 
 @scm_bp.post("/trabajos-color/<uuid:work_id>/<action>")

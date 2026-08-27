@@ -94,6 +94,14 @@ CAPACIDADES_SCM_INICIALES = (
         "Aprobar reemplazo de etiqueta de manga",
     ),
     ("MANGA_PESAR", "Confirmar pesaje de manga"),
+    (
+        "MANGA_CONTROL_PESO_REGISTRAR",
+        "Registrar un corte acumulado de una manga que continua abierta",
+    ),
+    (
+        "MANGA_TRANSFERIR_OT",
+        "Vincular una manga abierta a una OT compatible",
+    ),
     ("MANGA_PESAJE_VER", "Consultar pesajes de manga"),
     (
         "MANGA_ETIQUETA_POST_IMPRIMIR",
@@ -293,6 +301,8 @@ ROLES_SCM_INICIALES = (
             "MANGA_EXTRA_SOLICITAR",
             "MANGA_ETIQUETA_PRE_GENERAR",
             "MANGA_ETIQUETA_REEMPLAZAR_SOLICITAR",
+            "MANGA_CONTROL_PESO_REGISTRAR",
+            "MANGA_TRANSFERIR_OT",
             "OPERACION_EJECUTAR",
             "OA_EJECUTAR",
             "PESAJE_CORRECCION_SOLICITAR",
@@ -399,6 +409,8 @@ ROLES_SCM_INICIALES = (
             "MANGA_EXTRA_APROBAR",
             "MANGA_ETIQUETA_PRE_GENERAR",
             "MANGA_ETIQUETA_REEMPLAZAR_APROBAR",
+            "MANGA_CONTROL_PESO_REGISTRAR",
+            "MANGA_TRANSFERIR_OT",
             "OPERACION_PLANIFICAR",
             "OPERACION_EJECUTAR",
             "OPERACION_CORREGIR",
@@ -478,7 +490,13 @@ ROLES_SCM_INICIALES = (
     (
         "MAQUINISTA",
         "Maquinista",
-        ("OT_VER", "MANGA_PESAR", "MANGA_PESAJE_VER", "WIP_VER"),
+        (
+            "OT_VER",
+            "MANGA_PESAR",
+            "MANGA_CONTROL_PESO_REGISTRAR",
+            "MANGA_PESAJE_VER",
+            "WIP_VER",
+        ),
     ),
     (
         "OPERADOR_MOLINO",
@@ -496,6 +514,7 @@ ROLES_SCM_INICIALES = (
         (
             "OT_VER",
             "MANGA_PESAR",
+            "MANGA_CONTROL_PESO_REGISTRAR",
             "MANGA_PESAJE_VER",
             "MANGA_ETIQUETA_POST_IMPRIMIR",
             "MANGA_ETIQUETA_REEMPLAZAR_SOLICITAR",
