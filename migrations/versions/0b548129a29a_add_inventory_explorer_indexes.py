@@ -69,4 +69,3 @@ def downgrade():
         "ix_scm_articulo_clase_codigo_id",
         table_name="scm_articulo",
     )
-

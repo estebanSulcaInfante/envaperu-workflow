@@ -712,4 +712,3 @@ def downgrade():
     op.drop_table("scm_lectura_peso_preparacion")
     op.drop_table("scm_orden_preparacion_material")
     op.drop_table("scm_requerimiento_material_preparado")
-

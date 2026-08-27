@@ -64,7 +64,6 @@ def upgrade():
             "'ETIQUETADA_FINAL', 'PENDIENTE_RECEPCION_ALMACEN', "
             "'RECIBIDA', 'ANULADA')",
         )
-
     op.create_table(
         "scm_tramo_manga_trabajo",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -203,4 +202,3 @@ def downgrade():
             "'ETIQUETADA_FINAL', 'PENDIENTE_RECEPCION_ALMACEN', "
             "'RECIBIDA', 'ANULADA')",
         )
-
