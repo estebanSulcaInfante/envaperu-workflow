@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -58,6 +58,7 @@ from app.services.scm_configuration import ensure_initial_scm_configuration
 from app.services import scm_ot_service
 from app.services.scm_fabrication_order_service import list_fabrication_orders
 from app.services.scm_ot_service import (
+    _continuity_target_is_after_cut,
     _continuity_target_is_later,
     _operation_hash,
     _reserve_operation,
@@ -194,10 +195,21 @@ def test_recepcion_recupera_al_perder_carrera_de_idempotencia():
 
 def _k1_validation_context():
     source_ot = SimpleNamespace(
-        id=1, fecha=date(2026, 8, 26), turno="DIA", maquina_id=10
+        id=1,
+        fecha=date(2026, 8, 26),
+        turno="DIA",
+        maquina_id=10,
+        estado="EN_EJECUCION",
     )
     target_ot = SimpleNamespace(
-        id=2, fecha=date(2026, 8, 26), turno="NOCHE", maquina_id=10
+        id=2,
+        public_id=uuid4(),
+        codigo_ot="OT-K1-DESTINO",
+        fecha=date(2026, 8, 26),
+        turno="NOCHE",
+        maquina_id=10,
+        estado="PLANIFICADA",
+        trabajos_ot=[],
     )
     source_color = SimpleNamespace(
         corrida_fabricacion_id=uuid4(),
@@ -219,19 +231,165 @@ def _k1_validation_context():
     )
     target_work = SimpleNamespace(
         id=uuid4(),
+        estado="PLANIFICADO",
         orden_trabajo=target_ot,
         orden_operacion_id=source_work.orden_operacion_id,
         trabajo_color=target_color,
     )
+    control = SimpleNamespace(
+        pesado_at=datetime(
+            2026,
+            8,
+            26,
+            18,
+            tzinfo=timezone(timedelta(hours=-5)),
+        ),
+        timezone_snapshot="America/Lima",
+        fecha_local_pesaje=date(2026, 8, 26),
+    )
     return {
         "manga": SimpleNamespace(plan_linea=object()),
-        "segment": SimpleNamespace(trabajo=source_work),
+        "segment": SimpleNamespace(
+            trabajo=source_work,
+            control_peso=control,
+        ),
         "source_ot": source_ot,
         "target_ot": target_ot,
         "source_work": source_work,
         "target_work": target_work,
         "target_color": target_color,
     }
+
+
+class _ContinuityCandidates:
+    def __init__(self, candidates):
+        self.candidates = candidates
+
+    def unique(self):
+        return self
+
+    def all(self):
+        return self.candidates
+
+
+class _ContinuitySession:
+    def __init__(self, candidates):
+        self.candidates = candidates
+
+    def scalars(self, _statement):
+        return _ContinuityCandidates(self.candidates)
+
+
+def test_k1_destino_respeta_el_turno_del_corte_fisico(monkeypatch):
+    monkeypatch.setattr(
+        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
+    )
+    context = _k1_validation_context()
+
+    assert _continuity_target_is_after_cut(
+        segment=context["segment"], target_ot=context["target_ot"]
+    ) is True
+    scm_ot_service._validate_continuity_target(
+        manga=context["manga"],
+        segment=context["segment"],
+        target_work=context["target_work"],
+    )
+
+
+def test_k1_rechaza_ot_destino_anterior_al_corte_fisico(monkeypatch):
+    monkeypatch.setattr(
+        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
+    )
+    context = _k1_validation_context()
+    context["segment"].control_peso.pesado_at = datetime(
+        2026,
+        8,
+        27,
+        7,
+        tzinfo=timezone(timedelta(hours=-5)),
+    )
+    context["segment"].control_peso.fecha_local_pesaje = date(2026, 8, 27)
+
+    with pytest.raises(ScmServiceError) as error:
+        scm_ot_service._validate_continuity_target(
+            manga=context["manga"],
+            segment=context["segment"],
+            target_work=context["target_work"],
+        )
+
+    assert error.value.code == "CONTINUITY_TARGET_PRECEDES_CUT"
+
+
+def test_k1_acepta_primera_ot_del_turno_que_contiene_el_corte(monkeypatch):
+    monkeypatch.setattr(
+        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
+    )
+    context = _k1_validation_context()
+    context["segment"].control_peso.pesado_at = datetime(
+        2026,
+        8,
+        27,
+        7,
+        tzinfo=timezone(timedelta(hours=-5)),
+    )
+    context["segment"].control_peso.fecha_local_pesaje = date(2026, 8, 27)
+    context["target_ot"].fecha = date(2026, 8, 27)
+    context["target_ot"].turno = "DIA"
+
+    scm_ot_service._validate_continuity_target(
+        manga=context["manga"],
+        segment=context["segment"],
+        target_work=context["target_work"],
+    )
+
+
+def test_k1_destino_multicolor_evalua_el_trabajo_recien_creado(monkeypatch):
+    monkeypatch.setattr(
+        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
+    )
+    context = _k1_validation_context()
+    context["target_ot"].trabajos_ot = [SimpleNamespace(
+        estado="PLANIFICADO",
+        orden_operacion_id=uuid4(),
+    )]
+
+    scm_ot_service._validate_continuity_target(
+        manga=context["manga"],
+        segment=context["segment"],
+        target_work=context["target_work"],
+        session=_ContinuitySession([context["target_ot"]]),
+    )
+
+
+def test_k1_ot_cerrada_intermedia_no_bloquea_la_siguiente_enlazable(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
+    )
+    context = _k1_validation_context()
+    context["target_ot"].fecha = date(2026, 8, 27)
+    context["target_ot"].turno = "DIA"
+    closed_intermediate = SimpleNamespace(
+        id=3,
+        public_id=uuid4(),
+        codigo_ot="OT-K1-CERRADA",
+        fecha=date(2026, 8, 26),
+        turno="NOCHE",
+        maquina_id=10,
+        estado="CERRADA",
+        trabajos_ot=[],
+    )
+
+    scm_ot_service._validate_continuity_target(
+        manga=context["manga"],
+        segment=context["segment"],
+        target_work=context["target_work"],
+        session=_ContinuitySession([
+            closed_intermediate,
+            context["target_ot"],
+        ]),
+    )
 
 
 @pytest.mark.parametrize(
@@ -312,6 +470,7 @@ from app.services.scm_packaging_service import (
 )
 from app.services.scm_service_support import ScmServiceError
 from app.services.scm_weighing_service import (
+    _validate_corrected_operational_date,
     approve_weighing_correction,
     confirm_manga_weighing,
     get_manga_weighing,
@@ -319,6 +478,61 @@ from app.services.scm_weighing_service import (
     register_manga_weighing_control,
     resolve_manga_label,
 )
+
+
+def test_correccion_k1_usa_la_ot_del_tramo_final():
+    source_ot = SimpleNamespace(
+        fecha=date(2026, 8, 26),
+        timezone_snapshot="America/Lima",
+        public_id=uuid4(),
+        codigo_ot="OT-DIA-26",
+    )
+    final_ot = SimpleNamespace(
+        fecha=date(2026, 8, 27),
+        timezone_snapshot="America/Lima",
+        public_id=uuid4(),
+        codigo_ot="OT-DIA-27",
+    )
+    source_work = SimpleNamespace(orden_trabajo=source_ot)
+    final_work = SimpleNamespace(orden_trabajo=final_ot)
+    final_segment = SimpleNamespace(
+        id=uuid4(), secuencia=2, trabajo=final_work
+    )
+    manga = SimpleNamespace(
+        tramos_trabajo=[
+            SimpleNamespace(id=uuid4(), secuencia=1, trabajo=source_work),
+            final_segment,
+        ],
+        trabajo=source_work,
+        ot=source_ot,
+    )
+    weighing = SimpleNamespace(timezone_snapshot="America/Lima")
+    lima = timezone(timedelta(hours=-5))
+
+    with pytest.raises(ScmServiceError) as error:
+        _validate_corrected_operational_date(
+            manga,
+            weighing,
+            datetime(2026, 8, 26, 23, 30, tzinfo=lima),
+        )
+
+    assert error.value.code == "OPERATIONAL_DATE_IN_FUTURE"
+    assert error.value.details["ot_id"] == str(final_ot.public_id)
+    assert error.value.details["tramo_id"] == str(final_segment.id)
+
+    local_date, drift, operational_ot, segment = (
+        _validate_corrected_operational_date(
+            manga,
+            weighing,
+            datetime(2026, 8, 27, 8, tzinfo=lima),
+        )
+    )
+    assert local_date == date(2026, 8, 27)
+    assert drift == 0
+    assert operational_ot is final_ot
+    assert segment is final_segment
+
+
 from app.services.scm_warehouse_service import (
     _reserve_operation as _reserve_warehouse_operation,
     decide_manga_quality,
@@ -3831,6 +4045,38 @@ def test_k1_continua_misma_manga_y_qr_entre_turnos_con_atribucion_20_30(app):
                 "maquinista_predeterminado_id": pedro.id,
             },
         )["ot"]
+        later_header = create_fabrication_ot_header(
+            db.session,
+            actor_id=creator.id,
+            operation_id=uuid4(),
+            data={
+                "maquina_id": order.fabricacion.maquina_prevista_id,
+                "fecha_operativa": "2026-08-27",
+                "turno": "DIA",
+                "maquinista_predeterminado_id": pedro.id,
+            },
+        )["ot"]
+        assert list_pending_manga_continuities(
+            db.session,
+            actor_id=creator.id,
+            ot_id=UUID(later_header["public_id"]),
+            corrida_fabricacion_id=str(run.id),
+        )["items"] == []
+        with pytest.raises(ScmServiceError) as skipped_shift:
+            add_color_work(
+                db.session,
+                actor_id=creator.id,
+                ot_id=UUID(later_header["public_id"]),
+                operation_id=uuid4(),
+                data={
+                    "corrida_fabricacion_id": str(run.id),
+                    "maquinista_id": pedro.id,
+                    "asignaciones": [],
+                    "continuidad_manga_ids": [manga["public_id"]],
+                },
+            )
+        assert skipped_shift.value.code == "CONTINUITY_NEXT_OT_REQUIRED"
+
         candidates = list_pending_manga_continuities(
             db.session,
             actor_id=creator.id,
