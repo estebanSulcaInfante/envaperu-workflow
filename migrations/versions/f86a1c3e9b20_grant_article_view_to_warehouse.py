@@ -37,7 +37,6 @@ def upgrade():
         capability_code=CAPABILITY_CODE,
     ))
 
-
 def downgrade():
     op.execute(sa.text("""
         DELETE FROM scm_rol_capacidad
@@ -51,4 +50,3 @@ def downgrade():
         role_code=ROLE_CODE,
         capability_code=CAPABILITY_CODE,
     ))
-

@@ -139,4 +139,3 @@ def downgrade():
         )
     with op.batch_alter_table("scm_lote_apertura_inventario") as batch:
         batch.drop_column("metodo")
-

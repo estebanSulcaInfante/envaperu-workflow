@@ -57,4 +57,3 @@ def downgrade():
     op.execute(sa.text(
         "DELETE FROM scm_capacidad WHERE codigo = :code"
     ).bindparams(code=code))
-

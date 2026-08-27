@@ -335,4 +335,3 @@ def test_open_manga_continuity_migration_upgrade_downgrade_and_seed(monkeypatch)
             INSERT INTO scm_manga (id, estado)
             VALUES (103, 'EN_LLENADO')
         """)
-

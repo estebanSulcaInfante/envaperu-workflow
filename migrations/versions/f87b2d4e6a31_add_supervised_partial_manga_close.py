@@ -83,4 +83,3 @@ def downgrade():
             "fuente_cantidad IN ('PLAN_CONFIRMADO_POR_PESAJE', "
             "'RESPONSABLE_ARMADO', 'CORRECCION_AUTORIZADA')",
         )
-

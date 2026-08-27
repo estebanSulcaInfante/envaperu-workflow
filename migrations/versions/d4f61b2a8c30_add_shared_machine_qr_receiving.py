@@ -94,4 +94,3 @@ def downgrade():
             "fk_scm_ubicacion_inventario_maquina", type_="foreignkey"
         )
         batch.drop_column("maquina_id")
-
