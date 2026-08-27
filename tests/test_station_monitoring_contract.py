@@ -139,6 +139,9 @@ def test_capabilities_requires_station_auth_and_matches_contract(
     client,
     provisioned_station,
 ):
+    _validator(CAPABILITIES_DIR, "response").validate(
+        _load_json(CAPABILITIES_DIR / "examples.json")["response"]
+    )
     assert client.get("/api/integration/v1/capabilities").status_code == 401
 
     response = client.get(
@@ -155,6 +158,7 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "weight_event",
         "manga_prelabel",
         "manga_weighing",
+        "manga_weighing_control",
     }
     assert (
         "station-production-progress-v1"
@@ -168,6 +172,7 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "pilot_data_commands": True,
         "scm_manga_prelabel": True,
         "scm_manga_weighing": True,
+        "scm_manga_weighing_control": True,
     }
 
 
