@@ -13,7 +13,8 @@
         "station-legacy-continuity-v1"
       ],
       "manga_prelabel": ["scm-manga-prelabel-v1"],
-      "manga_weighing": ["scm-manga-weighing-v1"]
+      "manga_weighing": ["scm-manga-weighing-v1"],
+      "manga_weighing_control": ["scm-manga-weighing-control-v1"]
     },
     "features": {
       "monitoring": true,
@@ -22,7 +23,8 @@
       "remote_hardware_commands": false,
       "pilot_data_commands": true,
       "scm_manga_prelabel": true,
-      "scm_manga_weighing": true
+      "scm_manga_weighing": true,
+      "scm_manga_weighing_control": true
     }
   }
 }

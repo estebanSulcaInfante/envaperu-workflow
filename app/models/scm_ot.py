@@ -570,6 +570,12 @@ class ScmTrabajoOt(db.Model):
         lazy="selectin",
         order_by="ScmManga.secuencia_ot",
     )
+    tramos_manga = db.relationship(
+        "ScmTramoMangaTrabajo",
+        back_populates="trabajo",
+        lazy="selectin",
+        order_by="ScmTramoMangaTrabajo.secuencia",
+    )
     created_by = db.relationship("Trabajador", foreign_keys=[created_by_id])
     anulada_por = db.relationship("Trabajador", foreign_keys=[anulada_por_id])
 
@@ -719,6 +725,11 @@ class ScmAsignacionPersonalTrabajoOt(db.Model):
         back_populates="asignacion_personal_trabajo",
         foreign_keys="ScmPesajeManga.asignacion_personal_trabajo_id",
     )
+    tramos_manga = db.relationship(
+        "ScmTramoMangaTrabajo",
+        back_populates="asignacion_personal_trabajo",
+        foreign_keys="ScmTramoMangaTrabajo.asignacion_personal_trabajo_id",
+    )
 
 
 class ScmAsignacionPlanMangaOt(db.Model):
@@ -819,6 +830,7 @@ class ScmManga(db.Model):
         ),
         db.CheckConstraint(
             "estado IN ('PLANIFICADA', 'PREETIQUETADA', 'EN_ARMADO', "
+            "'CONTINUIDAD_PENDIENTE', 'EN_LLENADO', "
             "'CERRADA_ARMADO_PENDIENTE_PESAJE', 'PESADA', "
             "'ETIQUETADA_FINAL', 'PENDIENTE_RECEPCION_ALMACEN', "
             "'RECIBIDA', 'ANULADA')",
@@ -1038,6 +1050,265 @@ class ScmManga(db.Model):
         back_populates="manga",
         uselist=False,
     )
+    tramos_trabajo = db.relationship(
+        "ScmTramoMangaTrabajo",
+        back_populates="manga",
+        lazy="selectin",
+        order_by="ScmTramoMangaTrabajo.secuencia",
+    )
+    controles_peso = db.relationship(
+        "ScmControlPesoManga",
+        back_populates="manga",
+        lazy="selectin",
+        order_by="ScmControlPesoManga.pesado_at",
+    )
+
+
+class ScmTramoMangaTrabajo(db.Model):
+    """Responsabilidad de una manga dentro de un Trabajo de color.
+
+    La manga conserva su OT de origen. Los tramos son el ledger que permite
+    continuar la misma identidad fisica y el mismo QR en turnos posteriores.
+    """
+
+    __tablename__ = "scm_tramo_manga_trabajo"
+    __table_args__ = (
+        db.CheckConstraint(
+            "estado IN ('PROGRAMADO', 'ACTIVO', 'CERRADO', 'ANULADO')",
+            name="ck_scm_tramo_manga_estado",
+        ),
+        db.CheckConstraint(
+            "secuencia > 0 AND cantidad_inicio_un >= 0",
+            name="ck_scm_tramo_manga_inicio",
+        ),
+        db.CheckConstraint(
+            "cantidad_fin_un IS NULL OR cantidad_fin_un > cantidad_inicio_un",
+            name="ck_scm_tramo_manga_fin",
+        ),
+        db.CheckConstraint(
+            "cantidad_atribuida_un >= 0",
+            name="ck_scm_tramo_manga_atribuida",
+        ),
+        db.UniqueConstraint(
+            "manga_id", "secuencia", name="uq_scm_tramo_manga_secuencia"
+        ),
+        db.Index("ix_scm_tramo_manga_trabajo", "trabajo_ot_id"),
+        db.Index("ix_scm_tramo_manga_asignacion", "asignacion_personal_trabajo_id"),
+        db.Index(
+            "uq_scm_tramo_manga_abierto",
+            "manga_id",
+            unique=True,
+            postgresql_where=db.text("estado IN ('PROGRAMADO', 'ACTIVO')"),
+            sqlite_where=db.text("estado IN ('PROGRAMADO', 'ACTIVO')"),
+        ),
+    )
+
+    id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    manga_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_manga.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    asignacion_plan_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_asignacion_plan_manga_ot.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_trabajo_ot.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    asignacion_personal_trabajo_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey(
+            "scm_asignacion_personal_trabajo_ot.id",
+            name="fk_scm_tramo_manga_asignacion_personal",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    secuencia = db.Column(db.Integer, nullable=False)
+    estado = db.Column(
+        db.String(20), nullable=False, default="PROGRAMADO",
+        server_default="PROGRAMADO",
+    )
+    cantidad_inicio_un = db.Column(db.Numeric(15, 3), nullable=False)
+    cantidad_fin_un = db.Column(db.Numeric(15, 3), nullable=True)
+    cantidad_atribuida_un = db.Column(
+        db.Numeric(15, 3), nullable=False, default=0, server_default="0"
+    )
+    iniciada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    cerrada_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    motivo_cierre = db.Column(db.String(500), nullable=True)
+    created_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    operation_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now,
+        server_default=db.func.now(),
+    )
+
+    manga = db.relationship("ScmManga", back_populates="tramos_trabajo")
+    trabajo = db.relationship("ScmTrabajoOt", back_populates="tramos_manga")
+    asignacion_personal_trabajo = db.relationship(
+        "ScmAsignacionPersonalTrabajoOt", back_populates="tramos_manga",
+    )
+    asignacion_plan = db.relationship("ScmAsignacionPlanMangaOt")
+    created_by = db.relationship("Trabajador")
+    control_peso = db.relationship(
+        "ScmControlPesoManga", back_populates="tramo", uselist=False,
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "manga_id": str(self.manga.public_id) if self.manga else None,
+            "secuencia": self.secuencia,
+            "estado": self.estado,
+            "trabajo_color_id": str(self.trabajo_ot_id),
+            "trabajo_color_codigo": self.trabajo.codigo if self.trabajo else None,
+            "ot_id": (
+                str(self.trabajo.orden_trabajo.public_id)
+                if self.trabajo and self.trabajo.orden_trabajo else None
+            ),
+            "ot_codigo": (
+                self.trabajo.orden_trabajo.codigo_ot
+                if self.trabajo and self.trabajo.orden_trabajo else None
+            ),
+            "asignacion_personal_trabajo_id": str(
+                self.asignacion_personal_trabajo_id
+            ),
+            "asignacion_plan_id": self.asignacion_plan_id,
+            "maquinista_id": (
+                self.asignacion_personal_trabajo.trabajador_id
+                if self.asignacion_personal_trabajo else None
+            ),
+            "maquinista": (
+                self.asignacion_personal_trabajo.trabajador.nombre_completo
+                if self.asignacion_personal_trabajo
+                and self.asignacion_personal_trabajo.trabajador else None
+            ),
+            "cantidad_inicio_un": _decimal_text(self.cantidad_inicio_un),
+            "cantidad_fin_un": _decimal_text(self.cantidad_fin_un),
+            "cantidad_atribuida_un": _decimal_text(self.cantidad_atribuida_un),
+            "iniciada_at": _isoformat(self.iniciada_at),
+            "cerrada_at": _isoformat(self.cerrada_at),
+            "motivo_cierre": self.motivo_cierre,
+        }
+
+
+class ScmControlPesoManga(db.Model):
+    """Lectura acumulada de control; no es un pesaje final ni crea Kardex."""
+
+    __tablename__ = "scm_control_peso_manga"
+    __table_args__ = (
+        db.CheckConstraint(
+            "tipo = 'CORTE_TURNO'", name="ck_scm_control_peso_manga_tipo"
+        ),
+        db.CheckConstraint(
+            "peso_bruto_kg > 0 AND tara_kg >= 0 AND peso_neto_kg > 0",
+            name="ck_scm_control_peso_manga_pesos",
+        ),
+        db.CheckConstraint(
+            "peso_neto_kg = peso_bruto_kg - tara_kg",
+            name="ck_scm_control_peso_manga_neto",
+        ),
+        db.CheckConstraint(
+            "conteo_acumulado_un > 0",
+            name="ck_scm_control_peso_manga_conteo",
+        ),
+        db.UniqueConstraint("public_id", name="uq_scm_control_peso_manga_public"),
+        db.UniqueConstraint("tramo_id", name="uq_scm_control_peso_manga_tramo"),
+        db.UniqueConstraint("operation_id", name="uq_scm_control_peso_manga_operation"),
+        db.UniqueConstraint(
+            "source_system", "capture_id", name="uq_scm_control_peso_manga_capture"
+        ),
+        db.Index("ix_scm_control_peso_manga_manga", "manga_id"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(Uuid(as_uuid=True), nullable=False, default=uuid.uuid4)
+    manga_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_manga.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    tramo_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_tramo_manga_trabajo.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    operation_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_system = db.Column(db.String(40), nullable=False)
+    station_id = db.Column(
+        db.String(36),
+        db.ForeignKey("estacion_pesaje.station_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    capture_id = db.Column(Uuid(as_uuid=True), nullable=False)
+    tipo = db.Column(
+        db.String(24), nullable=False, default="CORTE_TURNO",
+        server_default="CORTE_TURNO",
+    )
+    peso_bruto_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    tara_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    peso_neto_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    tara_fuente = db.Column(db.String(28), nullable=False)
+    conteo_acumulado_un = db.Column(db.Numeric(15, 3), nullable=False)
+    motivo = db.Column(db.String(500), nullable=False)
+    pesado_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    timezone_snapshot = db.Column(
+        db.String(64), nullable=False, server_default="America/Lima"
+    )
+    fecha_local_pesaje = db.Column(db.Date, nullable=False)
+    pesado_por_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now,
+        server_default=db.func.now(),
+    )
+
+    manga = db.relationship("ScmManga", back_populates="controles_peso")
+    tramo = db.relationship("ScmTramoMangaTrabajo", back_populates="control_peso")
+    pesado_por = db.relationship("Trabajador")
+
+    def to_dict(self):
+        return {
+            "id": str(self.public_id),
+            "manga_id": str(self.manga.public_id) if self.manga else None,
+            "tramo_id": str(self.tramo_id),
+            "operation_id": str(self.operation_id),
+            "capture_id": str(self.capture_id),
+            "station_id": self.station_id,
+            "tipo": self.tipo,
+            "peso_bruto_kg": _decimal_text(self.peso_bruto_kg),
+            "tara_kg": _decimal_text(self.tara_kg),
+            "peso_neto_kg": _decimal_text(self.peso_neto_kg),
+            "tara_fuente": self.tara_fuente,
+            "conteo_acumulado_un": _decimal_text(self.conteo_acumulado_un),
+            "motivo": self.motivo,
+            "pesado_at": _isoformat(self.pesado_at),
+            "fecha_local_pesaje": self.fecha_local_pesaje.isoformat(),
+            "pesado_por_id": self.pesado_por_id,
+        }
+
+
+
 
 
 class ScmSolicitudMangaExtra(db.Model):
