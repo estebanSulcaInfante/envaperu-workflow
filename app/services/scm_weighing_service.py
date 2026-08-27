@@ -143,6 +143,43 @@ def _assert_final_weight_cumulative(session, manga, net):
         )
 
 
+def _final_weighing_operational_context(manga, weighing):
+    segments = list(getattr(manga, "tramos_trabajo", ()) or ())
+    final_segment = (
+        max(segments, key=lambda item: item.secuencia) if segments else None
+    )
+    final_work = final_segment.trabajo if final_segment else manga.trabajo
+    final_ot = final_work.orden_trabajo if final_work else manga.ot
+    timezone_name = (
+        final_ot.timezone_snapshot
+        or weighing.timezone_snapshot
+        or "America/Lima"
+    )
+    return final_ot, final_segment, timezone_name
+
+
+def _validate_corrected_operational_date(manga, weighing, weighed_at):
+    """Validate a correction against the OT that actually closed the manga."""
+    operational_ot, final_segment, timezone_name = (
+        _final_weighing_operational_context(manga, weighing)
+    )
+    local_date = weighed_at.astimezone(ZoneInfo(timezone_name)).date()
+    drift = (local_date - operational_ot.fecha).days
+    if drift < 0:
+        raise ScmServiceError(
+            "OPERATIONAL_DATE_IN_FUTURE",
+            "La correccion no puede quedar antes de la OT del tramo final.",
+            status_code=422,
+            details={
+                "ot_id": str(operational_ot.public_id),
+                "ot_codigo": operational_ot.codigo_ot,
+                "fecha_operativa": operational_ot.fecha.isoformat(),
+                "tramo_id": str(final_segment.id) if final_segment else None,
+            },
+        )
+    return local_date, drift, operational_ot, final_segment
+
+
 def _aware_datetime(value, field="pesada_at"):
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -1628,16 +1665,9 @@ def approve_weighing_correction(
         weighed_at = _aware_datetime(
             proposed.get("pesada_at", current["pesada_at"])
         )
-        local_date = weighed_at.astimezone(
-            ZoneInfo(weighing.timezone_snapshot)
-        ).date()
-        drift = (local_date - manga.ot.fecha).days
-        if drift < 0:
-            raise ScmServiceError(
-                "OPERATIONAL_DATE_IN_FUTURE",
-                "La correccion no puede quedar antes de la fecha OT.",
-                status_code=422,
-            )
+        local_date, drift, _operational_ot, _final_segment = (
+            _validate_corrected_operational_date(manga, weighing, weighed_at)
+        )
         production_kg = (
             quantity * Decimal(manga.peso_unitario_snapshot_g) / 1000
         ).quantize(KG_QUANTUM)

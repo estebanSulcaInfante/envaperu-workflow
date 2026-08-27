@@ -6,8 +6,9 @@ import json
 import math
 import re
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import String, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -1948,24 +1949,166 @@ _CONTINUITY_SHIFT_ORDER = {
     "EXTRA": 30,
 }
 
+_CONTINUITY_DAY_START_HOUR = 6
+_CONTINUITY_NIGHT_START_HOUR = 18
+
+
+def _continuity_ot_slot(ot):
+    rank = _CONTINUITY_SHIFT_ORDER.get(
+        str(ot.turno or "").strip().upper()
+    )
+    if rank is None or ot.fecha is None:
+        return None
+    return ot.fecha, rank
+
+
+def _continuity_control_slot(control):
+    """Map the physical cut to the operational shift containing it.
+
+    The pilot uses 06:00/18:00 boundaries. A cut before 06:00 belongs to
+    the previous operational night's slot.
+    """
+    weighed_at = control.pesado_at
+    timezone_name = control.timezone_snapshot or "America/Lima"
+    if weighed_at.tzinfo is not None:
+        local_cut = weighed_at.astimezone(ZoneInfo(timezone_name))
+        local_date = local_cut.date()
+        local_hour = local_cut.hour
+    else:
+        # SQLite drops timezone offsets. fecha_local_pesaje is the canonical
+        # local date captured at ingestion, while the stored wall time remains
+        # suitable for directed tests and local UAT.
+        local_date = control.fecha_local_pesaje
+        local_hour = weighed_at.hour
+    if local_hour < _CONTINUITY_DAY_START_HOUR:
+        return local_date - timedelta(days=1), _CONTINUITY_SHIFT_ORDER["NOCHE"]
+    if local_hour < _CONTINUITY_NIGHT_START_HOUR:
+        return local_date, _CONTINUITY_SHIFT_ORDER["DIA"]
+    return local_date, _CONTINUITY_SHIFT_ORDER["NOCHE"]
+
 
 def _continuity_target_is_later(source_ot, target_ot):
-    if target_ot.fecha != source_ot.fecha:
-        return target_ot.fecha > source_ot.fecha
-    source_rank = _CONTINUITY_SHIFT_ORDER.get(
-        str(source_ot.turno or "").strip().upper()
-    )
-    target_rank = _CONTINUITY_SHIFT_ORDER.get(
-        str(target_ot.turno or "").strip().upper()
-    )
+    source_slot = _continuity_ot_slot(source_ot)
+    target_slot = _continuity_ot_slot(target_ot)
     return (
-        source_rank is not None
-        and target_rank is not None
-        and target_rank > source_rank
+        source_slot is not None
+        and target_slot is not None
+        and target_slot > source_slot
     )
 
 
-def _validate_continuity_target(*, manga, segment, target_work):
+def _continuity_target_is_after_cut(*, segment, target_ot):
+    target_slot = _continuity_ot_slot(target_ot)
+    control = segment.control_peso
+    return (
+        target_slot is not None
+        and control is not None
+        and target_slot >= _continuity_control_slot(control)
+    )
+
+
+def _work_matches_manga_continuity(work, *, manga, segment):
+    source_work = segment.trabajo
+    source_color = source_work.trabajo_color
+    return (
+        work.estado in {"PLANIFICADO", "EN_EJECUCION", "PAUSADO"}
+        and work.orden_operacion_id == source_work.orden_operacion_id
+        and work.trabajo_color is not None
+        and source_color is not None
+        and work.trabajo_color.corrida_fabricacion_id
+        == source_color.corrida_fabricacion_id
+        and work.trabajo_color.color_id_snapshot
+        == source_color.color_id_snapshot
+        and work.trabajo_color.receta_revision_id_snapshot
+        == source_color.receta_revision_id_snapshot
+        and work.trabajo_color.receta_hash_snapshot
+        == source_color.receta_hash_snapshot
+        and _plan_line_belongs_to_work(manga.plan_linea, work)
+    )
+
+
+def _ot_can_host_continuity(ot, *, manga, segment):
+    works = list(getattr(ot, "trabajos_ot", ()) or ())
+    return not works or any(
+        _work_matches_manga_continuity(
+            work, manga=manga, segment=segment
+        )
+        for work in works
+    )
+
+
+def _next_linkable_continuity_ot(
+    session, *, manga, segment, target_ot, target_work=None
+):
+    """Return the earliest compatible OT that can still accept the manga.
+
+    Closed or annulled historical OTs do not block continuity because they can
+    no longer be linked. The destination work is evaluated explicitly: its OT
+    relationship collection may already be loaded without that just-created
+    work in a multi-color request.
+    """
+    source_ot = segment.trabajo.orden_trabajo
+    source_slot = _continuity_ot_slot(source_ot)
+    target_slot = _continuity_ot_slot(target_ot)
+    if source_slot is None or target_slot is None:
+        return None
+    cut_slot = _continuity_control_slot(segment.control_peso)
+    lower_date = min(source_slot[0], cut_slot[0])
+    candidates = session.scalars(
+        select(RegistroDiarioProduccion)
+        .options(
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.trabajo_color)
+        )
+        .where(
+            RegistroDiarioProduccion.tipo_ot == "FABRICACION",
+            RegistroDiarioProduccion.codigo_ot_sintetico.is_(False),
+            RegistroDiarioProduccion.maquina_id == target_ot.maquina_id,
+            RegistroDiarioProduccion.estado.in_(
+                {"PLANIFICADA", "EN_EJECUCION"}
+            ),
+            RegistroDiarioProduccion.fecha >= lower_date,
+            RegistroDiarioProduccion.fecha <= target_ot.fecha,
+            RegistroDiarioProduccion.id != source_ot.id,
+        )
+    ).unique().all()
+    eligible = [
+        candidate
+        for candidate in candidates
+        if (
+            (slot := _continuity_ot_slot(candidate)) is not None
+            and candidate.estado in {"PLANIFICADA", "EN_EJECUCION"}
+            and slot > source_slot
+            and slot >= cut_slot
+            and slot <= target_slot
+            and (
+                (
+                    candidate.id == target_ot.id
+                    and target_work is not None
+                    and _work_matches_manga_continuity(
+                        target_work, manga=manga, segment=segment
+                    )
+                )
+                or _ot_can_host_continuity(
+                    candidate, manga=manga, segment=segment
+                )
+            )
+        )
+    ]
+    if not eligible:
+        return None
+    return min(
+        eligible,
+        key=lambda candidate: (
+            *_continuity_ot_slot(candidate),
+            candidate.id,
+        ),
+    )
+
+
+def _validate_continuity_target(
+    *, manga, segment, target_work, session=None
+):
     source_work = segment.trabajo
     source_ot = source_work.orden_trabajo
     target_ot = target_work.orden_trabajo
@@ -1980,6 +2123,20 @@ def _validate_continuity_target(*, manga, segment, target_work):
             "CONTINUITY_TARGET_PRECEDES_SOURCE",
             "La OT destino debe pertenecer a una fecha/turno posterior al corte.",
             status_code=409,
+        )
+    if not _continuity_target_is_after_cut(
+        segment=segment, target_ot=target_ot
+    ):
+        raise ScmServiceError(
+            "CONTINUITY_TARGET_PRECEDES_CUT",
+            "La OT destino ocurre antes del corte fisico registrado.",
+            status_code=409,
+            details={
+                "corte_pesado_at": segment.control_peso.pesado_at.isoformat(),
+                "fecha_local_corte": (
+                    segment.control_peso.fecha_local_pesaje.isoformat()
+                ),
+            },
         )
     if source_ot.maquina_id != target_ot.maquina_id:
         raise ScmServiceError(
@@ -2006,6 +2163,28 @@ def _validate_continuity_target(*, manga, segment, target_work):
             "La OT destino no conserva la misma OF, corrida, color, receta y salida.",
             status_code=409,
         )
+    if session is not None:
+        next_ot = _next_linkable_continuity_ot(
+            session,
+            manga=manga,
+            segment=segment,
+            target_ot=target_ot,
+            target_work=target_work,
+        )
+        if next_ot is None or next_ot.id != target_ot.id:
+            raise ScmServiceError(
+                "CONTINUITY_NEXT_OT_REQUIRED",
+                "La manga debe vincularse a la primera OT compatible posterior al corte.",
+                status_code=409,
+                details={
+                    "ot_siguiente_id": (
+                        str(next_ot.public_id) if next_ot is not None else None
+                    ),
+                    "ot_siguiente_codigo": (
+                        next_ot.codigo_ot if next_ot is not None else None
+                    ),
+                },
+            )
 
 
 def _continuity_candidate_payload(manga):
@@ -2087,7 +2266,15 @@ def list_pending_manga_continuities(
             or not _continuity_target_is_later(
                 segment.trabajo.orden_trabajo, target_ot
             )
+            or not _continuity_target_is_after_cut(
+                segment=segment, target_ot=target_ot
+            )
         ):
+            continue
+        next_ot = _next_linkable_continuity_ot(
+            session, manga=manga, segment=segment, target_ot=target_ot
+        )
+        if next_ot is None or next_ot.id != target_ot.id:
             continue
         items.append(_continuity_candidate_payload(manga))
     return {"items": items}
@@ -2139,7 +2326,10 @@ def _attach_continuity_mangas(
                 status_code=409,
             )
         _validate_continuity_target(
-            manga=manga, segment=segment, target_work=work
+            manga=manga,
+            segment=segment,
+            target_work=work,
+            session=session,
         )
         boundary = Decimal(segment.cantidad_fin_un)
         remaining = Decimal(manga.cantidad_asignada_un) - boundary
@@ -4728,7 +4918,15 @@ def get_station_print_job(session, *, station_id, print_job_id):
 
 
 def claim_station_print_job(session, *, station_id, print_job_id):
-    """Atomically reserve a job immediately before physical printing."""
+    """Atomically reserve a job immediately before physical printing.
+
+    A replay from the owning station returns the same immutable job until its
+    result is acknowledged. That replay is transport idempotency, not reprint
+    authorization: the station must persist its per-label emission attempt
+    before talking to the spooler and retry only the acknowledgement after an
+    emitted or uncertain result. A physical retry is valid solely after the
+    station has durably classified the previous attempt FALLIDA_SIN_EMISION.
+    """
     job = session.scalar(
         select(ScmTrabajoImpresionManga)
         .where(ScmTrabajoImpresionManga.public_id == print_job_id)
