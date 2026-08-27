@@ -190,6 +190,13 @@ def _validate_classification(*, pieza, pieza_color=None, session=None):
 
 
 def _validate_piece(pieza, *, session=None, pieza_color=None):
+    if pieza_color is not None and pieza_color.activo is False:
+        _error(
+            f"El SKU {pieza_color.sku} esta inactivo",
+            "PIEZA_COLOR_INACTIVA",
+            409,
+            pieza_sku=pieza_color.sku,
+        )
     if pieza is None:
         _error(
             "El SKU no esta vinculado a una pieza maestra",

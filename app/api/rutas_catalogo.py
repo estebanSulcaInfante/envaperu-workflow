@@ -255,6 +255,10 @@ def listar_piezas_abstractas():
     from app.models.molde import Molde, MoldePieza, Pieza
     q = request.args.get('q', '').strip()
     limit = request.args.get('limit', 50, type=int)
+    include_inactive_variants = request.args.get(
+        'include_inactive_variants',
+        'false',
+    ).strip().lower() in {'1', 'true', 'yes'}
     
     query = Pieza.query
     
@@ -287,7 +291,11 @@ def listar_piezas_abstractas():
     piezas = query.order_by(Pieza.nombre, Pieza.codigo).limit(limit).all()
     
     return jsonify([
-        p.to_dict(include_variantes=True, include_moldes=True)
+        p.to_dict(
+            include_variantes=True,
+            include_moldes=True,
+            include_inactive_variantes=include_inactive_variants,
+        )
         for p in piezas
     ])
 
@@ -431,8 +439,14 @@ def listar_piezas_color():
     q = request.args.get('q', '').strip()
     producto_id = request.args.get('producto_id', '').strip()
     limit = request.args.get('limit', 50, type=int)
+    include_inactive = request.args.get(
+        'include_inactive',
+        'false',
+    ).strip().lower() in {'1', 'true', 'yes'}
     
     query = PiezaColor.query
+    if not include_inactive:
+        query = query.filter(PiezaColor.activo.is_(True))
     
     # Filtrar por producto via tabla intermedia
     if producto_id:
@@ -473,6 +487,8 @@ def listar_piezas_color():
         'mp': p.mp,
         'cod_mp': p.cod_mp,
         'estado_revision': p.estado_revision,
+        'activo': p.activo,
+        'version': p.version,
         'fecha_importacion': p.fecha_importacion.isoformat() if p.fecha_importacion else None,
         'fecha_revision': p.fecha_revision.isoformat() if p.fecha_revision else None,
         'notas_revision': p.notas_revision,
@@ -691,6 +707,8 @@ def _pieza_color_to_dict(pieza):
         'pieza_codigo': pieza.pieza_rel.codigo if pieza.pieza_rel else None,
         'imagen_url': f'/api/piezas-color/{pieza.sku}/imagen' if has_catalog_image(pieza) else None,
         'estado_revision': pieza.estado_revision,
+        'activo': pieza.activo,
+        'version': pieza.version,
         'moldes': relaciones,
     }
 
@@ -1231,6 +1249,9 @@ def _ensure_mold_color_variants(molde, color):
             db.session.flush()
             creadas.append(_pieza_color_to_dict(variante))
         else:
+            if variante.activo is False:
+                variante.activo = True
+                variante.version += 1
             reutilizadas.append(_pieza_color_to_dict(variante))
         por_pieza[composicion.pieza_id] = variante
 
@@ -1519,6 +1540,47 @@ def eliminar_pieza_color(sku):
         return jsonify({'error': str(exc)}), 409
 
 
+@catalogo_bp.route('/piezas-color/<sku>/estado', methods=['PATCH'])
+def cambiar_estado_pieza_color(sku):
+    """Activa o desactiva un SKU sin eliminar ninguna referencia histórica."""
+    pieza = db.session.get(PiezaColor, sku)
+    if not pieza:
+        return jsonify({'error': 'PiezaColor no encontrada'}), 404
+
+    data = request.get_json() or {}
+    if not isinstance(data.get('activo'), bool):
+        return jsonify({
+            'error': 'activo es obligatorio y debe ser booleano',
+            'codigo': 'ACTIVE_REQUIRED',
+        }), 400
+    if data.get('version') is None:
+        return jsonify({
+            'error': 'version es obligatoria para cambiar el estado',
+            'codigo': 'VERSION_REQUIRED',
+        }), 400
+    try:
+        expected_version = int(data['version'])
+    except (TypeError, ValueError):
+        return jsonify({'error': 'version debe ser un entero positivo'}), 400
+    if expected_version <= 0:
+        return jsonify({'error': 'version debe ser un entero positivo'}), 400
+    if expected_version != pieza.version:
+        return jsonify({
+            'error': 'La PiezaColor cambió desde que fue cargada',
+            'codigo': 'VERSION_CONFLICT',
+            'actual': _pieza_color_to_dict(pieza),
+        }), 409
+
+    nuevo_estado = data['activo']
+    if pieza.activo == nuevo_estado:
+        return jsonify(_pieza_color_to_dict(pieza)), 200
+
+    pieza.activo = nuevo_estado
+    pieza.version += 1
+    db.session.commit()
+    return jsonify(_pieza_color_to_dict(pieza)), 200
+
+
 # ============================================================
 # PIEZAS PRODUCIBLES (para selector de OP)
 # ============================================================
@@ -1530,7 +1592,11 @@ def obtener_piezas_producibles():
         PiezaColor.query
         .join(Pieza, Pieza.id == PiezaColor.pieza_id)
         .join(MoldePieza, MoldePieza.pieza_id == Pieza.id)
-        .filter(Pieza.activo.is_(True), MoldePieza.activo.is_(True))
+        .filter(
+            PiezaColor.activo.is_(True),
+            Pieza.activo.is_(True),
+            MoldePieza.activo.is_(True),
+        )
         .order_by(PiezaColor.piezas)
         .all()
     )

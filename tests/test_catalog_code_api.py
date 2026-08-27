@@ -7,7 +7,7 @@ from PIL import Image
 
 from app.extensions import db
 from app.models.molde import Molde, Pieza
-from app.models.producto import PiezaColor, ProductoTerminado
+from app.models.producto import PiezaColor, ProductoPieza, ProductoTerminado
 
 
 def _png_bytes():
@@ -383,3 +383,99 @@ def test_pieza_color_no_permite_recrear_componentes_legacy(client):
 
     assert response.status_code == 422
     assert response.get_json()["codigo"] == "LEGACY_KIT_NOT_SUPPORTED"
+
+
+def test_pieza_color_se_desactiva_sin_borrar_historial(client, app):
+    piece = client.post(
+        "/api/piezas",
+        json={
+            "nombre": "Compuerta histórica",
+            "peso_nominal_gr": 18,
+            "linea_id": 1,
+            "familia_id": 1,
+        },
+    ).get_json()
+    variant = client.post(
+        "/api/piezas-color",
+        json={
+            "nombre": "Compuerta Masterbatch Rojo Sólido",
+            "pieza_id": piece["id"],
+        },
+    ).get_json()
+    product = client.post(
+        "/api/productos",
+        json={
+            "producto": "Producto con historial",
+            "linea_id": 1,
+            "familia_id": 1,
+        },
+    ).get_json()
+
+    with app.app_context():
+        db.session.add(ProductoPieza(
+            producto_terminado_id=product["cod_sku_pt"],
+            pieza_sku=variant["sku"],
+            cantidad=1,
+        ))
+        db.session.commit()
+
+    response = client.patch(
+        f"/api/piezas-color/{variant['sku']}/estado",
+        json={"activo": False, "version": 1},
+    )
+
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["activo"] is False
+    assert response.get_json()["version"] == 2
+    assert client.get("/api/piezas-color").get_json() == []
+    inactive = client.get(
+        "/api/piezas-color?include_inactive=true",
+    ).get_json()
+    assert [item["sku"] for item in inactive] == [variant["sku"]]
+
+    default_piece = client.get(f"/api/piezas/{piece['id']}").get_json()
+    assert default_piece["variantes"] == []
+    admin_piece = client.get(
+        "/api/piezas?include_inactive_variants=true",
+    ).get_json()[0]
+    assert admin_piece["variantes"][0]["sku"] == variant["sku"]
+    assert admin_piece["variantes"][0]["activo"] is False
+
+    with app.app_context():
+        assert db.session.get(PiezaColor, variant["sku"]) is not None
+        assert ProductoPieza.query.filter_by(
+            pieza_sku=variant["sku"],
+        ).one().producto_terminado_id == product["cod_sku_pt"]
+
+
+def test_estado_pieza_color_protege_concurrencia_y_permite_reactivar(client):
+    variant = client.post(
+        "/api/piezas-color",
+        json={
+            "nombre": "Pin Rojo Sólido",
+            "linea_id": 1,
+            "familia_id": 1,
+        },
+    ).get_json()
+    path = f"/api/piezas-color/{variant['sku']}/estado"
+
+    assert client.patch(
+        path,
+        json={"activo": False, "version": 1},
+    ).status_code == 200
+
+    conflict = client.patch(
+        path,
+        json={"activo": True, "version": 1},
+    )
+    assert conflict.status_code == 409
+    assert conflict.get_json()["codigo"] == "VERSION_CONFLICT"
+    assert conflict.get_json()["actual"]["version"] == 2
+
+    reactivated = client.patch(
+        path,
+        json={"activo": True, "version": 2},
+    )
+    assert reactivated.status_code == 200
+    assert reactivated.get_json()["activo"] is True
+    assert reactivated.get_json()["version"] == 3

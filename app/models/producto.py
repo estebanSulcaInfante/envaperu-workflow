@@ -345,6 +345,7 @@ class PiezaColor(db.Model):
     # Restricción: No se puede repetir la misma forma y color de producción
     __table_args__ = (
         db.UniqueConstraint('pieza_id', 'color_produccion_id', name='uq_pieza_color'),
+        db.CheckConstraint('version > 0', name='ck_pieza_color_version'),
     )
 
     cod_pieza = db.Column(db.Integer)
@@ -367,6 +368,19 @@ class PiezaColor(db.Model):
     imagen_storage_key = db.Column(db.String(512), nullable=True)
     imagen_sha256 = db.Column(db.String(64), nullable=True)
     imagen_size_bytes = db.Column(db.Integer, nullable=True)
+    activo = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True,
+        server_default=db.true(),
+        index=True,
+    )
+    version = db.Column(
+        db.Integer,
+        nullable=False,
+        default=1,
+        server_default='1',
+    )
     
     # --- CAMPOS DE REVISIÓN PROGRESIVA ---
     estado_revision = db.Column(db.String(20), default='IMPORTADO')  # IMPORTADO, EN_REVISION, VERIFICADO
@@ -424,6 +438,8 @@ class PiezaColor(db.Model):
             ),
             'peso': self.peso,
             'cavidad_legacy': self.cavidad,
+            'activo': self.activo,
+            'version': self.version,
             'imagen_url': (
                 f'/api/piezas-color/{self.sku}/imagen'
                 if self.imagen_storage_key or self.imagen_data else None

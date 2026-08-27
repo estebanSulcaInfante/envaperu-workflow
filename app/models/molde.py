@@ -104,7 +104,18 @@ class Pieza(db.Model):
         order_by="MoldePieza.id",
     )
 
-    def to_dict(self, include_variantes=False, include_moldes=True):
+    def to_dict(
+        self,
+        include_variantes=False,
+        include_moldes=True,
+        include_inactive_variantes=False,
+    ):
+        variantes = list(self.variantes) if hasattr(self, "variantes") else []
+        variantes_visibles = (
+            variantes
+            if include_inactive_variantes
+            else [item for item in variantes if item.activo]
+        )
         data = {
             "id": self.id,
             "codigo": self.codigo,
@@ -114,14 +125,14 @@ class Pieza(db.Model):
             "peso_nominal_gr": self.peso_nominal_gr,
             "activo": self.activo,
             "version": self.version,
-            "variantes_count": len(self.variantes) if hasattr(self, "variantes") else 0,
+            "variantes_count": len(variantes_visibles),
         }
         if include_moldes:
             data["moldes"] = [
                 item.to_summary_dict() for item in self.molde_piezas if item.activo
             ]
-        if include_variantes and hasattr(self, "variantes"):
-            data["variantes"] = [item.to_dict() for item in self.variantes]
+        if include_variantes:
+            data["variantes"] = [item.to_dict() for item in variantes_visibles]
         return data
 
     def __repr__(self):
