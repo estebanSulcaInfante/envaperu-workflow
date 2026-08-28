@@ -107,7 +107,7 @@ GESTOR_SCM_WRITE_PREFIXES = (
 
 
 def _has_any(actor, capabilities):
-    return any(actor.tiene_capacidad(code) for code in capabilities)
+    return actor.tiene_alguna_capacidad(capabilities)
 
 
 def _authorize_request(actor):
@@ -148,10 +148,7 @@ def _authorize_request(actor):
                 403,
             )
 
-        is_master_steward = any(
-            role.codigo == "GESTOR_MAESTROS" and role.activo
-            for role in actor.roles
-        )
+        is_master_steward = actor.tiene_rol("GESTOR_MAESTROS")
         if is_master_steward:
             allowed = (
                 path.startswith(ARTICLE_MASTER_PREFIXES)

@@ -185,7 +185,7 @@ def load_actor(session, actor_id, *, capability=None):
 def load_actor_any(session, actor_id, *, capabilities):
     actor = load_actor(session, actor_id)
     required = tuple(capabilities or ())
-    if required and not any(actor.tiene_capacidad(code) for code in required):
+    if required and not actor.tiene_alguna_capacidad(required):
         raise ScmServiceError(
             "CAPABILITY_REQUIRED",
             f"El actor requiere una de las capacidades: {', '.join(required)}.",

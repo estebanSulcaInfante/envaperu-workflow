@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
 
+from sqlalchemy import inspect, select
+from sqlalchemy.orm import object_session
+
 from app.extensions import db
-from app.models.scm_catalogos import scm_rol_capacidad
+from app.models.scm_catalogos import ScmCapacidad, scm_rol_capacidad
 
 
 def utc_now():
@@ -252,7 +255,78 @@ class Trabajador(db.Model):
         }
 
     def tiene_capacidad(self, codigo):
-        return codigo in self.capacidades_efectivas
+        return self.tiene_alguna_capacidad((codigo,))
+
+    def tiene_alguna_capacidad(self, codigos):
+        if not self.activo:
+            return False
+        normalized = tuple({str(codigo).strip() for codigo in codigos if codigo})
+        if not normalized:
+            return False
+
+        session = object_session(self)
+        if (
+            session is not None
+            and self.id is not None
+            and "roles" in inspect(self).unloaded
+        ):
+            capability_id = session.scalar(
+                select(ScmCapacidad.id)
+                .join(
+                    scm_rol_capacidad,
+                    scm_rol_capacidad.c.capacidad_id == ScmCapacidad.id,
+                )
+                .join(
+                    RolOperativo,
+                    RolOperativo.id
+                    == scm_rol_capacidad.c.rol_operativo_id,
+                )
+                .join(
+                    trabajador_rol,
+                    trabajador_rol.c.rol_operativo_id == RolOperativo.id,
+                )
+                .where(
+                    trabajador_rol.c.trabajador_id == self.id,
+                    RolOperativo.activo.is_(True),
+                    ScmCapacidad.activo.is_(True),
+                    ScmCapacidad.codigo.in_(normalized),
+                )
+                .limit(1)
+            )
+            return capability_id is not None
+        return bool(set(normalized) & self.capacidades_efectivas)
+
+    def tiene_rol(self, codigo):
+        if not self.activo:
+            return False
+        normalized = str(codigo or "").strip()
+        if not normalized:
+            return False
+
+        session = object_session(self)
+        if (
+            session is not None
+            and self.id is not None
+            and "roles" in inspect(self).unloaded
+        ):
+            role_id = session.scalar(
+                select(RolOperativo.id)
+                .join(
+                    trabajador_rol,
+                    trabajador_rol.c.rol_operativo_id == RolOperativo.id,
+                )
+                .where(
+                    trabajador_rol.c.trabajador_id == self.id,
+                    RolOperativo.codigo == normalized,
+                    RolOperativo.activo.is_(True),
+                )
+                .limit(1)
+            )
+            return role_id is not None
+        return any(
+            role.codigo == normalized and role.activo
+            for role in self.roles
+        )
 
     @property
     def rol_principal_activo(self):

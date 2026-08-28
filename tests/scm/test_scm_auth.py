@@ -7,6 +7,7 @@ from app.extensions import db
 from app.models.scm_auditoria import ScmEvento
 from app.models.scm_catalogos import ScmCapacidad
 from app.models.trabajador import RolOperativo, Trabajador
+from app.services.scm_service_support import load_actor
 
 
 class FakeVerifier:
@@ -119,6 +120,46 @@ def test_auth_no_hidrata_roles_en_lectura_que_no_los_necesita(app, client):
         )
     ]
     assert authorization_relationship_queries == []
+
+
+def test_capability_check_queries_existence_without_catalog_hydration(app):
+    with app.app_context():
+        actor = Trabajador.query.filter_by(codigo="TRB-01").one()
+        capability = ScmCapacidad(
+            codigo="CAPABILITY_EGRESS_TEST",
+            nombre="Capacidad de prueba egress",
+        )
+        actor.roles[0].capacidades.append(capability)
+        db.session.commit()
+        actor_id = actor.id
+        db.session.expire_all()
+        engine = db.engine
+        statements = []
+
+        def record_statement(
+            _conn, _cursor, statement, _parameters, _context, _many
+        ):
+            statements.append(statement.lower())
+
+        event.listen(engine, "before_cursor_execute", record_statement)
+        try:
+            loaded = load_actor(
+                db.session,
+                actor_id,
+                capability="CAPABILITY_EGRESS_TEST",
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", record_statement)
+
+        assert loaded.id == actor_id
+        capability_queries = [
+            statement
+            for statement in statements
+            if "scm_rol_capacidad" in statement
+        ]
+        assert len(capability_queries) == 1
+        assert "scm_capacidad.nombre" not in capability_queries[0]
+        assert "scm_capacidad.descripcion" not in capability_queries[0]
 
 
 def test_auth_bloquea_inmediatamente_trabajador_inactivo(app, client):
