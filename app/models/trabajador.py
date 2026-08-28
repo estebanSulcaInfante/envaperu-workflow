@@ -212,7 +212,12 @@ class Trabajador(db.Model):
     auth_user_id = db.Column(db.Uuid(as_uuid=True), unique=True, nullable=True)
 
     # Relación N:M
-    roles = db.relationship('RolOperativo', secondary=trabajador_rol, lazy='subquery',
+    # La autenticacion resuelve un Trabajador en cada request. Mantener estas
+    # relaciones con eager loading hidrataba todos sus roles y capacidades aun
+    # en lecturas que solo necesitan validar que el actor exista y siga activo.
+    # Se cargan bajo demanda para que /auth/me y las autorizaciones conserven el
+    # mismo contrato sin pagar ese volumen en cada llamada operativa.
+    roles = db.relationship('RolOperativo', secondary=trabajador_rol, lazy='select',
         backref=db.backref('trabajadores', lazy=True))
     rol_principal = db.relationship(
         'RolOperativo',
@@ -226,7 +231,7 @@ class Trabajador(db.Model):
         ),
         uselist=False,
         viewonly=True,
-        lazy='selectin',
+        lazy='select',
     )
 
     @property

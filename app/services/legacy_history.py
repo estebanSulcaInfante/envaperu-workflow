@@ -10,6 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from jsonschema import Draft202012Validator, FormatChecker
+from sqlalchemy import case, func, select
 
 from app.extensions import db
 from app.models.legacy_pesaje import (
@@ -430,21 +431,90 @@ def _latest_complete_imports():
     return latest
 
 
-def _current_snapshot_captures():
-    imports = _latest_complete_imports()
+def _current_capture_groups(imports):
     station_ids = list(imports)
     if not station_ids:
-        return imports, []
-    captures = EstacionPesajeLegacy.query.filter(
-        EstacionPesajeLegacy.station_id.in_(station_ids)
+        return {}
+
+    capture = EstacionPesajeLegacy
+    op_raw = func.coalesce(capture.op_raw, "SIN OP")
+    active_bags = func.sum(
+        case((capture.is_deleted.is_(False), 1), else_=0)
+    )
+    deleted_bags = func.sum(
+        case((capture.is_deleted.is_(True), 1), else_=0)
+    )
+    active_weight = func.sum(
+        case((capture.is_deleted.is_(False), capture.weight_kg), else_=0)
+    )
+    rows = db.session.execute(
+        select(
+            capture.station_id.label("station_id"),
+            op_raw.label("op_raw"),
+            func.max(capture.op_normalized).label("op_normalized"),
+            func.max(capture.op_resolution_status).label(
+                "resolution_status"
+            ),
+            active_bags.label("active_bags"),
+            deleted_bags.label("deleted_bags"),
+            active_weight.label("active_weight_kg"),
+            func.min(capture.captured_at_utc).label(
+                "first_capture_at_utc"
+            ),
+            func.max(capture.captured_at_utc).label(
+                "last_capture_at_utc"
+            ),
+        )
+        .where(capture.station_id.in_(station_ids))
+        .group_by(capture.station_id, op_raw)
     ).all()
-    return imports, [
-        (imports[capture.station_id].import_id, capture) for capture in captures
-    ]
+
+    groups = {}
+    for row in rows:
+        import_id = imports[row.station_id].import_id
+        key = (import_id, row.station_id, row.op_raw)
+        groups[key] = {
+            "import_id": import_id,
+            "station_id": row.station_id,
+            "op_raw": row.op_raw,
+            "op_normalized": row.op_normalized,
+            "resolution_status": row.resolution_status,
+            "active_bags": int(row.active_bags or 0),
+            "deleted_bags": int(row.deleted_bags or 0),
+            "active_weight_kg": Decimal(row.active_weight_kg or 0),
+            "first_capture_at_utc": row.first_capture_at_utc,
+            "last_capture_at_utc": row.last_capture_at_utc,
+            "molds": set(),
+            "colors": set(),
+            "machines": set(),
+        }
+
+    dimensions = db.session.execute(
+        select(
+            capture.station_id.label("station_id"),
+            op_raw.label("op_raw"),
+            capture.mold_normalized.label("mold"),
+            capture.color_normalized.label("color"),
+            capture.machine_normalized.label("machine"),
+        )
+        .where(capture.station_id.in_(station_ids))
+        .distinct()
+    ).all()
+    for row in dimensions:
+        import_id = imports[row.station_id].import_id
+        group = groups[(import_id, row.station_id, row.op_raw)]
+        if row.mold:
+            group["molds"].add(row.mold)
+        if row.color:
+            group["colors"].add(row.color)
+        if row.machine:
+            group["machines"].add(row.machine)
+    return groups
 
 
 def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
-    imports, pairs = _current_snapshot_captures()
+    imports = _latest_complete_imports()
+    groups = _current_capture_groups(imports)
     import_ids = [record.import_id for record in imports.values()]
     closures = (
         EstacionCierreOpLegacy.query.filter(
@@ -468,49 +538,14 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
         item.numero_op: item
         for item in OrdenProduccion.query.filter(
             OrdenProduccion.numero_op.in_(
-                sorted({capture.op_raw for _, capture in pairs if capture.op_raw})
+                sorted({
+                    group["op_raw"]
+                    for group in groups.values()
+                    if group["op_raw"] != "SIN OP"
+                })
             )
         ).all()
     }
-
-    groups = {}
-    for import_id, capture in pairs:
-        key = (import_id, capture.station_id, capture.op_raw or "SIN OP")
-        group = groups.setdefault(
-            key,
-            {
-                "import_id": import_id,
-                "station_id": capture.station_id,
-                "op_raw": capture.op_raw or "SIN OP",
-                "op_normalized": capture.op_normalized,
-                "resolution_status": capture.op_resolution_status,
-                "active_bags": 0,
-                "deleted_bags": 0,
-                "active_weight_kg": Decimal("0"),
-                "first_capture_at_utc": capture.captured_at_utc,
-                "last_capture_at_utc": capture.captured_at_utc,
-                "molds": set(),
-                "colors": set(),
-                "machines": set(),
-            },
-        )
-        group["first_capture_at_utc"] = min(
-            group["first_capture_at_utc"], capture.captured_at_utc
-        )
-        group["last_capture_at_utc"] = max(
-            group["last_capture_at_utc"], capture.captured_at_utc
-        )
-        if capture.mold_normalized:
-            group["molds"].add(capture.mold_normalized)
-        if capture.color_normalized:
-            group["colors"].add(capture.color_normalized)
-        if capture.machine_normalized:
-            group["machines"].add(capture.machine_normalized)
-        if capture.is_deleted:
-            group["deleted_bags"] += 1
-        else:
-            group["active_bags"] += 1
-            group["active_weight_kg"] += Decimal(capture.weight_kg)
 
     items = []
     for key, group in groups.items():
@@ -626,30 +661,57 @@ def legacy_production_orders(*, page=1, per_page=50, query=None, status=None):
 
 
 def legacy_production_order_detail(station_id, op_raw, *, page=1, per_page=100):
-    imports, pairs = _current_snapshot_captures()
+    imports = _latest_complete_imports()
     current_import = imports.get(station_id)
     if current_import is None:
         return None
-    captures = [
-        capture
-        for import_id, capture in pairs
-        if import_id == current_import.import_id
-        and capture.station_id == station_id
-        and (capture.op_raw or "SIN OP") == op_raw
-    ]
-    if not captures:
+
+    capture = EstacionPesajeLegacy
+    op_filter = (
+        capture.op_raw.is_(None)
+        if op_raw == "SIN OP"
+        else capture.op_raw == op_raw
+    )
+    filters = (capture.station_id == station_id, op_filter)
+    total = db.session.scalar(
+        select(func.count(capture.id)).where(*filters)
+    ) or 0
+    if not total:
         return None
-    captures.sort(key=lambda item: (item.captured_at_utc, item.legacy_pesaje_id), reverse=True)
     start = (page - 1) * per_page
-    selected = captures[start : start + per_page]
+    selected = db.session.execute(
+        select(
+            capture.legacy_pesaje_id,
+            capture.weight_kg,
+            capture.captured_at_utc,
+            capture.captured_at_local,
+            capture.is_deleted,
+            capture.deleted_at_utc,
+            capture.ot_raw,
+            capture.mold_raw,
+            capture.color_raw,
+            capture.machine_raw,
+            capture.shift_raw,
+            capture.operator_raw,
+        )
+        .where(*filters)
+        .order_by(
+            capture.captured_at_utc.desc(),
+            capture.legacy_pesaje_id.desc(),
+        )
+        .offset(start)
+        .limit(per_page)
+    ).all()
+    selected_ids = [item.legacy_pesaje_id for item in selected]
     pending_voids = {
         item.legacy_pesaje_id: item
         for item in EstacionComandoPiloto.query.filter(
             EstacionComandoPiloto.station_id == station_id,
             EstacionComandoPiloto.action == "VOID_CAPTURE",
             EstacionComandoPiloto.status.in_(("PENDING", "DELIVERED")),
+            EstacionComandoPiloto.legacy_pesaje_id.in_(selected_ids),
         ).all()
-    }
+    } if selected_ids else {}
     return {
         "station_id": station_id,
         "op_raw": op_raw,
@@ -657,8 +719,8 @@ def legacy_production_order_detail(station_id, op_raw, *, page=1, per_page=100):
         "pagination": {
             "page": page,
             "per_page": per_page,
-            "total": len(captures),
-            "pages": (len(captures) + per_page - 1) // per_page,
+            "total": total,
+            "pages": (total + per_page - 1) // per_page,
         },
         "captures": [
             {

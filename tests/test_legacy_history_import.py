@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
+from sqlalchemy import event
 
 from app.extensions import db
 from app.models.control_peso import ControlPeso
@@ -227,6 +228,45 @@ def test_order_index_separates_pending_closed_and_deleted_totals(
     )
     assert detail.status_code == 200
     assert detail.get_json()["captures"][0]["is_deleted"] is True
+
+
+def test_legacy_order_reads_do_not_transfer_raw_payloads(
+    client,
+    app,
+    history_station,
+):
+    payload = _examples()["request"]
+    assert _put(client, history_station, payload).status_code == 200
+
+    with app.app_context():
+        engine = db.engine
+    statements = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        listing = client.get(
+            "/api/monitoring/v1/legacy-production-orders"
+        )
+        detail = client.get(
+            "/api/monitoring/v1/legacy-production-orders/detail",
+            query_string={"station_id": history_station, "op": "OP-0213"},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert listing.status_code == 200
+    assert detail.status_code == 200
+    raw_payload_reads = [
+        statement
+        for statement in statements
+        if statement.lstrip().startswith("select")
+        and "estacion_pesaje_legacy" in statement
+        and "raw_payload_json" in statement
+    ]
+    assert raw_payload_reads == []
 
 
 def _station_headers(idempotency_key=None):

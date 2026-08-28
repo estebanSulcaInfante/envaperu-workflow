@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 import jwt
+from sqlalchemy import event
 
 from app.extensions import db
 from app.models.scm_auditoria import ScmEvento
@@ -82,6 +83,42 @@ def test_auth_deriva_actor_del_token_e_ignora_actor_header(app, client):
     assert response.get_json()["id"] == actor_id
     assert response.get_json()["correo"] == "juan@example.com"
     assert response.headers["Cache-Control"] == "private, no-store"
+
+
+def test_auth_no_hidrata_roles_en_lectura_que_no_los_necesita(app, client):
+    auth_user_id = uuid4()
+    with app.app_context():
+        actor = Trabajador.query.filter_by(codigo="TRB-01").one()
+        actor.auth_user_id = auth_user_id
+        db.session.commit()
+        engine = db.engine
+
+    enable_auth(app, FakeVerifier({"sub": str(auth_user_id)}))
+    statements = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        response = client.get(
+            "/api/catalogo/maquinas",
+            headers={"Authorization": "Bearer valido"},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert response.status_code == 200
+    authorization_relationship_queries = [
+        statement
+        for statement in statements
+        if "scm_rol_capacidad" in statement
+        or (
+            "trabajador_rol" in statement
+            and "join rol_operativo" in statement
+        )
+    ]
+    assert authorization_relationship_queries == []
 
 
 def test_auth_bloquea_inmediatamente_trabajador_inactivo(app, client):
