@@ -603,6 +603,96 @@ def approve_production_order(
         raise
 
 
+def cancel_production_order(
+    session,
+    *,
+    actor_id,
+    operation_id,
+    order_id,
+    data,
+):
+    """Cancel a demand order before it creates executable commitments."""
+
+    try:
+        actor = load_actor(session, actor_id, capability="OP_CANCELAR")
+        reject_unknown_fields(data, allowed={"version", "motivo"})
+        command = {
+            "order_id": str(order_id),
+            "version": expected_version(data.get("version")),
+            "motivo": required_text(
+                data.get("motivo"),
+                field="motivo",
+                max_length=500,
+            ),
+        }
+        operation, replay = _reserve_operation(
+            session,
+            operation_id,
+            "POST /ordenes-produccion/{id}/cancelar",
+            actor,
+            command,
+        )
+        if replay is not None:
+            return replay
+
+        order = session.scalar(
+            select(ScmOrdenProduccion)
+            .where(ScmOrdenProduccion.id == order_id)
+            .with_for_update()
+        )
+        if order is None:
+            raise ScmServiceError(
+                "OP_NOT_FOUND",
+                "La orden de produccion no existe.",
+                status_code=404,
+            )
+        if order.version != command["version"]:
+            raise ScmServiceError(
+                "VERSION_CONFLICT",
+                "La OP fue modificada por otro usuario.",
+                status_code=409,
+            )
+        if order.estado not in ("BORRADOR", "APROBADA"):
+            raise ScmServiceError(
+                "OP_CANCELLATION_BLOCKED",
+                "Solo puede cancelarse una OP en BORRADOR o APROBADA. "
+                "Una OP planificada requiere revisar primero sus OF, OA y compromisos.",
+                status_code=409,
+                details={"estado": order.estado},
+            )
+
+        before = _serialize(order)
+        for line in order.lineas:
+            line.estado = "CANCELADA"
+            line.version += 1
+        for plan in order.planes:
+            if plan.estado == "CALCULADO":
+                plan.estado = "SUPERADO"
+        order.estado = "CANCELADA"
+        order.version += 1
+        session.flush()
+
+        response = _serialize(order)
+        operation.response_json = copy.deepcopy(response)
+        operation.estado_http = 200
+        session.add(ScmEvento(
+            aggregate_type="ORDEN_PRODUCCION",
+            aggregate_id=str(order.id),
+            tipo="OP_CANCELLED",
+            actor_id=actor.id,
+            actor_snapshot=actor_snapshot(actor),
+            motivo=command["motivo"],
+            before_json=before,
+            after_json=response,
+            operation_id=operation.operation_id,
+        ))
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+
 def _route_snapshot_payload(route):
     target_code = route.articulo_objetivo.codigo
     return {

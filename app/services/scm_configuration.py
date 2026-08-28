@@ -114,6 +114,7 @@ CAPACIDADES_SCM_INICIALES = (
     ("OP_VER", "Consultar ordenes de produccion"),
     ("OP_CREAR", "Crear ordenes de produccion"),
     ("OP_APROBAR", "Aprobar ordenes de produccion"),
+    ("OP_CANCELAR", "Cancelar ordenes de produccion no planificadas"),
     ("PLANIFICACION_CALCULAR", "Calcular cobertura y propuestas"),
     ("PLANIFICACION_CONFIRMAR", "Confirmar el plan de suministro"),
     ("INVENTARIO_VER", "Consultar Kardex normalizado"),

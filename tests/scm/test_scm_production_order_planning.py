@@ -159,6 +159,204 @@ def test_create_demand_order_api_uses_pt_lines_and_idempotency(
     assert [item["id"] for item in listed.get_json()["items"]] == [body["id"]]
 
 
+def test_general_manager_cancels_approved_demand_order_without_deleting_it(
+    app,
+    client,
+    scm_config,
+):
+    from app.models.producto import ProductoTerminado
+    from app.models.scm_auditoria import ScmEvento
+    from app.models.trabajador import RolOperativo, Trabajador
+
+    with app.app_context():
+        manager = Trabajador.query.filter_by(codigo="TRB-01").one()
+        manager.roles.append(
+            RolOperativo.query.filter_by(codigo="GERENTE_GENERAL").one()
+        )
+        product = ProductoTerminado(
+            cod_sku_pt="PT-CANCEL-001",
+            producto="Producto de OP equivocada",
+            linea_id=1,
+            familia_id=1,
+        )
+        order = ScmOrdenProduccion(
+            codigo="OP-000001",
+            origen="PLANIFICACION",
+            referencia_origen="OP-0268",
+            fecha_necesidad=date(2026, 8, 28),
+            estado="APROBADA",
+            created_by_id=manager.id,
+            approved_by_id=manager.id,
+        )
+        order.lineas.append(ScmOrdenProduccionLinea(
+            producto_terminado=product,
+            cantidad_solicitada=Decimal("100.000"),
+        ))
+        untouched_orders = [
+            ScmOrdenProduccion(
+                codigo="OP-000002",
+                origen="PLANIFICACION",
+                referencia_origen="OP-0293",
+                fecha_necesidad=date(2026, 8, 28),
+                estado="APROBADA",
+                created_by_id=manager.id,
+                approved_by_id=manager.id,
+            ),
+            ScmOrdenProduccion(
+                codigo="OP-000003",
+                origen="PLANIFICACION",
+                referencia_origen="OP-0291",
+                fecha_necesidad=date(2026, 8, 28),
+                estado="APROBADA",
+                created_by_id=manager.id,
+                approved_by_id=manager.id,
+            ),
+        ]
+        db.session.add_all([product, order, *untouched_orders])
+        db.session.commit()
+        actor_id = manager.id
+        order_id = order.id
+        version = order.version
+        untouched = {
+            item.id: (item.estado, item.version)
+            for item in untouched_orders
+        }
+
+    operation_id = str(uuid4())
+    headers = {
+        "X-Actor-Id": str(actor_id),
+        "Idempotency-Key": operation_id,
+    }
+    response = client.post(
+        f"/api/scm/v1/ordenes-produccion/{order_id}/cancelar",
+        headers=headers,
+        json={
+            "version": version,
+            "motivo": "OP creada por error durante el piloto",
+        },
+    )
+
+    assert response.status_code == 200, response.get_json()
+    body = response.get_json()
+    assert body["codigo"] == "OP-000001"
+    assert body["estado"] == "CANCELADA"
+    assert body["version"] == version + 1
+    assert body["lineas"][0]["estado"] == "CANCELADA"
+
+    replay = client.post(
+        f"/api/scm/v1/ordenes-produccion/{order_id}/cancelar",
+        headers=headers,
+        json={
+            "version": version,
+            "motivo": "OP creada por error durante el piloto",
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.get_json() == body
+
+    with app.app_context():
+        persisted = db.session.get(ScmOrdenProduccion, order_id)
+        assert persisted is not None
+        assert persisted.estado == "CANCELADA"
+        event = ScmEvento.query.filter_by(
+            aggregate_type="ORDEN_PRODUCCION",
+            aggregate_id=str(order_id),
+            tipo="OP_CANCELLED",
+        ).one()
+        assert event.motivo == "OP creada por error durante el piloto"
+        assert event.before_json["estado"] == "APROBADA"
+        assert event.after_json["estado"] == "CANCELADA"
+        assert {
+            item_id: (
+                db.session.get(ScmOrdenProduccion, item_id).estado,
+                db.session.get(ScmOrdenProduccion, item_id).version,
+            )
+            for item_id in untouched
+        } == untouched
+
+
+def test_demand_order_cancellation_requires_reason_and_safe_state(
+    app,
+    client,
+    scm_config,
+):
+    from app.models.producto import ProductoTerminado
+    from app.models.trabajador import RolOperativo, Trabajador
+
+    with app.app_context():
+        manager = Trabajador.query.filter_by(codigo="TRB-01").one()
+        manager.roles.append(
+            RolOperativo.query.filter_by(codigo="GERENTE_GENERAL").one()
+        )
+        product = ProductoTerminado(
+            cod_sku_pt="PT-CANCEL-PLANNED",
+            producto="Producto ya planificado",
+            linea_id=1,
+            familia_id=1,
+        )
+        order = ScmOrdenProduccion(
+            codigo="OP-000002",
+            origen="PLANIFICACION",
+            fecha_necesidad=date(2026, 8, 28),
+            estado="PLANIFICADA",
+            created_by_id=manager.id,
+            approved_by_id=manager.id,
+        )
+        order.lineas.append(ScmOrdenProduccionLinea(
+            producto_terminado=product,
+            cantidad_solicitada=Decimal("100.000"),
+        ))
+        db.session.add_all([product, order])
+        db.session.commit()
+        actor_id = manager.id
+        order_id = order.id
+        version = order.version
+
+    missing_reason = client.post(
+        f"/api/scm/v1/ordenes-produccion/{order_id}/cancelar",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={"version": version, "motivo": ""},
+    )
+    assert missing_reason.status_code == 400
+
+    blocked = client.post(
+        f"/api/scm/v1/ordenes-produccion/{order_id}/cancelar",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={"version": version, "motivo": "La demanda ya no aplica"},
+    )
+    assert blocked.status_code == 409
+    assert blocked.get_json()["error"]["code"] == "OP_CANCELLATION_BLOCKED"
+
+    with app.app_context():
+        persisted = db.session.get(ScmOrdenProduccion, order_id)
+        assert persisted.estado == "PLANIFICADA"
+        assert persisted.version == version
+
+
+def test_demand_order_cancellation_capability_is_limited_to_general_manager(
+    app,
+    scm_config,
+):
+    from app.models.scm_catalogos import ScmCapacidad
+    from app.models.trabajador import RolOperativo
+
+    with app.app_context():
+        capability = ScmCapacidad.query.filter_by(codigo="OP_CANCELAR").one()
+        manager = RolOperativo.query.filter_by(codigo="GERENTE_GENERAL").one()
+        planner = RolOperativo.query.filter_by(codigo="PLANIFICACION").one()
+        management = RolOperativo.query.filter_by(codigo="GERENCIA").one()
+
+        assert capability in manager.capacidades
+        assert capability not in planner.capacidades
+        assert capability not in management.capacidades
+
+
 def test_create_and_release_exceptional_fabrication_order(
     app,
     client,

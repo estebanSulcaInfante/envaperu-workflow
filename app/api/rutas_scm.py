@@ -130,6 +130,7 @@ from app.services.scm_weighing_service import (
 from app.services.scm_production_order_service import (
     adjust_production_plan_targets,
     approve_production_order,
+    cancel_production_order,
     calculate_production_plan,
     confirm_production_plan,
     create_production_order,
@@ -623,6 +624,17 @@ def orden_produccion_aprobar(order_id):
         operation_id=_idempotency_key(),
         order_id=order_id,
         expected_resource_version=payload.get("version"),
+    ))
+
+
+@scm_bp.post("/ordenes-produccion/<uuid:order_id>/cancelar")
+def orden_produccion_cancelar(order_id):
+    return jsonify(cancel_production_order(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        order_id=order_id,
+        data=_json_body(),
     ))
 
 
