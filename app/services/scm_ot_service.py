@@ -49,6 +49,7 @@ from app.models.scm_production_orders import (
     ScmOrdenOperacion,
     ScmOrdenOperacionSalida,
 )
+from app.models.scm_rutas import ScmCentroTrabajo
 from app.models.trabajador import Trabajador
 from app.services.catalog_code_generator import generar_codigo_catalogo
 from app.services.scm_color_identity import serialize_color_identity
@@ -3894,6 +3895,50 @@ def list_ots(
             )
             for item in items
         ]
+    }
+
+
+def list_plant_journeys(
+    session,
+    *,
+    actor_id,
+    operational_date,
+    shift,
+):
+    """Aggregate the daily board in one authenticated HTTP request."""
+    load_actor(session, actor_id, capability="OT_VER")
+    parsed_date = _parse_date(operational_date)
+    normalized_shift = required_text(
+        shift,
+        field="turno",
+        max_length=20,
+    ).upper()
+    machines = session.scalars(
+        select(Maquina)
+        .options(selectinload(Maquina.tipo_maquina))
+        .order_by(Maquina.codigo)
+    ).all()
+    work_centers = session.scalars(
+        select(ScmCentroTrabajo).order_by(ScmCentroTrabajo.codigo)
+    ).all()
+    journeys = list_ots(
+        session,
+        actor_id=actor_id,
+        operational_date=parsed_date.isoformat(),
+        shift=normalized_shift,
+    )
+    fabrication = []
+    assembly = []
+    for item in journeys["items"]:
+        target = assembly if item["tipo_ot"] == "ENSAMBLE" else fabrication
+        target.append(item)
+    return {
+        "fecha_operativa": parsed_date.isoformat(),
+        "turno": normalized_shift,
+        "maquinas": [item.to_dict() for item in machines],
+        "centros_trabajo": [item.to_dict() for item in work_centers],
+        "ots_fabricacion": fabrication,
+        "ots_armado": assembly,
     }
 
 

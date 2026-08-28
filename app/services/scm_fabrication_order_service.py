@@ -3,12 +3,13 @@
 import copy
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from sqlalchemy import select
+from sqlalchemy.orm import joinedload, load_only, selectinload
 
 from app.models.maquina import Maquina
 from app.models.molde import Molde, MoldePieza
-from app.models.producto import ColorProduccion
+from app.models.producto import ColorProduccion, PiezaColor
 from app.models.receta_color import RecetaColorMaestra
-from app.models.scm_articulos import ScmArticulo
+from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
 from app.models.scm_auditoria import ScmEvento
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
@@ -252,9 +253,34 @@ def _load_fabrication(session, operation_id):
 
 def list_fabrication_orders(session, *, actor_id):
     load_actor(session, actor_id, capability="OF_VER")
+    fabrication_runs = (
+        selectinload(ScmOrdenOperacion.fabricacion)
+        .selectinload(ScmOrdenFabricacion.corridas)
+    )
+    run_outputs = fabrication_runs.selectinload(
+        ScmCorridaFabricacion.salidas
+    )
+    output_articles = run_outputs.selectinload(
+        ScmOrdenOperacionSalida.articulo
+    )
     operations = session.scalars(
         select(ScmOrdenOperacion)
         .where(ScmOrdenOperacion.tipo == "FABRICACION")
+        .options(
+            selectinload(ScmOrdenOperacion.fabricacion),
+            selectinload(ScmOrdenOperacion.operacion_ruta_revision),
+            fabrication_runs
+            .joinedload(ScmCorridaFabricacion.color_produccion)
+            .joinedload(ColorProduccion.color_base_rel),
+            fabrication_runs
+            .joinedload(ScmCorridaFabricacion.color_produccion)
+            .joinedload(ColorProduccion.familia_color_rel),
+            output_articles,
+            output_articles
+            .selectinload(ScmArticulo.pieza_color)
+            .selectinload(ScmArticuloPiezaColor.pieza_color)
+            .load_only(PiezaColor.pieza_id),
+        )
         .order_by(ScmOrdenOperacion.created_at.desc())
     ).all()
     projections = operation_schedule_projections(session, operations)

@@ -110,6 +110,7 @@ from app.services.scm_ot_service import (
     get_fabrication_manga_plan,
     get_ot,
     list_extra_manga_requests,
+    list_plant_journeys,
     list_pending_manga_continuities,
     list_control_print_jobs,
     list_ots,
@@ -1141,6 +1142,18 @@ def ots_listar():
         ),
         machine_id=request.args.get("maquina_id"),
         machine=request.args.get("maquina"),
+        shift=request.args.get("turno"),
+    ))
+
+
+@scm_bp.get("/jornadas-planta")
+def jornadas_planta_listar():
+    return jsonify(list_plant_journeys(
+        db.session,
+        actor_id=_actor_id(),
+        operational_date=(
+            request.args.get("fecha_operativa") or request.args.get("fecha")
+        ),
         shift=request.args.get("turno"),
     ))
 

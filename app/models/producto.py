@@ -1,3 +1,5 @@
+from sqlalchemy.orm import deferred
+
 from app.extensions import db
 
 # Tabla de Asociación N:M entre ProductoTerminado y Pieza
@@ -288,7 +290,9 @@ class ProductoTerminado(db.Model):
     doc_x_bulto = db.Column(db.Integer)
     peso_g = db.Column(db.Float)
     imagen_mime = db.Column(db.String(32), nullable=True)
-    imagen_data = db.Column(db.LargeBinary, nullable=True)
+    # Los listados operativos nunca necesitan transferir el binario completo.
+    # El endpoint de imagen lo carga bajo demanda.
+    imagen_data = deferred(db.Column(db.LargeBinary, nullable=True))
     imagen_storage_key = db.Column(db.String(512), nullable=True)
     imagen_sha256 = db.Column(db.String(64), nullable=True)
     imagen_size_bytes = db.Column(db.Integer, nullable=True)
@@ -364,7 +368,7 @@ class PiezaColor(db.Model):
     cod_mp = db.Column(db.String(50))
     mp = db.Column(db.String(100))
     imagen_mime = db.Column(db.String(32), nullable=True)
-    imagen_data = db.Column(db.LargeBinary, nullable=True)
+    imagen_data = deferred(db.Column(db.LargeBinary, nullable=True))
     imagen_storage_key = db.Column(db.String(512), nullable=True)
     imagen_sha256 = db.Column(db.String(64), nullable=True)
     imagen_size_bytes = db.Column(db.Integer, nullable=True)
@@ -442,7 +446,7 @@ class PiezaColor(db.Model):
             'version': self.version,
             'imagen_url': (
                 f'/api/piezas-color/{self.sku}/imagen'
-                if self.imagen_storage_key or self.imagen_data else None
+                if self.imagen_storage_key or self.imagen_size_bytes else None
             ),
             'estado_revision': self.estado_revision,
         }

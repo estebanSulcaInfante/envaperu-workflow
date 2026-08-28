@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import event, inspect, select
 from sqlalchemy.exc import IntegrityError
 
 from app.extensions import db
@@ -4338,3 +4339,97 @@ def test_k1_continua_misma_manga_y_qr_entre_turnos_con_atribucion_20_30(app):
             manga_model.codigo,
             manga_model.secuencia_ot,
         ) == immutable_origin
+
+
+def test_jornadas_planta_agrega_recursos_y_ots_en_una_sola_lectura(app):
+    with app.app_context():
+        creator, _approver, order, _run, _output = _seed_fabrication_order()
+        center = ScmCentroTrabajo(
+            codigo="CTR-UAT-01",
+            nombre="Centro UAT",
+            tipo="ENSAMBLE",
+            activo=True,
+        )
+        db.session.add(center)
+        db.session.commit()
+        created = create_fabrication_ot_header(
+            db.session,
+            actor_id=creator.id,
+            operation_id=uuid4(),
+            data={
+                "maquina_id": order.fabricacion.maquina_prevista_id,
+                "fecha_operativa": "2026-08-27",
+                "turno": "DIA",
+                "maquinista_predeterminado_id": creator.id,
+            },
+        )["ot"]
+
+        response = app.test_client().get(
+            "/api/scm/v1/jornadas-planta",
+            query_string={
+                "fecha_operativa": "2026-08-27",
+                "turno": "DIA",
+            },
+            headers={"X-Actor-Id": str(creator.id)},
+        )
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["fecha_operativa"] == "2026-08-27"
+        assert payload["turno"] == "DIA"
+        assert any(
+            item["id"] == order.fabricacion.maquina_prevista_id
+            for item in payload["maquinas"]
+        )
+        assert payload["centros_trabajo"] == [center.to_dict()]
+        assert [
+            item["public_id"] for item in payload["ots_fabricacion"]
+        ] == [created["public_id"]]
+        assert payload["ots_armado"] == []
+
+
+def test_listado_of_operativo_no_transfiere_binarios_de_imagen(app):
+    with app.app_context():
+        creator, _approver, _order, _run, output = _seed_fabrication_order()
+        piece = output.articulo.pieza_color.pieza_color
+        piece.imagen_data = b"imagen-uat"
+        piece.imagen_storage_key = "catalog/piezas/uat.webp"
+        piece.imagen_size_bytes = len(piece.imagen_data)
+        piece_sku = piece.sku
+        creator_id = creator.id
+        db.session.commit()
+        db.session.expunge_all()
+
+        projected_piece = db.session.scalar(
+            select(PiezaColor).where(PiezaColor.sku == piece_sku)
+        )
+        assert "imagen_data" in inspect(projected_piece).unloaded
+        assert projected_piece.to_dict()["imagen_url"].endswith("/imagen")
+        assert "imagen_data" in inspect(projected_piece).unloaded
+        statements = []
+
+        def capture_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            statements.append(statement)
+
+        db.session.expire_all()
+        event.listen(db.engine, "before_cursor_execute", capture_statement)
+        try:
+            payload = list_fabrication_orders(
+                db.session,
+                actor_id=creator_id,
+            )
+        finally:
+            event.remove(db.engine, "before_cursor_execute", capture_statement)
+
+        assert len(payload["items"]) == 1
+        assert not any(
+            "pieza_color.imagen_data" in statement
+            for statement in statements
+        )
