@@ -4234,8 +4234,11 @@ def _packaging_profile_entity(
                 "El perfil empacable no existe o esta inactivo.",
                 status_code=422,
             )
-        resolved["perfil_empacable_ref"] = profile.id
-        resolved["perfil_estado"] = "ACTIVO"
+        resolved.update({
+            "perfil_empacable_ref": profile.id,
+            "perfil_empacable_version": profile.version,
+            "perfil_estado": "ACTIVO",
+        })
         checkpoint(result)
 
     if command.get("asignar_predeterminado") is not True:

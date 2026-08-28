@@ -423,6 +423,7 @@ def test_aplicar_c_rollback_total_y_retry_no_deja_operacion_incompleta(
     assert refs["empaques"][0]["articulo_ref"] == seeded[
         "product_article_id"
     ]
+    assert refs["empaques"][0]["perfil_empacable_version"] > 0
     with app.app_context():
         assert ScmRutaRevision.query.count() == 1
         assert ScmPerfilEmpacable.query.count() == 1
