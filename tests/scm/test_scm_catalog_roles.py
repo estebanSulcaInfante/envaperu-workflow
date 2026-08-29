@@ -220,7 +220,34 @@ def test_seed_scm_es_idempotente_y_no_asigna_personas(app, runner):
         } >= {"CONFIG_RECEPCION_ADMINISTRAR"}
         assert {
             item.codigo for item in roles["JEFE_PRODUCCION"].capacidades
-        } >= {"MANGA_ETIQUETA_PRE_GENERAR"}
+        } >= {"MANGA_ETIQUETA_PRE_GENERAR", "OA_EXCEPCIONAL_CREAR"}
+        roles_con_of_excepcional = {
+            codigo
+            for codigo, rol in roles.items()
+            if "OF_EXCEPCIONAL_CREAR"
+            in {item.codigo for item in rol.capacidades}
+        }
+        roles_con_oa_excepcional = {
+            codigo
+            for codigo, rol in roles.items()
+            if "OA_EXCEPCIONAL_CREAR"
+            in {item.codigo for item in rol.capacidades}
+        }
+        assert roles_con_oa_excepcional == roles_con_of_excepcional
+        assert roles_con_oa_excepcional == {
+            "GERENTE_GENERAL",
+            "JEFE_PRODUCCION",
+        }
+        assert "PLANIFICACION" not in roles_con_oa_excepcional
+        roles_con_cierre_of = {
+            codigo
+            for codigo, rol in roles.items()
+            if "OF_CERRAR" in {item.codigo for item in rol.capacidades}
+        }
+        assert roles_con_cierre_of == {
+            "GERENTE_GENERAL",
+            "JEFE_PRODUCCION",
+        }
         assert categorias["RESINA_VIRGEN"].modalidad_default == MODALIDAD_VIRGEN
         assert (
             categorias["LEGACY_POR_CONFIGURAR"].modalidad_default

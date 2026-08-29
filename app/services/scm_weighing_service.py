@@ -248,6 +248,7 @@ def _piece_color_label(manga):
 
 def _resolve_payload(label):
     manga = label.manga
+    article = manga.lote_articulo.articulo
     weighing = ScmPesajeManga.query.filter_by(manga_id=manga.id).one_or_none()
     is_assembly = manga.ot.tipo_ot == "ENSAMBLE"
     expected_state = (
@@ -380,6 +381,8 @@ def _resolve_payload(label):
             "asignacion_personal_trabajo_id": (
                 str(personal.id) if personal else None
             ),
+            "articulo_clase": article.clase,
+            "articulo_codigo": article.codigo,
             "pieza_color": _piece_color_label(manga),
             "color": manga.color_snapshot,
             **_order_ot_identity(manga),
@@ -619,12 +622,35 @@ def register_manga_weighing_control(
         if tare_source == "MEDIDA_AUTORIZADA":
             load_actor(session, actor_id, capability="PESAJE_TARA_OVERRIDE")
         previous_control = manga.controles_peso[-1] if manga.controles_peso else None
-        if previous_control is not None and net <= Decimal(previous_control.peso_neto_kg):
-            raise ScmServiceError(
-                "CONTROL_WEIGHT_NOT_MONOTONIC",
-                "El peso acumulado no puede disminuir; revise la manga antes de transferirla.",
-                status_code=409,
+        previous_net = Decimal("0.000")
+        if previous_control is not None:
+            if (
+                tare != Decimal(previous_control.tara_kg)
+                or tare_source != previous_control.tara_fuente
+            ):
+                raise ScmServiceError(
+                    "CONTROL_TARE_NOT_COMPARABLE",
+                    "La tara o su fuente cambió desde el control anterior; concilie la manga antes de publicar un aporte.",
+                    status_code=409,
+                    details={
+                        "tara_anterior_kg": format(
+                            Decimal(previous_control.tara_kg), "f"
+                        ),
+                        "tara_actual_kg": format(tare, "f"),
+                        "tara_fuente_anterior": previous_control.tara_fuente,
+                        "tara_fuente_actual": tare_source,
+                    },
+                )
+            previous_net = Decimal(previous_control.peso_neto_kg).quantize(
+                KG_QUANTUM
             )
+            if net <= previous_net:
+                raise ScmServiceError(
+                    "CONTROL_WEIGHT_NOT_MONOTONIC",
+                    "El peso acumulado no puede disminuir; revise la manga antes de transferirla.",
+                    status_code=409,
+                )
+        contribution = (net - previous_net).quantize(KG_QUANTUM)
 
         weighed_at = _aware_datetime(data.get("pesada_at"))
         timezone_name = work.orden_trabajo.timezone_snapshot or "America/Lima"
@@ -647,6 +673,7 @@ def register_manga_weighing_control(
             peso_bruto_kg=gross,
             tara_kg=tare,
             peso_neto_kg=net,
+            aporte_desde_control_anterior_kg=contribution,
             tara_fuente=tare_source,
             conteo_acumulado_un=count,
             motivo=reason,
@@ -670,14 +697,53 @@ def register_manga_weighing_control(
             _close_work_assignment(work, actor=actor, reason=reason)
             _recompute_parent_state(session, work)
         session.flush()
+        label_version = max(
+            (
+                item.version
+                for item in manga.etiquetas
+                if item.tipo == "CONTROL_PESO"
+            ),
+            default=0,
+        ) + 1
+        control_label_id = uuid.uuid4()
+        payload = _control_label_payload(
+            manga,
+            control,
+            control_label_id,
+            label_version,
+        )
+        job = ScmTrabajoImpresionManga(
+            plantilla_version=payload["template"]["version"],
+            payload_hash=_json_hash([payload]),
+            solicitado_por_id=actor.id,
+            station_id=station_id,
+        )
+        session.add(job)
+        session.flush()
+        control_label = ScmEtiquetaManga(
+            public_id=control_label_id,
+            manga_id=manga.id,
+            trabajo_impresion_id=job.public_id,
+            tipo="CONTROL_PESO",
+            version=label_version,
+            plantilla_version=payload["template"]["version"],
+            payload_json=payload,
+            payload_hash=_json_hash(payload),
+        )
+        session.add(control_label)
+        session.flush()
+        control.etiqueta_id = control_label.id
+        session.flush()
         response = {
             "control": control.to_dict(),
             "manga": _serialize_manga(manga),
             "produccion_confirmada_un": "0",
             "inventario_creado": False,
-            "print_job_id": None,
+            "print_job_id": str(job.public_id),
+            "print_template_version": payload["template"]["version"],
+            "control_label": _serialize_label(control_label),
             "qr_preservado": True,
-            "continuidad_estado": "PENDIENTE_VINCULO",
+            "continuidad_estado": "PENDIENTE_RELEVO",
             "idempotent_replay": False,
         }
         session.add(_event(
@@ -691,28 +757,87 @@ def register_manga_weighing_control(
         session.rollback()
         raise
 
-def _post_label_payload(manga, weighing, label_id, version):
-    canonical = (
-        manga.trabajo is not None
-        or manga.ot.orden_operacion_id is not None
-    )
-    personal = manga.asignacion_personal_trabajo
-    worker = personal.trabajador if personal is not None else manga.maquinista_previsto
-    return {
-        "template": {
-            "version": (
-                "POSTPESAJE_TSPL_3"
-                if manga.trabajo is not None and manga.ot.orden_operacion_id is None
-                else ("POSTPESAJE_TSPL_2" if canonical else "POSTPESAJE_TSPL_1")
+
+def _control_label_payload(manga, control, label_id, version):
+    segment = control.tramo
+    work = segment.trabajo
+    personal = segment.asignacion_personal_trabajo
+    worker = personal.trabajador if personal is not None else None
+    current_ot = work.orden_trabajo
+    order_identity = _order_ot_identity(manga)
+    if work is not manga.trabajo:
+        order_identity = {
+            "of_ot": f"{work.orden_operacion.codigo} - {current_ot.codigo_ot}",
+            "ot_id": str(current_ot.public_id),
+            "trabajo_color_id": str(work.id),
+            "trabajo_color_codigo": work.codigo,
+            "corrida_fabricacion_id": str(
+                work.trabajo_color.corrida_fabricacion_id
             ),
+        }
+    return {
+        "document_type": "CONTROL_PESO",
+        "template": {
+            "version": "CONTROL_PESO_TSPL_1",
             "dpi": 203,
             "sheet_width_mm": 109,
             "sheet_height_mm": 50,
             "gap_mm": 3,
             "sticker_width_mm": 50,
             "columns_x_dots": [24, 464],
-            "qr_module_dots": 4,
-            "qr_reference": "STICKER_PESAJE_LEGACY",
+            "qr_required": False,
+        },
+        "generated_at": utc_now().isoformat(),
+        "fecha_ot": current_ot.fecha.isoformat(),
+        "maquinista": worker.nombre_completo if worker else None,
+        "codigo_manga": manga.codigo,
+        "pieza_color": _piece_color_label(manga),
+        "color": manga.color_snapshot,
+        "tipo_manga": manga.tipo,
+        "cantidad_acumulada_un": format(
+            Decimal(control.conteo_acumulado_un).normalize(), "f"
+        ),
+        "peso_neto_real_kg": format(Decimal(control.peso_neto_kg), "f"),
+        "aporte_desde_control_anterior_kg": format(
+            Decimal(control.aporte_desde_control_anterior_kg), "f"
+        ),
+        "peso_estandar_segun_unidades_kg": format(
+            (
+                Decimal(control.conteo_acumulado_un)
+                * Decimal(manga.peso_unitario_snapshot_g)
+                / Decimal("1000")
+            ).quantize(KG_QUANTUM),
+            "f",
+        ),
+        "manga_id": str(manga.public_id),
+        "artifact_id": str(label_id),
+        "artifact_version": version,
+        "qr_required": False,
+        **order_identity,
+    }
+
+
+def _post_label_payload(manga, weighing, label_id, version):
+    personal = manga.asignacion_personal_trabajo
+    worker = personal.trabajador if personal is not None else manga.maquinista_previsto
+    confirmed_quantity = Decimal(
+        getattr(
+            weighing,
+            "cantidad_confirmada",
+            manga.cantidad_confirmada_un or manga.cantidad_asignada_un,
+        )
+    )
+    return {
+        "document_type": "POSTPESAJE",
+        "template": {
+            "version": "POSTPESAJE_TSPL_4",
+            "dpi": 203,
+            "sheet_width_mm": 109,
+            "sheet_height_mm": 50,
+            "gap_mm": 3,
+            "sticker_width_mm": 50,
+            "columns_x_dots": [24, 464],
+            "qr_required": False,
         },
         "generated_at": utc_now().isoformat(),
         "fecha_ot": manga.ot.fecha.isoformat(),
@@ -731,19 +856,25 @@ def _post_label_payload(manga, weighing, label_id, version):
         "cantidad_planificada_un": format(
             Decimal(manga.cantidad_planificada_un).normalize(), "f"
         ),
+        "cantidad_confirmada_un": format(confirmed_quantity.normalize(), "f"),
         "kg_fisico": format(weighing.peso_fisico_neto_kg, "f"),
         "kg_produccion_ot": format(weighing.kg_produccion_ot, "f"),
-        "qr": {
-            "v": 1,
-            "type": "SCM_MANGA_LABEL",
-            "manga_id": str(manga.public_id),
-            "label_id": str(label_id),
-            "label_type": "POSTPESAJE",
-            "label_version": version,
-            "trabajo_color_id": (
-                str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
-            ),
-        },
+        "peso_neto_real_kg": format(weighing.peso_fisico_neto_kg, "f"),
+        "peso_estandar_segun_unidades_kg": format(
+            weighing.kg_produccion_ot, "f"
+        ),
+        "aporte_desde_control_anterior_kg": format(
+            (
+                Decimal(weighing.peso_fisico_neto_kg)
+                - Decimal(manga.controles_peso[-1].peso_neto_kg)
+                if manga.controles_peso else Decimal(weighing.peso_fisico_neto_kg)
+            ).quantize(KG_QUANTUM),
+            "f",
+        ),
+        "manga_id": str(manga.public_id),
+        "artifact_id": str(label_id),
+        "artifact_version": version,
+        "qr_required": False,
         **_order_ot_identity(manga),
     }
 

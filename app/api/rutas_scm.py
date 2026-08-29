@@ -61,9 +61,11 @@ from app.services.scm_structure_service import (
 )
 from app.services.scm_route_service import (
     approve_route,
+    create_article_route,
     create_route,
     create_work_center,
     get_route,
+    list_article_routes,
     list_routes,
     list_work_centers,
     publish_route_directly,
@@ -140,6 +142,7 @@ from app.services.scm_production_order_service import (
     refresh_production_order_routes,
 )
 from app.services.scm_fabrication_order_service import (
+    close_fabrication_order,
     create_exceptional_fabrication_order,
     get_fabrication_order,
     list_fabrication_orders,
@@ -147,6 +150,7 @@ from app.services.scm_fabrication_order_service import (
     update_fabrication_order,
 )
 from app.services.scm_assembly_order_service import (
+    create_exceptional_assembly_order,
     get_assembly_order,
     list_assembly_orders,
     transition_assembly_order,
@@ -723,6 +727,17 @@ def orden_fabricacion_liberar(order_id):
     ))
 
 
+@scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/cerrar")
+def orden_fabricacion_cerrar(order_id):
+    return jsonify(close_fabrication_order(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        operation_order_id=order_id,
+        data=_json_body(),
+    ))
+
+
 @scm_bp.get("/ordenes-armado")
 @scm_bp.get("/ordenes-ensamble")
 def ordenes_armado_listar():
@@ -730,6 +745,17 @@ def ordenes_armado_listar():
         db.session,
         actor_id=_actor_id(),
     ))
+
+
+@scm_bp.post("/ordenes-armado/excepcionales")
+def orden_armado_excepcional_crear():
+    payload, created = create_exceptional_assembly_order(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )
+    return jsonify(payload), 201 if created else 200
 
 
 @scm_bp.get("/ordenes-armado/<uuid:order_id>")
@@ -1555,12 +1581,32 @@ def rutas_listar(product_id):
     ))
 
 
+@scm_bp.get("/articulos/<int:article_id>/rutas")
+def rutas_articulo_listar(article_id):
+    return jsonify(list_article_routes(
+        db.session,
+        actor_id=_actor_id(),
+        article_id=article_id,
+    ))
+
+
 @scm_bp.post("/productos/<string:product_id>/rutas")
 def rutas_crear(product_id):
     payload = create_route(
         db.session,
         actor_id=_actor_id(),
         product_id=product_id,
+        data=_json_body(),
+    )
+    return jsonify(payload), 201
+
+
+@scm_bp.post("/articulos/<int:article_id>/rutas")
+def rutas_articulo_crear(article_id):
+    payload = create_article_route(
+        db.session,
+        actor_id=_actor_id(),
+        article_id=article_id,
         data=_json_body(),
     )
     return jsonify(payload), 201

@@ -464,7 +464,7 @@ def test_concurrent_assembly_ot_rejects_color_work_linked_to_assembly_order(
         assert error.value.code == "ASSEMBLY_COLOR_WORK_NOT_FABRICATION"
 
 
-def test_legacy_close_is_blocked_when_assembly_order_has_traceable_ot(
+def test_traceable_close_waits_until_assembly_ot_is_terminal(
     app, scm_config
 ):
     with app.app_context():
@@ -500,4 +500,27 @@ def test_legacy_close_is_blocked_when_assembly_order_has_traceable_ot(
                 },
             )
 
-        assert error.value.code == "OA_TRACEABLE_CLOSE_REQUIRED"
+        assert error.value.code == "OA_HAS_PENDING_OTS"
+
+        db.session.rollback()
+        order = db.session.get(ScmOrdenOperacion, order.id)
+        traceable_ot = RegistroDiarioProduccion.query.filter_by(
+            orden_operacion_id=order.id,
+            tipo_ot="ENSAMBLE",
+        ).one()
+        traceable_ot.estado = "CERRADA"
+        order.salidas[0].cantidad_real = order.salidas[0].cantidad_objetivo
+        db.session.commit()
+
+        closed = transition_assembly_order(
+            db.session,
+            actor_id=actor.id,
+            operation_id=uuid4(),
+            order_id=order.id,
+            action="cerrar",
+            data={"version": order.version},
+        )
+        assert closed["estado"] == "CERRADA"
+        assert closed["salida"]["cantidad_real"] == (
+            format(order.salidas[0].cantidad_objetivo, "f")
+        )

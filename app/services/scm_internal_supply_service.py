@@ -24,6 +24,7 @@ from app.models.scm_inventory import (
     ScmSaldoInventario,
     ScmUbicacionInventario,
 )
+from app.models.scm_inline_wip import ScmReservaWipSalida
 from app.models.scm_ot import ScmEtiquetaManga, ScmManga, ScmTrabajoOt
 from app.models.scm_production_orders import ScmOrdenOperacion
 from app.models.scm_rutas import ScmCentroTrabajo, ScmOperacionRuta
@@ -493,7 +494,33 @@ def create_supply_request(session, *, actor_id, ot_id, operation_id):
         )
         session.add(request)
         target = Decimal(ot.cantidad_objetivo)
+        inline_component_ids = set()
+        if ot.modo_ejecucion_ensamble == "CONCURRENTE":
+            reservations = session.scalars(
+                select(ScmReservaWipSalida)
+                .join(ScmManga, ScmManga.id == ScmReservaWipSalida.manga_id)
+                .where(
+                    ScmManga.ot_id == ot.id,
+                    ScmReservaWipSalida.estado.in_((
+                        "CREDITO_EN_LINEA_PENDIENTE",
+                        "APLICADA",
+                    )),
+                )
+                .order_by(ScmReservaWipSalida.id)
+                .with_for_update(of=ScmReservaWipSalida)
+            ).all()
+            inline_component_ids = {
+                item.articulo_componente_id for item in reservations
+            }
+            if len(inline_component_ids) != 1:
+                raise ScmServiceError(
+                    "INLINE_RESERVATION_REQUIRED",
+                    "Asigna las mangas y su reserva en línea antes de solicitar abastecimiento.",
+                    status_code=409,
+                )
         for component in route_operation.estructura_revision.componentes:
+            if component.articulo_componente_id in inline_component_ids:
+                continue
             per_output = Decimal(component.cantidad)
             waste = Decimal(component.merma_tecnica_pct or 0)
             required = target * per_output

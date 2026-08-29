@@ -11,6 +11,11 @@ from app.models.producto import ColorProduccion, PiezaColor
 from app.models.receta_color import RecetaColorMaestra
 from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
 from app.models.scm_auditoria import ScmEvento
+from app.models.scm_inline_wip import (
+    ScmReservaWipSalida,
+    ScmSaldoWipSalida,
+)
+from app.models.scm_ot import ScmLoteArticulo, ScmManga, ScmTrabajoOt
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
     ScmOrdenFabricacion,
@@ -68,6 +73,50 @@ def _decimal_text(value, scale):
         return None
     quantum = Decimal(1).scaleb(-scale)
     return format(Decimal(value).quantize(quantum), "f")
+
+
+def _credit_output_allocations(output, accepted_quantity):
+    """Project the authoritative output total without additive replay."""
+
+    remaining = max(Decimal(accepted_quantity), Decimal("0"))
+    changes = []
+    active = sorted(
+        (
+            item for item in output.asignaciones
+            if item.estado != "CANCELADA"
+        ),
+        key=lambda item: (item.created_at, str(item.id)),
+    )
+    for allocation in active:
+        planned = Decimal(allocation.cantidad_planificada)
+        satisfied = min(planned, remaining)
+        remaining -= satisfied
+        next_state = (
+            "SATISFECHA" if satisfied >= planned
+            else "COMPROMETIDA" if satisfied > 0
+            else "PLANIFICADA"
+        )
+        before = (
+            Decimal(allocation.cantidad_comprometida),
+            Decimal(allocation.cantidad_satisfecha),
+            allocation.estado,
+        )
+        after = (satisfied, satisfied, next_state)
+        if before != after:
+            allocation.cantidad_comprometida = satisfied
+            allocation.cantidad_satisfecha = satisfied
+            allocation.estado = next_state
+            allocation.version += 1
+        changes.append({
+            "id": str(allocation.id),
+            "planificada": format(planned, "f"),
+            "satisfecha": format(satisfied, "f"),
+            "estado": next_state,
+        })
+    return {
+        "asignaciones": changes,
+        "excedente_no_asignado": format(remaining, "f"),
+    }
 
 
 def _serialize_output(output):
@@ -236,8 +285,14 @@ def _validate_machine_for_operation(machine, operation):
         )
 
 
-def _load_fabrication(session, operation_id):
-    operation = session.get(ScmOrdenOperacion, operation_id)
+def _load_fabrication(session, operation_id, *, lock=False):
+    statement = select(ScmOrdenOperacion).where(
+        ScmOrdenOperacion.id == operation_id,
+        ScmOrdenOperacion.tipo == "FABRICACION",
+    )
+    if lock:
+        statement = statement.with_for_update(of=ScmOrdenOperacion)
+    operation = session.scalar(statement)
     if (
         operation is None
         or operation.tipo != "FABRICACION"
@@ -906,6 +961,260 @@ def release_fabrication_order(
             tipo="OF_RELEASED",
             actor_id=actor.id,
             actor_snapshot=actor_snapshot(actor),
+            after_json=response,
+            operation_id=operation.operation_id,
+        ))
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+def close_fabrication_order(
+    session,
+    *,
+    actor_id,
+    operation_id,
+    operation_order_id,
+    data,
+):
+    """Close an OF from effective manga facts and credit its demand.
+
+    This command never creates inventory movements.  Warehouse receipt remains
+    the sole authority for Kardex; the close only reconciles operational output
+    and the OP allocations that output satisfies.
+    """
+
+    try:
+        actor = load_actor(session, actor_id, capability="OF_CERRAR")
+        reject_unknown_fields(data, allowed={"version", "motivo"})
+        command = {
+            "order_id": str(operation_order_id),
+            "version": expected_version(data.get("version")),
+            "motivo": (
+                str(data.get("motivo") or "").strip() or None
+            ),
+        }
+        operation, replay = _reserve_operation(
+            session,
+            operation_id,
+            "POST /ordenes-fabricacion/{id}/cerrar",
+            actor,
+            command,
+        )
+        if replay is not None:
+            return replay
+        # El TrabajoColor es la raíz de bloqueo para producción en línea.
+        # Tomarlo antes de la OF mantiene el mismo orden que cierre/corrección
+        # de Armado y evita el ciclo OF -> trabajo frente a trabajo -> reserva.
+        works = session.scalars(
+            select(ScmTrabajoOt)
+            .where(
+                ScmTrabajoOt.orden_operacion_id == operation_order_id
+            )
+            .order_by(ScmTrabajoOt.created_at, ScmTrabajoOt.id)
+            .with_for_update(of=ScmTrabajoOt)
+        ).all()
+        order = _load_fabrication(
+            session, operation_order_id, lock=True
+        )
+        if order.version != command["version"]:
+            raise ScmServiceError(
+                "VERSION_CONFLICT",
+                "La OF fue modificada por otro usuario.",
+                status_code=409,
+            )
+        if order.estado != "EN_EJECUCION":
+            raise ScmServiceError(
+                "INVALID_OF_STATE",
+                "Solo una OF en ejecución puede cerrarse.",
+                status_code=409,
+            )
+        active_works = [item for item in works if item.estado != "ANULADO"]
+        if not active_works:
+            raise ScmServiceError(
+                "OF_WORK_REQUIRED",
+                "La OF no tiene trabajos ejecutados que puedan acreditarse.",
+                status_code=409,
+            )
+        pending_works = [
+            item for item in active_works if item.estado != "COMPLETADO"
+        ]
+        if pending_works:
+            raise ScmServiceError(
+                "OF_HAS_PENDING_WORKS",
+                "La OF conserva trabajos de color sin completar.",
+                status_code=409,
+                details={
+                    "trabajos": [item.codigo for item in pending_works],
+                },
+            )
+        work_ids = [item.id for item in active_works]
+        pending_inline_reservations = session.scalars(
+            select(ScmReservaWipSalida)
+            .join(
+                ScmSaldoWipSalida,
+                ScmSaldoWipSalida.id == ScmReservaWipSalida.saldo_id,
+            )
+            .where(
+                ScmSaldoWipSalida.trabajo_color_id.in_(work_ids),
+                ScmReservaWipSalida.estado
+                == "CREDITO_EN_LINEA_PENDIENTE",
+            )
+            .order_by(ScmReservaWipSalida.id)
+            .with_for_update(of=ScmReservaWipSalida)
+        ).all()
+        if pending_inline_reservations:
+            raise ScmServiceError(
+                "OF_HAS_PENDING_INLINE_RESERVATIONS",
+                "La OF conserva reservas de producción en línea sin conciliar.",
+                status_code=409,
+                details={
+                    "reservas": [
+                        str(item.id) for item in pending_inline_reservations
+                    ],
+                },
+            )
+        mangas = session.scalars(
+            select(ScmManga)
+            .join(ScmTrabajoOt, ScmTrabajoOt.id == ScmManga.trabajo_ot_id)
+            .where(ScmTrabajoOt.orden_operacion_id == order.id)
+            .order_by(ScmManga.id)
+            .with_for_update(of=ScmManga)
+        ).all()
+        terminal_states = {
+            "PESADA",
+            "ETIQUETADA_FINAL",
+            "PENDIENTE_RECEPCION_ALMACEN",
+            "RECIBIDA",
+            "ANULADA",
+        }
+        pending_mangas = [
+            item for item in mangas
+            if item.estado not in terminal_states
+            or (
+                item.estado != "ANULADA"
+                and item.cantidad_confirmada_un is None
+            )
+        ]
+        if pending_mangas:
+            raise ScmServiceError(
+                "OF_HAS_PENDING_MANGAS",
+                "La OF conserva mangas sin pesar o anular.",
+                status_code=409,
+                details={
+                    "mangas": [item.codigo for item in pending_mangas],
+                },
+            )
+        output_by_id = {item.id: item for item in order.salidas}
+        actual_by_output = {item.id: Decimal("0") for item in order.salidas}
+        for manga in mangas:
+            if manga.estado == "ANULADA":
+                continue
+            output_id = manga.plan_linea.orden_operacion_salida_id
+            if output_id not in output_by_id:
+                raise ScmServiceError(
+                    "OF_MANGA_OUTPUT_MISMATCH",
+                    "Una manga no corresponde a una salida de la OF.",
+                    status_code=409,
+                    details={"manga": manga.codigo},
+                )
+            actual_by_output[output_id] += Decimal(
+                manga.cantidad_confirmada_un
+            )
+        inline_balances = session.scalars(
+            select(ScmSaldoWipSalida)
+            .where(ScmSaldoWipSalida.trabajo_color_id.in_(work_ids))
+            .order_by(ScmSaldoWipSalida.id)
+            .with_for_update(of=ScmSaldoWipSalida)
+        ).all()
+        for balance in inline_balances:
+            output_id = balance.orden_operacion_salida_id
+            if output_id not in output_by_id:
+                raise ScmServiceError(
+                    "OF_INLINE_OUTPUT_MISMATCH",
+                    "Un crédito en línea no corresponde a una salida de la OF.",
+                    status_code=409,
+                    details={"saldo_wip_salida_id": str(balance.id)},
+                )
+            actual_by_output[output_id] += Decimal(
+                balance.cantidad_acreditada
+            )
+        differences = []
+        for output in order.salidas:
+            actual = actual_by_output[output.id]
+            target = Decimal(output.cantidad_objetivo)
+            if actual != target:
+                differences.append({
+                    "salida_id": str(output.id),
+                    "articulo": output.articulo.codigo,
+                    "objetivo": format(target, "f"),
+                    "real": format(actual, "f"),
+                })
+        if differences and command["motivo"] is None:
+            raise ScmServiceError(
+                "OF_CLOSE_REASON_REQUIRED",
+                "Explique la diferencia entre la producción objetivo y real.",
+                status_code=422,
+                details={"diferencias": differences},
+            )
+        fulfillment = []
+        closed_at = utc_now()
+        for output in order.salidas:
+            actual = actual_by_output[output.id]
+            output.cantidad_real = actual
+            output.cantidad_rechazada = Decimal("0")
+            lot = session.scalar(
+                select(ScmLoteArticulo)
+                .where(
+                    ScmLoteArticulo.orden_operacion_salida_id == output.id
+                )
+                .with_for_update(of=ScmLoteArticulo)
+            )
+            if lot is None:
+                lot = ScmLoteArticulo(
+                    codigo=(
+                        f"LOT-{order.codigo}-{str(output.id)[:8]}"
+                    ).upper()[:64],
+                    articulo_id=output.articulo_scm_id,
+                    clase="SALIDA_ORDEN_OPERACION",
+                    orden_operacion_salida_id=output.id,
+                )
+                session.add(lot)
+            lot.cantidad_acreditada = actual
+            lot.event_time = closed_at
+            lot.actor_id = actor.id
+            fulfillment.append({
+                "salida_id": str(output.id),
+                "articulo": output.articulo.codigo,
+                "cantidad_real": format(actual, "f"),
+                **_credit_output_allocations(output, actual),
+            })
+        for run in order.fabricacion.corridas:
+            if run.estado != "ANULADA":
+                run.estado = "COMPLETADA"
+        order.estado = "CERRADA"
+        order.closed_by_id = actor.id
+        order.closed_at = closed_at
+        order.version += 1
+        session.flush()
+        response = {
+            **_serialize(session, order),
+            "cierre": {
+                "motivo": command["motivo"],
+                "diferencias": differences,
+                "salidas": fulfillment,
+            },
+        }
+        operation.response_json = copy.deepcopy(response)
+        operation.estado_http = 200
+        session.add(ScmEvento(
+            aggregate_type="ORDEN_FABRICACION",
+            aggregate_id=str(order.id),
+            tipo="OF_CLOSED",
+            actor_id=actor.id,
+            actor_snapshot=actor_snapshot(actor),
+            motivo=command["motivo"],
             after_json=response,
             operation_id=operation.operation_id,
         ))

@@ -21,15 +21,24 @@ from app.models.scm_internal_supply import (
     ScmSolicitudAbastecimiento,
 )
 from app.models.scm_inventory import ScmMovimientoInventario, ScmSaldoInventario
+from app.models.scm_inline_wip import (
+    ScmMovimientoWipSalida,
+    ScmReservaWipSalida,
+    ScmSaldoWipSalida,
+)
 from app.models.scm_ot import (
     ScmAsignacionPlanMangaOt,
     ScmLoteArticulo,
     ScmManga,
     ScmPlanMangaOp,
     ScmPlanMangaOpLinea,
+    ScmTrabajoOt,
     utc_now,
 )
-from app.models.scm_production_orders import ScmOrdenOperacion
+from app.models.scm_production_orders import (
+    ScmOrdenOperacion,
+    ScmOrdenOperacionSalida,
+)
 from app.models.scm_rutas import ScmOperacionRuta
 from app.models.scm_warehouse import ScmExistenciaManga
 from app.services.scm_ot_service import (
@@ -54,6 +63,233 @@ from app.services.scm_service_support import (
 
 
 QUANTUM = Decimal("0.001")
+
+
+def _inline_source_for_ot(session, *, ot, structure, lock=False):
+    if ot.modo_ejecucion_ensamble != "CONCURRENTE":
+        return None
+    if ot.trabajo_color_contexto_id is None:
+        raise ScmServiceError(
+            "INLINE_COLOR_WORK_CONTEXT_REQUIRED",
+            "El armado concurrente requiere un TrabajoColor exacto.",
+            status_code=409,
+        )
+    statement = select(ScmTrabajoOt).where(
+        ScmTrabajoOt.id == ot.trabajo_color_contexto_id,
+        ScmTrabajoOt.tipo == "COLOR",
+    )
+    if lock:
+        statement = statement.with_for_update()
+    work = session.scalar(statement)
+    if (
+        work is None
+        or work.orden_operacion is None
+        or work.orden_operacion.tipo != "FABRICACION"
+        or work.trabajo_color is None
+        or work.trabajo_color.corrida is None
+    ):
+        raise ScmServiceError(
+            "INLINE_SOURCE_OUTPUT_UNRESOLVED",
+            "El TrabajoColor no conserva una corrida de fabricación resoluble.",
+            status_code=409,
+        )
+    component_by_article = {
+        item.articulo_componente_id: item for item in structure.componentes
+    }
+    matches = [
+        (component_by_article[output.articulo_scm_id], output)
+        for output in work.trabajo_color.corrida.salidas
+        if output.orden_operacion_id == work.orden_operacion_id
+        and output.articulo_scm_id in component_by_article
+    ]
+    if len(matches) != 1:
+        raise ScmServiceError(
+            "INLINE_SOURCE_OUTPUT_AMBIGUOUS",
+            "La BOM debe coincidir con exactamente una salida del TrabajoColor.",
+            status_code=422,
+            details={
+                "trabajo_color_id": str(work.id),
+                "coincidencias": len(matches),
+            },
+        )
+    component, output = matches[0]
+    if output.articulo is None or not output.articulo.activo:
+        raise ScmServiceError(
+            "INLINE_SOURCE_ARTICLE_INACTIVE",
+            "La salida fresca seleccionada debe permanecer activa.",
+            status_code=422,
+        )
+    return work, component, output
+
+
+def _inline_plan_allocation(
+    session, *, work, output, actor=None, create=False
+):
+    line_statement = (
+        select(ScmPlanMangaOpLinea)
+        .join(ScmPlanMangaOp)
+        .where(
+            ScmPlanMangaOp.orden_operacion_id == work.orden_operacion_id,
+            ScmPlanMangaOp.estado == "ACTIVO",
+            ScmPlanMangaOpLinea.orden_operacion_salida_id == output.id,
+        )
+        .with_for_update(of=ScmPlanMangaOpLinea)
+    )
+    line = session.scalar(line_statement)
+    if line is None:
+        raise ScmServiceError(
+            "INLINE_SOURCE_PLAN_MISSING",
+            "La salida fresca no conserva una cuota activa del plan de mangas.",
+            status_code=409,
+            details={"orden_operacion_salida_id": str(output.id)},
+        )
+    assignment = session.scalar(
+        select(ScmAsignacionPlanMangaOt)
+        .where(
+            ScmAsignacionPlanMangaOt.plan_linea_id == line.id,
+            ScmAsignacionPlanMangaOt.trabajo_ot_id == work.id,
+        )
+        .with_for_update()
+    )
+    if assignment is None and create:
+        assignment = ScmAsignacionPlanMangaOt(
+            plan_linea_id=line.id,
+            ot_id=work.orden_trabajo_id,
+            trabajo_ot_id=work.id,
+            cantidad_asignada_un=Decimal("0"),
+            mangas_asignadas=0,
+            asignada_por_id=actor.id,
+        )
+        session.add(assignment)
+        session.flush()
+    if assignment is None:
+        raise ScmServiceError(
+            "INLINE_SOURCE_PLAN_ALLOCATION_MISSING",
+            "La reserva perdió su asignación de cuota del TrabajoColor.",
+            status_code=409,
+            details={"trabajo_color_id": str(work.id)},
+        )
+    return line, assignment
+
+
+def _release_inline_plan_quota(
+    *, work, assignment, quantity, error_code="INLINE_RESERVATION_CONTEXT_MISMATCH"
+):
+    """Return unused inline output to the exact source work allocation.
+
+    Callers must already hold row locks for ``work`` and ``assignment``.  The
+    invariant deliberately includes the confirmed quantity so a cancellation
+    or partial close can never shrink the source target below facts that have
+    already been credited.
+    """
+    amount = Decimal(quantity).quantize(QUANTUM)
+    assigned = Decimal(assignment.cantidad_asignada_un)
+    target = Decimal(work.cantidad_objetivo_un or 0)
+    confirmed = Decimal(work.cantidad_confirmada_un or 0)
+    if (
+        amount < 0
+        or assigned < amount
+        or target - confirmed < amount
+    ):
+        raise ScmServiceError(
+            error_code,
+            "La cuota reservada ya no coincide con el TrabajoColor de origen.",
+            status_code=409,
+            details={
+                "trabajo_color_id": str(work.id),
+                "cantidad_liberar": format(amount, "f"),
+                "cantidad_asignada": format(assigned, "f"),
+                "cantidad_objetivo": format(target, "f"),
+                "cantidad_confirmada": format(confirmed, "f"),
+            },
+        )
+    if amount == 0:
+        return
+    assignment.cantidad_asignada_un = assigned - amount
+    work.cantidad_objetivo_un = target - amount
+
+
+def _reserve_inline_output_for_mangas(
+    session, *, ot, structure, mangas, actor, operation
+):
+    source = _inline_source_for_ot(
+        session, ot=ot, structure=structure, lock=True
+    )
+    if source is None:
+        return []
+    work, component, output = source
+    line, assignment = _inline_plan_allocation(
+        session, work=work, output=output, actor=actor, create=True
+    )
+    assigned_total = session.scalar(
+        select(func.coalesce(
+            func.sum(ScmAsignacionPlanMangaOt.cantidad_asignada_un), 0
+        )).where(ScmAsignacionPlanMangaOt.plan_linea_id == line.id)
+    )
+    available = Decimal(line.cantidad_objetivo_un) - Decimal(assigned_total)
+    required_by_manga = []
+    for manga in sorted(mangas, key=lambda item: item.id):
+        required = (
+            Decimal(manga.cantidad_asignada_un)
+            * Decimal(component.cantidad)
+        ).quantize(QUANTUM)
+        if required <= 0 or required > available:
+            raise ScmServiceError(
+                "INLINE_OUTPUT_QUOTA_EXCEEDED",
+                "La reserva en línea excede la salida autorizada del TrabajoColor.",
+                status_code=409,
+                details={
+                    "trabajo_color_id": str(work.id),
+                    "articulo_id": output.articulo_scm_id,
+                    "requerido": format(required, "f"),
+                    "disponible": format(available, "f"),
+                },
+            )
+        required_by_manga.append((manga, required))
+        available -= required
+
+    reserved_total = sum(
+        (required for _manga, required in required_by_manga),
+        Decimal("0"),
+    )
+    assignment.cantidad_asignada_un = (
+        Decimal(assignment.cantidad_asignada_un) + reserved_total
+    )
+    work.cantidad_objetivo_un = (
+        Decimal(work.cantidad_objetivo_un or 0) + reserved_total
+    )
+    work.version += 1
+    saldo = session.scalar(
+        select(ScmSaldoWipSalida)
+        .where(
+            ScmSaldoWipSalida.trabajo_color_id == work.id,
+            ScmSaldoWipSalida.orden_operacion_salida_id == output.id,
+        )
+        .with_for_update()
+    )
+    if saldo is None:
+        saldo = ScmSaldoWipSalida(
+            trabajo_color_id=work.id,
+            orden_operacion_salida_id=output.id,
+            articulo_id=output.articulo_scm_id,
+        )
+        session.add(saldo)
+        session.flush()
+    reservations = []
+    for manga, required in required_by_manga:
+        reservation = ScmReservaWipSalida(
+            saldo=saldo,
+            manga_id=manga.id,
+            asignacion_plan_id=assignment.id,
+            articulo_componente_id=component.articulo_componente_id,
+            cantidad_reservada=required,
+            creada_por_id=actor.id,
+            operation_id=operation.operation_id,
+        )
+        session.add(reservation)
+        reservations.append(reservation)
+    session.flush()
+    return reservations
 
 
 def _quantity(value, field="cantidad_real"):
@@ -418,9 +654,33 @@ def assign_assembly_output_mangas(
             actor=actor,
             kind="NORMAL",
         )
+        order = _load_order(session, ot.orden_operacion_id, lock=True)
+        route_operation = session.get(
+            ScmOperacionRuta, order.operacion_ruta_revision_id
+        )
+        structure = (
+            route_operation.estructura_revision if route_operation else None
+        )
+        if structure is None:
+            raise ScmServiceError(
+                "OA_BOM_SNAPSHOT_MISSING",
+                "La OA no conserva una estructura congelada resoluble.",
+                status_code=409,
+            )
+        inline_reservations = _reserve_inline_output_for_mangas(
+            session,
+            ot=ot,
+            structure=structure,
+            mangas=mangas,
+            actor=actor,
+            operation=operation,
+        )
         response = {
             "ot": _serialize_ot(ot),
             "mangas": [_serialize_manga(item) for item in mangas],
+            "reservas_produccion_linea": [
+                item.to_dict() for item in inline_reservations
+            ],
         }
         _complete_operation(operation, response)
         session.add(_event(
@@ -566,12 +826,207 @@ def approve_assembly_quantity_correction(
             .with_for_update()
         )
         lines = {item.articulo_scm_id: item for item in request.lineas}
+        inline_consumptions = {
+            item.articulo_componente_id: item
+            for item in confirmation.consumos
+            if item.reserva_wip_salida_id is not None
+        }
         effects = []
         for component in structure.componentes:
             amount = (abs(delta) * Decimal(component.cantidad)).quantize(QUANTUM)
             if amount <= 0:
                 continue
-            line = lines[component.articulo_componente_id]
+            inline_consumption = inline_consumptions.get(
+                component.articulo_componente_id
+            )
+            if inline_consumption is not None:
+                reservation_context = session.get(
+                    ScmReservaWipSalida,
+                    inline_consumption.reserva_wip_salida_id,
+                )
+                saldo_context = (
+                    session.get(
+                        ScmSaldoWipSalida, reservation_context.saldo_id
+                    )
+                    if reservation_context is not None
+                    else None
+                )
+                if saldo_context is None:
+                    raise ScmServiceError(
+                        "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                        "La corrección perdió el saldo de producción en línea.",
+                        status_code=409,
+                    )
+                work = session.scalar(
+                    select(ScmTrabajoOt)
+                    .where(
+                        ScmTrabajoOt.id
+                        == saldo_context.trabajo_color_id
+                    )
+                    .with_for_update()
+                )
+                if work is None or work.orden_operacion.estado == "CERRADA":
+                    raise ScmServiceError(
+                        "INLINE_SOURCE_OF_REOPEN_REQUIRED",
+                        "La OF de origen ya cerró; requiere una reapertura controlada antes de corregir el crédito en línea.",
+                        status_code=409,
+                        details={
+                            "trabajo_color_id": (
+                                str(work.id) if work is not None else None
+                            )
+                        },
+                    )
+                assignment = session.scalar(
+                    select(ScmAsignacionPlanMangaOt)
+                    .where(
+                        ScmAsignacionPlanMangaOt.id
+                        == reservation_context.asignacion_plan_id
+                    )
+                    .with_for_update()
+                )
+                reservation = session.scalar(
+                    select(ScmReservaWipSalida)
+                    .where(
+                        ScmReservaWipSalida.id
+                        == inline_consumption.reserva_wip_salida_id
+                    )
+                    .with_for_update()
+                )
+                saldo = session.scalar(
+                    select(ScmSaldoWipSalida)
+                    .where(ScmSaldoWipSalida.id == reservation.saldo_id)
+                    .with_for_update()
+                )
+                source_output = session.scalar(
+                    select(ScmOrdenOperacionSalida)
+                    .where(
+                        ScmOrdenOperacionSalida.id
+                        == saldo.orden_operacion_salida_id
+                    )
+                    .with_for_update()
+                )
+                if (
+                    assignment is None
+                    or assignment.trabajo_ot_id != work.id
+                    or reservation.asignacion_plan_id != assignment.id
+                    or saldo.trabajo_color_id != work.id
+                    or source_output is None
+                ):
+                    raise ScmServiceError(
+                        "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                        "La corrección ya no coincide con la cuota del TrabajoColor.",
+                        status_code=409,
+                    )
+                signed = amount if delta > 0 else -amount
+                if delta > 0:
+                    available = (
+                        Decimal(reservation.cantidad_reservada)
+                        - Decimal(reservation.cantidad_aplicada)
+                    )
+                    if available < amount or (
+                        Decimal(work.cantidad_confirmada_un) + amount
+                        > Decimal(work.cantidad_objetivo_un)
+                    ):
+                        raise ScmServiceError(
+                            "ASSEMBLY_CORRECTION_INLINE_COVERAGE_MISSING",
+                            "La reserva en línea no cubre la corrección.",
+                            status_code=409,
+                            details={
+                                "articulo_id": (
+                                    component.articulo_componente_id
+                                ),
+                                "faltante": format(
+                                    max(amount - available, Decimal("0")),
+                                    "f",
+                                ),
+                            },
+                        )
+                    movement_types = (
+                        "SALIDA_BUENA_CONFIRMADA",
+                        "CONSUMO_EN_LINEA_ARMADO",
+                    )
+                else:
+                    if (
+                        Decimal(reservation.cantidad_aplicada) < amount
+                        or Decimal(inline_consumption.cantidad_incorporada)
+                        < amount
+                        or Decimal(work.cantidad_confirmada_un) < amount
+                        or Decimal(assignment.cantidad_asignada_un) < amount
+                        or Decimal(work.cantidad_objetivo_un) < amount
+                    ):
+                        raise ScmServiceError(
+                            "ASSEMBLY_CORRECTION_INLINE_COVERAGE_MISSING",
+                            "El crédito en línea no permite esa compensación.",
+                            status_code=409,
+                            details={
+                                "articulo_id": (
+                                    component.articulo_componente_id
+                                )
+                            },
+                        )
+                    movement_types = (
+                        "REVERSO_SALIDA_BUENA",
+                        "REVERSO_CONSUMO_EN_LINEA_ARMADO",
+                    )
+                    assignment.cantidad_asignada_un = (
+                        Decimal(assignment.cantidad_asignada_un) - amount
+                    )
+                    work.cantidad_objetivo_un = (
+                        Decimal(work.cantidad_objetivo_un) - amount
+                    )
+                reservation.cantidad_aplicada = (
+                    Decimal(reservation.cantidad_aplicada) + signed
+                )
+                saldo.cantidad_acreditada = (
+                    Decimal(saldo.cantidad_acreditada) + signed
+                )
+                saldo.cantidad_consumida = (
+                    Decimal(saldo.cantidad_consumida) + signed
+                )
+                saldo.version += 1
+                work.cantidad_confirmada_un = (
+                    Decimal(work.cantidad_confirmada_un) + signed
+                )
+                work.version += 1
+                source_output.cantidad_real = (
+                    Decimal(source_output.cantidad_real or 0) + signed
+                )
+                inline_consumption.cantidad_incorporada = (
+                    Decimal(inline_consumption.cantidad_incorporada) + signed
+                )
+                for index, movement_type in enumerate(movement_types):
+                    session.add(ScmMovimientoWipSalida(
+                        saldo_id=saldo.id,
+                        reserva_id=reservation.id,
+                        confirmacion_id=confirmation.id,
+                        tipo=movement_type,
+                        cantidad=amount,
+                        effect_key=(
+                            f"{correction.id}:{reservation.id}:"
+                            f"{movement_type}:{index}"
+                        ),
+                        actor_id=actor.id,
+                        operation_id=operation.operation_id,
+                    ))
+                effects.append({
+                    "articulo_id": component.articulo_componente_id,
+                    "nivel": "EXACTA",
+                    "procedencia": "PRODUCIDO_OT_ACTUAL",
+                    "fuente_id": str(reservation.id),
+                    "delta": format(signed, "f"),
+                })
+                continue
+            line = lines.get(component.articulo_componente_id)
+            if line is None:
+                raise ScmServiceError(
+                    "ASSEMBLY_CORRECTION_COMPONENT_COVERAGE_MISSING",
+                    "Falta una fuente para compensar la corrección.",
+                    status_code=409,
+                    details={
+                        "articulo_id": component.articulo_componente_id,
+                        "faltante": format(amount, "f"),
+                    },
+                )
             remaining = amount
             if delta > 0:
                 sources = [
@@ -761,6 +1216,28 @@ def close_assembly_manga(
                 "La OA no conserva una estructura congelada resoluble.",
                 status_code=409,
             )
+        inline_source = _inline_source_for_ot(
+            session, ot=ot, structure=structure, lock=True
+        )
+        inline_assignment = None
+        if inline_source is not None:
+            source_work, _source_component, source_output = inline_source
+            if source_work.estado not in {"EN_EJECUCION", "PAUSADO"}:
+                raise ScmServiceError(
+                    "INLINE_SOURCE_WORK_NOT_ACTIVE",
+                    "El TrabajoColor de origen debe estar activo para cerrar el armado en línea.",
+                    status_code=409,
+                    details={
+                        "trabajo_color_id": str(source_work.id),
+                        "estado": source_work.estado,
+                    },
+                )
+            _source_line, inline_assignment = _inline_plan_allocation(
+                session,
+                work=source_work,
+                output=source_output,
+                create=False,
+            )
         request = session.scalar(
             select(ScmSolicitudAbastecimiento)
             .where(ScmSolicitudAbastecimiento.orden_trabajo_id == ot.id)
@@ -773,8 +1250,56 @@ def close_assembly_manga(
                 status_code=409,
             )
         request_lines = {item.articulo_scm_id: item for item in request.lineas}
+        inline_reservations = session.scalars(
+            select(ScmReservaWipSalida)
+            .where(
+                ScmReservaWipSalida.manga_id == manga.id,
+                ScmReservaWipSalida.estado.in_((
+                    "CREDITO_EN_LINEA_PENDIENTE",
+                    "APLICADA",
+                )),
+            )
+            .order_by(ScmReservaWipSalida.id)
+            .with_for_update()
+        ).all()
+        inline_by_article = {
+            item.articulo_componente_id: item
+            for item in inline_reservations
+        }
+        if len(inline_by_article) != len(inline_reservations):
+            raise ScmServiceError(
+                "INLINE_RESERVATION_AMBIGUOUS",
+                "La manga posee reservas en línea ambiguas.",
+                status_code=409,
+            )
         requirements = []
         for component in structure.componentes:
+            required = (real * Decimal(component.cantidad)).quantize(QUANTUM)
+            inline_reservation = inline_by_article.get(
+                component.articulo_componente_id
+            )
+            if inline_reservation is not None:
+                reservation_remaining = (
+                    Decimal(inline_reservation.cantidad_reservada)
+                    - Decimal(inline_reservation.cantidad_aplicada)
+                )
+                if reservation_remaining < required:
+                    raise ScmServiceError(
+                        "INLINE_OUTPUT_RESERVATION_INSUFFICIENT",
+                        "La salida fresca reservada no cubre el cierre de Armado.",
+                        status_code=409,
+                        details={
+                            "articulo_id": component.articulo_componente_id,
+                            "requerido": format(required, "f"),
+                            "disponible": format(
+                                reservation_remaining, "f"
+                            ),
+                        },
+                    )
+                requirements.append(
+                    (component, None, required, inline_reservation)
+                )
+                continue
             line = request_lines.get(component.articulo_componente_id)
             if line is None:
                 raise ScmServiceError(
@@ -783,7 +1308,6 @@ def close_assembly_manga(
                     status_code=409,
                     details={"articulo_id": component.articulo_componente_id},
                 )
-            required = (real * Decimal(component.cantidad)).quantize(QUANTUM)
             available = sum(
                 (
                     Decimal(item.saldo)
@@ -811,7 +1335,7 @@ def close_assembly_manga(
                         "disponible": format(available, "f"),
                     },
                 )
-            requirements.append((component, line, required))
+            requirements.append((component, line, required, None))
 
         confirmation = ScmConfirmacionMangaArmado(
             manga_id=manga.id,
@@ -830,7 +1354,129 @@ def close_assembly_manga(
         )
         session.add(confirmation)
         session.flush()
-        for component, line, required in requirements:
+        for component, line, required, inline_reservation in requirements:
+            if inline_reservation is not None:
+                if inline_source is None or inline_assignment is None:
+                    raise ScmServiceError(
+                        "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                        "La reserva en línea no conserva un origen resoluble.",
+                        status_code=409,
+                    )
+                source_work, _source_component, source_output = inline_source
+                if inline_reservation.asignacion_plan_id != inline_assignment.id:
+                    raise ScmServiceError(
+                        "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                        "La reserva en línea ya no coincide con la cuota del TrabajoColor.",
+                        status_code=409,
+                    )
+                saldo = session.scalar(
+                    select(ScmSaldoWipSalida)
+                    .where(
+                        ScmSaldoWipSalida.id
+                        == inline_reservation.saldo_id
+                    )
+                    .with_for_update()
+                )
+                source_output = session.scalar(
+                    select(ScmOrdenOperacionSalida)
+                    .where(
+                        ScmOrdenOperacionSalida.id
+                        == saldo.orden_operacion_salida_id
+                    )
+                    .with_for_update()
+                )
+                if (
+                    source_output is None
+                    or source_work.id != ot.trabajo_color_contexto_id
+                    or saldo.trabajo_color_id != source_work.id
+                    or source_output.articulo_scm_id
+                    != component.articulo_componente_id
+                    or source_output.orden_operacion_id
+                    != source_work.orden_operacion_id
+                ):
+                    raise ScmServiceError(
+                        "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                        "La reserva en línea ya no coincide con el TrabajoColor.",
+                        status_code=409,
+                    )
+                confirmed = Decimal(
+                    source_work.cantidad_confirmada_un or 0
+                )
+                if confirmed + required > Decimal(
+                    source_work.cantidad_objetivo_un
+                ):
+                    raise ScmServiceError(
+                        "INLINE_OUTPUT_QUOTA_EXCEEDED",
+                        "El crédito en línea excede la cuota del TrabajoColor.",
+                        status_code=409,
+                    )
+                unused = (
+                    Decimal(inline_reservation.cantidad_reservada)
+                    - Decimal(inline_reservation.cantidad_aplicada)
+                    - required
+                )
+                _release_inline_plan_quota(
+                    work=source_work,
+                    assignment=inline_assignment,
+                    quantity=unused,
+                )
+                inline_reservation.cantidad_aplicada = (
+                    Decimal(inline_reservation.cantidad_aplicada) + required
+                )
+                inline_reservation.estado = "APLICADA"
+                inline_reservation.aplicada_at = utc_now()
+                saldo.cantidad_acreditada = (
+                    Decimal(saldo.cantidad_acreditada) + required
+                )
+                saldo.cantidad_consumida = (
+                    Decimal(saldo.cantidad_consumida) + required
+                )
+                saldo.version += 1
+                source_work.cantidad_confirmada_un = confirmed + required
+                source_work.version += 1
+                source_output.cantidad_real = (
+                    Decimal(source_output.cantidad_real or 0) + required
+                )
+                session.add_all([
+                    ScmMovimientoWipSalida(
+                        saldo_id=saldo.id,
+                        reserva_id=inline_reservation.id,
+                        confirmacion_id=confirmation.id,
+                        tipo="SALIDA_BUENA_CONFIRMADA",
+                        cantidad=required,
+                        effect_key=(
+                            f"{confirmation.id}:"
+                            f"{inline_reservation.id}:CREDITO"
+                        ),
+                        actor_id=actor.id,
+                        operation_id=operation.operation_id,
+                    ),
+                    ScmMovimientoWipSalida(
+                        saldo_id=saldo.id,
+                        reserva_id=inline_reservation.id,
+                        confirmacion_id=confirmation.id,
+                        tipo="CONSUMO_EN_LINEA_ARMADO",
+                        cantidad=required,
+                        effect_key=(
+                            f"{confirmation.id}:"
+                            f"{inline_reservation.id}:CONSUMO"
+                        ),
+                        actor_id=actor.id,
+                        operation_id=operation.operation_id,
+                    ),
+                    ScmConsumoComponenteArmado(
+                        confirmacion_id=confirmation.id,
+                        reserva_wip_salida_id=inline_reservation.id,
+                        articulo_componente_id=(
+                            component.articulo_componente_id
+                        ),
+                        cantidad_incorporada=required,
+                        cantidad_merma=0,
+                        nivel_genealogia="EXACTA",
+                        procedencia="PRODUCIDO_OT_ACTUAL",
+                    ),
+                ])
+                continue
             remaining = required
             assignments = session.scalars(
                 select(ScmAsignacionAbastecimiento)
@@ -840,7 +1486,7 @@ def close_assembly_manga(
                         "EN_STAGING_ARMADO", "ABIERTA_EN_CONSUMO"
                     )),
                 )
-                .order_by(ScmAsignacionAbastecimiento.asignada_at)
+                .order_by(ScmAsignacionAbastecimiento.id)
                 .with_for_update()
             ).all()
             for assignment in assignments:
@@ -907,6 +1553,7 @@ def close_assembly_manga(
                     cantidad_incorporada=take,
                     cantidad_merma=0,
                     nivel_genealogia="EXACTA",
+                    procedencia="CONSUMIDO_STOCK_PREVIO",
                 ))
                 remaining -= take
             if remaining > 0:
@@ -918,7 +1565,7 @@ def close_assembly_manga(
                             "EN_STAGING_ARMADO", "ABIERTA_EN_CONSUMO"
                         )),
                     )
-                    .order_by(ScmAsignacionPoolArmado.asignada_at)
+                    .order_by(ScmAsignacionPoolArmado.id)
                     .with_for_update()
                 ).all()
                 for assignment in pool_assignments:
@@ -965,8 +1612,20 @@ def close_assembly_manga(
                         articulo_componente_id=component.articulo_componente_id,
                         cantidad_incorporada=take, cantidad_merma=0,
                         nivel_genealogia=assignment.pool.modo,
+                        procedencia="CONSUMIDO_STOCK_PREVIO",
                     ))
                     remaining -= take
+
+            if remaining > 0:
+                raise ScmServiceError(
+                    "COMPONENT_STOCK_INSUFFICIENT",
+                    "El saldo cambió durante el cierre de Armado y ya no cubre la BOM.",
+                    status_code=409,
+                    details={
+                        "articulo_id": component.articulo_componente_id,
+                        "faltante": format(remaining, "f"),
+                    },
+                )
 
         manga.cantidad_confirmada_un = real
         manga.cantidad_contenida_un = real

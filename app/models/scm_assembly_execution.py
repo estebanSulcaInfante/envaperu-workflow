@@ -137,10 +137,33 @@ class ScmConsumoComponenteArmado(db.Model):
             "confirmacion_id", "asignacion_pool_id",
             name="uq_scm_consumo_armado_pool",
         ),
+        db.UniqueConstraint(
+            "confirmacion_id", "reserva_wip_salida_id",
+            name="uq_scm_consumo_armado_reserva_wip",
+        ),
         db.CheckConstraint(
-            "(asignacion_abastecimiento_id IS NOT NULL) <> "
-            "(asignacion_pool_id IS NOT NULL)",
+            "(asignacion_abastecimiento_id IS NOT NULL AND "
+            "asignacion_pool_id IS NULL AND reserva_wip_salida_id IS NULL) "
+            "OR (asignacion_abastecimiento_id IS NULL AND "
+            "asignacion_pool_id IS NOT NULL AND reserva_wip_salida_id IS NULL) "
+            "OR (asignacion_abastecimiento_id IS NULL AND "
+            "asignacion_pool_id IS NULL AND reserva_wip_salida_id IS NOT NULL)",
             name="ck_scm_consumo_armado_fuente_unica",
+        ),
+        db.CheckConstraint(
+            "procedencia IN ('PRODUCIDO_OT_ACTUAL', "
+            "'CONSUMIDO_STOCK_PREVIO')",
+            name="ck_scm_consumo_armado_procedencia",
+        ),
+        db.CheckConstraint(
+            "(reserva_wip_salida_id IS NOT NULL AND "
+            "procedencia = 'PRODUCIDO_OT_ACTUAL') OR "
+            "(reserva_wip_salida_id IS NULL AND "
+            "procedencia = 'CONSUMIDO_STOCK_PREVIO')",
+            name="ck_scm_consumo_armado_procedencia_fuente",
+        ),
+        db.Index(
+            "ix_scm_consumo_armado_reserva_wip", "reserva_wip_salida_id"
         ),
     )
 
@@ -160,6 +183,11 @@ class ScmConsumoComponenteArmado(db.Model):
         db.ForeignKey("scm_asignacion_abastecimiento.id", ondelete="RESTRICT"),
         nullable=True,
     )
+    reserva_wip_salida_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_reserva_wip_salida.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     articulo_componente_id = db.Column(
         db.Integer,
         db.ForeignKey("scm_articulo.id", ondelete="RESTRICT"),
@@ -172,12 +200,21 @@ class ScmConsumoComponenteArmado(db.Model):
     nivel_genealogia = db.Column(
         db.String(28), nullable=False, default="EXACTA", server_default="EXACTA"
     )
+    procedencia = db.Column(
+        db.String(32),
+        nullable=False,
+        default="CONSUMIDO_STOCK_PREVIO",
+        server_default="CONSUMIDO_STOCK_PREVIO",
+    )
 
     confirmacion = db.relationship(
         "ScmConfirmacionMangaArmado", back_populates="consumos"
     )
     asignacion_abastecimiento = db.relationship("ScmAsignacionAbastecimiento")
     asignacion_pool = db.relationship("ScmAsignacionPoolArmado")
+    reserva_wip_salida = db.relationship(
+        "ScmReservaWipSalida", back_populates="consumos"
+    )
     articulo_componente = db.relationship("ScmArticulo")
 
     def to_dict(self):
@@ -188,6 +225,7 @@ class ScmConsumoComponenteArmado(db.Model):
             "cantidad_incorporada": _decimal(self.cantidad_incorporada),
             "cantidad_merma": _decimal(self.cantidad_merma),
             "nivel_genealogia": self.nivel_genealogia,
+            "procedencia": self.procedencia,
         }
         if assignment is not None:
             payload.update({
@@ -195,7 +233,7 @@ class ScmConsumoComponenteArmado(db.Model):
                 "manga_origen_id": str(assignment.existencia.manga.public_id),
                 "manga_origen_codigo": assignment.existencia.manga.codigo,
             })
-        else:
+        elif self.asignacion_pool is not None:
             pool_assignment = self.asignacion_pool
             payload.update({
                 "asignacion_pool_id": str(pool_assignment.id),
@@ -204,6 +242,17 @@ class ScmConsumoComponenteArmado(db.Model):
                     {"manga_id": str(value.manga.public_id), "codigo": value.manga.codigo}
                     for value in pool_assignment.pool.candidatos
                 ],
+            })
+        else:
+            reservation = self.reserva_wip_salida
+            payload.update({
+                "reserva_wip_salida_id": str(reservation.id),
+                "trabajo_color_origen_id": str(
+                    reservation.saldo.trabajo_color_id
+                ),
+                "orden_operacion_salida_origen_id": str(
+                    reservation.saldo.orden_operacion_salida_id
+                ),
             })
         return payload
 

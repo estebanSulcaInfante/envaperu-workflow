@@ -576,6 +576,12 @@ class ScmTrabajoOt(db.Model):
         lazy="selectin",
         order_by="ScmTramoMangaTrabajo.secuencia",
     )
+    saldos_wip_salida = db.relationship(
+        "ScmSaldoWipSalida",
+        foreign_keys="ScmSaldoWipSalida.trabajo_color_id",
+        back_populates="trabajo_color",
+        lazy="selectin",
+    )
     created_by = db.relationship("Trabajador", foreign_keys=[created_by_id])
     anulada_por = db.relationship("Trabajador", foreign_keys=[anulada_por_id])
 
@@ -1229,6 +1235,9 @@ class ScmControlPesoManga(db.Model):
         db.UniqueConstraint("tramo_id", name="uq_scm_control_peso_manga_tramo"),
         db.UniqueConstraint("operation_id", name="uq_scm_control_peso_manga_operation"),
         db.UniqueConstraint(
+            "etiqueta_id", name="uq_scm_control_peso_manga_etiqueta"
+        ),
+        db.UniqueConstraint(
             "source_system", "capture_id", name="uq_scm_control_peso_manga_capture"
         ),
         db.Index("ix_scm_control_peso_manga_manga", "manga_id"),
@@ -1265,6 +1274,9 @@ class ScmControlPesoManga(db.Model):
     peso_bruto_kg = db.Column(db.Numeric(15, 3), nullable=False)
     tara_kg = db.Column(db.Numeric(15, 3), nullable=False)
     peso_neto_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    aporte_desde_control_anterior_kg = db.Column(
+        db.Numeric(15, 3), nullable=False, default=0, server_default="0"
+    )
     tara_fuente = db.Column(db.String(28), nullable=False)
     conteo_acumulado_un = db.Column(db.Numeric(15, 3), nullable=False)
     motivo = db.Column(db.String(500), nullable=False)
@@ -1278,6 +1290,15 @@ class ScmControlPesoManga(db.Model):
         db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    etiqueta_id = db.Column(
+        db.Integer,
+        db.ForeignKey(
+            "scm_etiqueta_manga.id",
+            name="fk_scm_control_peso_manga_etiqueta",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
     created_at = db.Column(
         db.DateTime(timezone=True), nullable=False, default=utc_now,
         server_default=db.func.now(),
@@ -1286,6 +1307,7 @@ class ScmControlPesoManga(db.Model):
     manga = db.relationship("ScmManga", back_populates="controles_peso")
     tramo = db.relationship("ScmTramoMangaTrabajo", back_populates="control_peso")
     pesado_por = db.relationship("Trabajador")
+    etiqueta = db.relationship("ScmEtiquetaManga", foreign_keys=[etiqueta_id])
 
     def to_dict(self):
         return {
@@ -1299,12 +1321,18 @@ class ScmControlPesoManga(db.Model):
             "peso_bruto_kg": _decimal_text(self.peso_bruto_kg),
             "tara_kg": _decimal_text(self.tara_kg),
             "peso_neto_kg": _decimal_text(self.peso_neto_kg),
+            "aporte_desde_control_anterior_kg": _decimal_text(
+                self.aporte_desde_control_anterior_kg
+            ),
             "tara_fuente": self.tara_fuente,
             "conteo_acumulado_un": _decimal_text(self.conteo_acumulado_un),
             "motivo": self.motivo,
             "pesado_at": _isoformat(self.pesado_at),
             "fecha_local_pesaje": self.fecha_local_pesaje.isoformat(),
             "pesado_por_id": self.pesado_por_id,
+            "etiqueta_id": (
+                str(self.etiqueta.public_id) if self.etiqueta else None
+            ),
         }
 
 
@@ -1488,7 +1516,7 @@ class ScmEtiquetaManga(db.Model):
     __tablename__ = "scm_etiqueta_manga"
     __table_args__ = (
         db.CheckConstraint(
-            "tipo IN ('PREPESAJE', 'POSTPESAJE')",
+            "tipo IN ('PREPESAJE', 'POSTPESAJE', 'CONTROL_PESO')",
             name="ck_scm_etiqueta_manga_tipo",
         ),
         db.CheckConstraint(

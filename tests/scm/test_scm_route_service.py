@@ -5,6 +5,9 @@ import pytest
 from app.extensions import db
 from app.models.producto import Familia, Linea, ProductoTerminado
 from app.models.scm_articulos import ScmArticulo, ScmArticuloProducto
+from app.models.scm_auditoria import ScmEvento
+from app.models.scm_catalogos import ScmCapacidad
+from app.models.scm_production_orders import ScmOrdenOperacion
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_article_service import create_wip_article
 from app.services.scm_configuration import ensure_initial_scm_configuration
@@ -15,6 +18,7 @@ from app.services.scm_structure_service import (
 )
 from app.services.scm_route_service import (
     approve_route,
+    create_article_route,
     create_route,
     create_work_center,
     list_work_centers,
@@ -106,6 +110,96 @@ def _operation(
     if structure_id is not None:
         payload["estructura_revision_id"] = structure_id
     return payload
+
+
+def _grant_exceptional_assembly_capability(actor):
+    capability = ScmCapacidad.query.filter_by(
+        codigo="OA_EXCEPCIONAL_CREAR"
+    ).one_or_none()
+    if capability is None:
+        capability = ScmCapacidad(
+            codigo="OA_EXCEPCIONAL_CREAR",
+            nombre="Crear orden de armado excepcional",
+        )
+        db.session.add(capability)
+        db.session.flush()
+    role = actor.roles[0]
+    if capability not in role.capacidades:
+        role.capacidades.append(capability)
+    db.session.commit()
+
+
+def _approved_wip_route(creator, approver, suffix):
+    target_id = _wip(creator, f"WIP objetivo {suffix}")
+    component_id = _wip(creator, f"WIP componente {suffix}")
+    center = _center(
+        creator,
+        f"OA-{suffix}",
+        operation_type="ENSAMBLE",
+    )
+    structure = create_structure(
+        db.session,
+        actor_id=creator.id,
+        article_id=target_id,
+        data={
+            "componentes": [
+                {"articulo_id": component_id, "cantidad": "1"},
+            ],
+        },
+    )
+    structure = send_structure_for_approval(
+        db.session,
+        actor_id=creator.id,
+        structure_id=structure["id"],
+        operation_id=uuid4(),
+        data={"version": structure["version"]},
+    )
+    structure = approve_structure(
+        db.session,
+        actor_id=approver.id,
+        structure_id=structure["id"],
+        operation_id=uuid4(),
+        data={"version": structure["version"]},
+    )
+    operation = _operation(
+        "ARMAR_WIP",
+        10,
+        center["id"],
+        target_id,
+        executor_kind="ORDEN_OPERACION",
+        structure_id=structure["id"],
+        operation_type="ENSAMBLE",
+    )
+    operation["permite_concurrente"] = True
+    route = create_article_route(
+        db.session,
+        actor_id=creator.id,
+        article_id=target_id,
+        data={"operaciones": [operation], "precedencias": []},
+    )
+    route = approve_route(
+        db.session,
+        actor_id=approver.id,
+        route_id=route["id"],
+        operation_id=uuid4(),
+        data={"version": route["version"]},
+    )
+    return target_id, structure, route
+
+
+def _exceptional_assembly_payload(target_id, structure, route):
+    return {
+        "origen_demanda": "REPOSICION_WIP",
+        "motivo": "Reposicion sintetica para F3",
+        "articulo_salida_id": target_id,
+        "operacion_ruta_revision_id": route["operaciones"][0]["id"],
+        "estructura_revision_id": structure["id"],
+        "cantidad_objetivo": "20",
+        "versiones": {
+            "ruta": route["version"],
+            "estructura": structure["version"],
+        },
+    }
 
 
 def test_centro_trabajo_genera_codigo_automatico(app):
@@ -587,3 +681,219 @@ def test_api_expone_flujo_ruta_y_aprobacion_idempotente(app, client):
     )
     assert listed.status_code == 200
     assert listed.get_json()["items"][0]["articulo_objetivo_id"] == target_id
+
+
+def test_create_and_approve_route_with_wip_target(app, client):
+    with app.app_context():
+        creator, approver = _actors()
+        target_id = _wip(creator, "Tapa armada WIP")
+        component_id = _wip(creator, "Componente de tapa WIP")
+        center = _center(
+            creator,
+            "WIP-API",
+            operation_type="ENSAMBLE",
+        )
+        structure = create_structure(
+            db.session,
+            actor_id=creator.id,
+            article_id=target_id,
+            data={
+                "componentes": [
+                    {"articulo_id": component_id, "cantidad": "1"},
+                ],
+            },
+        )
+        structure = send_structure_for_approval(
+            db.session,
+            actor_id=creator.id,
+            structure_id=structure["id"],
+            operation_id=uuid4(),
+            data={"version": structure["version"]},
+        )
+        structure = approve_structure(
+            db.session,
+            actor_id=approver.id,
+            structure_id=structure["id"],
+            operation_id=uuid4(),
+            data={"version": structure["version"]},
+        )
+        creator_id = creator.id
+        approver_id = approver.id
+        center_id = center["id"]
+        structure_id = structure["id"]
+
+    operation = _operation(
+        "ARMAR_WIP",
+        10,
+        center_id,
+        target_id,
+        executor_kind="ORDEN_OPERACION",
+        structure_id=structure_id,
+        operation_type="ENSAMBLE",
+    )
+    operation["permite_concurrente"] = True
+    created = client.post(
+        f"/api/scm/v1/articulos/{target_id}/rutas",
+        headers={"X-Actor-Id": str(creator_id)},
+        json={"operaciones": [operation], "precedencias": []},
+    )
+
+    assert created.status_code == 201
+    route = created.get_json()
+    assert route["articulo_objetivo"]["clase"] == "SUBENSAMBLE_WIP"
+    assert route["producto_id"] is None
+
+    approved = client.post(
+        f"/api/scm/v1/rutas/{route['id']}/aprobar",
+        headers={
+            "X-Actor-Id": str(approver_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={"version": route["version"]},
+    )
+    assert approved.status_code == 200
+    assert approved.get_json()["estado"] == "APROBADA"
+
+    listed = client.get(
+        f"/api/scm/v1/articulos/{target_id}/rutas",
+        headers={"X-Actor-Id": str(creator_id)},
+    )
+    assert listed.status_code == 200
+    assert listed.get_json()["items"][0]["articulo_objetivo_id"] == target_id
+
+
+def test_api_crea_oa_excepcional_wip_idempotente_y_gobernada(app, client):
+    with app.app_context():
+        creator, approver = _actors()
+        target_id, structure, route = _approved_wip_route(
+            creator,
+            approver,
+            "CREATE",
+        )
+        _grant_exceptional_assembly_capability(approver)
+        payload = _exceptional_assembly_payload(target_id, structure, route)
+        unauthorized_id = creator.id
+        authorized_id = approver.id
+
+    forbidden = client.post(
+        "/api/scm/v1/ordenes-armado/excepcionales",
+        headers={
+            "X-Actor-Id": str(unauthorized_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json=payload,
+    )
+    assert forbidden.status_code == 403
+    assert forbidden.get_json()["error"]["code"] == (
+        "EXCEPTIONAL_ASSEMBLY_AUTHORIZATION_REQUIRED"
+    )
+
+    idempotency_key = str(uuid4())
+    created = client.post(
+        "/api/scm/v1/ordenes-armado/excepcionales",
+        headers={
+            "X-Actor-Id": str(authorized_id),
+            "Idempotency-Key": idempotency_key,
+        },
+        json=payload,
+    )
+    assert created.status_code == 201
+    order = created.get_json()
+    assert order["tipo"] == "ENSAMBLE"
+    assert order["estado"] == "BORRADOR"
+    assert order["origen_demanda"] == "REPOSICION_WIP"
+    assert order["motivo"] == payload["motivo"]
+    assert order["plan_produccion_id"] is None
+    assert order["salida"]["articulo_scm_id"] == target_id
+    assert order["salida"]["clase"] == "SUBENSAMBLE_WIP"
+    assert order["salida"]["cantidad_objetivo"] == "20"
+    assert order["operacion"]["id"] == payload[
+        "operacion_ruta_revision_id"
+    ]
+    assert order["operacion"]["estructura_revision_id"] == structure["id"]
+
+    replay = client.post(
+        "/api/scm/v1/ordenes-armado/excepcionales",
+        headers={
+            "X-Actor-Id": str(authorized_id),
+            "Idempotency-Key": idempotency_key,
+        },
+        json=payload,
+    )
+    assert replay.status_code == 200
+    assert replay.get_json() == order
+
+    conflict = client.post(
+        "/api/scm/v1/ordenes-armado/excepcionales",
+        headers={
+            "X-Actor-Id": str(authorized_id),
+            "Idempotency-Key": idempotency_key,
+        },
+        json={**payload, "motivo": "Otro motivo con la misma clave"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.get_json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    with app.app_context():
+        assert ScmOrdenOperacion.query.filter_by(
+            tipo="ENSAMBLE",
+            origen_demanda="REPOSICION_WIP",
+        ).count() == 1
+        assert ScmEvento.query.filter_by(
+            aggregate_type="ORDEN_ARMADO",
+            tipo="EXCEPTIONAL_ASSEMBLY_ORDER_CREATED",
+        ).count() == 1
+
+
+def test_api_rechaza_oa_excepcional_con_ruta_o_bom_incompatible(app, client):
+    with app.app_context():
+        creator, approver = _actors()
+        target_id, structure, route = _approved_wip_route(
+            creator,
+            approver,
+            "MISMATCH",
+        )
+        other_target_id = _wip(creator, "Otro WIP no compatible")
+        _grant_exceptional_assembly_capability(approver)
+        payload = _exceptional_assembly_payload(target_id, structure, route)
+        actor_id = approver.id
+
+    wrong_output = {
+        **payload,
+        "articulo_salida_id": other_target_id,
+    }
+    output_response = client.post(
+        "/api/scm/v1/ordenes-armado/excepcionales",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json=wrong_output,
+    )
+    assert output_response.status_code == 422
+    assert output_response.get_json()["error"]["code"] == (
+        "ASSEMBLY_ENGINEERING_NOT_READY"
+    )
+
+    wrong_structure = {
+        **payload,
+        "estructura_revision_id": structure["id"] + 999999,
+    }
+    structure_response = client.post(
+        "/api/scm/v1/ordenes-armado/excepcionales",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json=wrong_structure,
+    )
+    assert structure_response.status_code == 422
+    assert structure_response.get_json()["error"]["code"] == (
+        "ASSEMBLY_ENGINEERING_NOT_READY"
+    )
+
+    with app.app_context():
+        assert ScmOrdenOperacion.query.filter_by(
+            tipo="ENSAMBLE",
+            origen_demanda="REPOSICION_WIP",
+        ).count() == 0

@@ -44,6 +44,10 @@ from app.models.scm_ot import (
     utc_now,
 )
 from app.models.scm_internal_supply import ScmSolicitudAbastecimiento
+from app.models.scm_inline_wip import (
+    ScmReservaWipSalida,
+    ScmSaldoWipSalida,
+)
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
     ScmOrdenOperacion,
@@ -2580,12 +2584,6 @@ def add_color_work(
                 "continuidad_manga_ids debe ser una lista.",
                 status_code=400,
             )
-        if not allocations and not continuity_ids:
-            raise ScmServiceError(
-                "REQUIRED_FIELD",
-                "Asigne saldo del plan o seleccione una manga abierta compatible.",
-                status_code=400,
-            )
         mangas = _allocate_work_lines(
             session,
             work=work,
@@ -2763,6 +2761,27 @@ def _recompute_parent_state(session, work):
     parent.version += 1
 
 
+def _pending_inline_reservations_for_work(
+    session, work_id, *, lock=False
+):
+    statement = (
+        select(ScmReservaWipSalida)
+        .join(
+            ScmSaldoWipSalida,
+            ScmSaldoWipSalida.id == ScmReservaWipSalida.saldo_id,
+        )
+        .where(
+            ScmSaldoWipSalida.trabajo_color_id == work_id,
+            ScmReservaWipSalida.estado
+            == "CREDITO_EN_LINEA_PENDIENTE",
+        )
+        .order_by(ScmReservaWipSalida.id)
+    )
+    if lock:
+        statement = statement.with_for_update(of=ScmReservaWipSalida)
+    return session.scalars(statement).all()
+
+
 def transition_color_work(
     session,
     *,
@@ -2837,6 +2856,40 @@ def transition_color_work(
                     "WORK_HAS_PRODUCTION_FACTS",
                     "El trabajo posee mangas pesadas o recibidas y no puede anularse.",
                     status_code=409,
+                )
+            pending_inline = _pending_inline_reservations_for_work(
+                session, work.id, lock=True
+            )
+            if pending_inline:
+                raise ScmServiceError(
+                    "WORK_HAS_PENDING_INLINE_RESERVATIONS",
+                    "Concilia o libera las reservas de producción en línea antes de anular el trabajo.",
+                    status_code=409,
+                    details={
+                        "reservas": [str(item.id) for item in pending_inline],
+                    },
+                )
+            applied_inline = session.scalars(
+                select(ScmReservaWipSalida)
+                .join(
+                    ScmSaldoWipSalida,
+                    ScmSaldoWipSalida.id == ScmReservaWipSalida.saldo_id,
+                )
+                .where(
+                    ScmSaldoWipSalida.trabajo_color_id == work.id,
+                    ScmReservaWipSalida.cantidad_aplicada > 0,
+                )
+                .order_by(ScmReservaWipSalida.id)
+                .with_for_update(of=ScmReservaWipSalida)
+            ).all()
+            if applied_inline:
+                raise ScmServiceError(
+                    "WORK_HAS_PRODUCTION_FACTS",
+                    "El trabajo ya acreditó salidas consumidas en Armado y no puede anularse.",
+                    status_code=409,
+                    details={
+                        "reservas": [str(item.id) for item in applied_inline],
+                    },
                 )
             reason = required_text(
                 data.get("motivo"), field="motivo", max_length=500
@@ -2969,6 +3022,20 @@ def transition_color_work(
                         "El trabajo conserva mangas sin pesar o anular.",
                         status_code=409,
                         details={"pending": len(pending)},
+                    )
+                pending_inline = _pending_inline_reservations_for_work(
+                    session, work.id, lock=True
+                )
+                if pending_inline:
+                    raise ScmServiceError(
+                        "WORK_HAS_PENDING_INLINE_RESERVATIONS",
+                        "Concilia o libera las reservas de producción en línea antes de completar el trabajo.",
+                        status_code=409,
+                        details={
+                            "reservas": [
+                                str(item.id) for item in pending_inline
+                            ],
+                        },
                     )
                 work.completada_at = now
                 work.cantidad_confirmada_un = _work_confirmed_quantity(work)
@@ -3219,11 +3286,90 @@ def assign_color_work_worker(
             data.get("motivo"), field="motivo", max_length=500
         )
         raw_ids = data.get("manga_ids")
+        open_relief = data.get("manga_abierta") is True
+        if open_relief:
+            load_actor(
+                session,
+                actor_id,
+                capability="MANGA_REASIGNAR_MAQUINISTA",
+            )
         eligible_states = {"PLANIFICADA", "PREETIQUETADA"}
         eligible = [
             manga for manga in work.mangas if manga.estado in eligible_states
         ]
-        if raw_ids is not None:
+        if open_relief:
+            if not isinstance(raw_ids, list) or not raw_ids:
+                raise ScmServiceError(
+                    "INVALID_MANGA_SELECTION",
+                    "Seleccione al menos una manga abierta para registrar el relevo.",
+                    status_code=400,
+                )
+            requested = {
+                _uuid_value(value, field="manga_ids") for value in raw_ids
+            }
+            selected = session.scalars(
+                select(ScmManga)
+                .where(ScmManga.public_id.in_(requested))
+                .with_for_update()
+            ).all()
+            if len(selected) != len(requested):
+                raise ScmServiceError(
+                    "MANGA_NOT_ELIGIBLE_FOR_REASSIGNMENT",
+                    "Una manga seleccionada no existe.",
+                    status_code=404,
+                )
+            for manga in selected:
+                segment = _latest_manga_segment(manga)
+                if (
+                    manga.estado != "CONTINUIDAD_PENDIENTE"
+                    or segment is None
+                    or segment.trabajo_ot_id != work.id
+                    or segment.estado != "CERRADO"
+                    or segment.control_peso is None
+                ):
+                    raise ScmServiceError(
+                        "OPEN_MANGA_RELIEF_INCOMPATIBLE",
+                        "La manga no posee un control vigente cerrado en este Trabajo.",
+                        status_code=409,
+                        details={"manga_id": str(manga.public_id)},
+                    )
+                if Decimal(segment.control_peso.conteo_acumulado_un) >= Decimal(
+                    manga.cantidad_asignada_un
+                ):
+                    raise ScmServiceError(
+                        "OPEN_MANGA_RELIEF_NOT_READY",
+                        "La frontera ya alcanzó el total; corresponde cierre final.",
+                        status_code=409,
+                        details={"manga_id": str(manga.public_id)},
+                    )
+            if data.get("conteo_frontera") is not None:
+                if len(selected) != 1:
+                    raise ScmServiceError(
+                        "INVALID_SHIFT_BOUNDARY_COUNT",
+                        "No redigite una frontera común para varias mangas.",
+                        status_code=422,
+                    )
+                persisted_count = Decimal(
+                    _latest_manga_segment(selected[0])
+                    .control_peso.conteo_acumulado_un
+                )
+                supplied_count = _decimal(
+                    data.get("conteo_frontera"),
+                    "conteo_frontera",
+                    integral=True,
+                )
+                if supplied_count != persisted_count:
+                    raise ScmServiceError(
+                        "INVALID_SHIFT_BOUNDARY_COUNT",
+                        "La frontera no coincide con el último control; no vuelva a escribirla.",
+                        status_code=409,
+                        details={
+                            "conteo_control_un": _compact_number(
+                                persisted_count
+                            )
+                        },
+                    )
+        elif raw_ids is not None:
             if not isinstance(raw_ids, list):
                 raise ScmServiceError(
                     "INVALID_MANGA_SELECTION",
@@ -3258,15 +3404,17 @@ def assign_color_work_worker(
             # responsabilidad, sin transferir stickers.
             selected = eligible
         active_assignment = _active_work_assignment(work)
-        same_worker_mangas = [
-            manga.codigo
-            for manga in selected
-            if (
-                manga.asignacion_personal_trabajo is not None
-                and manga.asignacion_personal_trabajo.trabajador_id == worker.id
+        same_worker_mangas = []
+        for manga in selected:
+            responsible_assignment = (
+                _latest_manga_segment(manga).asignacion_personal_trabajo
+                if open_relief else manga.asignacion_personal_trabajo
             )
-            or manga.maquinista_previsto_id == worker.id
-        ]
+            if (
+                responsible_assignment is not None
+                and responsible_assignment.trabajador_id == worker.id
+            ) or (not open_relief and manga.maquinista_previsto_id == worker.id):
+                same_worker_mangas.append(manga.codigo)
         if (
             active_assignment is not None
             and active_assignment.trabajador_id == worker.id
@@ -3287,10 +3435,10 @@ def assign_color_work_worker(
                 "El relevo sin stickers requiere un trabajo en ejecución y una asignación activa.",
                 status_code=409,
             )
-        if data.get("manga_abierta") is True or data.get("conteo_frontera") is not None:
+        if not open_relief and data.get("conteo_frontera") is not None:
             raise ScmServiceError(
                 "OPEN_MANGA_RELIEF_NOT_ALLOWED",
-                "Una manga con contenido no se transfiere. Pésela con el responsable saliente y registre el relevo después.",
+                "La frontera solo se usa al relevar una manga abierta ya controlada.",
                 status_code=422,
             )
         selected_prelabels = [
@@ -3347,9 +3495,14 @@ def assign_color_work_worker(
         assignment = ScmAsignacionPersonalTrabajoOt(
             trabajo_ot_id=work.id,
             trabajador_id=worker.id,
-            estado="ACTIVA" if work.estado == "EN_EJECUCION" else "PREVISTA",
+            estado=(
+                "ACTIVA"
+                if work.estado == "EN_EJECUCION" or open_relief
+                else "PREVISTA"
+            ),
             iniciada_at=(
-                utc_now() if work.estado == "EN_EJECUCION"
+                utc_now()
+                if work.estado == "EN_EJECUCION" or open_relief
                 else None
             ),
             asignada_por_id=actor.id,
@@ -3357,16 +3510,51 @@ def assign_color_work_worker(
         )
         session.add(assignment)
         session.flush()
-        for manga in selected:
-            manga.asignacion_personal_trabajo_id = assignment.id
-            manga.maquinista_previsto_id = worker.id
-            manga.version += 1
+        if open_relief:
+            opened_segments = []
+            for manga in selected:
+                previous_segment = _latest_manga_segment(manga)
+                frontier = Decimal(
+                    previous_segment.control_peso.conteo_acumulado_un
+                )
+                next_segment = ScmTramoMangaTrabajo(
+                    manga_id=manga.id,
+                    trabajo_ot_id=work.id,
+                    asignacion_personal_trabajo_id=assignment.id,
+                    asignacion_plan_id=previous_segment.asignacion_plan_id,
+                    secuencia=previous_segment.secuencia + 1,
+                    estado="ACTIVO",
+                    cantidad_inicio_un=frontier,
+                    cantidad_atribuida_un=Decimal("0"),
+                    iniciada_at=assignment.iniciada_at,
+                    created_by_id=actor.id,
+                    operation_id=operation.operation_id,
+                )
+                session.add(next_segment)
+                manga.estado = "EN_LLENADO"
+                manga.version += 1
+                opened_segments.append(next_segment)
+            work.estado = "EN_EJECUCION"
+            work.pausada_at = None
+            work.motivo_pausa = None
+            session.flush()
+            _recompute_parent_state(session, work)
+        else:
+            opened_segments = []
+            for manga in selected:
+                manga.asignacion_personal_trabajo_id = assignment.id
+                manga.maquinista_previsto_id = worker.id
+                manga.version += 1
         session.flush()
-        replacement_jobs = _replace_prelabels_for_reassignment(
-            session,
-            selected,
-            actor=actor,
-            reason=reason,
+        replacement_jobs = (
+            []
+            if open_relief
+            else _replace_prelabels_for_reassignment(
+                session,
+                selected,
+                actor=actor,
+                reason=reason,
+            )
         )
         work.version += 1
         session.flush()
@@ -3375,9 +3563,19 @@ def assign_color_work_worker(
             "asignacion": _serialize_person_assignment(assignment),
             "mangas": [_serialize_manga(item) for item in selected],
             "trabajos_impresion_reemplazo": replacement_jobs,
-            "transferencia_manga_abierta": None,
-            "relevo_sin_stickers": not selected,
-            "stickers_transferidos": len(selected),
+            "transferencia_manga_abierta": (
+                {
+                    "continua_incompleta": True,
+                    "qr_preservado": True,
+                    "tramos_abiertos": [
+                        _serialize_manga_segment(item)
+                        for item in opened_segments
+                    ],
+                }
+                if open_relief else None
+            ),
+            "relevo_sin_stickers": not selected or open_relief,
+            "stickers_transferidos": 0 if open_relief else len(selected),
         }
         event = _event(
             "TRABAJO_COLOR",
@@ -4609,6 +4807,72 @@ def annul_manga(
             data.get("motivo"), field="motivo", max_length=500
         )
         before = _serialize_manga(manga)
+        inline_candidates = session.scalars(
+            select(ScmReservaWipSalida)
+            .where(
+                ScmReservaWipSalida.manga_id == manga.id,
+                ScmReservaWipSalida.estado
+                == "CREDITO_EN_LINEA_PENDIENTE",
+            )
+            .order_by(ScmReservaWipSalida.id)
+        ).all()
+        inline_reservations = []
+        for candidate in inline_candidates:
+            saldo = session.get(ScmSaldoWipSalida, candidate.saldo_id)
+            if saldo is None:
+                raise ScmServiceError(
+                    "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                    "La reserva en línea perdió su saldo de origen.",
+                    status_code=409,
+                )
+            source_work = session.scalar(
+                select(ScmTrabajoOt)
+                .where(ScmTrabajoOt.id == saldo.trabajo_color_id)
+                .with_for_update()
+            )
+            assignment = session.scalar(
+                select(ScmAsignacionPlanMangaOt)
+                .where(
+                    ScmAsignacionPlanMangaOt.id
+                    == candidate.asignacion_plan_id
+                )
+                .with_for_update()
+            )
+            reservation = session.scalar(
+                select(ScmReservaWipSalida)
+                .where(ScmReservaWipSalida.id == candidate.id)
+                .with_for_update()
+            )
+            if (
+                source_work is None
+                or assignment is None
+                or assignment.trabajo_ot_id != source_work.id
+                or reservation is None
+                or reservation.estado != "CREDITO_EN_LINEA_PENDIENTE"
+            ):
+                raise ScmServiceError(
+                    "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                    "La reserva en línea ya no coincide con la cuota del TrabajoColor.",
+                    status_code=409,
+                )
+            quantity = (
+                Decimal(reservation.cantidad_reservada)
+                - Decimal(reservation.cantidad_aplicada)
+            )
+            assigned = Decimal(assignment.cantidad_asignada_un)
+            target = Decimal(source_work.cantidad_objetivo_un or 0)
+            confirmed = Decimal(source_work.cantidad_confirmada_un or 0)
+            if assigned < quantity or target - confirmed < quantity:
+                raise ScmServiceError(
+                    "INLINE_RESERVATION_CONTEXT_MISMATCH",
+                    "La cuota reservada ya no permite cancelar la manga.",
+                    status_code=409,
+                )
+            assignment.cantidad_asignada_un = assigned - quantity
+            source_work.cantidad_objetivo_un = target - quantity
+            source_work.version += 1
+            reservation.estado = "CANCELADA"
+            inline_reservations.append(reservation)
         returned = _annul_unweighed_manga_model(
             manga, actor=actor, reason=reason
         )
@@ -4625,6 +4889,9 @@ def annul_manga(
                     str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
                 ),
                 "cantidad_devuelta_un": _compact_number(returned),
+                "reservas_produccion_linea_canceladas": [
+                    str(item.id) for item in inline_reservations
+                ],
             },
         }
         event = _event(
@@ -4701,12 +4968,16 @@ def replace_prelabel(
         else:
             new_payload = copy.deepcopy(old.payload_json)
             new_payload["generated_at"] = utc_now().isoformat()
-            new_payload["qr"] = {
-                **new_payload["qr"],
-                "label_id": str(new_id),
-                "label_type": old.tipo,
-                "label_version": version,
-            }
+            if "qr" in new_payload:
+                new_payload["qr"] = {
+                    **new_payload["qr"],
+                    "label_id": str(new_id),
+                    "label_type": old.tipo,
+                    "label_version": version,
+                }
+            else:
+                new_payload["artifact_id"] = str(new_id)
+                new_payload["artifact_version"] = version
         job = ScmTrabajoImpresionManga(
             payload_hash=_json_hash([new_payload]),
             solicitado_por_id=actor.id,
@@ -4793,7 +5064,9 @@ def list_control_print_jobs(session, *, actor_id, filters=None):
             "El estado de impresion no es valido.",
             status_code=400,
         )
-    if normalized_type not in {"PREPESAJE", "POSTPESAJE", "ALL"}:
+    if normalized_type not in {
+        "PREPESAJE", "POSTPESAJE", "CONTROL_PESO", "ALL"
+    }:
         raise ScmServiceError(
             "INVALID_PRINT_JOB_TYPE",
             "El tipo de etiqueta no es valido.",
@@ -4863,7 +5136,7 @@ def list_control_print_jobs(session, *, actor_id, filters=None):
 def list_station_print_jobs(
     session, *, station_id, status="PENDING", limit=20
 ):
-    """List PREPESAJE jobs visible to one station without claiming them.
+    """List actionable PREPESAJE and CONTROL_PESO jobs for one station.
 
     ``PENDING`` is an actionable inbox: it includes never-printed, partial and
     failed jobs while excluding fully printed jobs. Exact status filters remain
@@ -4898,7 +5171,7 @@ def list_station_print_jobs(
         select(ScmTrabajoImpresionManga)
         .where(
             ScmTrabajoImpresionManga.etiquetas.any(
-                ScmEtiquetaManga.tipo == "PREPESAJE"
+                ScmEtiquetaManga.tipo.in_(("PREPESAJE", "CONTROL_PESO"))
             ),
             or_(
                 ScmTrabajoImpresionManga.station_id.is_(None),

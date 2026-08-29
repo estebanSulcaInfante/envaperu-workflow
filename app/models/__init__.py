@@ -102,6 +102,11 @@ from app.models.scm_assembly_execution import (
     ScmConsumoComponenteArmado,
     ScmCorreccionMangaArmado,
 )
+from app.models.scm_inline_wip import (
+    ScmMovimientoWipSalida,
+    ScmReservaWipSalida,
+    ScmSaldoWipSalida,
+)
 from app.models.scm_material_execution import (
     ScmDevolucionMaterial,
     ScmEmisionMaterial,

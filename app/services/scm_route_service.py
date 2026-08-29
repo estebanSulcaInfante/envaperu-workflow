@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.scm_articulos import (
     CLASE_PRODUCTO_TERMINADO,
+    CLASE_SUBENSAMBLE_WIP,
     ScmArticulo,
     ScmArticuloProducto,
 )
@@ -195,6 +196,50 @@ def _event(route, actor, event_type, *, operation=None, before=None):
     )
 
 
+ROUTE_TARGET_CLASSES = frozenset({
+    CLASE_SUBENSAMBLE_WIP,
+    CLASE_PRODUCTO_TERMINADO,
+})
+
+
+def _validate_route_target(
+    target,
+    *,
+    unsupported_code="ROUTE_TARGET_CLASS_UNSUPPORTED",
+):
+    if target.clase not in ROUTE_TARGET_CLASSES:
+        raise ScmServiceError(
+            unsupported_code,
+            "La ruta requiere un articulo SUBENSAMBLE_WIP o "
+            "PRODUCTO_TERMINADO.",
+            status_code=422,
+            details={"article_id": target.id, "class": target.clase},
+        )
+    if not target.activo:
+        raise ScmServiceError(
+            "ARTICLE_INACTIVE",
+            "El articulo objetivo debe estar activo.",
+            status_code=422,
+            details={"article_id": target.id},
+        )
+    return target
+
+
+def _article_route_target(session, article_id, *, lock=False):
+    statement = select(ScmArticulo).where(ScmArticulo.id == article_id)
+    if lock:
+        statement = statement.with_for_update()
+    target = session.scalar(statement)
+    if target is None:
+        raise ScmServiceError(
+            "ARTICLE_NOT_FOUND",
+            "El articulo objetivo no existe.",
+            status_code=404,
+            details={"article_id": article_id},
+        )
+    return _validate_route_target(target)
+
+
 def _route_target(session, product_id, *, lock=False):
     statement = (
         select(ScmArticulo)
@@ -219,16 +264,13 @@ def _route_target(session, product_id, *, lock=False):
     if target.clase != CLASE_PRODUCTO_TERMINADO:
         raise ScmServiceError(
             "ARTICLE_SUBTYPE_MISMATCH",
-            "La ruta requiere un articulo PRODUCTO_TERMINADO.",
+            "La ruta del producto requiere un articulo PRODUCTO_TERMINADO.",
             status_code=422,
         )
-    if not target.activo:
-        raise ScmServiceError(
-            "ARTICLE_INACTIVE",
-            "El producto objetivo debe estar activo.",
-            status_code=422,
-        )
-    return target
+    return _validate_route_target(
+        target,
+        unsupported_code="ARTICLE_SUBTYPE_MISMATCH",
+    )
 
 
 def _new_operations(session, raw_operations):
@@ -515,8 +557,13 @@ def _assert_route_approvable(session, route):
         != route.articulo_objetivo_id
     ):
         raise ScmServiceError(
-            "OUTPUT_ARTICLE_INCOMPATIBLE",
-            "La ruta requiere un unico terminal con el producto objetivo.",
+            (
+                "ROUTE_TERMINAL_OUTPUT_MISMATCH"
+                if route.articulo_objetivo.clase
+                == CLASE_SUBENSAMBLE_WIP
+                else "OUTPUT_ARTICLE_INCOMPATIBLE"
+            ),
+            "La ruta requiere un unico terminal con el articulo objetivo.",
             status_code=422,
             details={
                 "target_article_id": route.articulo_objetivo_id,
@@ -757,15 +804,25 @@ def update_work_center(session, *, actor_id, center_id, data):
         ) from error
 
 
-def list_routes(session, *, actor_id, product_id):
-    load_actor(session, actor_id, capability="RUTA_VER")
-    target = _route_target(session, product_id)
+def _list_routes_for_target(session, target):
     routes = session.scalars(
         select(ScmRutaRevision)
         .where(ScmRutaRevision.articulo_objetivo_id == target.id)
         .order_by(ScmRutaRevision.numero_revision.desc())
     ).all()
     return {"items": [serialize_route(route) for route in routes]}
+
+
+def list_article_routes(session, *, actor_id, article_id):
+    load_actor(session, actor_id, capability="RUTA_VER")
+    target = _article_route_target(session, article_id)
+    return _list_routes_for_target(session, target)
+
+
+def list_routes(session, *, actor_id, product_id):
+    load_actor(session, actor_id, capability="RUTA_VER")
+    target = _route_target(session, product_id)
+    return _list_routes_for_target(session, target)
 
 
 def get_route(session, *, actor_id, route_id):
@@ -780,8 +837,14 @@ def get_route(session, *, actor_id, route_id):
     return serialize_route(route)
 
 
-def create_route(
-    session, *, actor_id, product_id, data, commit=True
+def _create_route(
+    session,
+    *,
+    actor_id,
+    data,
+    commit,
+    article_id=None,
+    product_id=None,
 ):
     try:
         actor = load_actor(
@@ -793,7 +856,11 @@ def create_route(
             data,
             allowed={"notas", "operaciones", "precedencias"},
         )
-        target = _route_target(session, product_id, lock=True)
+        target = (
+            _article_route_target(session, article_id, lock=True)
+            if article_id is not None
+            else _route_target(session, product_id, lock=True)
+        )
         open_revision = session.scalar(
             select(ScmRutaRevision.id).where(
                 ScmRutaRevision.articulo_objetivo_id == target.id,
@@ -803,7 +870,7 @@ def create_route(
         if open_revision is not None:
             raise ScmServiceError(
                 "ROUTE_OPEN_REVISION_EXISTS",
-                "El producto ya tiene una revision de ruta abierta.",
+                "El articulo ya tiene una revision de ruta abierta.",
                 status_code=409,
             )
         last_number = session.scalar(
@@ -821,7 +888,15 @@ def create_route(
         session.add(route)
         session.flush()
         _replace_content(session, route, data)
-        session.add(_event(route, actor, "ROUTE_CREATED"))
+        session.add(_event(
+            route,
+            actor,
+            (
+                "ROUTE_ARTICLE_DRAFT_CREATED"
+                if target.clase == CLASE_SUBENSAMBLE_WIP
+                else "ROUTE_CREATED"
+            ),
+        ))
         if commit:
             session.commit()
         return serialize_route(route)
@@ -837,6 +912,30 @@ def create_route(
             "La ruta entra en conflicto con otro registro.",
             status_code=409,
         ) from error
+
+
+def create_article_route(
+    session, *, actor_id, article_id, data, commit=True
+):
+    return _create_route(
+        session,
+        actor_id=actor_id,
+        article_id=article_id,
+        data=data,
+        commit=commit,
+    )
+
+
+def create_route(
+    session, *, actor_id, product_id, data, commit=True
+):
+    return _create_route(
+        session,
+        actor_id=actor_id,
+        product_id=product_id,
+        data=data,
+        commit=commit,
+    )
 
 
 def update_route(
@@ -936,7 +1035,7 @@ def approve_route(
         if not route.articulo_objetivo.activo:
             raise ScmServiceError(
                 "ARTICLE_INACTIVE",
-                "El producto objetivo debe permanecer activo.",
+                "El articulo objetivo debe permanecer activo.",
                 status_code=422,
             )
         _assert_route_approvable(session, route)
@@ -969,7 +1068,12 @@ def approve_route(
             _event(
                 route,
                 actor,
-                "ROUTE_APPROVED",
+                (
+                    "ROUTE_WIP_APPROVED"
+                    if route.articulo_objetivo.clase
+                    == CLASE_SUBENSAMBLE_WIP
+                    else "ROUTE_APPROVED"
+                ),
                 operation=operation,
             )
         )
@@ -1034,7 +1138,7 @@ def publish_route_directly(
         if not route.articulo_objetivo.activo:
             raise ScmServiceError(
                 "ARTICLE_INACTIVE",
-                "El producto objetivo debe permanecer activo.",
+                "El articulo objetivo debe permanecer activo.",
                 status_code=422,
             )
         _assert_route_approvable(session, route)
