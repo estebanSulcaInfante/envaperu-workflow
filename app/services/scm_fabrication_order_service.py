@@ -1,6 +1,8 @@
 """Services for canonical fabrication orders introduced by TS-010P."""
 
 import copy
+import hashlib
+import json
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from sqlalchemy import select
 
@@ -28,6 +30,7 @@ from app.models.scm_production_orders import (
 )
 from app.services.catalog_code_generator import generar_codigo_catalogo
 from app.services.scm_color_identity import serialize_color_identity
+from app.services.color_recipe_service import serialize_recipe
 from app.services.scm_operation_schedule_projection import (
     operation_schedule_projection,
     operation_schedule_projections,
@@ -173,6 +176,85 @@ def _default_recipe_for_run(session, run, outputs):
     return None
 
 
+def _recipe_product_scopes(outputs):
+    scopes = set()
+    for output in outputs:
+        article = getattr(output, "articulo", output)
+        if article is not None and article.producto is not None:
+            scopes.add(article.producto.producto_terminado_id)
+    return scopes
+
+
+def _validated_approved_recipe(
+    session,
+    recipe_id,
+    color_id,
+    *,
+    outputs=None,
+):
+    recipe = session.get(RecetaColorMaestra, recipe_id)
+    if recipe is None or recipe.color_produccion_id != color_id:
+        raise ScmServiceError(
+            "RECIPE_COLOR_MISMATCH",
+            "La receta no corresponde al color de la corrida.",
+            status_code=422,
+        )
+    if recipe.estado != "APROBADA":
+        raise ScmServiceError(
+            "APPROVED_RECIPE_REQUIRED",
+            "La OF solo puede usar una formulación de material aprobada.",
+            status_code=422,
+            details={"receta_revision_id": recipe.id, "estado": recipe.estado},
+        )
+    if (
+        outputs is not None
+        and recipe.producto_scope != "*"
+        and recipe.producto_scope not in _recipe_product_scopes(outputs)
+    ):
+        raise ScmServiceError(
+            "RECIPE_SCOPE_MISMATCH",
+            "La formulación no corresponde al producto de la corrida.",
+            status_code=422,
+            details={
+                "receta_revision_id": recipe.id,
+                "producto_scope": recipe.producto_scope,
+            },
+        )
+    return recipe
+
+
+def _recipe_content_hash(recipe):
+    content = {
+        "id": recipe.id,
+        "color_produccion_id": recipe.color_produccion_id,
+        "producto_scope": recipe.producto_scope,
+        "nombre_variante": recipe.nombre_variante,
+        "revision": recipe.revision,
+        "base_virgen_kg": format(Decimal(recipe.base_virgen_kg), "f"),
+        "lineas": [
+            {
+                "material_id": line.material_id,
+                "tipo_componente": line.tipo_componente,
+                "cantidad": format(Decimal(line.cantidad), "f"),
+                "unidad": line.unidad,
+                "base_kg": (
+                    format(Decimal(line.base_kg), "f")
+                    if line.base_kg is not None else None
+                ),
+                "orden": line.orden,
+            }
+            for line in recipe.lineas
+        ],
+    }
+    raw = json.dumps(
+        content,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _serialize_output(session, output):
     piece_color, derivation = _output_piece_color(session, output)
     piece_id = piece_color.pieza_id if piece_color is not None else None
@@ -184,6 +266,10 @@ def _serialize_output(session, output):
             "nombre": output.articulo.nombre,
             "clase": output.articulo.clase,
             "pieza_id": piece_id,
+            "producto_sku": (
+                output.articulo.producto.producto_terminado_id
+                if output.articulo.producto is not None else None
+            ),
             "derivacion_molde": derivation,
         } if output.articulo else None,
         "cantidad_por_ciclo_snapshot": (
@@ -236,10 +322,8 @@ def _serialize_run(session, run):
         "receta_hash": run.receta_hash,
         "receta": (
             {
-                "id": run.receta_revision.id,
+                **serialize_recipe(run.receta_revision),
                 "nombre": run.receta_revision.nombre_variante,
-                "revision": run.receta_revision.revision,
-                "estado": run.receta_revision.estado,
             }
             if run.receta_revision is not None else None
         ),
@@ -521,19 +605,9 @@ def create_exceptional_fabrication_order(
                     status_code=422,
                 )
             recipe_id = raw_run.get("receta_revision_id")
-            recipe = (
-                session.get(RecetaColorMaestra, recipe_id)
-                if recipe_id is not None
-                else None
-            )
-            if recipe_id is not None and (
-                recipe is None or recipe.color_produccion_id != color_id
-            ):
-                raise ScmServiceError(
-                    "RECIPE_COLOR_MISMATCH",
-                    "La receta no corresponde al color de la corrida.",
-                    status_code=422,
-                )
+            recipe = None
+            if recipe_id is not None:
+                recipe = _validated_approved_recipe(session, recipe_id, color_id)
             cycles = int(_positive_decimal(
                 raw_run.get("ciclos_objetivo"),
                 "ciclos_objetivo",
@@ -551,13 +625,13 @@ def create_exceptional_fabrication_order(
                 secuencia=sequence,
                 color_produccion_id=color_id,
                 receta_revision_id=recipe_id,
-                # RecetaColorMaestra aun no persiste content_hash; la FK y
-                # revision son el snapshot disponible en esta fase expand.
+                # The immutable content fingerprint is calculated at release.
                 receta_hash=None,
                 ciclos_objetivo=cycles,
             )
             fabrication.corridas.append(run)
             seen_articles = set()
+            output_articles = []
             for raw_output in raw_outputs:
                 if not isinstance(raw_output, dict):
                     raise ScmServiceError(
@@ -617,6 +691,14 @@ def create_exceptional_fabrication_order(
                     ),
                 )
                 seen_articles.add(article_id)
+                output_articles.append(article)
+            if recipe is not None:
+                _validated_approved_recipe(
+                    session,
+                    recipe.id,
+                    color_id,
+                    outputs=output_articles,
+                )
         session.add(order)
         session.flush()
         response = _serialize(session, order)
@@ -868,16 +950,12 @@ def update_fabrication_order(
                 if default_recipe is not None:
                     recipe_id = default_recipe.id
             if recipe_id is not None:
-                recipe = session.get(RecetaColorMaestra, recipe_id)
-                if (
-                    recipe is None
-                    or recipe.color_produccion_id != run.color_produccion_id
-                ):
-                    raise ScmServiceError(
-                        "RECIPE_COLOR_MISMATCH",
-                        "La receta no corresponde al color de la corrida.",
-                        status_code=422,
-                    )
+                _validated_approved_recipe(
+                    session,
+                    recipe_id,
+                    run.color_produccion_id,
+                    outputs=[item[0] for item in prepared],
+                )
             run.receta_revision_id = recipe_id
             run.ciclos_objetivo = cycles
             for output, per_cycle, unit_weight, required in prepared:
@@ -979,16 +1057,13 @@ def release_fabrication_order(
             )
         for run in fabrication.corridas:
             if run.receta_revision_id is not None:
-                recipe = session.get(
-                    RecetaColorMaestra,
+                recipe = _validated_approved_recipe(
+                    session,
                     run.receta_revision_id,
+                    run.color_produccion_id,
+                    outputs=run.salidas,
                 )
-                if recipe is None or recipe.estado != "APROBADA":
-                    raise ScmServiceError(
-                        "OF_NOT_RELEASABLE",
-                        "Todas las recetas informadas deben estar aprobadas.",
-                        status_code=422,
-                    )
+                run.receta_hash = _recipe_content_hash(recipe)
             run.estado = "LIBERADA"
         order.estado = "LIBERADA"
         order.released_by_id = actor.id

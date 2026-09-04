@@ -370,6 +370,7 @@ def test_create_and_release_exceptional_fabrication_order(
         ProductoTerminado,
     )
     from app.models.scm_articulos import ScmArticuloProducto
+    from app.models.receta_color import RecetaColorMaestra
     from app.models.trabajador import RolOperativo, Trabajador
 
     with app.app_context():
@@ -385,10 +386,17 @@ def test_create_and_release_exceptional_fabrication_order(
             linea_id=1,
             familia_id=1,
         )
+        other_product = ProductoTerminado(
+            cod_sku_pt="PT-OF-OTRO",
+            producto="Otro producto",
+            linea_id=1,
+            familia_id=1,
+        )
         db.session.add_all([
             base,
             family,
             product,
+            other_product,
             Molde(
                 codigo="ML-OF-API",
                 nombre="Molde API",
@@ -403,12 +411,109 @@ def test_create_and_release_exceptional_fabrication_order(
         )
         db.session.add(color)
         db.session.flush()
+        approved_recipe = RecetaColorMaestra(
+            color_produccion_id=color.id,
+            nombre_variante="Natural estándar",
+            revision=1,
+            estado="APROBADA",
+            es_default=True,
+            base_virgen_kg=25,
+        )
+        draft_recipe = RecetaColorMaestra(
+            color_produccion_id=color.id,
+            nombre_variante="Natural en revisión",
+            revision=1,
+            estado="BORRADOR",
+            es_default=False,
+            base_virgen_kg=25,
+        )
+        other_product_recipe = RecetaColorMaestra(
+            color_produccion_id=color.id,
+            producto_sku=other_product.cod_sku_pt,
+            producto_scope=other_product.cod_sku_pt,
+            nombre_variante="Natural para otro producto",
+            revision=1,
+            estado="APROBADA",
+            es_default=False,
+            base_virgen_kg=25,
+        )
+        db.session.add_all([
+            approved_recipe,
+            draft_recipe,
+            other_product_recipe,
+        ])
+        db.session.flush()
         article_id = ScmArticuloProducto.query.filter_by(
             producto_terminado_id=product.cod_sku_pt,
         ).one().articulo_id
         actor_id = actor.id
         color_id = color.id
+        approved_recipe_id = approved_recipe.id
+        draft_recipe_id = draft_recipe.id
+        other_product_recipe_id = other_product_recipe.id
         db.session.commit()
+
+    rejected_draft = client.post(
+        "/api/scm/v1/ordenes-fabricacion/excepcionales",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={
+            "motivo": "No debe aceptar receta sin aprobar",
+            "molde_id": "ML-OF-API",
+            "maquina_prevista_id": 1,
+            "snapshot_tiempo_ciclo_seg": 30,
+            "snapshot_horas_turno": 24,
+            "snapshot_peso_colada_gr": 10,
+            "corridas": [{
+                "color_produccion_id": color_id,
+                "receta_revision_id": draft_recipe_id,
+                "ciclos_objetivo": 50,
+                "salidas": [{
+                    "articulo_scm_id": article_id,
+                    "cantidad_por_ciclo": 2,
+                    "peso_unitario_g": 45,
+                }],
+            }],
+        },
+    )
+    assert rejected_draft.status_code == 422
+    assert (
+        rejected_draft.get_json()["error"]["code"]
+        == "APPROVED_RECIPE_REQUIRED"
+    )
+
+    rejected_scope = client.post(
+        "/api/scm/v1/ordenes-fabricacion/excepcionales",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={
+            "motivo": "No debe aceptar receta de otro producto",
+            "molde_id": "ML-OF-API",
+            "maquina_prevista_id": 1,
+            "snapshot_tiempo_ciclo_seg": 30,
+            "snapshot_horas_turno": 24,
+            "snapshot_peso_colada_gr": 10,
+            "corridas": [{
+                "color_produccion_id": color_id,
+                "receta_revision_id": other_product_recipe_id,
+                "ciclos_objetivo": 50,
+                "salidas": [{
+                    "articulo_scm_id": article_id,
+                    "cantidad_por_ciclo": 2,
+                    "peso_unitario_g": 45,
+                }],
+            }],
+        },
+    )
+    assert rejected_scope.status_code == 422
+    assert (
+        rejected_scope.get_json()["error"]["code"]
+        == "RECIPE_SCOPE_MISMATCH"
+    )
 
     headers = {
         "X-Actor-Id": str(actor_id),
@@ -426,6 +531,7 @@ def test_create_and_release_exceptional_fabrication_order(
             "snapshot_peso_colada_gr": 10,
             "corridas": [{
                 "color_produccion_id": color_id,
+                "receta_revision_id": approved_recipe_id,
                 "ciclos_objetivo": 50,
                 "salidas": [{
                     "articulo_scm_id": article_id,
@@ -463,6 +569,8 @@ def test_create_and_release_exceptional_fabrication_order(
     assert body["corridas"][0]["salidas"][0]["kg_estandar_objetivo"] == (
         "4.500000"
     )
+    assert body["corridas"][0]["receta"]["nombre"] == "Natural estándar"
+    assert body["corridas"][0]["receta"]["base_virgen_kg"] == 25.0
 
     released = client.post(
         f"/api/scm/v1/ordenes-fabricacion/{body['id']}/liberar",
@@ -475,6 +583,7 @@ def test_create_and_release_exceptional_fabrication_order(
     assert released.status_code == 200
     assert released.get_json()["estado"] == "LIBERADA"
     assert released.get_json()["corridas"][0]["estado"] == "LIBERADA"
+    assert len(released.get_json()["corridas"][0]["receta_hash"]) == 64
 
 
 def test_calcular_y_confirmar_plan_crea_of_y_oa_en_borrador(app, scm_config):
