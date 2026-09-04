@@ -628,7 +628,9 @@ class ScmTrabajoColor(db.Model):
     colada_final = db.Column(db.Integer, nullable=True)
 
     trabajo = db.relationship("ScmTrabajoOt", back_populates="trabajo_color")
-    corrida = db.relationship("ScmCorridaFabricacion")
+    corrida = db.relationship(
+        "ScmCorridaFabricacion", back_populates="trabajos_color"
+    )
 
 
 class ScmAsignacionPersonalTrabajoOt(db.Model):
@@ -1068,6 +1070,12 @@ class ScmManga(db.Model):
         lazy="selectin",
         order_by="ScmControlPesoManga.pesado_at",
     )
+    reaperturas = db.relationship(
+        "ScmReaperturaManga",
+        back_populates="manga",
+        lazy="selectin",
+        order_by="ScmReaperturaManga.reabierta_at",
+    )
 
 
 class ScmTramoMangaTrabajo(db.Model):
@@ -1169,9 +1177,24 @@ class ScmTramoMangaTrabajo(db.Model):
     )
     asignacion_plan = db.relationship("ScmAsignacionPlanMangaOt")
     created_by = db.relationship("Trabajador")
-    control_peso = db.relationship(
-        "ScmControlPesoManga", back_populates="tramo", uselist=False,
+    controles_peso = db.relationship(
+        "ScmControlPesoManga",
+        back_populates="tramo",
+        lazy="selectin",
+        order_by="ScmControlPesoManga.pesado_at",
     )
+
+    @property
+    def control_peso(self):
+        """Boundary control kept for the legacy shift-continuity contract."""
+        return next(
+            (
+                control
+                for control in reversed(self.controles_peso)
+                if control.tipo == "CORTE_TURNO"
+            ),
+            None,
+        )
 
     def to_dict(self):
         return {
@@ -1217,7 +1240,8 @@ class ScmControlPesoManga(db.Model):
     __tablename__ = "scm_control_peso_manga"
     __table_args__ = (
         db.CheckConstraint(
-            "tipo = 'CORTE_TURNO'", name="ck_scm_control_peso_manga_tipo"
+            "tipo IN ('CORTE_TURNO', 'AVANCE_KG')",
+            name="ck_scm_control_peso_manga_tipo",
         ),
         db.CheckConstraint(
             "peso_bruto_kg > 0 AND tara_kg >= 0 AND peso_neto_kg > 0",
@@ -1228,11 +1252,11 @@ class ScmControlPesoManga(db.Model):
             name="ck_scm_control_peso_manga_neto",
         ),
         db.CheckConstraint(
-            "conteo_acumulado_un > 0",
+            "(tipo = 'CORTE_TURNO' AND conteo_acumulado_un > 0) OR "
+            "(tipo = 'AVANCE_KG' AND conteo_acumulado_un IS NULL)",
             name="ck_scm_control_peso_manga_conteo",
         ),
         db.UniqueConstraint("public_id", name="uq_scm_control_peso_manga_public"),
-        db.UniqueConstraint("tramo_id", name="uq_scm_control_peso_manga_tramo"),
         db.UniqueConstraint("operation_id", name="uq_scm_control_peso_manga_operation"),
         db.UniqueConstraint(
             "etiqueta_id", name="uq_scm_control_peso_manga_etiqueta"
@@ -1241,6 +1265,13 @@ class ScmControlPesoManga(db.Model):
             "source_system", "capture_id", name="uq_scm_control_peso_manga_capture"
         ),
         db.Index("ix_scm_control_peso_manga_manga", "manga_id"),
+        db.Index(
+            "uq_scm_control_peso_manga_corte_tramo",
+            "tramo_id",
+            unique=True,
+            postgresql_where=db.text("tipo = 'CORTE_TURNO'"),
+            sqlite_where=db.text("tipo = 'CORTE_TURNO'"),
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -1278,7 +1309,7 @@ class ScmControlPesoManga(db.Model):
         db.Numeric(15, 3), nullable=False, default=0, server_default="0"
     )
     tara_fuente = db.Column(db.String(28), nullable=False)
-    conteo_acumulado_un = db.Column(db.Numeric(15, 3), nullable=False)
+    conteo_acumulado_un = db.Column(db.Numeric(15, 3), nullable=True)
     motivo = db.Column(db.String(500), nullable=False)
     pesado_at = db.Column(db.DateTime(timezone=True), nullable=False)
     timezone_snapshot = db.Column(
@@ -1305,7 +1336,7 @@ class ScmControlPesoManga(db.Model):
     )
 
     manga = db.relationship("ScmManga", back_populates="controles_peso")
-    tramo = db.relationship("ScmTramoMangaTrabajo", back_populates="control_peso")
+    tramo = db.relationship("ScmTramoMangaTrabajo", back_populates="controles_peso")
     pesado_por = db.relationship("Trabajador")
     etiqueta = db.relationship("ScmEtiquetaManga", foreign_keys=[etiqueta_id])
 
@@ -1334,9 +1365,6 @@ class ScmControlPesoManga(db.Model):
                 str(self.etiqueta.public_id) if self.etiqueta else None
             ),
         }
-
-
-
 
 
 class ScmSolicitudMangaExtra(db.Model):
@@ -1657,11 +1685,22 @@ class ScmPesajeManga(db.Model):
         ),
         db.CheckConstraint(
             "fuente_cantidad IN ('PLAN_CONFIRMADO_POR_PESAJE', "
-            "'RESPONSABLE_ARMADO', 'CORRECCION_AUTORIZADA')",
+            "'RESPONSABLE_ARMADO', 'CORRECCION_AUTORIZADA', "
+            "'CIERRE_PARCIAL_SUPERVISADO')",
             name="ck_scm_pesaje_manga_fuente_cantidad",
         ),
+        db.CheckConstraint(
+            "estado IN ('VIGENTE', 'REABIERTO', 'ANULADO')",
+            name="ck_scm_pesaje_manga_estado",
+        ),
         db.UniqueConstraint("public_id", name="uq_scm_pesaje_manga_public_id"),
-        db.UniqueConstraint("manga_id", name="uq_scm_pesaje_manga_manga"),
+        db.Index(
+            "uq_scm_pesaje_manga_vigente",
+            "manga_id",
+            unique=True,
+            postgresql_where=db.text("estado = 'VIGENTE'"),
+            sqlite_where=db.text("estado = 'VIGENTE'"),
+        ),
         db.UniqueConstraint(
             "operation_id", name="uq_scm_pesaje_manga_operation"
         ),
@@ -1704,6 +1743,12 @@ class ScmPesajeManga(db.Model):
         nullable=False,
         default="PLAN_CONFIRMADO_POR_PESAJE",
         server_default="PLAN_CONFIRMADO_POR_PESAJE",
+    )
+    estado = db.Column(
+        db.String(16),
+        nullable=False,
+        default="VIGENTE",
+        server_default="VIGENTE",
     )
     kg_produccion_ot = db.Column(db.Numeric(15, 3), nullable=False)
     pesada_at = db.Column(db.DateTime(timezone=True), nullable=False)
@@ -1749,6 +1794,11 @@ class ScmPesajeManga(db.Model):
         back_populates="pesaje",
         uselist=False,
     )
+    reapertura = db.relationship(
+        "ScmReaperturaManga",
+        back_populates="pesaje",
+        uselist=False,
+    )
 
     def to_dict(self):
         return {
@@ -1763,6 +1813,7 @@ class ScmPesajeManga(db.Model):
             "peso_fisico_neto_kg": _decimal_text(self.peso_fisico_neto_kg),
             "cantidad_confirmada": _decimal_text(self.cantidad_confirmada),
             "fuente_cantidad": self.fuente_cantidad,
+            "estado": self.estado,
             "kg_produccion_ot": _decimal_text(self.kg_produccion_ot),
             "pesada_at": _isoformat(self.pesada_at),
             "fecha_local_pesaje": self.fecha_local_pesaje.isoformat(),
@@ -1783,6 +1834,85 @@ class ScmPesajeManga(db.Model):
             "estado_manga": self.manga.estado if self.manga else None,
             "estado_inventario": "NO_INGRESADA",
             "ubicacion_id": None,
+        }
+
+
+class ScmReaperturaManga(db.Model):
+    """Compensación append-only que devuelve la misma manga a llenado."""
+
+    __tablename__ = "scm_reapertura_manga"
+    __table_args__ = (
+        db.UniqueConstraint("public_id", name="uq_scm_reapertura_manga_public_id"),
+        db.UniqueConstraint("pesaje_id", name="uq_scm_reapertura_manga_pesaje"),
+        db.UniqueConstraint("operation_id", name="uq_scm_reapertura_manga_operation"),
+        db.CheckConstraint(
+            "tipo_reapertura IN ('CIERRE_ACCIDENTAL', 'CONTINUAR_LLENADO')",
+            name="ck_scm_reapertura_manga_tipo",
+        ),
+        db.CheckConstraint(
+            "(tipo_reapertura = 'CIERRE_ACCIDENTAL' AND "
+            "peso_base_neto_kg IS NULL) OR "
+            "(tipo_reapertura = 'CONTINUAR_LLENADO' AND "
+            "peso_base_neto_kg IS NOT NULL AND "
+            "peso_base_neto_kg > 0)",
+            name="ck_scm_reapertura_manga_base",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(Uuid(as_uuid=True), nullable=False, default=uuid.uuid4)
+    manga_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_manga.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    pesaje_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_pesaje_manga.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    motivo = db.Column(db.String(500), nullable=False)
+    evidencia = db.Column(db.String(500), nullable=True)
+    tipo_reapertura = db.Column(
+        db.String(28),
+        nullable=False,
+        default="CIERRE_ACCIDENTAL",
+        server_default="CIERRE_ACCIDENTAL",
+    )
+    peso_base_neto_kg = db.Column(db.Numeric(15, 3), nullable=True)
+    reabierta_por_id = db.Column(
+        db.Integer,
+        db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    reabierta_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        server_default=db.func.now(),
+    )
+    operation_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    manga = db.relationship("ScmManga", back_populates="reaperturas")
+    pesaje = db.relationship("ScmPesajeManga", back_populates="reapertura")
+    reabierta_por = db.relationship("Trabajador")
+
+    def to_dict(self):
+        return {
+            "id": str(self.public_id),
+            "manga_id": str(self.manga.public_id),
+            "pesaje_id": str(self.pesaje.public_id),
+            "motivo": self.motivo,
+            "evidencia": self.evidencia,
+            "tipo_reapertura": self.tipo_reapertura,
+            "peso_base_neto_kg": _decimal_text(self.peso_base_neto_kg),
+            "reabierta_por_id": self.reabierta_por_id,
+            "reabierta_at": _isoformat(self.reabierta_at),
+            "operation_id": str(self.operation_id),
         }
 
 

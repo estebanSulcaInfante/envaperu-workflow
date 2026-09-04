@@ -1,7 +1,7 @@
 """TS-010D core: connected weighing of a simple SCM manga."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -22,6 +22,7 @@ from app.models.scm_ot import (
     ScmControlPesoManga,
     ScmManga,
     ScmPesajeManga,
+    ScmReaperturaManga,
     ScmTrabajoImpresionManga,
     ScmTramoMangaTrabajo,
     utc_now,
@@ -42,8 +43,10 @@ from app.services.scm_alert_service import (
     current_alert_rule,
     upsert_operational_alert,
 )
+from app.services.scm_color_identity import serialize_color_identity
 from app.services.scm_service_support import (
     ScmServiceError,
+    expected_version,
     load_actor,
     reject_unknown_fields,
     required_text,
@@ -61,6 +64,76 @@ def _elapsed_hours(later, earlier):
     if earlier.tzinfo is None:
         earlier = earlier.replace(tzinfo=ZoneInfo("UTC"))
     return Decimal(str((later - earlier).total_seconds() / 3600))
+
+
+def _active_manga_weighing(manga_id):
+    """Return the only final that still closes the physical manga."""
+    return ScmPesajeManga.query.filter_by(
+        manga_id=manga_id,
+        estado="VIGENTE",
+    ).one_or_none()
+
+
+def _latest_weight_reference(manga):
+    """Return the latest comparable cumulative NET retained for the manga."""
+    candidates = []
+    for control in manga.controles_peso:
+        candidates.append((
+            control.created_at or control.pesado_at,
+            control.id,
+            SimpleNamespace(
+                fuente="CONTROL_PESO",
+                peso_neto_kg=Decimal(control.peso_neto_kg).quantize(KG_QUANTUM),
+                tara_kg=Decimal(control.tara_kg).quantize(KG_QUANTUM),
+                tara_fuente=control.tara_fuente,
+                pesado_at=control.pesado_at,
+            ),
+        ))
+    for reopening in manga.reaperturas:
+        if reopening.peso_base_neto_kg is None:
+            continue
+        candidates.append((
+            reopening.reabierta_at,
+            reopening.id,
+            SimpleNamespace(
+                fuente="CIERRE_REABIERTO",
+                peso_neto_kg=Decimal(reopening.peso_base_neto_kg).quantize(
+                    KG_QUANTUM
+                ),
+                tara_kg=Decimal(reopening.pesaje.tara_kg).quantize(KG_QUANTUM),
+                tara_fuente=reopening.pesaje.tara_fuente,
+                pesado_at=reopening.reabierta_at,
+            ),
+        ))
+    if not candidates:
+        return None
+
+    def timeline_key(candidate):
+        timestamp = candidate[0]
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+        return timestamp, candidate[1]
+
+    return max(candidates, key=timeline_key)[2]
+
+
+def _serialize_weight_reference(reference):
+    if reference is None:
+        return None
+    timestamp = reference.pesado_at
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+    return {
+        "fuente": reference.fuente,
+        "peso_neto_kg": format(reference.peso_neto_kg, "f"),
+        "tara_kg": format(reference.tara_kg, "f"),
+        "tara_fuente": reference.tara_fuente,
+        "pesado_at": timestamp.isoformat(),
+    }
 
 
 def _exceeds_alert_threshold(session, code, value):
@@ -117,67 +190,22 @@ def _units(value, field):
 def _assert_final_weight_cumulative(session, manga, net):
     if not manga.tramos_trabajo:
         return
-    previous_control = session.scalar(
-        select(ScmControlPesoManga)
-        .where(ScmControlPesoManga.manga_id == manga.id)
-        .order_by(
-            ScmControlPesoManga.pesado_at.desc(),
-            ScmControlPesoManga.id.desc(),
-        )
-        .limit(1)
-    )
+    previous_reference = _latest_weight_reference(manga)
     if (
-        previous_control is not None
-        and net <= Decimal(previous_control.peso_neto_kg)
+        previous_reference is not None
+        and net <= Decimal(previous_reference.peso_neto_kg)
     ):
         raise ScmServiceError(
             "FINAL_WEIGHT_NOT_CUMULATIVE",
-            "El pesaje final debe contener el peso acumulado total de la misma manga y superar el último corte.",
+            "El pesaje final debe contener el peso acumulado total de la misma manga y superar la última referencia aceptada.",
             status_code=409,
             details={
                 "ultimo_control_neto_kg": format(
-                    Decimal(previous_control.peso_neto_kg), "f"
+                    Decimal(previous_reference.peso_neto_kg), "f"
                 ),
                 "peso_final_neto_kg": format(net, "f"),
             },
         )
-
-
-def _final_weighing_operational_context(manga, weighing):
-    segments = list(getattr(manga, "tramos_trabajo", ()) or ())
-    final_segment = (
-        max(segments, key=lambda item: item.secuencia) if segments else None
-    )
-    final_work = final_segment.trabajo if final_segment else manga.trabajo
-    final_ot = final_work.orden_trabajo if final_work else manga.ot
-    timezone_name = (
-        final_ot.timezone_snapshot
-        or weighing.timezone_snapshot
-        or "America/Lima"
-    )
-    return final_ot, final_segment, timezone_name
-
-
-def _validate_corrected_operational_date(manga, weighing, weighed_at):
-    """Validate a correction against the OT that actually closed the manga."""
-    operational_ot, final_segment, timezone_name = (
-        _final_weighing_operational_context(manga, weighing)
-    )
-    local_date = weighed_at.astimezone(ZoneInfo(timezone_name)).date()
-    drift = (local_date - operational_ot.fecha).days
-    if drift < 0:
-        raise ScmServiceError(
-            "OPERATIONAL_DATE_IN_FUTURE",
-            "La correccion no puede quedar antes de la OT del tramo final.",
-            status_code=422,
-            details={
-                "ot_id": str(operational_ot.public_id),
-                "ot_codigo": operational_ot.codigo_ot,
-                "fecha_operativa": operational_ot.fecha.isoformat(),
-                "tramo_id": str(final_segment.id) if final_segment else None,
-            },
-        )
-    return local_date, drift, operational_ot, final_segment
 
 
 def _aware_datetime(value, field="pesada_at"):
@@ -246,10 +274,129 @@ def _piece_color_label(manga):
     return manga.articulo_nombre_snapshot
 
 
+def _article_image_path(article):
+    """Return a catalog route only when the canonical article has an image."""
+    if article.clase == "PIEZA_COLOR" and article.pieza_color is not None:
+        piece_color = article.pieza_color.pieza_color
+        if piece_color is not None and (
+            piece_color.imagen_storage_key or piece_color.imagen_data
+        ):
+            return f"/api/piezas-color/{piece_color.sku}/imagen"
+    if article.clase == "PRODUCTO_TERMINADO" and article.producto is not None:
+        product = article.producto.producto_terminado
+        if product is not None and (
+            product.imagen_storage_key or product.imagen_data
+        ):
+            return f"/api/productos/{product.cod_sku_pt}/imagen"
+    return None
+
+
+def _weighing_color_identity(manga, current_work):
+    """Project the catalog color without inventing a visual reference."""
+    color_work = (
+        current_work.trabajo_color
+        if current_work is not None else None
+    )
+    catalog_color = (
+        color_work.corrida.color_produccion
+        if color_work is not None and color_work.corrida is not None
+        else None
+    )
+    identity = serialize_color_identity(
+        catalog_color,
+        color_id=(color_work.color_id_snapshot if color_work else None),
+        name_snapshot=(
+            color_work.color_nombre_snapshot
+            if color_work is not None else manga.color_snapshot
+        ),
+    )
+    if identity is None:
+        return None
+
+    base_name = (identity.get("base") or {}).get("nombre")
+    family_name = (identity.get("familia") or {}).get("nombre")
+    if (
+        base_name
+        and family_name
+        and base_name.strip().casefold() == family_name.strip().casefold()
+    ):
+        # Transparente/Transparente is one human identity, not two labels.
+        identity = {**identity, "nombre": base_name.strip()}
+    return identity
+
+
+def _weighing_block_reason(*, manga_state, label_type, label_state,
+                           has_weighing, work_state, segment_state,
+                           is_assembly, action):
+    """Explain a denied capability; never grants permission or changes state."""
+    responsible = "CENTRAL"
+    if manga_state == "ANULADA":
+        code, message, recovery = (
+            "MANGA_ANULADA", "Manga anulada",
+            "No utilice esta manga. Solicite a Central revisar su identificación.",
+        )
+    elif has_weighing or manga_state in {
+        "PESADA", "ETIQUETADA", "PENDIENTE_RECEPCION_ALMACEN", "RECIBIDA",
+    }:
+        code, message, recovery = (
+            "MANGA_CERRADA", "Manga cerrada",
+            "Escanee otra manga. Si el cierre fue incorrecto, solicite revisión en Central.",
+        )
+    elif label_type != "PREPESAJE":
+        code, message, recovery = (
+            "PREETIQUETA_REQUERIDA", "Este QR no es una preetiqueta",
+            "Escanee el QR de PREPESAJE de la manga.",
+        )
+        responsible = "ESTACION"
+    elif label_state != "IMPRESA":
+        code, message, recovery = (
+            "ETIQUETA_NO_IMPRESA", "Preetiqueta sin impresión confirmada",
+            "Revise la impresión de la preetiqueta y vuelva a escanear. Si persiste, avise a Central.",
+        )
+        responsible = "ESTACION"
+    elif manga_state == "CONTINUIDAD_PENDIENTE":
+        code, message, recovery = (
+            "CONTINUIDAD_PENDIENTE", "Continuidad pendiente de vinculación",
+            "Solicite a Central revisar el vínculo al Trabajo que continuará la manga. Conserve el mismo QR.",
+        )
+    elif segment_state == "PROGRAMADO":
+        code, message, recovery = (
+            "CONTINUIDAD_NO_INICIADA", "Continuidad aún no iniciada",
+            "Solicite a Central iniciar el Trabajo vinculado y vuelva a escanear el mismo QR.",
+        )
+    elif work_state in {"PLANIFICADO", "PROGRAMADO"}:
+        code, message, recovery = (
+            "TRABAJO_NO_INICIADO", "Trabajo de la OT sin iniciar",
+            "Solicite a Central iniciar el Trabajo de la OT y vuelva a escanear.",
+        )
+    elif work_state and work_state not in {"EN_EJECUCION", "PAUSADO"}:
+        code, message, recovery = (
+            "TRABAJO_NO_HABILITADO", "Trabajo de la OT no habilitado para pesar",
+            "Solicite a Central revisar el estado del Trabajo antes de volver a escanear.",
+        )
+    elif is_assembly and action == "registrar_avance_kg":
+        code, message, recovery = (
+            "CONTROL_ARMADO_NO_DISPONIBLE", "Control de avance no disponible para Armado",
+            "Use el pesaje final cuando la manga esté cerrada por Armado.",
+        )
+    elif is_assembly and manga_state != "CERRADA_ARMADO_PENDIENTE_PESAJE":
+        code, message, recovery = (
+            "ARMADO_PENDIENTE_CIERRE", "Manga de Armado pendiente de cierre",
+            "Solicite revisar el cierre en Armado desde Central y vuelva a escanear.",
+        )
+    else:
+        code, message, recovery = (
+            "MANGA_NO_HABILITADA", "Manga no habilitada para pesar",
+            "Solicite a Central revisar el estado de la manga y su Trabajo. No genere otra manga para resolver el bloqueo.",
+        )
+    return {"codigo": code, "mensaje": message, "recuperacion": recovery,
+            "responsable": responsible}
+
+
 def _resolve_payload(label):
     manga = label.manga
     article = manga.lote_articulo.articulo
-    weighing = ScmPesajeManga.query.filter_by(manga_id=manga.id).one_or_none()
+    weighing = _active_manga_weighing(manga.id)
     is_assembly = manga.ot.tipo_ot == "ENSAMBLE"
     expected_state = (
         "CERRADA_ARMADO_PENDIENTE_PESAJE"
@@ -304,11 +451,39 @@ def _resolve_payload(label):
     latest_control = (
         manga.controles_peso[-1] if manga.controles_peso else None
     )
+    latest_weight_reference = _latest_weight_reference(manga)
+    latest_shift_control = next(
+        (
+            control
+            for control in reversed(manga.controles_peso)
+            if control.tipo == "CORTE_TURNO"
+        ),
+        None,
+    )
     accumulated = (
-        Decimal(latest_control.conteo_acumulado_un)
-        if latest_control is not None else Decimal("0")
+        Decimal(latest_shift_control.conteo_acumulado_un)
+        if latest_shift_control is not None else Decimal("0")
     )
     assigned = Decimal(manga.cantidad_asignada_un)
+    color_identity = _weighing_color_identity(manga, current_work)
+    color_name = (
+        color_identity["nombre"]
+        if color_identity is not None else manga.color_snapshot
+    )
+    fabricated_theoretical_kg = _fabricated_theoretical_kg(manga)
+    blockers = {
+        action: None if allowed else _weighing_block_reason(
+            manga_state=manga.estado, label_type=label.tipo,
+            label_state=label.estado, has_weighing=weighing is not None,
+            work_state=current_work.estado if current_work else None,
+            segment_state=current_segment.estado if current_segment else None,
+            is_assembly=is_assembly, action=action,
+        )
+        for action, allowed in (
+            ("completar_final", can_finalize),
+            ("registrar_avance_kg", can_cut_shift),
+        )
+    }
     return {
         "label": _serialize_label(label),
         "manga": {
@@ -338,11 +513,16 @@ def _resolve_payload(label):
             "peso_bruto_max_kg": format(
                 Decimal(manga.peso_bruto_max_kg_snapshot), "f"
             ),
+            "peso_fabricado_teorico_kg": (
+                format(fabricated_theoretical_kg, "f")
+                if fabricated_theoretical_kg is not None else None
+            ),
             "fecha_operativa": current_ot.fecha.isoformat(),
             "maquinista": worker.nombre_completo if worker else None,
             "ot": {
                 "id": str(current_ot.public_id),
                 "codigo": current_ot.codigo_ot,
+                "estado": current_ot.estado,
                 "maquina": (
                     current_ot.maquina_nombre_snapshot
                     or (current_ot.maquina.nombre if current_ot.maquina else None)
@@ -362,7 +542,11 @@ def _resolve_payload(label):
                     "estado": current_work.estado,
                     "orden_fabricacion": current_work.orden_operacion.codigo,
                     "corrida": current_work.trabajo_color.corrida.codigo,
-                    "color": current_work.trabajo_color.color_nombre_snapshot,
+                    "color": color_name,
+                    "color_hex": (
+                        color_identity["hex"] if color_identity else None
+                    ),
+                    "color_identidad": color_identity,
                 }
                 if current_work is not None else None
             ),
@@ -383,8 +567,11 @@ def _resolve_payload(label):
             ),
             "articulo_clase": article.clase,
             "articulo_codigo": article.codigo,
+            "imagen_path": _article_image_path(article),
             "pieza_color": _piece_color_label(manga),
-            "color": manga.color_snapshot,
+            "color": color_name,
+            "color_hex": color_identity["hex"] if color_identity else None,
+            "color_identidad": color_identity,
             **_order_ot_identity(manga),
         },
         "weighing": weighing.to_dict() if weighing else None,
@@ -402,6 +589,9 @@ def _resolve_payload(label):
             "ultimo_control": (
                 latest_control.to_dict() if latest_control else None
             ),
+            "ultima_referencia_peso": _serialize_weight_reference(
+                latest_weight_reference
+            ),
             "conteo_acumulado_un": format(accumulated.normalize(), "f"),
             "cantidad_pendiente_un": format(
                 max(assigned - accumulated, Decimal("0")).normalize(), "f"
@@ -410,10 +600,13 @@ def _resolve_payload(label):
         },
         "acciones": {
             "registrar_corte_turno": can_cut_shift,
+            "registrar_avance_kg": can_cut_shift,
             "completar_final": can_finalize,
         },
         "can_weigh": can_finalize,
         "can_register_shift_cut": can_cut_shift,
+        "can_register_weight_control": can_cut_shift,
+        "bloqueos_pesaje": blockers,
     }
 
 
@@ -448,7 +641,7 @@ def register_manga_weighing_control(
     actor_id,
     data,
 ):
-    """Register an accumulated shift boundary without finalizing the manga."""
+    """Register a shift boundary or a repeatable kg-only progress control."""
     actor = load_actor(
         session, actor_id, capability="MANGA_CONTROL_PESO_REGISTRAR"
     )
@@ -457,6 +650,8 @@ def register_manga_weighing_control(
         session, operation_id, endpoint, actor, data
     )
     if replay is not None:
+        if str(data.get("control_type") or "").strip().upper() == "AVANCE_KG":
+            return {**replay, "idempotent_replay": True}
         return replay
     reject_unknown_fields(
         data,
@@ -469,15 +664,26 @@ def register_manga_weighing_control(
             "pesada_at",
             "pesado_por_id",
             "reading_stable",
+            "control_type",
             "conteo_acumulado_un",
             "motivo",
         },
     )
     try:
+        control_type = str(
+            data.get("control_type") or "CORTE_TURNO"
+        ).strip().upper()
+        if control_type not in {"CORTE_TURNO", "AVANCE_KG"}:
+            raise ScmServiceError(
+                "INVALID_CONTROL_TYPE",
+                "control_type debe ser CORTE_TURNO o AVANCE_KG.",
+                status_code=422,
+            )
+        is_weight_progress = control_type == "AVANCE_KG"
         if data.get("reading_stable") is not True:
             raise ScmServiceError(
                 "SCALE_READING_UNSTABLE",
-                "El corte requiere una lectura estable de la balanza.",
+                "El control requiere una lectura estable de la balanza.",
                 status_code=422,
             )
         try:
@@ -510,10 +716,10 @@ def register_manga_weighing_control(
         ):
             raise ScmServiceError(
                 "MANGA_NOT_READY",
-                "El corte requiere una preetiqueta de fabricacion impresa y vigente.",
+                "El control requiere una preetiqueta de fabricacion impresa y vigente.",
                 status_code=409,
             )
-        if ScmPesajeManga.query.filter_by(manga_id=manga.id).one_or_none():
+        if _active_manga_weighing(manga.id):
             raise ScmServiceError(
                 "MANGA_ALREADY_WEIGHED",
                 "La manga ya posee un pesaje final.",
@@ -531,7 +737,7 @@ def register_manga_weighing_control(
             if manga.estado != "PREETIQUETADA":
                 raise ScmServiceError(
                     "MANGA_NOT_READY",
-                    "La manga no esta abierta para registrar un corte.",
+                    "La manga no esta abierta para registrar un control.",
                     status_code=409,
                 )
             work = manga.trabajo
@@ -563,7 +769,7 @@ def register_manga_weighing_control(
             if manga.estado != "EN_LLENADO" or segment.estado != "ACTIVO":
                 raise ScmServiceError(
                     "MANGA_CONTINUITY_NOT_ACTIVE",
-                    "La continuidad debe estar vinculada e iniciada antes de otro corte.",
+                    "La continuidad debe estar vinculada e iniciada antes de otro control.",
                     status_code=409,
                 )
         if work.estado not in {"EN_EJECUCION", "PAUSADO"}:
@@ -573,25 +779,31 @@ def register_manga_weighing_control(
                 status_code=409,
             )
 
-        count = _units(data.get("conteo_acumulado_un"), "conteo_acumulado_un")
-        if count != count.to_integral_value():
-            raise ScmServiceError(
-                "INVALID_QUANTITY",
-                "El conteo acumulado de piezas debe ser entero.",
-                status_code=422,
+        count = None
+        if not is_weight_progress:
+            count = _units(
+                data.get("conteo_acumulado_un"), "conteo_acumulado_un"
             )
-        assigned = Decimal(manga.cantidad_asignada_un).quantize(UNIT_QUANTUM)
-        start = Decimal(segment.cantidad_inicio_un).quantize(UNIT_QUANTUM)
-        if count <= start or count >= assigned:
-            raise ScmServiceError(
-                "INVALID_SHIFT_BOUNDARY_COUNT",
-                "El corte debe avanzar sobre el tramo y ser menor al total asignado; el total se cierra con F2.",
-                status_code=422,
-                details={
-                    "cantidad_inicio_un": format(start, "f"),
-                    "cantidad_asignada_un": format(assigned, "f"),
-                },
+            if count != count.to_integral_value():
+                raise ScmServiceError(
+                    "INVALID_QUANTITY",
+                    "El conteo acumulado de piezas debe ser entero.",
+                    status_code=422,
+                )
+            assigned = Decimal(manga.cantidad_asignada_un).quantize(
+                UNIT_QUANTUM
             )
+            start = Decimal(segment.cantidad_inicio_un).quantize(UNIT_QUANTUM)
+            if count <= start or count >= assigned:
+                raise ScmServiceError(
+                    "INVALID_SHIFT_BOUNDARY_COUNT",
+                    "El corte debe avanzar sobre el tramo y ser menor al total asignado; el total se cierra con F2.",
+                    status_code=422,
+                    details={
+                        "cantidad_inicio_un": format(start, "f"),
+                        "cantidad_asignada_un": format(assigned, "f"),
+                    },
+                )
         gross = _kg(data.get("peso_bruto_kg"), "peso_bruto_kg")
         tare = _kg(data.get("tara_kg"), "tara_kg", allow_zero=True)
         net = (gross - tare).quantize(KG_QUANTUM)
@@ -621,12 +833,12 @@ def register_manga_weighing_control(
             )
         if tare_source == "MEDIDA_AUTORIZADA":
             load_actor(session, actor_id, capability="PESAJE_TARA_OVERRIDE")
-        previous_control = manga.controles_peso[-1] if manga.controles_peso else None
+        previous_reference = _latest_weight_reference(manga)
         previous_net = Decimal("0.000")
-        if previous_control is not None:
+        if previous_reference is not None:
             if (
-                tare != Decimal(previous_control.tara_kg)
-                or tare_source != previous_control.tara_fuente
+                tare != Decimal(previous_reference.tara_kg)
+                or tare_source != previous_reference.tara_fuente
             ):
                 raise ScmServiceError(
                     "CONTROL_TARE_NOT_COMPARABLE",
@@ -634,14 +846,14 @@ def register_manga_weighing_control(
                     status_code=409,
                     details={
                         "tara_anterior_kg": format(
-                            Decimal(previous_control.tara_kg), "f"
+                            Decimal(previous_reference.tara_kg), "f"
                         ),
                         "tara_actual_kg": format(tare, "f"),
-                        "tara_fuente_anterior": previous_control.tara_fuente,
+                        "tara_fuente_anterior": previous_reference.tara_fuente,
                         "tara_fuente_actual": tare_source,
                     },
                 )
-            previous_net = Decimal(previous_control.peso_neto_kg).quantize(
+            previous_net = Decimal(previous_reference.peso_neto_kg).quantize(
                 KG_QUANTUM
             )
             if net <= previous_net:
@@ -661,7 +873,11 @@ def register_manga_weighing_control(
                 "No se puede registrar el corte antes de la fecha de la OT vigente.",
                 status_code=422,
             )
-        reason = required_text(data.get("motivo"), field="motivo", max_length=500)
+        reason = (
+            "MANGA_INCOMPLETA"
+            if is_weight_progress
+            else required_text(data.get("motivo"), field="motivo", max_length=500)
+        )
         control = ScmControlPesoManga(
             manga=manga,
             tramo=segment,
@@ -669,7 +885,7 @@ def register_manga_weighing_control(
             source_system="SCM_STATION",
             station_id=station_id,
             capture_id=capture_id,
-            tipo="CORTE_TURNO",
+            tipo=control_type,
             peso_bruto_kg=gross,
             tara_kg=tare,
             peso_neto_kg=net,
@@ -683,13 +899,16 @@ def register_manga_weighing_control(
             pesado_por_id=actor.id,
         )
         session.add(control)
-        segment.estado = "CERRADO"
-        segment.cantidad_fin_un = count
-        segment.cerrada_at = weighed_at
-        segment.motivo_cierre = reason
-        manga.estado = "CONTINUIDAD_PENDIENTE"
+        if is_weight_progress:
+            manga.estado = "EN_LLENADO"
+        else:
+            segment.estado = "CERRADO"
+            segment.cantidad_fin_un = count
+            segment.cerrada_at = weighed_at
+            segment.motivo_cierre = reason
+            manga.estado = "CONTINUIDAD_PENDIENTE"
         manga.version += 1
-        if work.estado == "EN_EJECUCION":
+        if not is_weight_progress and work.estado == "EN_EJECUCION":
             work.estado = "PAUSADO"
             work.pausada_at = weighed_at
             work.motivo_pausa = reason
@@ -743,11 +962,19 @@ def register_manga_weighing_control(
             "print_template_version": payload["template"]["version"],
             "control_label": _serialize_label(control_label),
             "qr_preservado": True,
-            "continuidad_estado": "PENDIENTE_RELEVO",
+            "continuidad_estado": (
+                "ACTIVA" if is_weight_progress else "PENDIENTE_RELEVO"
+            ),
             "idempotent_replay": False,
         }
         session.add(_event(
-            "MANGA", manga.id, "MANGA_SHIFT_CONTROL_RECORDED",
+            "MANGA",
+            manga.id,
+            (
+                "MANGA_WEIGHT_PROGRESS_RECORDED"
+                if is_weight_progress
+                else "MANGA_SHIFT_CONTROL_RECORDED"
+            ),
             actor, operation, response,
         ))
         _complete_operation(operation, response)
@@ -775,10 +1002,14 @@ def _control_label_payload(manga, control, label_id, version):
                 work.trabajo_color.corrida_fabricacion_id
             ),
         }
+    is_weight_progress = control.tipo == "AVANCE_KG"
     return {
         "document_type": "CONTROL_PESO",
         "template": {
-            "version": "CONTROL_PESO_TSPL_1",
+            "version": (
+                "CONTROL_PESO_TSPL_2"
+                if is_weight_progress else "CONTROL_PESO_TSPL_1"
+            ),
             "dpi": 203,
             "sheet_width_mm": 109,
             "sheet_height_mm": 50,
@@ -794,20 +1025,30 @@ def _control_label_payload(manga, control, label_id, version):
         "pieza_color": _piece_color_label(manga),
         "color": manga.color_snapshot,
         "tipo_manga": manga.tipo,
-        "cantidad_acumulada_un": format(
-            Decimal(control.conteo_acumulado_un).normalize(), "f"
+        "cantidad_acumulada_un": (
+            None
+            if control.conteo_acumulado_un is None
+            else format(
+                Decimal(control.conteo_acumulado_un).normalize(), "f"
+            )
         ),
-        "peso_neto_real_kg": format(Decimal(control.peso_neto_kg), "f"),
+        "peso_neto_real_kg": format(
+            Decimal(control.peso_neto_kg), "f"
+        ),
         "aporte_desde_control_anterior_kg": format(
             Decimal(control.aporte_desde_control_anterior_kg), "f"
         ),
-        "peso_estandar_segun_unidades_kg": format(
-            (
-                Decimal(control.conteo_acumulado_un)
-                * Decimal(manga.peso_unitario_snapshot_g)
-                / Decimal("1000")
-            ).quantize(KG_QUANTUM),
-            "f",
+        "peso_estandar_segun_unidades_kg": (
+            None
+            if control.conteo_acumulado_un is None
+            else format(
+                (
+                    Decimal(control.conteo_acumulado_un)
+                    * Decimal(manga.peso_unitario_snapshot_g)
+                    / Decimal("1000")
+                ).quantize(KG_QUANTUM),
+                "f",
+            )
         ),
         "manga_id": str(manga.public_id),
         "artifact_id": str(label_id),
@@ -817,8 +1058,58 @@ def _control_label_payload(manga, control, label_id, version):
     }
 
 
+def _fabricated_theoretical_kg(manga, weighing=None):
+    """Return only mass attributable to pieces fabricated in the current flow."""
+    if manga.ot.tipo_ot != "ENSAMBLE":
+        if weighing is not None:
+            return Decimal(weighing.kg_produccion_ot).quantize(KG_QUANTUM)
+        return (
+            Decimal(manga.cantidad_asignada_un)
+            * Decimal(manga.peso_unitario_snapshot_g)
+            / Decimal("1000")
+        ).quantize(KG_QUANTUM)
+    confirmation = manga.confirmacion_armado
+    if confirmation is None:
+        return None
+    total = Decimal("0")
+    for consumption in confirmation.consumos:
+        if consumption.procedencia != "PRODUCIDO_OT_ACTUAL":
+            continue
+        reservation = consumption.reserva_wip_salida
+        source_output = (
+            reservation.saldo.orden_operacion_salida
+            if reservation is not None and reservation.saldo is not None
+            else None
+        )
+        unit_weight_g = (
+            source_output.peso_unitario_snapshot_g
+            if source_output is not None else None
+        )
+        if unit_weight_g is None:
+            return None
+        total += (
+            Decimal(consumption.cantidad_incorporada)
+            * Decimal(unit_weight_g)
+            / Decimal("1000")
+        )
+    return total.quantize(KG_QUANTUM) if total > 0 else None
+
+
 def _post_label_payload(manga, weighing, label_id, version):
-    personal = manga.asignacion_personal_trabajo
+    latest_segment = _latest_manga_segment(manga)
+    closing_work = (
+        latest_segment.trabajo
+        if latest_segment is not None else manga.trabajo
+    )
+    closing_ot = (
+        closing_work.orden_trabajo
+        if closing_work is not None else manga.ot
+    )
+    personal = (
+        latest_segment.asignacion_personal_trabajo
+        if latest_segment is not None
+        else manga.asignacion_personal_trabajo
+    )
     worker = personal.trabajador if personal is not None else manga.maquinista_previsto
     confirmed_quantity = Decimal(
         getattr(
@@ -827,10 +1118,12 @@ def _post_label_payload(manga, weighing, label_id, version):
             manga.cantidad_confirmada_un or manga.cantidad_asignada_un,
         )
     )
-    return {
+    fabricated_theoretical_kg = _fabricated_theoretical_kg(manga, weighing)
+    previous_reference = _latest_weight_reference(manga)
+    payload = {
         "document_type": "POSTPESAJE",
         "template": {
-            "version": "POSTPESAJE_TSPL_4",
+            "version": "POSTPESAJE_TSPL_5",
             "dpi": 203,
             "sheet_width_mm": 109,
             "sheet_height_mm": 50,
@@ -840,7 +1133,8 @@ def _post_label_payload(manga, weighing, label_id, version):
             "qr_required": False,
         },
         "generated_at": utc_now().isoformat(),
-        "fecha_ot": manga.ot.fecha.isoformat(),
+        "fecha_ot": closing_ot.fecha.isoformat(),
+        "ot_cierre": closing_ot.codigo_ot,
         "maquinista": worker.nombre_completo if worker else None,
         "trabajo_color": (
             {
@@ -856,7 +1150,14 @@ def _post_label_payload(manga, weighing, label_id, version):
         "cantidad_planificada_un": format(
             Decimal(manga.cantidad_planificada_un).normalize(), "f"
         ),
-        "cantidad_confirmada_un": format(confirmed_quantity.normalize(), "f"),
+        "cantidad_confirmada_un": format(
+            confirmed_quantity.normalize(), "f"
+        ),
+        "fuente_cantidad": weighing.fuente_cantidad,
+        "cierre_parcial": (
+            manga.tipo == "NORMAL"
+            and confirmed_quantity < Decimal(manga.cantidad_asignada_un)
+        ),
         "kg_fisico": format(weighing.peso_fisico_neto_kg, "f"),
         "kg_produccion_ot": format(weighing.kg_produccion_ot, "f"),
         "peso_neto_real_kg": format(weighing.peso_fisico_neto_kg, "f"),
@@ -866,8 +1167,9 @@ def _post_label_payload(manga, weighing, label_id, version):
         "aporte_desde_control_anterior_kg": format(
             (
                 Decimal(weighing.peso_fisico_neto_kg)
-                - Decimal(manga.controles_peso[-1].peso_neto_kg)
-                if manga.controles_peso else Decimal(weighing.peso_fisico_neto_kg)
+                - Decimal(previous_reference.peso_neto_kg)
+                if previous_reference is not None else
+                Decimal(weighing.peso_fisico_neto_kg)
             ).quantize(KG_QUANTUM),
             "f",
         ),
@@ -877,6 +1179,11 @@ def _post_label_payload(manga, weighing, label_id, version):
         "qr_required": False,
         **_order_ot_identity(manga),
     }
+    if fabricated_theoretical_kg is not None:
+        payload["peso_fabricado_teorico_kg"] = format(
+            fabricated_theoretical_kg, "f"
+        )
+    return payload
 
 
 def confirm_manga_weighing(
@@ -887,7 +1194,7 @@ def confirm_manga_weighing(
     actor_id,
     data,
 ):
-    actor = load_actor(session, actor_id, capability="MANGA_PESAR")
+    actor = load_actor(session, actor_id)
     endpoint = "/integration/v1/manga-weighings"
     operation, replay = _reserve_operation(
         session, operation_id, endpoint, actor, data
@@ -1047,10 +1354,89 @@ def confirm_manga_weighing(
             session, "PESAJE_FECHA_OPERATIVA_DIFERENTE", drift
         )
 
-        quantity = Decimal(
+        assigned_quantity = Decimal(
             manga.cantidad_confirmada_un
             if is_assembly else manga.cantidad_asignada_un
         ).quantize(UNIT_QUANTUM)
+        requested_quantity = data.get("cantidad_confirmada_un")
+        partial_reason_value = data.get("motivo_cierre_parcial")
+        if is_assembly and (
+            requested_quantity is not None or partial_reason_value is not None
+        ):
+            raise ScmServiceError(
+                "PARTIAL_CLOSE_NOT_AVAILABLE",
+                "El cierre parcial supervisado solo aplica a mangas de fabricación.",
+                status_code=422,
+            )
+        if requested_quantity is None:
+            if partial_reason_value is not None:
+                raise ScmServiceError(
+                    "PARTIAL_QUANTITY_REQUIRED",
+                    "Indique la cantidad real para cerrar una manga incompleta.",
+                    status_code=422,
+                )
+            quantity = assigned_quantity
+        else:
+            quantity = _units(
+                requested_quantity, "cantidad_confirmada_un"
+            )
+        if quantity > assigned_quantity:
+            raise ScmServiceError(
+                "QUANTITY_EXCEEDS_ASSIGNED",
+                "La cantidad confirmada no puede superar la cantidad asignada a la manga.",
+                status_code=422,
+                details={
+                    "cantidad_asignada_un": format(assigned_quantity, "f"),
+                },
+            )
+        partial_close = not is_assembly and quantity < assigned_quantity
+        if partial_close and current_segment is not None:
+            raise ScmServiceError(
+                "PARTIAL_CLOSE_NOT_AVAILABLE_AFTER_CONTINUITY",
+                "Una manga continuada debe cerrarse con su cantidad total; el cierre parcial definitivo no redistribuye tramos.",
+                status_code=409,
+            )
+        partial_reason = None
+        returned_quantity = Decimal("0.000")
+        plan_assignment = None
+        if partial_close:
+            load_actor(
+                session,
+                actor_id,
+                capability="MANGA_FINALIZAR_PARCIAL",
+            )
+            partial_reason = required_text(
+                partial_reason_value,
+                field="motivo_cierre_parcial",
+                max_length=500,
+            )
+            if manga.tipo != "NORMAL" or manga.asignacion_id is None:
+                raise ScmServiceError(
+                    "PARTIAL_CLOSE_NOT_AVAILABLE",
+                    "Solo una manga normal asignada al plan puede cerrarse parcialmente.",
+                    status_code=409,
+                )
+            plan_assignment = session.scalar(
+                select(ScmAsignacionPlanMangaOt)
+                .where(ScmAsignacionPlanMangaOt.id == manga.asignacion_id)
+                .with_for_update()
+            )
+            returned_quantity = assigned_quantity - quantity
+            if (
+                plan_assignment is None
+                or Decimal(plan_assignment.cantidad_asignada_un)
+                < returned_quantity
+                or manga.trabajo is None
+                or Decimal(manga.trabajo.cantidad_objetivo_un)
+                < returned_quantity
+            ):
+                raise ScmServiceError(
+                    "PLAN_ASSIGNMENT_INCONSISTENT",
+                    "La asignación del plan no permite devolver el saldo de la manga.",
+                    status_code=409,
+                )
+        else:
+            load_actor(session, actor_id, capability="MANGA_PESAR")
         production_kg = (
             quantity * Decimal(manga.peso_unitario_snapshot_g) / 1000
         ).quantize(KG_QUANTUM)
@@ -1067,7 +1453,12 @@ def confirm_manga_weighing(
             cantidad_confirmada=quantity,
             fuente_cantidad=(
                 "RESPONSABLE_ARMADO"
-                if is_assembly else "PLAN_CONFIRMADO_POR_PESAJE"
+                if is_assembly
+                else (
+                    "CIERRE_PARCIAL_SUPERVISADO"
+                    if partial_close
+                    else "PLAN_CONFIRMADO_POR_PESAJE"
+                )
             ),
             kg_produccion_ot=production_kg,
             pesada_at=weighed_at,
@@ -1097,6 +1488,17 @@ def confirm_manga_weighing(
                 "peso_unitario_g": format(
                     manga.peso_unitario_snapshot_g, "f"
                 ),
+                "cierre_parcial": partial_close,
+                "cantidad_asignada_original_un": format(
+                    assigned_quantity, "f"
+                ),
+                "cantidad_devuelta_plan_un": format(
+                    returned_quantity, "f"
+                ),
+                "motivo_cierre_parcial": partial_reason,
+                "cierre_parcial_autorizado_por_id": (
+                    actor.id if partial_close else None
+                ),
             },
         )
         session.add(weighing)
@@ -1105,6 +1507,15 @@ def confirm_manga_weighing(
         manga.cantidad_contenida_un = quantity
         manga.estado = "PESADA"
         manga.version += 1
+        if partial_close:
+            plan_assignment.cantidad_asignada_un = (
+                Decimal(plan_assignment.cantidad_asignada_un)
+                - returned_quantity
+            )
+            manga.trabajo.cantidad_objetivo_un = (
+                Decimal(manga.trabajo.cantidad_objetivo_un)
+                - returned_quantity
+            )
         if current_segment is not None:
             current_segment.estado = "CERRADO"
             current_segment.cantidad_fin_un = quantity
@@ -1228,6 +1639,10 @@ def confirm_manga_weighing(
             "post_label": _serialize_label(post_label),
             "print_job_id": str(job.public_id),
             "alertas_generadas": generated_alerts,
+            "cierre_parcial": partial_close,
+            "cantidad_devuelta_plan_un": format(
+                returned_quantity.normalize(), "f"
+            ),
             "atribucion_turnos": [
                 segment.to_dict() for segment in segments
             ],
@@ -1281,7 +1696,12 @@ def annul_manga_weighing(
             .where(ScmManga.id == weighing.manga_id)
             .with_for_update()
         )
-        if manga.estado == "ANULADA" or weighing.anulacion is not None:
+        _ensure_operational_order_mutable(manga)
+        if (
+            weighing.estado != "VIGENTE"
+            or manga.estado == "ANULADA"
+            or weighing.anulacion is not None
+        ):
             raise ScmServiceError(
                 "WEIGHING_ALREADY_ANNULLED",
                 "El pesaje ya fue anulado.",
@@ -1432,6 +1852,7 @@ def annul_manga_weighing(
         manga.anulada_por_id = actor.id
         manga.motivo_anulacion = reason
         manga.version += 1
+        weighing.estado = "ANULADO"
         for label in manga.etiquetas:
             if label.estado != "INVALIDADA":
                 label.estado = "INVALIDADA"
@@ -1557,6 +1978,278 @@ def _effective_projection(weighing):
     }
 
 
+def _ensure_operational_order_mutable(manga):
+    operation_order = (
+        manga.trabajo.orden_operacion
+        if manga.trabajo is not None
+        else manga.ot.orden_operacion
+    )
+    if operation_order is not None and operation_order.estado == "CERRADA":
+        raise ScmServiceError(
+            "OPERATION_REOPEN_REQUIRED",
+            "La orden operativa ya fue cerrada. Reábrala de forma "
+            "controlada antes de corregir o anular el pesaje.",
+            status_code=409,
+            details={
+                "orden_operacion_id": str(operation_order.id),
+                "codigo": operation_order.codigo,
+            },
+        )
+
+
+def reopen_manga_after_accidental_close(
+    session, *, actor_id, manga_id, operation_id, data
+):
+    """Invalidate one final while preserving the physical manga and its history."""
+    reject_unknown_fields(
+        data,
+        allowed={"version", "motivo", "evidencia", "tipo_reapertura"},
+    )
+    actor = load_actor(session, actor_id, capability="MANGA_REABRIR")
+    version = expected_version(data.get("version"))
+    reason = required_text(data.get("motivo"), field="motivo", max_length=500)
+    evidence = str(data.get("evidencia") or "").strip()[:500] or None
+    reopening_type = str(
+        data.get("tipo_reapertura") or "CIERRE_ACCIDENTAL"
+    ).strip().upper()
+    if reopening_type not in {"CIERRE_ACCIDENTAL", "CONTINUAR_LLENADO"}:
+        raise ScmServiceError(
+            "INVALID_REOPENING_TYPE",
+            "tipo_reapertura debe ser CIERRE_ACCIDENTAL o CONTINUAR_LLENADO.",
+            status_code=422,
+        )
+    command = {"version": version, "motivo": reason, "evidencia": evidence}
+    if "tipo_reapertura" in data:
+        command["tipo_reapertura"] = reopening_type
+    endpoint = f"/mangas/{manga_id}/reabrir"
+    operation, replay = _reserve_operation(
+        session, operation_id, endpoint, actor, command
+    )
+    if replay is not None:
+        return replay
+
+    try:
+        manga = session.scalar(
+            select(ScmManga)
+            .where(ScmManga.public_id == manga_id)
+            .with_for_update()
+        )
+        if manga is None:
+            raise ScmServiceError(
+                "MANGA_NOT_FOUND", "La manga no existe.", status_code=404
+            )
+        if manga.version != version:
+            raise ScmServiceError(
+                "MANGA_VERSION_CONFLICT",
+                "La manga cambió. Actualice y revise su estado antes de reabrir.",
+                status_code=409,
+                details={"version_actual": manga.version},
+            )
+        _ensure_operational_order_mutable(manga)
+        if manga.ot.tipo_ot != "FABRICACION" or manga.tipo != "NORMAL":
+            raise ScmServiceError(
+                "MANGA_REOPEN_NOT_AVAILABLE",
+                "Este corte solo permite reabrir mangas normales de Fabricación.",
+                status_code=409,
+            )
+        existence = session.scalar(
+            select(ScmExistenciaManga)
+            .where(
+                ScmExistenciaManga.manga_id == manga.id,
+                ScmExistenciaManga.estado_logistico != "REVERSADA",
+            )
+            .with_for_update()
+        )
+        if existence is not None:
+            raise ScmServiceError(
+                "RECEIPT_REVERSAL_REQUIRED",
+                "La manga ya ingresó a Almacén; primero debe aprobarse la reversa de recepción.",
+                status_code=409,
+                details={"existencia_id": str(existence.id)},
+            )
+        if manga.estado not in {
+            "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN"
+        }:
+            raise ScmServiceError(
+                "MANGA_REOPEN_NOT_AVAILABLE",
+                "La manga no posee un cierre vigente que pueda reabrirse.",
+                status_code=409,
+            )
+
+        weighing = session.scalar(
+            select(ScmPesajeManga)
+            .where(
+                ScmPesajeManga.manga_id == manga.id,
+                ScmPesajeManga.estado == "VIGENTE",
+            )
+            .with_for_update()
+        )
+        if weighing is None:
+            raise ScmServiceError(
+                "WEIGHING_NOT_ACTIVE",
+                "La manga no tiene un pesaje final vigente para reabrir.",
+                status_code=409,
+            )
+        if weighing.fuente_cantidad != "PLAN_CONFIRMADO_POR_PESAJE":
+            raise ScmServiceError(
+                "MANGA_REOPEN_NOT_AVAILABLE",
+                "El cierre no es normal; use la recuperación supervisada de su origen.",
+                status_code=409,
+            )
+        segments = session.scalars(
+            select(ScmTramoMangaTrabajo)
+            .where(ScmTramoMangaTrabajo.manga_id == manga.id)
+            .order_by(ScmTramoMangaTrabajo.secuencia)
+            .with_for_update()
+        ).all()
+        current_segment = segments[-1] if segments else None
+        current_work = current_segment.trabajo if current_segment else manga.trabajo
+        current_personal = (
+            current_segment.asignacion_personal_trabajo
+            if current_segment else manga.asignacion_personal_trabajo
+        )
+        if (
+            current_work is None
+            or current_personal is None
+            or current_work.estado not in {"EN_EJECUCION", "PAUSADO"}
+        ):
+            raise ScmServiceError(
+                "MANGA_REOPEN_NOT_AVAILABLE",
+                "El Trabajo y su maquinista deben seguir habilitados para continuar la manga.",
+                status_code=409,
+            )
+
+        if segments:
+            if (
+                current_segment.estado != "CERRADO"
+                or current_segment.motivo_cierre != "PESAJE_FINAL"
+            ):
+                raise ScmServiceError(
+                    "MANGA_REOPEN_NOT_AVAILABLE",
+                    "El último tramo no corresponde al cierre final vigente.",
+                    status_code=409,
+                )
+            for segment in segments:
+                attributed = Decimal(
+                    segment.cantidad_atribuida_un or 0
+                ).quantize(UNIT_QUANTUM)
+                confirmed = Decimal(
+                    segment.trabajo.cantidad_confirmada_un or 0
+                ).quantize(UNIT_QUANTUM)
+                if attributed > confirmed:
+                    raise ScmServiceError(
+                        "CONTINUITY_ATTRIBUTION_MISMATCH",
+                        "La atribución vigente no permite invalidar el cierre de forma segura.",
+                        status_code=409,
+                    )
+                if attributed:
+                    segment.trabajo.cantidad_confirmada_un = confirmed - attributed
+                    segment.trabajo.version += 1
+                segment.cantidad_atribuida_un = Decimal("0.000")
+            current_segment.estado = "ACTIVO"
+            current_segment.cantidad_fin_un = None
+            current_segment.cerrada_at = None
+            current_segment.motivo_cierre = None
+        else:
+            quantity = Decimal(weighing.cantidad_confirmada).quantize(UNIT_QUANTUM)
+            confirmed = Decimal(
+                current_work.cantidad_confirmada_un or 0
+            ).quantize(UNIT_QUANTUM)
+            if quantity > confirmed:
+                raise ScmServiceError(
+                    "PLAN_ASSIGNMENT_INCONSISTENT",
+                    "El Trabajo no permite invalidar la cantidad del cierre.",
+                    status_code=409,
+                )
+            current_work.cantidad_confirmada_un = confirmed - quantity
+            current_work.version += 1
+            current_segment = ScmTramoMangaTrabajo(
+                manga=manga,
+                trabajo=current_work,
+                asignacion_personal_trabajo=current_personal,
+                asignacion_plan_id=manga.asignacion_id,
+                secuencia=1,
+                estado="ACTIVO",
+                cantidad_inicio_un=Decimal("0.000"),
+                cantidad_atribuida_un=Decimal("0.000"),
+                iniciada_at=current_personal.iniciada_at or current_work.iniciada_at,
+                created_by_id=actor.id,
+                operation_id=operation.operation_id,
+            )
+            session.add(current_segment)
+
+        invalidated_labels = []
+        now = utc_now()
+        for label in manga.etiquetas:
+            if label.tipo == "POSTPESAJE" and label.estado != "INVALIDADA":
+                label.estado = "INVALIDADA"
+                label.invalidada_por_id = actor.id
+                label.invalidada_at = now
+                label.motivo_invalidacion = f"Manga reabierta: {reason}"
+                invalidated_labels.append(str(label.public_id))
+        pending_corrections = session.scalars(
+            select(ScmCorreccionPesajeManga).where(
+                ScmCorreccionPesajeManga.pesaje_id == weighing.id,
+                ScmCorreccionPesajeManga.estado == "PENDIENTE",
+            )
+        ).all()
+        for correction in pending_corrections:
+            correction.estado = "RECHAZADA"
+            correction.resolved_by_id = actor.id
+            correction.resolved_at = now
+            correction.resolution_reason = (
+                "Rechazada automáticamente por reapertura de la manga."
+            )
+
+        weighing.estado = "REABIERTO"
+        manga.estado = "EN_LLENADO"
+        manga.cantidad_confirmada_un = None
+        manga.cantidad_contenida_un = None
+        manga.version += 1
+        reopening = ScmReaperturaManga(
+            manga=manga,
+            pesaje=weighing,
+            motivo=reason,
+            evidencia=evidence,
+            tipo_reapertura=reopening_type,
+            peso_base_neto_kg=(
+                weighing.peso_fisico_neto_kg
+                if reopening_type == "CONTINUAR_LLENADO" else None
+            ),
+            reabierta_por_id=actor.id,
+            reabierta_at=now,
+            operation_id=operation.operation_id,
+        )
+        session.add(reopening)
+        session.flush()
+
+        response = {
+            "manga": _serialize_manga(manga),
+            "pesaje_invalidado": weighing.to_dict(),
+            "reapertura": reopening.to_dict(),
+            "postetiquetas_invalidadas": invalidated_labels,
+            "idempotent_replay": False,
+        }
+        session.add(_event(
+            "MANGA",
+            manga.id,
+            (
+                "MANGA_REOPENED_FOR_CONTINUED_FILLING"
+                if reopening_type == "CONTINUAR_LLENADO"
+                else "MANGA_REOPENED_AFTER_ACCIDENTAL_CLOSE"
+            ),
+            actor,
+            operation,
+            response,
+        ))
+        _complete_operation(operation, response)
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+
 def get_manga_weighing(session, *, actor_id, manga_id):
     load_actor(session, actor_id, capability="MANGA_PESAJE_VER")
     manga = session.scalar(
@@ -1566,9 +2259,14 @@ def get_manga_weighing(session, *, actor_id, manga_id):
         raise ScmServiceError(
             "MANGA_NOT_FOUND", "La manga no existe.", status_code=404
         )
-    weighing = ScmPesajeManga.query.filter_by(
+    weighings = ScmPesajeManga.query.filter_by(
         manga_id=manga.id
-    ).one_or_none()
+    ).order_by(ScmPesajeManga.id).all()
+    active_weighing = next(
+        (item for item in reversed(weighings) if item.estado == "VIGENTE"),
+        None,
+    )
+    weighing = active_weighing or (weighings[-1] if weighings else None)
     corrections = []
     if weighing is not None:
         corrections = (
@@ -1581,6 +2279,7 @@ def get_manga_weighing(session, *, actor_id, manga_id):
     return {
         "manga_id": str(manga.public_id),
         "manga_codigo": manga.codigo,
+        "manga_version": manga.version,
         "estado_manga": manga.estado,
         "estado_inventario": "NO_INGRESADA",
         "ubicacion_id": None,
@@ -1589,7 +2288,22 @@ def get_manga_weighing(session, *, actor_id, manga_id):
             weighing.anulacion.to_dict()
             if weighing and weighing.anulacion else None
         ),
-        "vigente": _effective_projection(weighing) if weighing and not weighing.anulacion else None,
+        "reapertura": (
+            weighing.reapertura.to_dict()
+            if weighing and weighing.reapertura else None
+        ),
+        "vigente": (
+            _effective_projection(active_weighing)
+            if active_weighing is not None else None
+        ),
+        "historial": [
+            {
+                "pesaje": item.to_dict(),
+                "anulacion": item.anulacion.to_dict() if item.anulacion else None,
+                "reapertura": item.reapertura.to_dict() if item.reapertura else None,
+            }
+            for item in weighings
+        ],
         "correcciones": [item.to_dict() for item in corrections],
         "etiquetas_postpesaje": [
             _serialize_label(label)
@@ -1623,8 +2337,13 @@ def request_weighing_correction(
                 "El pesaje SCM no existe.",
                 status_code=404,
             )
+        _ensure_operational_order_mutable(weighing.manga)
         proposed = data.get("proposed")
-        if weighing.anulacion is not None or weighing.manga.estado == "ANULADA":
+        if (
+            weighing.estado != "VIGENTE"
+            or weighing.anulacion is not None
+            or weighing.manga.estado == "ANULADA"
+        ):
             raise ScmServiceError(
                 "WEIGHING_ANNULLED",
                 "Un pesaje anulado no admite correcciones.",
@@ -1753,6 +2472,7 @@ def approve_weighing_correction(
             .where(ScmManga.id == weighing.manga_id)
             .with_for_update()
         )
+        _ensure_operational_order_mutable(manga)
         current = _effective_projection(weighing)
         previous_manga_quantity = Decimal(
             manga.cantidad_confirmada_un or current["cantidad_confirmada"]
@@ -1764,7 +2484,11 @@ def approve_weighing_correction(
                 "La cantidad de una manga continuada no puede redistribuirse desde esta aprobacion.",
                 status_code=409,
             )
-        if weighing.anulacion is not None or manga.estado == "ANULADA":
+        if (
+            weighing.estado != "VIGENTE"
+            or weighing.anulacion is not None
+            or manga.estado == "ANULADA"
+        ):
             raise ScmServiceError(
                 "WEIGHING_ANNULLED",
                 "Un pesaje anulado no admite correcciones.",
@@ -1796,9 +2520,16 @@ def approve_weighing_correction(
         weighed_at = _aware_datetime(
             proposed.get("pesada_at", current["pesada_at"])
         )
-        local_date, drift, _operational_ot, _final_segment = (
-            _validate_corrected_operational_date(manga, weighing, weighed_at)
-        )
+        local_date = weighed_at.astimezone(
+            ZoneInfo(weighing.timezone_snapshot)
+        ).date()
+        drift = (local_date - manga.ot.fecha).days
+        if drift < 0:
+            raise ScmServiceError(
+                "OPERATIONAL_DATE_IN_FUTURE",
+                "La correccion no puede quedar antes de la fecha OT.",
+                status_code=422,
+            )
         production_kg = (
             quantity * Decimal(manga.peso_unitario_snapshot_g) / 1000
         ).quantize(KG_QUANTUM)

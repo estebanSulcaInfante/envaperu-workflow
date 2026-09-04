@@ -24,13 +24,36 @@ class ScmRequerimientoMaterial(db.Model):
             "corrida_fabricacion_id", "material_id",
             name="uq_scm_req_material_corrida_material",
         ),
+        db.UniqueConstraint(
+            "orden_preparacion_material_id", "material_id",
+            name="uq_scm_req_material_opm_material",
+        ),
+        db.CheckConstraint(
+            "(corrida_fabricacion_id IS NOT NULL AND "
+            "orden_preparacion_material_id IS NULL) OR "
+            "(corrida_fabricacion_id IS NULL AND "
+            "orden_preparacion_material_id IS NOT NULL)",
+            name="ck_scm_req_material_origen",
+        ),
+        db.Index(
+            "ix_scm_req_material_opm", "orden_preparacion_material_id"
+        ),
     )
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     corrida_fabricacion_id = db.Column(
         Uuid(as_uuid=True),
         db.ForeignKey("scm_corrida_fabricacion.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
+    )
+    orden_preparacion_material_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey(
+            "scm_orden_preparacion_material.id",
+            name="fk_scm_req_material_opm",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
     )
     material_id = db.Column(
         db.Integer, db.ForeignKey("scm_material.id", ondelete="RESTRICT"),
@@ -53,6 +76,10 @@ class ScmRequerimientoMaterial(db.Model):
     )
 
     corrida = db.relationship("ScmCorridaFabricacion")
+    orden_preparacion = db.relationship(
+        "ScmOrdenPreparacionMaterial",
+        back_populates="requerimientos_insumo",
+    )
     material = db.relationship("ScmMaterial")
     reservas = db.relationship(
         "ScmReservaMaterial", back_populates="requerimiento",

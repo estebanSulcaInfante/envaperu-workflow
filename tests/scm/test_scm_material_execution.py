@@ -7,6 +7,7 @@ from app.models.receta_color import RecetaColorLinea, RecetaColorMaestra
 from app.models.scm_articulos import ScmArticulo
 from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial
 from app.models.scm_inventory import ScmSaldoMaterialInventario, ScmUbicacionInventario
+from app.models.scm_material_execution import ScmLotePremezcla
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
     ScmOrdenFabricacion,
@@ -46,7 +47,12 @@ def _seed_us010b():
         MateriaPrima(nombre=resin.nombre, tipo="VIRGEN", scm_material_id=resin.id),
         Colorante(nombre=pigment.nombre, tipo="COLORANTE", scm_material_id=pigment.id),
     ])
-    from app.models.producto import ColorBase, ColorProduccion, FamiliaColor
+    from app.models.producto import (
+        ColorBase,
+        ColorProduccion,
+        FamiliaColor,
+        PiezaColor,
+    )
     color_base = ColorBase.query.first()
     if color_base is None:
         color_base = ColorBase(nombre="AMARILLO US010B")
@@ -79,9 +85,15 @@ def _seed_us010b():
     ]
     db.session.add(recipe)
     db.session.flush()
-    article = ScmArticulo(
-        codigo="PC-US010B", nombre="Pieza US010B", clase="PIEZA_COLOR",
+    piece_color = PiezaColor(
+        sku="PC-US010B",
+        piezas="Pieza US010B",
+        color_produccion_id=color.id,
+        peso=100,
     )
+    db.session.add(piece_color)
+    db.session.flush()
+    article = ScmArticulo.query.filter_by(codigo="PC-US010B").one()
     order = ScmOrdenOperacion(
         codigo="OF-US010B", tipo="FABRICACION", origen_demanda="EXCEPCIONAL",
         estado="LIBERADA", created_by_id=planner.id, released_by_id=planner.id,
@@ -105,7 +117,7 @@ def _seed_us010b():
         codigo="ALMACEN_MP_US010B", nombre="Almacen MP US010B",
         clases_articulo_json=["MATERIA_PRIMA", "COLORANTE"],
     )
-    db.session.add_all([article, order, fabrication, run, output, location])
+    db.session.add_all([order, fabrication, run, output, location])
     db.session.flush()
     db.session.add_all([
         ScmSaldoMaterialInventario(
@@ -259,3 +271,67 @@ def test_premezcla_consume_emisiones_y_crea_wip_genealogico(app, client, scm_con
         json={"cantidad_kg": "0.001", "motivo": "No debe permitirse"},
     )
     assert rejected_return.status_code == 409
+
+
+def test_cutover_impide_premezcla_legacy_si_corrida_ya_usa_opm_canonica(
+    app, client, scm_config,
+):
+    with app.app_context():
+        planner_id, _warehouse_id, _order_id, run_id, _resin_id, _pigment_id = (
+            _seed_us010b()
+        )
+
+    canonical = client.post(
+        "/api/scm/v1/requerimientos-preparacion/calcular",
+        headers=_headers(planner_id, idempotent=True),
+        json={"corrida_fabricacion_id": str(run_id)},
+    )
+    assert canonical.status_code == 200, canonical.get_json()
+    legacy = client.post(
+        f"/api/scm/v1/corridas-fabricacion/{run_id}/premezclas",
+        headers=_headers(planner_id, idempotent=True),
+        json={"motivo": "No crear doble realidad", "genealogia_tipo": "EXACTA"},
+    )
+    assert legacy.status_code == 409, legacy.get_json()
+    assert (
+        legacy.get_json()["error"]["code"]
+        == "CANONICAL_PREPARED_MATERIAL_ALREADY_ACTIVE"
+    )
+
+
+def test_cutover_exige_migracion_si_corrida_ya_tiene_premezcla_legacy(
+    app, client, scm_config,
+):
+    with app.app_context():
+        planner_id, _warehouse_id, _order_id, run_id, _resin_id, _pigment_id = (
+            _seed_us010b()
+        )
+        legacy = ScmLotePremezcla(
+            codigo="LMP-LEGACY-CUTOVER-001",
+            corrida_fabricacion_id=run_id,
+            secuencia=1,
+            cantidad_kg=Decimal("11.044"),
+            genealogia_tipo="EXACTA",
+            estado="DISPONIBLE_MAQUINA",
+            ubicacion_codigo="PREPARACION_PRODUCCION",
+            motivo="Historico legacy preservado",
+            actor_id=planner_id,
+            operation_id=uuid4(),
+        )
+        db.session.add(legacy)
+        db.session.commit()
+
+    canonical = client.post(
+        "/api/scm/v1/requerimientos-preparacion/calcular",
+        headers=_headers(planner_id, idempotent=True),
+        json={"corrida_fabricacion_id": str(run_id)},
+    )
+    assert canonical.status_code == 409, canonical.get_json()
+    assert (
+        canonical.get_json()["error"]["code"]
+        == "PREPARED_MATERIAL_LEGACY_MIGRATION_REQUIRED"
+    )
+    with app.app_context():
+        assert ScmLotePremezcla.query.filter_by(
+            corrida_fabricacion_id=run_id,
+        ).count() == 1

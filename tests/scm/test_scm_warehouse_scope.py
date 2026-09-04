@@ -85,6 +85,18 @@ def test_almacen_configurable_activa_scope_fail_closed(
     )
     assert hidden.status_code == 200
     assert hidden.get_json()["items"] == []
+    hidden_explorer = client.get(
+        "/api/scm/v1/inventario/explorador",
+        headers=_headers(scoped_id),
+        query_string={"kardex": "PIEZAS_WIP", "limite": 25},
+    )
+    assert hidden_explorer.status_code == 200
+    assert hidden_explorer.get_json()["items"] == []
+    hidden_summary = client.get(
+        "/api/scm/v1/inventario/resumen", headers=_headers(scoped_id),
+    )
+    assert hidden_summary.status_code == 200
+    assert hidden_summary.get_json()["items"] == []
 
     assigned = client.post(
         f"/api/scm/v1/almacenes/{warehouse['id']}/trabajadores",
@@ -104,6 +116,21 @@ def test_almacen_configurable_activa_scope_fail_closed(
     assert [item["articulo"]["codigo"] for item in visible.get_json()["items"]] == [
         "PC-SCOPE-018"
     ]
+    visible_explorer = client.get(
+        "/api/scm/v1/inventario/explorador",
+        headers=_headers(scoped_id),
+        query_string={"kardex": "PIEZAS_WIP", "limite": 25},
+    )
+    assert visible_explorer.status_code == 200
+    assert [
+        item["articulo"]["codigo"]
+        for item in visible_explorer.get_json()["items"]
+    ] == ["PC-SCOPE-018"]
+    visible_summary = client.get(
+        "/api/scm/v1/inventario/resumen", headers=_headers(scoped_id),
+    )
+    assert visible_summary.status_code == 200
+    assert visible_summary.get_json()["items"][0]["fisico"] == "12.000"
 
     reach = client.get(
         "/api/scm/v1/mi-alcance-almacen",

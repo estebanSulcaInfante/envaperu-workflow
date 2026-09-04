@@ -1558,7 +1558,10 @@ def _hydrate(session, *, rows, actor, as_of, detail=False):
             .options(noload("*"))
             .where(ScmPesajeManga.manga_id.in_(manga_ids))
         ).all()
-        weighing_by_manga = {item.manga_id: item for item in weighing_rows}
+        for item in weighing_rows:
+            current = weighing_by_manga.get(item.manga_id)
+            if current is None or item.estado == "VIGENTE":
+                weighing_by_manga[item.manga_id] = item
         weighing_ids = [item.id for item in weighing_rows]
         if weighing_ids:
             correction_rows = session.scalars(

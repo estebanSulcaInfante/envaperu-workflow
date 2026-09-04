@@ -26,7 +26,9 @@
             "weight_event",
             "manga_prelabel",
             "manga_weighing",
-            "manga_weighing_control"
+            "manga_weighing_control",
+            "inventory_opening_weighing",
+            "prepared_material_weighing"
           ],
           "properties": {
             "heartbeat": {
@@ -46,6 +48,14 @@
             "manga_weighing_control": {
               "type": "array",
               "contains": {"const": "scm-manga-weighing-control-v1"}
+            },
+            "inventory_opening_weighing": {
+              "type": "array",
+              "contains": {"const": "scm-inventory-opening-weighing-v1"}
+            },
+            "prepared_material_weighing": {
+              "type": "array",
+              "contains": {"const": "scm-prepared-material-weighing-v1"}
             }
           }
         },
@@ -60,7 +70,9 @@
             "pilot_data_commands",
             "scm_manga_prelabel",
             "scm_manga_weighing",
-            "scm_manga_weighing_control"
+            "scm_manga_weighing_control",
+            "scm_inventory_opening_weighing",
+            "scm_prepared_material_weighing"
           ],
           "properties": {
             "monitoring": {"type": "boolean"},
@@ -70,7 +82,9 @@
             "pilot_data_commands": {"type": "boolean"},
             "scm_manga_prelabel": {"type": "boolean"},
             "scm_manga_weighing": {"type": "boolean"},
-            "scm_manga_weighing_control": {"type": "boolean"}
+            "scm_manga_weighing_control": {"type": "boolean"},
+            "scm_inventory_opening_weighing": {"type": "boolean"},
+            "scm_prepared_material_weighing": {"type": "boolean"}
           }
         }
       }

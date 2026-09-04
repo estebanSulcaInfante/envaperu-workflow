@@ -583,6 +583,9 @@ class ScmCorridaFabricacion(db.Model):
         "ScmLotePremezcla", back_populates="corrida", lazy="selectin",
         order_by="ScmLotePremezcla.secuencia",
     )
+    trabajos_color = db.relationship(
+        "ScmTrabajoColor", back_populates="corrida", lazy="selectin"
+    )
     salidas = db.relationship(
         "ScmOrdenOperacionSalida",
         back_populates="corrida_fabricacion",

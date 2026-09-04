@@ -22,6 +22,11 @@ from app.models.scm_material_execution import (
     ScmReservaMaterial,
 )
 from app.models.scm_production_orders import ScmCorridaFabricacion, ScmOrdenOperacion
+from app.models.scm_prepared_material import (
+    ScmAsignacionRequerimientoPreparacion,
+    ScmOrdenPreparacionMaterial,
+    ScmRequerimientoMaterialPreparado,
+)
 from app.services.scm_inventory_service import _positive_quantity, _reserve_operation
 from app.services.scm_service_support import (
     ScmServiceError,
@@ -116,8 +121,13 @@ def _serialize_requirement(item):
     }
 
 
-def _load_run(session, run_id):
-    run = session.get(ScmCorridaFabricacion, run_id)
+def _load_run(session, run_id, *, lock=False):
+    statement = select(ScmCorridaFabricacion).where(
+        ScmCorridaFabricacion.id == run_id
+    )
+    if lock:
+        statement = statement.with_for_update(of=ScmCorridaFabricacion)
+    run = session.scalar(statement)
     if run is None:
         raise ScmServiceError("FABRICATION_RUN_NOT_FOUND", "La corrida no existe.", status_code=404)
     return run
@@ -575,7 +585,57 @@ def confirm_premix(session, *, actor_id, operation_id, run_id, data):
         )
         if replay is not None:
             return replay
-        run = _load_run(session, run_id)
+        run = _load_run(session, run_id, lock=True)
+        canonical_requirement = session.scalar(
+            select(ScmRequerimientoMaterialPreparado)
+            .where(
+                ScmRequerimientoMaterialPreparado.corrida_fabricacion_id
+                == run.id,
+                ScmRequerimientoMaterialPreparado.estado != "CANCELADA",
+            )
+            .with_for_update(of=ScmRequerimientoMaterialPreparado)
+        )
+        canonical_assignment = session.scalar(
+            select(ScmAsignacionRequerimientoPreparacion.id)
+            .join(ScmRequerimientoMaterialPreparado)
+            .where(
+                ScmRequerimientoMaterialPreparado.corrida_fabricacion_id
+                == run.id,
+                ScmAsignacionRequerimientoPreparacion.estado.in_((
+                    "PLANIFICADA", "COMPROMETIDA", "SATISFECHA",
+                )),
+            )
+            .limit(1)
+        )
+        canonical_order = session.scalar(
+            select(ScmOrdenPreparacionMaterial.id)
+            .join(ScmAsignacionRequerimientoPreparacion)
+            .join(ScmRequerimientoMaterialPreparado)
+            .where(
+                ScmRequerimientoMaterialPreparado.corrida_fabricacion_id
+                == run.id,
+                ScmOrdenPreparacionMaterial.estado.notin_((
+                    "ANULADA", "CERRADA",
+                )),
+            )
+            .limit(1)
+        )
+        if (
+            canonical_requirement is not None
+            or canonical_assignment is not None
+            or canonical_order is not None
+        ):
+            raise ScmServiceError(
+                "CANONICAL_PREPARED_MATERIAL_ALREADY_ACTIVE",
+                "La corrida ya usa el flujo canonico OPM; no admite premezcla legacy.",
+                status_code=409,
+                details={
+                    "requerimiento_id": (
+                        str(canonical_requirement.id)
+                        if canonical_requirement is not None else None
+                    ),
+                },
+            )
         requirements = session.scalars(
             select(ScmRequerimientoMaterial)
             .where(ScmRequerimientoMaterial.corrida_fabricacion_id == run.id)

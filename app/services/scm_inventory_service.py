@@ -1,14 +1,19 @@
 """Servicios del Kardex normalizado por articulo SCM."""
 
+import base64
 import copy
 import hashlib
 import json
+import uuid
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import select
+from sqlalchemy import and_, false, func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.scm_articulos import ScmArticulo
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
+from app.models.scm_catalogos import ScmMaterial
 from app.models.scm_inventory import (
     ScmMovimientoInventario,
     ScmMovimientoMaterialInventario,
@@ -24,6 +29,387 @@ from app.services.scm_service_support import (
     required_text,
 )
 from app.services.scm_warehouse_scope_service import allowed_location_ids
+
+
+INVENTORY_LEDGERS = {
+    "MATERIALES": {"kind": "material", "classes": ("MATERIA_PRIMA", "COLORANTE")},
+    "PIEZAS_WIP": {"kind": "article", "classes": ("PIEZA_COLOR", "SUBENSAMBLE_WIP")},
+    "PRODUCTO_TERMINADO": {"kind": "article", "classes": ("PRODUCTO_TERMINADO",)},
+}
+INVENTORY_SORTS = {
+    "CODIGO", "NOMBRE", "FISICO_DESC", "LIBRE_DESC", "ACTUALIZADO",
+}
+INVENTORY_STOCK_FILTERS = {
+    "TODOS", "CON_EXISTENCIA", "LIBRE", "RESERVADO", "NO_DISPONIBLE",
+}
+
+
+def _page_limit(value):
+    try:
+        parsed = int(value or 25)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "INVALID_INVENTORY_LIMIT",
+            "limite debe ser un entero entre 1 y 100.",
+            status_code=400,
+        ) from error
+    if parsed < 1 or parsed > 100:
+        raise ScmServiceError(
+            "INVALID_INVENTORY_LIMIT",
+            "limite debe estar entre 1 y 100.",
+            status_code=400,
+        )
+    return parsed
+
+
+def _encode_inventory_cursor(*, ledger, sort, value, row_id):
+    raw = json.dumps({
+        "v": 1, "ledger": ledger, "sort": sort,
+        "value": str(value), "id": str(row_id),
+    }, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_inventory_cursor(value, *, ledger, sort):
+    if not value:
+        return None
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(value + padding))
+        if (
+            payload.get("v") != 1
+            or payload.get("ledger") != ledger
+            or payload.get("sort") != sort
+        ):
+            raise ValueError("cursor scope mismatch")
+        if sort in {"FISICO_DESC", "LIBRE_DESC"}:
+            Decimal(payload["value"])
+        elif sort == "ACTUALIZADO":
+            datetime.fromisoformat(payload["value"])
+        return {"value": payload["value"], "id": uuid.UUID(payload["id"])}
+    except (
+        InvalidOperation, KeyError, TypeError, ValueError, json.JSONDecodeError,
+    ) as error:
+        raise ScmServiceError(
+            "INVALID_INVENTORY_CURSOR",
+            "El cursor no corresponde a este Kardex y orden.",
+            status_code=400,
+        ) from error
+
+
+def _search_pattern(value):
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _scope_condition(scope, class_column):
+    if not scope["configured"] or scope["transversal"]:
+        return None
+    conditions = []
+    for warehouse_id, classes in scope["classes"].items():
+        if classes:
+            conditions.append(and_(
+                ScmUbicacionInventario.almacen_id == warehouse_id,
+                class_column.in_(classes),
+            ))
+    return or_(*conditions) if conditions else false()
+
+
+def _availability_condition(stock_filter, physical, reserved, unavailable):
+    if stock_filter == "TODOS":
+        return None
+    if stock_filter == "CON_EXISTENCIA":
+        return physical > 0
+    if stock_filter == "LIBRE":
+        return physical - reserved - unavailable > 0
+    if stock_filter == "RESERVADO":
+        return reserved > 0
+    return unavailable > 0
+
+
+def _cursor_condition(cursor, *, sort, primary, row_id):
+    if cursor is None:
+        return None
+    raw = cursor["value"]
+    if sort in {"FISICO_DESC", "LIBRE_DESC"}:
+        value = Decimal(raw)
+        return or_(primary < value, and_(primary == value, row_id > cursor["id"]))
+    if sort == "ACTUALIZADO":
+        value = datetime.fromisoformat(raw)
+        return or_(primary < value, and_(primary == value, row_id > cursor["id"]))
+    return or_(primary > raw, and_(primary == raw, row_id > cursor["id"]))
+
+
+def _inventory_order(sort, *, code, name, physical, free, updated, row_id):
+    if sort == "NOMBRE":
+        return name, (name.asc(), row_id.asc())
+    if sort == "FISICO_DESC":
+        return physical, (physical.desc(), row_id.asc())
+    if sort == "LIBRE_DESC":
+        return free, (free.desc(), row_id.asc())
+    if sort == "ACTUALIZADO":
+        return updated, (updated.desc(), row_id.asc())
+    return code, (code.asc(), row_id.asc())
+
+
+def _row_quantity(value):
+    return format(Decimal(value).quantize(Decimal("0.001")), "f")
+
+
+def _article_explorer(session, *, ledger, classes, scope, query, location, stock_filter, sort, limit, cursor):
+    free = (
+        ScmSaldoInventario.cantidad_fisica
+        - ScmSaldoInventario.cantidad_reservada
+        - ScmSaldoInventario.cantidad_no_disponible
+    )
+    primary, ordering = _inventory_order(
+        sort,
+        code=ScmArticulo.codigo,
+        name=ScmArticulo.nombre,
+        physical=ScmSaldoInventario.cantidad_fisica,
+        free=free,
+        updated=ScmSaldoInventario.updated_at,
+        row_id=ScmSaldoInventario.id,
+    )
+    conditions = [ScmArticulo.clase.in_(classes)]
+    scoped = _scope_condition(scope, ScmArticulo.clase)
+    if scoped is not None:
+        conditions.append(scoped)
+    pattern = _search_pattern(query)
+    if pattern:
+        conditions.append(or_(
+            ScmArticulo.codigo.ilike(pattern, escape="\\"),
+            ScmArticulo.nombre.ilike(pattern, escape="\\"),
+            ScmUbicacionInventario.codigo.ilike(pattern, escape="\\"),
+            ScmUbicacionInventario.nombre.ilike(pattern, escape="\\"),
+        ))
+    if location:
+        conditions.append(ScmUbicacionInventario.codigo == location)
+    available = _availability_condition(
+        stock_filter,
+        ScmSaldoInventario.cantidad_fisica,
+        ScmSaldoInventario.cantidad_reservada,
+        ScmSaldoInventario.cantidad_no_disponible,
+    )
+    if available is not None:
+        conditions.append(available)
+    page_after = _cursor_condition(
+        cursor, sort=sort, primary=primary, row_id=ScmSaldoInventario.id,
+    )
+    page_conditions = conditions + ([page_after] if page_after is not None else [])
+    columns = (
+        ScmSaldoInventario.id.label("id"),
+        ScmSaldoInventario.articulo_scm_id.label("article_id"),
+        ScmArticulo.codigo.label("code"),
+        ScmArticulo.nombre.label("name"),
+        ScmArticulo.clase.label("class_name"),
+        ScmArticulo.unidad_base.label("unit"),
+        ScmUbicacionInventario.id.label("location_id"),
+        ScmUbicacionInventario.codigo.label("location_code"),
+        ScmUbicacionInventario.nombre.label("location_name"),
+        ScmSaldoInventario.cantidad_fisica.label("physical"),
+        ScmSaldoInventario.cantidad_reservada.label("reserved"),
+        ScmSaldoInventario.cantidad_no_disponible.label("unavailable"),
+        free.label("free"),
+        ScmSaldoInventario.version.label("version"),
+        ScmSaldoInventario.updated_at.label("updated_at"),
+    )
+    base_from = (
+        ScmSaldoInventario.__table__
+        .join(ScmArticulo, ScmArticulo.id == ScmSaldoInventario.articulo_scm_id)
+        .join(ScmUbicacionInventario, ScmUbicacionInventario.id == ScmSaldoInventario.ubicacion_id)
+    )
+    rows = session.execute(
+        select(*columns).select_from(base_from)
+        .where(*page_conditions).order_by(*ordering).limit(limit + 1)
+    ).mappings().all()
+    total = session.scalar(
+        select(func.count()).select_from(base_from).where(*conditions)
+    ) or 0
+    visible = rows[:limit]
+    items = [{
+        "id": str(row["id"]),
+        "articulo_scm_id": row["article_id"],
+        "articulo": {
+            "codigo": row["code"], "nombre": row["name"],
+            "clase": row["class_name"], "unidad": row["unit"],
+        },
+        "ubicacion": {
+            "id": row["location_id"], "codigo": row["location_code"],
+            "nombre": row["location_name"],
+        },
+        "cantidad_fisica": _row_quantity(row["physical"]),
+        "cantidad_reservada": _row_quantity(row["reserved"]),
+        "cantidad_no_disponible": _row_quantity(row["unavailable"]),
+        "cantidad_libre": _row_quantity(row["free"]),
+        "version": row["version"],
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+    } for row in visible]
+    next_cursor = None
+    if len(rows) > limit and visible:
+        last = visible[-1]
+        cursor_value = {
+            "CODIGO": last["code"], "NOMBRE": last["name"],
+            "FISICO_DESC": last["physical"], "LIBRE_DESC": last["free"],
+            "ACTUALIZADO": last["updated_at"].isoformat(),
+        }[sort]
+        next_cursor = _encode_inventory_cursor(
+            ledger=ledger, sort=sort, value=cursor_value, row_id=last["id"],
+        )
+    return items, int(total), next_cursor
+
+
+def _material_explorer(session, *, ledger, classes, scope, query, location, stock_filter, sort, limit, cursor):
+    free = (
+        ScmSaldoMaterialInventario.cantidad_fisica_kg
+        - ScmSaldoMaterialInventario.cantidad_reservada_kg
+        - ScmSaldoMaterialInventario.cantidad_no_disponible_kg
+    )
+    primary, ordering = _inventory_order(
+        sort,
+        code=ScmMaterial.codigo,
+        name=ScmMaterial.nombre,
+        physical=ScmSaldoMaterialInventario.cantidad_fisica_kg,
+        free=free,
+        updated=ScmSaldoMaterialInventario.updated_at,
+        row_id=ScmSaldoMaterialInventario.id,
+    )
+    conditions = [ScmMaterial.clase.in_(classes)]
+    scoped = _scope_condition(scope, ScmMaterial.clase)
+    if scoped is not None:
+        conditions.append(scoped)
+    pattern = _search_pattern(query)
+    if pattern:
+        conditions.append(or_(
+            ScmMaterial.codigo.ilike(pattern, escape="\\"),
+            ScmMaterial.nombre.ilike(pattern, escape="\\"),
+            ScmUbicacionInventario.codigo.ilike(pattern, escape="\\"),
+            ScmUbicacionInventario.nombre.ilike(pattern, escape="\\"),
+        ))
+    if location:
+        conditions.append(ScmUbicacionInventario.codigo == location)
+    available = _availability_condition(
+        stock_filter,
+        ScmSaldoMaterialInventario.cantidad_fisica_kg,
+        ScmSaldoMaterialInventario.cantidad_reservada_kg,
+        ScmSaldoMaterialInventario.cantidad_no_disponible_kg,
+    )
+    if available is not None:
+        conditions.append(available)
+    page_after = _cursor_condition(
+        cursor, sort=sort, primary=primary,
+        row_id=ScmSaldoMaterialInventario.id,
+    )
+    page_conditions = conditions + ([page_after] if page_after is not None else [])
+    columns = (
+        ScmSaldoMaterialInventario.id.label("id"),
+        ScmSaldoMaterialInventario.material_id.label("article_id"),
+        ScmMaterial.codigo.label("code"), ScmMaterial.nombre.label("name"),
+        ScmMaterial.clase.label("class_name"),
+        ScmUbicacionInventario.id.label("location_id"),
+        ScmUbicacionInventario.codigo.label("location_code"),
+        ScmUbicacionInventario.nombre.label("location_name"),
+        ScmSaldoMaterialInventario.cantidad_fisica_kg.label("physical"),
+        ScmSaldoMaterialInventario.cantidad_reservada_kg.label("reserved"),
+        ScmSaldoMaterialInventario.cantidad_no_disponible_kg.label("unavailable"),
+        free.label("free"), ScmSaldoMaterialInventario.version.label("version"),
+        ScmSaldoMaterialInventario.updated_at.label("updated_at"),
+    )
+    base_from = (
+        ScmSaldoMaterialInventario.__table__
+        .join(ScmMaterial, ScmMaterial.id == ScmSaldoMaterialInventario.material_id)
+        .join(ScmUbicacionInventario, ScmUbicacionInventario.id == ScmSaldoMaterialInventario.ubicacion_id)
+    )
+    rows = session.execute(
+        select(*columns).select_from(base_from)
+        .where(*page_conditions).order_by(*ordering).limit(limit + 1)
+    ).mappings().all()
+    total = session.scalar(
+        select(func.count()).select_from(base_from).where(*conditions)
+    ) or 0
+    visible = rows[:limit]
+    items = [{
+        "id": str(row["id"]), "material_scm_id": row["article_id"],
+        "articulo": {
+            "codigo": row["code"], "nombre": row["name"],
+            "clase": row["class_name"], "unidad": "KG",
+        },
+        "ubicacion": {
+            "id": row["location_id"], "codigo": row["location_code"],
+            "nombre": row["location_name"],
+        },
+        "cantidad_fisica": _row_quantity(row["physical"]),
+        "cantidad_reservada": _row_quantity(row["reserved"]),
+        "cantidad_no_disponible": _row_quantity(row["unavailable"]),
+        "cantidad_libre": _row_quantity(row["free"]),
+        "version": row["version"],
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+    } for row in visible]
+    next_cursor = None
+    if len(rows) > limit and visible:
+        last = visible[-1]
+        cursor_value = {
+            "CODIGO": last["code"], "NOMBRE": last["name"],
+            "FISICO_DESC": last["physical"], "LIBRE_DESC": last["free"],
+            "ACTUALIZADO": last["updated_at"].isoformat(),
+        }[sort]
+        next_cursor = _encode_inventory_cursor(
+            ledger=ledger, sort=sort, value=cursor_value, row_id=last["id"],
+        )
+    return items, int(total), next_cursor
+
+
+def explore_inventory_balances(
+    session, *, actor_id, ledger, query=None, location=None,
+    stock_filter="TODOS", sort="CODIGO", limit=25, cursor=None,
+):
+    load_actor(session, actor_id, capability="INVENTARIO_VER")
+    ledger = str(ledger or "").strip().upper()
+    if ledger not in INVENTORY_LEDGERS:
+        raise ScmServiceError(
+            "INVALID_INVENTORY_LEDGER",
+            "kardex debe ser MATERIALES, PIEZAS_WIP o PRODUCTO_TERMINADO.",
+            status_code=400,
+        )
+    sort = str(sort or "CODIGO").strip().upper()
+    if sort not in INVENTORY_SORTS:
+        raise ScmServiceError(
+            "INVALID_INVENTORY_SORT", "ordenar no es valido.", status_code=400,
+        )
+    stock_filter = str(stock_filter or "TODOS").strip().upper()
+    if stock_filter not in INVENTORY_STOCK_FILTERS:
+        raise ScmServiceError(
+            "INVALID_INVENTORY_FILTER",
+            "disponibilidad no es valida.", status_code=400,
+        )
+    limit = _page_limit(limit)
+    decoded_cursor = _decode_inventory_cursor(cursor, ledger=ledger, sort=sort)
+    _, scope = allowed_location_ids(session, actor_id=actor_id)
+    definition = INVENTORY_LEDGERS[ledger]
+    explorer = _material_explorer if definition["kind"] == "material" else _article_explorer
+    items, total, next_cursor = explorer(
+        session, ledger=ledger, classes=definition["classes"], scope=scope,
+        query=query, location=str(location or "").strip().upper() or None,
+        stock_filter=stock_filter, sort=sort, limit=limit,
+        cursor=decoded_cursor,
+    )
+    return {
+        "items": items,
+        "page": {
+            "next_cursor": next_cursor,
+            "limit": limit,
+            "has_more": next_cursor is not None,
+            "total": total,
+        },
+        "filters": {
+            "kardex": ledger, "q": str(query or "").strip(),
+            "ubicacion": str(location or "").strip().upper() or None,
+            "disponibilidad": stock_filter, "ordenar": sort,
+        },
+    }
 
 
 def _hash(value):
@@ -42,8 +428,8 @@ def _reserve_operation(session, operation_id, endpoint, actor, data):
         "actor_id": actor.id,
         "data": data,
     })
-    existing = session.get(ScmOperacion, operation_id)
-    if existing is not None:
+
+    def replay_or_conflict(existing):
         if (
             existing.endpoint != endpoint
             or existing.request_sha256 != request_hash
@@ -60,14 +446,33 @@ def _reserve_operation(session, operation_id, endpoint, actor, data):
                 status_code=409,
             )
         return None, copy.deepcopy(existing.response_json)
+
+    existing = session.get(ScmOperacion, operation_id)
+    if existing is not None:
+        return replay_or_conflict(existing)
     operation = ScmOperacion(
         operation_id=operation_id,
         endpoint=endpoint,
         actor_id=actor.id,
         request_sha256=request_hash,
     )
-    session.add(operation)
-    session.flush()
+    try:
+        # El savepoint mantiene utilizable la transaccion del perdedor cuando
+        # dos solicitudes intentan reservar la misma clave a la vez. En
+        # PostgreSQL el INSERT espera al ganador y el conflicto se resuelve
+        # aqui como replay, no como un IntegrityError expuesto por la API.
+        with session.begin_nested():
+            session.add(operation)
+            session.flush()
+    except IntegrityError as error:
+        existing = session.get(
+            ScmOperacion,
+            operation_id,
+            populate_existing=True,
+        )
+        if existing is None:
+            raise error
+        return replay_or_conflict(existing)
     return operation, None
 
 

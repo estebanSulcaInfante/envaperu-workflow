@@ -6,9 +6,11 @@ import json
 from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, false, func, or_, select
 
+from app.models.scm_articulos import ScmArticulo
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
+from app.models.scm_catalogos import ScmMaterial
 from app.models.scm_inventory import (
     ScmMovimientoInventario, ScmSaldoInventario, ScmSaldoMaterialInventario,
     ScmUbicacionInventario,
@@ -528,9 +530,19 @@ def inventory_summary(session, *, actor_id):
         func.sum(ScmSaldoInventario.cantidad_fisica),
         func.sum(ScmSaldoInventario.cantidad_reservada),
         func.sum(ScmSaldoInventario.cantidad_no_disponible),
-    ).join(ScmSaldoInventario, ScmSaldoInventario.ubicacion_id == ScmUbicacionInventario.id).group_by(ScmUbicacionInventario.almacen_id)
+    ).join(
+        ScmSaldoInventario,
+        ScmSaldoInventario.ubicacion_id == ScmUbicacionInventario.id,
+    ).join(
+        ScmArticulo,
+        ScmArticulo.id == ScmSaldoInventario.articulo_scm_id,
+    ).group_by(ScmUbicacionInventario.almacen_id)
     if scope["configured"] and not scope["transversal"]:
-        query = query.where(ScmUbicacionInventario.almacen_id.in_(scope["warehouse_ids"]))
+        article_scope = [and_(
+            ScmUbicacionInventario.almacen_id == warehouse_id,
+            ScmArticulo.clase.in_(classes),
+        ) for warehouse_id, classes in scope["classes"].items() if classes]
+        query = query.where(or_(*article_scope) if article_scope else false())
     rows = session.execute(query).all()
     material_query = select(
         ScmUbicacionInventario.almacen_id,
@@ -541,10 +553,17 @@ def inventory_summary(session, *, actor_id):
     ).join(
         ScmSaldoMaterialInventario,
         ScmSaldoMaterialInventario.ubicacion_id == ScmUbicacionInventario.id,
+    ).join(
+        ScmMaterial,
+        ScmMaterial.id == ScmSaldoMaterialInventario.material_id,
     ).group_by(ScmUbicacionInventario.almacen_id)
     if scope["configured"] and not scope["transversal"]:
+        material_scope = [and_(
+            ScmUbicacionInventario.almacen_id == warehouse_id,
+            ScmMaterial.clase.in_(classes),
+        ) for warehouse_id, classes in scope["classes"].items() if classes]
         material_query = material_query.where(
-            ScmUbicacionInventario.almacen_id.in_(scope["warehouse_ids"])
+            or_(*material_scope) if material_scope else false()
         )
     material_rows = session.execute(material_query).all()
     return {

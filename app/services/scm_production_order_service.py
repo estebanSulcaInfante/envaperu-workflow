@@ -1089,7 +1089,17 @@ def _build_plan_proposal(session, order):
             use="DEMANDA_DIRECTA",
         )
         requirements[root_id] += root_uncovered
-        if root_uncovered > 0:
+        # OP_OT es la autoridad de una OF. Cuando la operacion terminal
+        # acredita directamente el PT (producto moldeado monocomponente), la
+        # BOM conserva la ingenieria del producto pero no describe una OA
+        # adicional. Los materiales se calculan despues desde la receta de la
+        # corrida de la OF. Una terminal ORDEN_OPERACION si consume su BOM y
+        # debe expandirla para planificar las salidas predecesoras.
+        terminal_fabricates_root = (
+            terminals[0].articulo_salida_id == root_id
+            and terminals[0].executor_kind == EXECUTOR_OP_OT
+        )
+        if root_uncovered > 0 and not terminal_fabricates_root:
             _expand_requirements(
                 session,
                 article_id=root_id,

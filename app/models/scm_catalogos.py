@@ -227,6 +227,12 @@ class ScmMaterial(db.Model):
             name="ck_scm_material_version",
         ),
         db.UniqueConstraint("codigo", name="uq_scm_material_codigo"),
+        db.Index(
+            "ix_scm_material_clase_codigo_id",
+            "clase",
+            "codigo",
+            "id",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)

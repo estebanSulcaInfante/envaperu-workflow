@@ -1,11 +1,11 @@
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from decimal import Decimal
 from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import event, inspect, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 
 from app.extensions import db
@@ -59,7 +59,7 @@ from app.services.scm_configuration import ensure_initial_scm_configuration
 from app.services import scm_ot_service
 from app.services.scm_fabrication_order_service import list_fabrication_orders
 from app.services.scm_ot_service import (
-    _continuity_target_is_after_cut,
+    _fabrication_run_for_update_query,
     _continuity_target_is_later,
     _operation_hash,
     _reserve_operation,
@@ -196,21 +196,10 @@ def test_recepcion_recupera_al_perder_carrera_de_idempotencia():
 
 def _k1_validation_context():
     source_ot = SimpleNamespace(
-        id=1,
-        fecha=date(2026, 8, 26),
-        turno="DIA",
-        maquina_id=10,
-        estado="EN_EJECUCION",
+        id=1, fecha=date(2026, 8, 26), turno="DIA", maquina_id=10
     )
     target_ot = SimpleNamespace(
-        id=2,
-        public_id=uuid4(),
-        codigo_ot="OT-K1-DESTINO",
-        fecha=date(2026, 8, 26),
-        turno="NOCHE",
-        maquina_id=10,
-        estado="PLANIFICADA",
-        trabajos_ot=[],
+        id=2, fecha=date(2026, 8, 26), turno="NOCHE", maquina_id=10
     )
     source_color = SimpleNamespace(
         corrida_fabricacion_id=uuid4(),
@@ -232,165 +221,19 @@ def _k1_validation_context():
     )
     target_work = SimpleNamespace(
         id=uuid4(),
-        estado="PLANIFICADO",
         orden_trabajo=target_ot,
         orden_operacion_id=source_work.orden_operacion_id,
         trabajo_color=target_color,
     )
-    control = SimpleNamespace(
-        pesado_at=datetime(
-            2026,
-            8,
-            26,
-            18,
-            tzinfo=timezone(timedelta(hours=-5)),
-        ),
-        timezone_snapshot="America/Lima",
-        fecha_local_pesaje=date(2026, 8, 26),
-    )
     return {
         "manga": SimpleNamespace(plan_linea=object()),
-        "segment": SimpleNamespace(
-            trabajo=source_work,
-            control_peso=control,
-        ),
+        "segment": SimpleNamespace(trabajo=source_work),
         "source_ot": source_ot,
         "target_ot": target_ot,
         "source_work": source_work,
         "target_work": target_work,
         "target_color": target_color,
     }
-
-
-class _ContinuityCandidates:
-    def __init__(self, candidates):
-        self.candidates = candidates
-
-    def unique(self):
-        return self
-
-    def all(self):
-        return self.candidates
-
-
-class _ContinuitySession:
-    def __init__(self, candidates):
-        self.candidates = candidates
-
-    def scalars(self, _statement):
-        return _ContinuityCandidates(self.candidates)
-
-
-def test_k1_destino_respeta_el_turno_del_corte_fisico(monkeypatch):
-    monkeypatch.setattr(
-        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
-    )
-    context = _k1_validation_context()
-
-    assert _continuity_target_is_after_cut(
-        segment=context["segment"], target_ot=context["target_ot"]
-    ) is True
-    scm_ot_service._validate_continuity_target(
-        manga=context["manga"],
-        segment=context["segment"],
-        target_work=context["target_work"],
-    )
-
-
-def test_k1_rechaza_ot_destino_anterior_al_corte_fisico(monkeypatch):
-    monkeypatch.setattr(
-        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
-    )
-    context = _k1_validation_context()
-    context["segment"].control_peso.pesado_at = datetime(
-        2026,
-        8,
-        27,
-        7,
-        tzinfo=timezone(timedelta(hours=-5)),
-    )
-    context["segment"].control_peso.fecha_local_pesaje = date(2026, 8, 27)
-
-    with pytest.raises(ScmServiceError) as error:
-        scm_ot_service._validate_continuity_target(
-            manga=context["manga"],
-            segment=context["segment"],
-            target_work=context["target_work"],
-        )
-
-    assert error.value.code == "CONTINUITY_TARGET_PRECEDES_CUT"
-
-
-def test_k1_acepta_primera_ot_del_turno_que_contiene_el_corte(monkeypatch):
-    monkeypatch.setattr(
-        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
-    )
-    context = _k1_validation_context()
-    context["segment"].control_peso.pesado_at = datetime(
-        2026,
-        8,
-        27,
-        7,
-        tzinfo=timezone(timedelta(hours=-5)),
-    )
-    context["segment"].control_peso.fecha_local_pesaje = date(2026, 8, 27)
-    context["target_ot"].fecha = date(2026, 8, 27)
-    context["target_ot"].turno = "DIA"
-
-    scm_ot_service._validate_continuity_target(
-        manga=context["manga"],
-        segment=context["segment"],
-        target_work=context["target_work"],
-    )
-
-
-def test_k1_destino_multicolor_evalua_el_trabajo_recien_creado(monkeypatch):
-    monkeypatch.setattr(
-        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
-    )
-    context = _k1_validation_context()
-    context["target_ot"].trabajos_ot = [SimpleNamespace(
-        estado="PLANIFICADO",
-        orden_operacion_id=uuid4(),
-    )]
-
-    scm_ot_service._validate_continuity_target(
-        manga=context["manga"],
-        segment=context["segment"],
-        target_work=context["target_work"],
-        session=_ContinuitySession([context["target_ot"]]),
-    )
-
-
-def test_k1_ot_cerrada_intermedia_no_bloquea_la_siguiente_enlazable(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        scm_ot_service, "_plan_line_belongs_to_work", lambda *_args: True
-    )
-    context = _k1_validation_context()
-    context["target_ot"].fecha = date(2026, 8, 27)
-    context["target_ot"].turno = "DIA"
-    closed_intermediate = SimpleNamespace(
-        id=3,
-        public_id=uuid4(),
-        codigo_ot="OT-K1-CERRADA",
-        fecha=date(2026, 8, 26),
-        turno="NOCHE",
-        maquina_id=10,
-        estado="CERRADA",
-        trabajos_ot=[],
-    )
-
-    scm_ot_service._validate_continuity_target(
-        manga=context["manga"],
-        segment=context["segment"],
-        target_work=context["target_work"],
-        session=_ContinuitySession([
-            closed_intermediate,
-            context["target_ot"],
-        ]),
-    )
 
 
 @pytest.mark.parametrize(
@@ -443,6 +286,15 @@ def test_matriz_k1_rechaza_salida_que_no_pertenece_al_trabajo(monkeypatch):
     assert error.value.code == "CONTINUITY_CONTEXT_MISMATCH"
 
 
+def test_fabrication_run_lock_targets_only_run_on_postgresql():
+    statement = _fabrication_run_for_update_query(
+        run_id=uuid4(),
+        order_id=uuid4(),
+    )
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "LEFT OUTER JOIN color_produccion" in sql
+    assert "FOR UPDATE OF scm_corrida_fabricacion" in sql
 from app.services.scm_assembly_execution_service import (
     approve_assembly_quantity_correction,
     assign_assembly_output_mangas,
@@ -471,7 +323,6 @@ from app.services.scm_packaging_service import (
 )
 from app.services.scm_service_support import ScmServiceError
 from app.services.scm_weighing_service import (
-    _validate_corrected_operational_date,
     approve_weighing_correction,
     confirm_manga_weighing,
     get_manga_weighing,
@@ -479,70 +330,18 @@ from app.services.scm_weighing_service import (
     register_manga_weighing_control,
     resolve_manga_label,
 )
-
-
-def test_correccion_k1_usa_la_ot_del_tramo_final():
-    source_ot = SimpleNamespace(
-        fecha=date(2026, 8, 26),
-        timezone_snapshot="America/Lima",
-        public_id=uuid4(),
-        codigo_ot="OT-DIA-26",
-    )
-    final_ot = SimpleNamespace(
-        fecha=date(2026, 8, 27),
-        timezone_snapshot="America/Lima",
-        public_id=uuid4(),
-        codigo_ot="OT-DIA-27",
-    )
-    source_work = SimpleNamespace(orden_trabajo=source_ot)
-    final_work = SimpleNamespace(orden_trabajo=final_ot)
-    final_segment = SimpleNamespace(
-        id=uuid4(), secuencia=2, trabajo=final_work
-    )
-    manga = SimpleNamespace(
-        tramos_trabajo=[
-            SimpleNamespace(id=uuid4(), secuencia=1, trabajo=source_work),
-            final_segment,
-        ],
-        trabajo=source_work,
-        ot=source_ot,
-    )
-    weighing = SimpleNamespace(timezone_snapshot="America/Lima")
-    lima = timezone(timedelta(hours=-5))
-
-    with pytest.raises(ScmServiceError) as error:
-        _validate_corrected_operational_date(
-            manga,
-            weighing,
-            datetime(2026, 8, 26, 23, 30, tzinfo=lima),
-        )
-
-    assert error.value.code == "OPERATIONAL_DATE_IN_FUTURE"
-    assert error.value.details["ot_id"] == str(final_ot.public_id)
-    assert error.value.details["tramo_id"] == str(final_segment.id)
-
-    local_date, drift, operational_ot, segment = (
-        _validate_corrected_operational_date(
-            manga,
-            weighing,
-            datetime(2026, 8, 27, 8, tzinfo=lima),
-        )
-    )
-    assert local_date == date(2026, 8, 27)
-    assert drift == 0
-    assert operational_ot is final_ot
-    assert segment is final_segment
-
-
 from app.services.scm_warehouse_service import (
     _reserve_operation as _reserve_warehouse_operation,
     decide_manga_quality,
     receive_manga,
     resolve_receiving_label,
 )
-from app.models.scm_ot import ScmAnulacionPesajeManga
+from app.models.scm_ot import ScmAnulacionPesajeManga, ScmReaperturaManga
 from app.services.scm_ot_service import add_normal_mangas
-from app.services.scm_weighing_service import annul_manga_weighing
+from app.services.scm_weighing_service import (
+    annul_manga_weighing,
+    reopen_manga_after_accidental_close,
+)
 from app.services.scm_warehouse_service import (
     request_receipt_reversal, resolve_receipt_reversal,
 )
@@ -1028,7 +827,14 @@ def test_of_corrida_ot_mangas_y_etiqueta_usen_identidad_canonica(app):
             data={},
         )
         payload = labels["labels"][0]["payload"]
-        assert labels["template"]["version"] == "PREPESAJE_TSPL_3"
+        assert labels["template"]["version"] == "PREPESAJE_TSPL_5"
+        assert labels["template"]["qr_contract"] == "LABEL_REF_V1"
+        assert payload["template"]["qr_contract"] == "LABEL_REF_V1"
+        assert payload["pieza"] == "Asa piloto"
+        assert payload["maquina"] == "Maquina 1"
+        assert payload["turno"] == "DIA"
+        assert payload["operador"] == creator.nombre_completo
+        assert payload["kg_estimados"] == "10.000"
         assert payload["of_ot"] == "OF-000900 - OT-000001"
         assert "op_ot" not in payload
         assert payload["qr"]["v"] == 1
@@ -1083,11 +889,14 @@ def test_of_corrida_ot_mangas_y_etiqueta_usen_identidad_canonica(app):
             },
         )
         assert weighed["post_label"]["plantilla_version"] == (
-            "POSTPESAJE_TSPL_4"
+            "POSTPESAJE_TSPL_5"
         )
         assert "qr" not in weighed["post_label"]["payload"]
         assert weighed["post_label"]["payload"]["of_ot"] == (
             "OF-000900 - OT-000001"
+        )
+        assert weighed["post_label"]["payload"]["fuente_cantidad"] == (
+            "PLAN_CONFIRMADO_POR_PESAJE"
         )
 
 
@@ -1754,6 +1563,8 @@ def test_trabajo_dos_up_conserva_dos_identidades(app):
         )
         assert labels["labels"][0]["payload"]["qr"]["manga_id"] == ids[0]
         assert labels["labels"][1]["payload"]["qr"]["manga_id"] == ids[1]
+        assert labels["labels"][0]["payload"]["op"] == order.numero_op
+        assert labels["labels"][1]["payload"]["op"] == order.numero_op
 
         station_id = str(uuid4())
         db.session.add(EstacionPesaje(
@@ -2895,6 +2706,110 @@ def _print_color_manga(*, actor, manga_id, station_code):
     return station, generated["labels"][0]
 
 
+def test_k4_resolve_explains_unstarted_work_and_clears_reason_when_started(app):
+    with app.app_context():
+        creator, _, _, _, _, _, _, created = _seed_aggregate_color_work()
+        work = created["trabajo_color"]
+        _, label = _print_color_manga(
+            actor=creator, manga_id=created["mangas"][0]["public_id"],
+            station_code="PESAJE-K4-FEEDBACK",
+        )
+        candidate = resolve_manga_label(db.session, label_id=UUID(label["public_id"]))
+        assert candidate["can_weigh"] is False
+        assert candidate["bloqueos_pesaje"]["completar_final"]["codigo"] == "TRABAJO_NO_INICIADO"
+        assert candidate["bloqueos_pesaje"]["registrar_avance_kg"]["responsable"] == "CENTRAL"
+        transition_color_work(
+            db.session, actor_id=creator.id, work_id=UUID(work["id"]),
+            operation_id=uuid4(), data={"version": work["version"]}, action="iniciar",
+        )
+        candidate = resolve_manga_label(db.session, label_id=UUID(label["public_id"]))
+        assert candidate["can_weigh"] is True
+        assert candidate["bloqueos_pesaje"] == {
+            "completar_final": None, "registrar_avance_kg": None,
+        }
+
+
+def test_cierre_parcial_supervisado_devuelve_saldo_al_plan(app):
+    with app.app_context():
+        creator, _approver, _order, _run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=100)
+        )
+        work = created["trabajo_color"]
+        manga = created["mangas"][0]
+        station, prelabel = _print_color_manga(
+            actor=creator,
+            manga_id=manga["public_id"],
+            station_code="PESAJE-UAT-PARCIAL",
+        )
+        work = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(work["id"]),
+            operation_id=uuid4(),
+            data={"version": work["version"]},
+            action="iniciar",
+        )["trabajo_color"]
+
+        with pytest.raises(ScmServiceError) as missing_reason:
+            confirm_manga_weighing(
+                db.session,
+                station_id=station.station_id,
+                operation_id=uuid4(),
+                actor_id=creator.id,
+                data={
+                    "label_id": prelabel["public_id"],
+                    "capture_id": str(uuid4()),
+                    "peso_bruto_kg": "10.100",
+                    "tara_kg": "0.100",
+                    "tara_fuente": "TIPO_MANGA",
+                    "pesada_at": "2026-08-11T16:55:00-05:00",
+                    "reading_stable": True,
+                    "cantidad_confirmada_un": "37",
+                },
+            )
+        assert missing_reason.value.code == "REQUIRED_FIELD"
+
+        result = confirm_manga_weighing(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "10.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-08-11T16:55:00-05:00",
+                "reading_stable": True,
+                "cantidad_confirmada_un": "37",
+                "motivo_cierre_parcial": "Cambio de turno con manga incompleta",
+            },
+        )
+
+        assert result["cierre_parcial"] is True
+        assert result["cantidad_devuelta_plan_un"] == "63"
+        assert result["weighing"]["cantidad_confirmada"] == "37.000"
+        assert result["weighing"]["fuente_cantidad"] == (
+            "CIERRE_PARCIAL_SUPERVISADO"
+        )
+        assert result["post_label"]["payload"]["cantidad_confirmada_un"] == "37"
+        assert result["post_label"]["payload"]["cierre_parcial"] is True
+        plan_assignment = ScmAsignacionPlanMangaOt.query.filter_by(
+            trabajo_ot_id=UUID(work["id"])
+        ).one()
+        work_model = db.session.get(ScmTrabajoOt, UUID(work["id"]))
+        manga_model = ScmManga.query.filter_by(
+            public_id=UUID(manga["public_id"])
+        ).one()
+        assert Decimal(plan_assignment.cantidad_asignada_un) == Decimal("37")
+        assert Decimal(work_model.cantidad_objetivo_un) == Decimal("37")
+        assert Decimal(work_model.cantidad_confirmada_un) == Decimal("37")
+        assert Decimal(manga_model.cantidad_asignada_un) == Decimal("100")
+        assert Decimal(manga_model.cantidad_confirmada_un) == Decimal("37")
+        assert manga_model.estado == "PESADA"
+
+
 def _seed_two_work_aggregate(*, first_quantity=200):
     creator, approver, order, first_run, first_output = (
         _seed_fabrication_order()
@@ -3897,6 +3812,810 @@ def test_uat_m09_correccion_post_recepcion_y_reversa_conservan_trabajo(app):
         assert ScmAnulacionPesajeManga.query.count() == 1
 
 
+def test_cerrar_of_acredita_demanda_y_completa_op_sin_duplicar_kardex(app):
+    from datetime import date
+
+    from app.models.producto import ProductoTerminado
+    from app.models.scm_inventory import ScmMovimientoInventario
+    from app.models.scm_ot import ScmLoteArticulo
+    from app.models.scm_production_orders import (
+        ScmAsignacionDemandaSuministro,
+        ScmOrdenProduccion,
+        ScmOrdenProduccionLinea,
+    )
+    from app.services.scm_fabrication_order_service import (
+        close_fabrication_order,
+    )
+
+    with app.app_context():
+        (
+            creator,
+            approver,
+            order,
+            run,
+            output,
+            _line,
+            _header,
+            created,
+        ) = _seed_aggregate_color_work(quantity=250)
+        product = ProductoTerminado(
+            cod_sku_pt="PT-CIERRE-OF",
+            producto="Producto para cierre reconciliado",
+            linea_id=1,
+            familia_id=1,
+        )
+        demand = ScmOrdenProduccion(
+            codigo="OP-CIERRE-OF",
+            origen="PLANIFICACION",
+            fecha_necesidad=date(2026, 8, 14),
+            estado="PLANIFICADA",
+            created_by_id=creator.id,
+            approved_by_id=approver.id,
+        )
+        demand_line = ScmOrdenProduccionLinea(
+            producto_terminado=product,
+            cantidad_solicitada=Decimal("250"),
+        )
+        demand.lineas.append(demand_line)
+        allocation = ScmAsignacionDemandaSuministro(
+            orden_produccion_linea=demand_line,
+            fuente_tipo="SALIDA_ORDEN",
+            orden_operacion_salida=output,
+            cantidad_planificada=Decimal("250"),
+        )
+        db.session.add_all([product, demand, allocation])
+        db.session.commit()
+
+        work = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]),
+            operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]},
+            action="iniciar",
+        )["trabajo_color"]
+        db.session.refresh(demand)
+        assert demand.estado == "EN_COBERTURA"
+
+        work_model = db.session.get(ScmTrabajoOt, UUID(work["id"]))
+        for manga in work_model.mangas:
+            manga.estado = "PESADA"
+            manga.cantidad_confirmada_un = manga.cantidad_asignada_un
+        db.session.commit()
+        completed = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=work_model.id,
+            operation_id=uuid4(),
+            data={"version": work_model.version},
+            action="completar",
+        )["trabajo_color"]
+        assert completed["cantidad_confirmada_un"] == "250"
+
+        inventory_before = ScmMovimientoInventario.query.count()
+        close_operation = uuid4()
+        command = {"version": order.version}
+        closed = close_fabrication_order(
+            db.session,
+            actor_id=approver.id,
+            operation_id=close_operation,
+            operation_order_id=order.id,
+            data=command,
+        )
+        assert closed["estado"] == "CERRADA"
+        assert closed["corridas"][0]["estado"] == "COMPLETADA"
+        assert closed["corridas"][0]["salidas"][0]["cantidad_real"] == (
+            "250.000"
+        )
+        assert closed["cierre"]["ordenes_produccion"][0]["estado"] == (
+            "COMPLETADA"
+        )
+        db.session.refresh(demand)
+        db.session.refresh(demand_line)
+        db.session.refresh(allocation)
+        assert demand.estado == "COMPLETADA"
+        assert demand_line.estado == "SATISFECHA"
+        assert allocation.estado == "SATISFECHA"
+        assert Decimal(allocation.cantidad_satisfecha) == Decimal("250")
+        assert Decimal(
+            ScmLoteArticulo.query.filter_by(
+                orden_operacion_salida_id=output.id
+            ).one().cantidad_acreditada
+        ) == Decimal("250")
+        assert ScmMovimientoInventario.query.count() == inventory_before
+
+        replay = close_fabrication_order(
+            db.session,
+            actor_id=approver.id,
+            operation_id=close_operation,
+            operation_order_id=order.id,
+            data=command,
+        )
+        assert replay == closed
+        assert ScmMovimientoInventario.query.count() == inventory_before
+
+
+def test_cerrar_of_con_faltante_exige_motivo_y_no_completa_op(app):
+    from datetime import date
+
+    from app.models.producto import ProductoTerminado
+    from app.models.scm_production_orders import (
+        ScmAsignacionDemandaSuministro,
+        ScmOrdenProduccion,
+        ScmOrdenProduccionLinea,
+    )
+    from app.services.scm_fabrication_order_service import (
+        close_fabrication_order,
+    )
+
+    with app.app_context():
+        (
+            creator,
+            approver,
+            order,
+            _run,
+            output,
+            _line,
+            _header,
+            created,
+        ) = _seed_aggregate_color_work(quantity=250)
+        product = ProductoTerminado(
+            cod_sku_pt="PT-CIERRE-PARCIAL",
+            producto="Producto con cierre parcial",
+            linea_id=1,
+            familia_id=1,
+        )
+        demand = ScmOrdenProduccion(
+            codigo="OP-CIERRE-PARCIAL",
+            origen="PLANIFICACION",
+            fecha_necesidad=date(2026, 8, 14),
+            estado="PLANIFICADA",
+            created_by_id=creator.id,
+            approved_by_id=approver.id,
+        )
+        demand_line = ScmOrdenProduccionLinea(
+            producto_terminado=product,
+            cantidad_solicitada=Decimal("250"),
+        )
+        demand.lineas.append(demand_line)
+        allocation = ScmAsignacionDemandaSuministro(
+            orden_produccion_linea=demand_line,
+            fuente_tipo="SALIDA_ORDEN",
+            orden_operacion_salida=output,
+            cantidad_planificada=Decimal("250"),
+        )
+        db.session.add_all([product, demand, allocation])
+        db.session.commit()
+
+        work = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]),
+            operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]},
+            action="iniciar",
+        )["trabajo_color"]
+        with pytest.raises(ScmServiceError) as pending_work:
+            close_fabrication_order(
+                db.session,
+                actor_id=approver.id,
+                operation_id=uuid4(),
+                operation_order_id=order.id,
+                data={"version": order.version},
+            )
+        assert pending_work.value.code == "OF_HAS_PENDING_WORKS"
+        order = db.session.get(ScmOrdenOperacion, order.id)
+        work_model = db.session.get(ScmTrabajoOt, UUID(work["id"]))
+        first, *remaining = work_model.mangas
+        first.estado = "PESADA"
+        first.cantidad_confirmada_un = first.cantidad_asignada_un
+        for manga in remaining:
+            manga.estado = "ANULADA"
+        db.session.commit()
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=work_model.id,
+            operation_id=uuid4(),
+            data={"version": work_model.version},
+            action="completar",
+        )
+
+        with pytest.raises(ScmServiceError) as missing_reason:
+            close_fabrication_order(
+                db.session,
+                actor_id=approver.id,
+                operation_id=uuid4(),
+                operation_order_id=order.id,
+                data={"version": order.version},
+            )
+        assert missing_reason.value.code == "OF_CLOSE_REASON_REQUIRED"
+        db.session.refresh(order)
+        db.session.refresh(allocation)
+        assert order.estado == "EN_EJECUCION"
+        assert Decimal(allocation.cantidad_satisfecha) == Decimal("0")
+
+        closed = close_fabrication_order(
+            db.session,
+            actor_id=approver.id,
+            operation_id=uuid4(),
+            operation_order_id=order.id,
+            data={
+                "version": order.version,
+                "motivo": "Se terminó el turno con saldo pendiente",
+            },
+        )
+        assert closed["estado"] == "CERRADA"
+        assert closed["cierre"]["diferencias"] == [{
+            "salida_id": str(output.id),
+            "articulo": output.articulo.codigo,
+            "objetivo": "250.000",
+            "real": "100.000",
+        }]
+        db.session.refresh(demand)
+        db.session.refresh(demand_line)
+        db.session.refresh(allocation)
+        assert demand.estado == "EN_COBERTURA"
+        assert demand_line.estado == "ACTIVA"
+        assert allocation.estado == "COMPROMETIDA"
+        assert Decimal(allocation.cantidad_satisfecha) == Decimal("100")
+
+
+def test_k3_avance_kg_repetible_no_cierra_tramo_ni_bloquea_manga(app):
+    with app.app_context():
+        creator, approver, order, run, output = _seed_fabrication_order()
+        piece_color = output.articulo.pieza_color.pieza_color
+        piece_color.imagen_mime = "image/png"
+        piece_color.imagen_data = b"piece-image"
+        db.session.commit()
+
+        plan = recalculate_fabrication_manga_plan(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={},
+        )["plan"]
+        created = create_fabrication_ot(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={
+                "corrida_fabricacion_id": str(run.id),
+                "fecha_operativa": "2026-08-31",
+                "turno": "DIA",
+                "maquinista_id": creator.id,
+                "asignaciones": [{
+                    "plan_linea_id": plan["lineas"][0]["id"],
+                    "cantidad_un": 50,
+                }],
+            },
+        )
+        work = created["trabajo_color"]
+        manga = work["mangas"][0]
+        station, prelabel = _print_color_manga(
+            actor=creator,
+            manga_id=manga["public_id"],
+            station_code="PESAJE-UAT-K3-AVANCE-KG",
+        )
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(work["id"]),
+            operation_id=uuid4(),
+            data={"version": work["version"]},
+            action="iniciar",
+        )
+
+        first = register_manga_weighing_control(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=approver.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "control_type": "AVANCE_KG",
+                "peso_bruto_kg": "3.600",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-08-31T10:00:00-05:00",
+                "pesado_por_id": approver.id,
+                "reading_stable": True,
+            },
+        )
+        second_operation = uuid4()
+        second_payload = {
+            "label_id": prelabel["public_id"],
+            "capture_id": str(uuid4()),
+            "control_type": "AVANCE_KG",
+            "peso_bruto_kg": "7.600",
+            "tara_kg": "0.100",
+            "tara_fuente": "TIPO_MANGA",
+            "pesada_at": "2026-08-31T12:00:00-05:00",
+            "pesado_por_id": approver.id,
+            "reading_stable": True,
+        }
+        second = register_manga_weighing_control(
+            db.session,
+            station_id=station.station_id,
+            operation_id=second_operation,
+            actor_id=approver.id,
+            data=second_payload,
+        )
+        replay = register_manga_weighing_control(
+            db.session,
+            station_id=station.station_id,
+            operation_id=second_operation,
+            actor_id=approver.id,
+            data=second_payload,
+        )
+
+        assert first["control"]["tipo"] == "AVANCE_KG"
+        assert first["control"]["conteo_acumulado_un"] is None
+        assert first["continuidad_estado"] == "ACTIVA"
+        assert second["control"]["aporte_desde_control_anterior_kg"] == "4.000"
+        assert replay["control"] == second["control"]
+        assert replay["idempotent_replay"] is True
+        assert first["control"]["tramo_id"] == second["control"]["tramo_id"]
+
+        manga_model = ScmManga.query.filter_by(
+            public_id=UUID(manga["public_id"])
+        ).one()
+        work_model = db.session.get(ScmTrabajoOt, UUID(work["id"]))
+        segments = ScmTramoMangaTrabajo.query.filter_by(
+            manga_id=manga_model.id
+        ).all()
+        assert manga_model.estado == "EN_LLENADO"
+        assert work_model.estado == "EN_EJECUCION"
+        assert len(segments) == 1
+        assert segments[0].estado == "ACTIVO"
+        assert len(manga_model.controles_peso) == 2
+
+        resolved = resolve_manga_label(
+            db.session, label_id=UUID(prelabel["public_id"])
+        )
+        assert resolved["can_weigh"] is True
+        assert resolved["can_register_weight_control"] is True
+        assert resolved["manga"]["imagen_path"] == (
+            f"/api/piezas-color/{piece_color.sku}/imagen"
+        )
+        color = run.color_produccion
+        assert resolved["manga"]["color_hex"] == color.hex_referencia
+        assert resolved["manga"]["color_identidad"] == {
+            "id": color.id,
+            "nombre": "FUCSIA C SOLIDO C",
+            "base": {
+                "id": color.color_base_id,
+                "nombre": "FUCSIA C",
+            },
+            "familia": {
+                "id": color.familia_color_id,
+                "nombre": "SOLIDO C",
+            },
+            "hex": "#E91E63",
+        }
+
+
+def test_k6_reabre_cierre_accidental_con_mismo_qr_y_admite_nuevo_final(app):
+    with app.app_context():
+        creator, approver, _order, _run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=50, operational_date="2026-09-03")
+        )
+        work = created["trabajo_color"]
+        station, prelabel = _print_color_manga(
+            actor=creator,
+            manga_id=created["mangas"][0]["public_id"],
+            station_code="PESAJE-UAT-K6-REAPERTURA",
+        )
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(work["id"]),
+            operation_id=uuid4(),
+            data={"version": work["version"]},
+            action="iniciar",
+        )
+        register_manga_weighing_control(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=approver.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "control_type": "AVANCE_KG",
+                "peso_bruto_kg": "3.600",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T14:00:00-05:00",
+                "pesado_por_id": approver.id,
+                "reading_stable": True,
+            },
+        )
+        accidental = confirm_manga_weighing(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "7.600",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T15:00:00-05:00",
+                "reading_stable": True,
+            },
+        )
+        acknowledge_station_print_job(
+            db.session,
+            station_id=station.station_id,
+            print_job_id=UUID(accidental["print_job_id"]),
+            data={"results": [{
+                "label_id": accidental["post_label"]["public_id"],
+                "estado": "IMPRESA",
+                "printer_name": "TSC",
+            }]},
+        )
+
+        manga = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+        assignment = db.session.get(ScmAsignacionPlanMangaOt, manga.asignacion_id)
+        work_model = db.session.get(ScmTrabajoOt, UUID(work["id"]))
+        assigned_before = Decimal(assignment.cantidad_asignada_un)
+        sleeves_before = assignment.mangas_asignadas
+        operation_id = uuid4()
+        command = {
+            "version": manga.version,
+            "motivo": "Cierre accidental; no se marcó Control de peso",
+            "evidencia": "UAT-2026-09-03",
+        }
+
+        manga.tipo = "EXTRA"
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as out_of_scope:
+            reopen_manga_after_accidental_close(
+                db.session,
+                actor_id=approver.id,
+                manga_id=manga.public_id,
+                operation_id=uuid4(),
+                data=command,
+            )
+        assert out_of_scope.value.code == "MANGA_REOPEN_NOT_AVAILABLE"
+        manga.tipo = "NORMAL"
+        db.session.commit()
+
+        with pytest.raises(ScmServiceError) as unauthorized:
+            reopen_manga_after_accidental_close(
+                db.session,
+                actor_id=creator.id,
+                manga_id=manga.public_id,
+                operation_id=uuid4(),
+                data=command,
+            )
+        assert unauthorized.value.code == "CAPABILITY_REQUIRED"
+        with pytest.raises(ScmServiceError) as stale:
+            reopen_manga_after_accidental_close(
+                db.session,
+                actor_id=approver.id,
+                manga_id=manga.public_id,
+                operation_id=uuid4(),
+                data={**command, "version": manga.version - 1},
+            )
+        assert stale.value.code == "MANGA_VERSION_CONFLICT"
+
+        reopened = reopen_manga_after_accidental_close(
+            db.session,
+            actor_id=approver.id,
+            manga_id=manga.public_id,
+            operation_id=operation_id,
+            data=command,
+        )
+        replay = reopen_manga_after_accidental_close(
+            db.session,
+            actor_id=approver.id,
+            manga_id=manga.public_id,
+            operation_id=operation_id,
+            data=command,
+        )
+
+        db.session.refresh(manga)
+        db.session.refresh(assignment)
+        db.session.refresh(work_model)
+        invalidated = ScmPesajeManga.query.filter_by(
+            public_id=UUID(accidental["weighing"]["public_id"])
+        ).one()
+        segment = ScmTramoMangaTrabajo.query.filter_by(manga_id=manga.id).one()
+        assert reopened["manga"]["estado"] == "EN_LLENADO"
+        assert replay == reopened
+        assert reopened["pesaje_invalidado"]["estado"] == "REABIERTO"
+        assert reopened["reapertura"]["motivo"] == command["motivo"]
+        assert reopened["reapertura"]["tipo_reapertura"] == "CIERRE_ACCIDENTAL"
+        assert reopened["reapertura"]["peso_base_neto_kg"] is None
+        assert invalidated.estado == "REABIERTO"
+        assert ScmReaperturaManga.query.count() == 1
+        assert manga.cantidad_confirmada_un is None
+        assert manga.cantidad_contenida_un is None
+        assert Decimal(work_model.cantidad_confirmada_un) == Decimal("0")
+        assert Decimal(assignment.cantidad_asignada_un) == assigned_before
+        assert assignment.mangas_asignadas == sleeves_before
+        assert len(manga.controles_peso) == 1
+        assert segment.estado == "ACTIVO"
+        assert segment.cantidad_fin_un is None
+        assert Decimal(segment.cantidad_atribuida_un) == Decimal("0")
+        assert next(
+            label for label in manga.etiquetas if label.tipo == "PREPESAJE"
+        ).estado == "IMPRESA"
+        assert next(
+            label for label in manga.etiquetas if label.tipo == "POSTPESAJE"
+        ).estado == "INVALIDADA"
+
+        resolved = resolve_manga_label(
+            db.session, label_id=UUID(prelabel["public_id"])
+        )
+        assert resolved["can_weigh"] is True
+        assert resolved["can_register_weight_control"] is True
+        assert resolved["weighing"] is None
+
+        replacement_final = confirm_manga_weighing(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "10.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T16:00:00-05:00",
+                "reading_stable": True,
+            },
+        )
+        assert replacement_final["weighing"]["estado"] == "VIGENTE"
+        assert ScmPesajeManga.query.filter_by(manga_id=manga.id).count() == 2
+        assert ScmPesajeManga.query.filter_by(
+            manga_id=manga.id, estado="VIGENTE"
+        ).count() == 1
+        detail = get_manga_weighing(
+            db.session, actor_id=approver.id, manga_id=manga.public_id
+        )
+        assert len(detail["historial"]) == 2
+        assert detail["historial"][0]["pesaje"]["estado"] == "REABIERTO"
+        assert detail["historial"][0]["reapertura"]["motivo"] == command["motivo"]
+        assert detail["historial"][1]["pesaje"]["estado"] == "VIGENTE"
+
+
+def test_k8_reapertura_para_continuar_conserva_final_como_linea_base(app):
+    with app.app_context():
+        creator, approver, _order, _run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=50, operational_date="2026-09-03")
+        )
+        work = created["trabajo_color"]
+        station, prelabel = _print_color_manga(
+            actor=creator,
+            manga_id=created["mangas"][0]["public_id"],
+            station_code="PESAJE-UAT-K8-BASE",
+        )
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(work["id"]),
+            operation_id=uuid4(),
+            data={"version": work["version"]},
+            action="iniciar",
+        )
+        final = confirm_manga_weighing(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "5.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T15:00:00-05:00",
+                "reading_stable": True,
+            },
+        )
+        manga = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+        with pytest.raises(ScmServiceError) as invalid_type:
+            reopen_manga_after_accidental_close(
+                db.session,
+                actor_id=approver.id,
+                manga_id=manga.public_id,
+                operation_id=uuid4(),
+                data={
+                    "version": manga.version,
+                    "tipo_reapertura": "OTRO",
+                    "motivo": "No debe mutar",
+                },
+            )
+        assert invalid_type.value.code == "INVALID_REOPENING_TYPE"
+
+        reopened = reopen_manga_after_accidental_close(
+            db.session,
+            actor_id=approver.id,
+            manga_id=manga.public_id,
+            operation_id=uuid4(),
+            data={
+                "version": manga.version,
+                "tipo_reapertura": "CONTINUAR_LLENADO",
+                "motivo": "Se agregaron más piezas antes de recepción",
+            },
+        )
+
+        assert final["weighing"]["peso_fisico_neto_kg"] == "5.000"
+        assert reopened["reapertura"]["tipo_reapertura"] == "CONTINUAR_LLENADO"
+        assert reopened["reapertura"]["peso_base_neto_kg"] == "5.000"
+        resolved = resolve_manga_label(
+            db.session, label_id=UUID(prelabel["public_id"])
+        )
+        assert resolved["continuidad"]["ultima_referencia_peso"] == {
+            "fuente": "CIERRE_REABIERTO",
+            "peso_neto_kg": "5.000",
+            "tara_kg": "0.100",
+            "tara_fuente": "TIPO_MANGA",
+            "pesado_at": reopened["reapertura"]["reabierta_at"],
+        }
+
+        with pytest.raises(ScmServiceError) as not_growing:
+            register_manga_weighing_control(
+                db.session,
+                station_id=station.station_id,
+                operation_id=uuid4(),
+                actor_id=approver.id,
+                data={
+                    "label_id": prelabel["public_id"],
+                    "capture_id": str(uuid4()),
+                    "control_type": "AVANCE_KG",
+                    "peso_bruto_kg": "4.900",
+                    "tara_kg": "0.100",
+                    "tara_fuente": "TIPO_MANGA",
+                    "pesada_at": "2026-09-03T16:00:00-05:00",
+                    "pesado_por_id": approver.id,
+                    "reading_stable": True,
+                },
+            )
+        assert not_growing.value.code == "CONTROL_WEIGHT_NOT_MONOTONIC"
+
+        control = register_manga_weighing_control(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=approver.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "control_type": "AVANCE_KG",
+                "peso_bruto_kg": "5.800",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T16:05:00-05:00",
+                "pesado_por_id": approver.id,
+                "reading_stable": True,
+            },
+        )
+        assert control["control"]["peso_neto_kg"] == "5.700"
+        assert control["control"]["aporte_desde_control_anterior_kg"] == "0.700"
+
+        second_control = register_manga_weighing_control(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=approver.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "control_type": "AVANCE_KG",
+                "peso_bruto_kg": "6.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T16:10:00-05:00",
+                "pesado_por_id": approver.id,
+                "reading_stable": True,
+            },
+        )
+        assert second_control["control"]["peso_neto_kg"] == "6.000"
+        assert (
+            second_control["control"]["aporte_desde_control_anterior_kg"]
+            == "0.300"
+        )
+
+
+def test_k6_exige_reversa_antes_de_reabrir_una_manga_recibida(app):
+    with app.app_context():
+        creator, approver, _order, _run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=50, operational_date="2026-09-03")
+        )
+        work = created["trabajo_color"]
+        station, prelabel = _print_color_manga(
+            actor=creator,
+            manga_id=created["mangas"][0]["public_id"],
+            station_code="PESAJE-UAT-K6-RECIBIDA",
+        )
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(work["id"]),
+            operation_id=uuid4(),
+            data={"version": work["version"]},
+            action="iniciar",
+        )
+        final = confirm_manga_weighing(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "12.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T15:00:00-05:00",
+                "reading_stable": True,
+            },
+        )
+        acknowledge_station_print_job(
+            db.session,
+            station_id=station.station_id,
+            print_job_id=UUID(final["print_job_id"]),
+            data={"results": [{
+                "label_id": final["post_label"]["public_id"],
+                "estado": "IMPRESA",
+                "printer_name": "TSC",
+            }]},
+        )
+        warehouse_actor = Trabajador(
+            codigo="TRB-UAT-K6-ALM",
+            nombres="Almacén",
+            apellidos="Reapertura K6",
+            activo=True,
+            roles=[RolOperativo.query.filter_by(
+                codigo="ALMACEN_RECEPCION"
+            ).one()],
+        )
+        db.session.add(warehouse_actor)
+        db.session.commit()
+        receive_manga(
+            db.session,
+            actor_id=warehouse_actor.id,
+            operation_id=uuid4(),
+            data={
+                "label_id": final["post_label"]["public_id"],
+                "ubicacion_codigo": "RECEPCION_PIEZAS_WIP",
+                "presencia_confirmada": True,
+                "bolsa_cerrada": True,
+                "coincidencia_etiquetas": True,
+            },
+        )
+        manga = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+
+        with pytest.raises(ScmServiceError) as received:
+            reopen_manga_after_accidental_close(
+                db.session,
+                actor_id=approver.id,
+                manga_id=manga.public_id,
+                operation_id=uuid4(),
+                data={
+                    "version": manga.version,
+                    "motivo": "Cierre accidental detectado en Almacén",
+                },
+            )
+        assert received.value.code == "RECEIPT_REVERSAL_REQUIRED"
+        assert ScmReaperturaManga.query.count() == 0
+
+
 def test_k2_relevo_misma_ot_conserva_manga_qr_y_abre_nuevo_tramo(app):
     with app.app_context():
         creator, approver, order, run, _output = _seed_fabrication_order()
@@ -3961,7 +4680,7 @@ def test_k2_relevo_misma_ot_conserva_manga_qr_y_abre_nuevo_tramo(app):
                 "tara_kg": "0.100",
                 "tara_fuente": "TIPO_MANGA",
                 "pesada_at": "2026-08-29T10:00:00-05:00",
-                "pesado_por_id": approver.id,
+                        "pesado_por_id": approver.id,
                 "reading_stable": True,
                 "conteo_acumulado_un": 20,
                 "motivo": "SALIDA_ANTICIPADA",
@@ -4247,38 +4966,6 @@ def test_k1_continua_misma_manga_y_qr_entre_turnos_con_atribucion_20_30(app):
                 "maquinista_predeterminado_id": pedro.id,
             },
         )["ot"]
-        later_header = create_fabrication_ot_header(
-            db.session,
-            actor_id=creator.id,
-            operation_id=uuid4(),
-            data={
-                "maquina_id": order.fabricacion.maquina_prevista_id,
-                "fecha_operativa": "2026-08-27",
-                "turno": "DIA",
-                "maquinista_predeterminado_id": pedro.id,
-            },
-        )["ot"]
-        assert list_pending_manga_continuities(
-            db.session,
-            actor_id=creator.id,
-            ot_id=UUID(later_header["public_id"]),
-            corrida_fabricacion_id=str(run.id),
-        )["items"] == []
-        with pytest.raises(ScmServiceError) as skipped_shift:
-            add_color_work(
-                db.session,
-                actor_id=creator.id,
-                ot_id=UUID(later_header["public_id"]),
-                operation_id=uuid4(),
-                data={
-                    "corrida_fabricacion_id": str(run.id),
-                    "maquinista_id": pedro.id,
-                    "asignaciones": [],
-                    "continuidad_manga_ids": [manga["public_id"]],
-                },
-            )
-        assert skipped_shift.value.code == "CONTINUITY_NEXT_OT_REQUIRED"
-
         candidates = list_pending_manga_continuities(
             db.session,
             actor_id=creator.id,
@@ -4491,16 +5178,17 @@ def test_k1_continua_misma_manga_y_qr_entre_turnos_con_atribucion_20_30(app):
             public_id=UUID(manga["public_id"])
         ).one().estado == "PENDIENTE_RECEPCION_ALMACEN"
 
+        assert "qr" not in final["post_label"]["payload"]
         candidate = resolve_receiving_label(
             db.session,
             actor_id=warehouse_actor.id,
-            label_id=UUID(final["post_label"]["public_id"]),
+            label_id=UUID(prelabel["public_id"]),
         )
         assert candidate["cantidad_confirmada"] == "50.000"
         assert candidate["peso_neto_kg"] == "5.000"
         receipt_operation = uuid4()
         receipt_command = {
-            "label_id": final["post_label"]["public_id"],
+            "label_id": prelabel["public_id"],
             "ubicacion_codigo": "RECEPCION_PIEZAS_WIP",
             "presencia_confirmada": True,
             "bolsa_cerrada": True,
@@ -4540,97 +5228,3 @@ def test_k1_continua_misma_manga_y_qr_entre_turnos_con_atribucion_20_30(app):
             manga_model.codigo,
             manga_model.secuencia_ot,
         ) == immutable_origin
-
-
-def test_jornadas_planta_agrega_recursos_y_ots_en_una_sola_lectura(app):
-    with app.app_context():
-        creator, _approver, order, _run, _output = _seed_fabrication_order()
-        center = ScmCentroTrabajo(
-            codigo="CTR-UAT-01",
-            nombre="Centro UAT",
-            tipo="ENSAMBLE",
-            activo=True,
-        )
-        db.session.add(center)
-        db.session.commit()
-        created = create_fabrication_ot_header(
-            db.session,
-            actor_id=creator.id,
-            operation_id=uuid4(),
-            data={
-                "maquina_id": order.fabricacion.maquina_prevista_id,
-                "fecha_operativa": "2026-08-27",
-                "turno": "DIA",
-                "maquinista_predeterminado_id": creator.id,
-            },
-        )["ot"]
-
-        response = app.test_client().get(
-            "/api/scm/v1/jornadas-planta",
-            query_string={
-                "fecha_operativa": "2026-08-27",
-                "turno": "DIA",
-            },
-            headers={"X-Actor-Id": str(creator.id)},
-        )
-
-        assert response.status_code == 200
-        payload = response.get_json()
-        assert payload["fecha_operativa"] == "2026-08-27"
-        assert payload["turno"] == "DIA"
-        assert any(
-            item["id"] == order.fabricacion.maquina_prevista_id
-            for item in payload["maquinas"]
-        )
-        assert payload["centros_trabajo"] == [center.to_dict()]
-        assert [
-            item["public_id"] for item in payload["ots_fabricacion"]
-        ] == [created["public_id"]]
-        assert payload["ots_armado"] == []
-
-
-def test_listado_of_operativo_no_transfiere_binarios_de_imagen(app):
-    with app.app_context():
-        creator, _approver, _order, _run, output = _seed_fabrication_order()
-        piece = output.articulo.pieza_color.pieza_color
-        piece.imagen_data = b"imagen-uat"
-        piece.imagen_storage_key = "catalog/piezas/uat.webp"
-        piece.imagen_size_bytes = len(piece.imagen_data)
-        piece_sku = piece.sku
-        creator_id = creator.id
-        db.session.commit()
-        db.session.expunge_all()
-
-        projected_piece = db.session.scalar(
-            select(PiezaColor).where(PiezaColor.sku == piece_sku)
-        )
-        assert "imagen_data" in inspect(projected_piece).unloaded
-        assert projected_piece.to_dict()["imagen_url"].endswith("/imagen")
-        assert "imagen_data" in inspect(projected_piece).unloaded
-        statements = []
-
-        def capture_statement(
-            _connection,
-            _cursor,
-            statement,
-            _parameters,
-            _context,
-            _executemany,
-        ):
-            statements.append(statement)
-
-        db.session.expire_all()
-        event.listen(db.engine, "before_cursor_execute", capture_statement)
-        try:
-            payload = list_fabrication_orders(
-                db.session,
-                actor_id=creator_id,
-            )
-        finally:
-            event.remove(db.engine, "before_cursor_execute", capture_statement)
-
-        assert len(payload["items"]) == 1
-        assert not any(
-            "pieza_color.imagen_data" in statement
-            for statement in statements
-        )

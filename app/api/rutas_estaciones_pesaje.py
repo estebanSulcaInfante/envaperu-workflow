@@ -41,6 +41,14 @@ from app.services.scm_ot_service import (
     list_station_print_jobs,
 )
 from app.services.scm_service_support import ScmServiceError
+from app.services.scm_inventory_opening_service import (
+    capture_physical_opening_unit,
+    resolve_physical_opening_target,
+)
+from app.services.scm_prepared_material_service import (
+    record_preparation_reading,
+    resolve_preparation_source_unit,
+)
 from app.services.scm_weighing_service import (
     confirm_manga_weighing,
     get_label_print_payload,
@@ -81,8 +89,11 @@ def capabilities():
                 "manga_prelabel": ["scm-manga-prelabel-v1"],
                 "manga_weighing": ["scm-manga-weighing-v1"],
                 "manga_weighing_control": [
-                    "scm-manga-weighing-control-v1"
+                    "scm-manga-weighing-control-v1",
+                    "scm-manga-weight-progress-v2",
                 ],
+                "inventory_opening_weighing": ["scm-inventory-opening-weighing-v1"],
+                "prepared_material_weighing": ["scm-prepared-material-weighing-v1"],
             },
             "features": {
                 "monitoring": True,
@@ -95,9 +106,113 @@ def capabilities():
                 "scm_manga_prelabel": True,
                 "scm_manga_weighing": True,
                 "scm_manga_weighing_control": True,
+                "scm_inventory_opening_weighing": True,
+                "scm_prepared_material_weighing": True,
             },
         }
     )
+
+
+@integration_station_bp.post("/stations/<station_id>/inventory-opening-units")
+@require_station_auth
+def capture_inventory_opening_unit(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"code": "JSON_REQUIRED", "message": "JSON requerido"}), 415
+    try:
+        operation_id = UUID(request.headers.get("Idempotency-Key", ""))
+    except (TypeError, ValueError):
+        return jsonify({
+            "code": "IDEMPOTENCY_KEY_REQUIRED",
+            "message": "Idempotency-Key debe ser un UUID.",
+        }), 422
+    try:
+        return jsonify(capture_physical_opening_unit(
+            db.session, station_id=station_id, operation_id=operation_id, data=payload,
+        ))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/stations/<station_id>/inventory-opening-targets/resolve")
+@require_station_auth
+def resolve_inventory_opening_target(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"code": "JSON_REQUIRED", "message": "JSON requerido"}), 415
+    try:
+        return jsonify(resolve_physical_opening_target(db.session, data=payload))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/stations/<station_id>/prepared-material-readings")
+@require_station_auth
+def capture_prepared_material_reading(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"code": "JSON_REQUIRED", "message": "JSON requerido"}), 415
+    try:
+        operation_id = UUID(request.headers.get("Idempotency-Key", ""))
+        order_id = UUID(str(payload.get("orden_preparacion_id")))
+    except (TypeError, ValueError, AttributeError):
+        return jsonify({"code": "INVALID_UUID", "message": "IDs de captura inválidos."}), 422
+    if payload.get("reading_stable") is not True:
+        return jsonify({"code": "SCALE_READING_UNSTABLE", "message": "La lectura debe ser estable."}), 422
+    try:
+        return jsonify(record_preparation_reading(
+            db.session,
+            actor_id=payload.get("pesado_por_id"),
+            operation_id=operation_id,
+            order_id=order_id,
+            data={
+                "version": payload.get("version"),
+                "tipo_uso": payload.get("tipo_uso"),
+                "metodo": "BALANZA_ESTACION",
+                "bruto_kg": payload.get("peso_bruto_kg"),
+                "tara_kg": payload.get("tara_kg"),
+                "neto_kg": payload.get("peso_neto_kg"),
+                "motivo": "Pesaje estable capturado en estación de Preparación",
+                "evidencia_ref": f"station:{station_id}:{operation_id}",
+                "asignacion_requerimiento_id": payload.get("asignacion_requerimiento_id"),
+                "unidades_origen_qr": payload.get("unidades_origen_qr") or [],
+            },
+        ))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/stations/<station_id>/prepared-material-source-units/resolve")
+@require_station_auth
+def resolve_prepared_material_source_unit(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"code": "JSON_REQUIRED", "message": "JSON requerido"}), 415
+    try:
+        order_id = UUID(str(payload.get("orden_preparacion_id")))
+    except (TypeError, ValueError, AttributeError):
+        return jsonify({"code": "INVALID_UUID", "message": "La OPM es inválida."}), 422
+    try:
+        return jsonify(resolve_preparation_source_unit(
+            db.session,
+            actor_id=payload.get("actor_id"),
+            order_id=order_id,
+            qr_value=payload.get("qr_value"),
+        ))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
 
 
 @integration_station_bp.put("/stations/<station_id>/heartbeat")

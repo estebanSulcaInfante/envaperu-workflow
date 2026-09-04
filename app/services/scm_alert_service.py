@@ -160,6 +160,7 @@ def evaluate_inventory_alerts(session, *, actor_id, now=None):
             .join(ScmPesajeManga, ScmPesajeManga.manga_id == ScmManga.id)
             .outerjoin(ScmExistenciaManga, ScmExistenciaManga.manga_id == ScmManga.id)
             .where(
+                ScmPesajeManga.estado == "VIGENTE",
                 ScmPesajeManga.pesada_at < cutoff,
                 ScmExistenciaManga.id.is_(None),
                 ScmManga.estado == "PENDIENTE_RECEPCION_ALMACEN",

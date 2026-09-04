@@ -102,6 +102,7 @@ from app.services.scm_ot_service import (
     add_normal_mangas,
     add_work_mangas,
     annul_manga,
+    annul_empty_fabrication_ot,
     assign_color_work_worker,
     approve_extra_manga,
     create_fabrication_ot_header,
@@ -128,6 +129,7 @@ from app.services.scm_weighing_service import (
     approve_weighing_correction,
     get_manga_weighing,
     request_weighing_correction,
+    reopen_manga_after_accidental_close,
 )
 from app.services.scm_production_order_service import (
     adjust_production_plan_targets,
@@ -156,6 +158,7 @@ from app.services.scm_assembly_order_service import (
     transition_assembly_order,
 )
 from app.services.scm_inventory_service import (
+    explore_inventory_balances,
     list_inventory_balances,
     list_inventory_movements,
     register_inventory_movement,
@@ -175,6 +178,43 @@ from app.services.scm_material_execution_service import (
     list_material_execution,
     reserve_run_materials,
     return_emitted_material,
+)
+from app.services.scm_prepared_material_service import (
+    assign_prepared_stock_to_requirement,
+    cancel_preparation_order,
+    close_preparation_order,
+    confirm_preparation_reading,
+    create_preparation_order,
+    emit_preparation_input,
+    generate_prepared_requirement,
+    get_preparation_order,
+    get_prepared_material_lot,
+    incorporate_preparation_input,
+    invalidate_preparation_reading,
+    reconcile_preparation_order,
+    record_preparation_reading,
+    receive_prepared_bag,
+    release_preparation_order,
+    reserve_preparation_inputs,
+    start_preparation_order,
+    decide_prepared_bag_quality,
+    dispatch_prepared_material_delivery,
+    list_eligible_preparation_runs,
+    list_compatible_prepared_stock,
+    list_preparation_orders,
+    list_prepared_material_destinations,
+    list_prepared_material_lots,
+    list_prepared_requirements,
+    list_work_prepared_material_reservations,
+    prepare_prepared_material_delivery,
+    resolve_prepared_material_machine_qr,
+    confirm_prepared_material_machine_qr,
+    receive_prepared_material_at_machine,
+    release_prepared_material_reservation,
+    reserve_prepared_material_for_work,
+    consume_prepared_material_delivery,
+    release_prepared_stock_assignment,
+    return_prepared_material_delivery,
 )
 from app.services.scm_internal_supply_service import (
     assign_non_exact_supply_source,
@@ -461,6 +501,21 @@ def inventario_saldos_listar():
     ))
 
 
+@scm_bp.get("/inventario/explorador")
+def inventario_explorador():
+    return jsonify(explore_inventory_balances(
+        db.session,
+        actor_id=_actor_id(),
+        ledger=request.args.get("kardex"),
+        query=request.args.get("q"),
+        location=request.args.get("ubicacion"),
+        stock_filter=request.args.get("disponibilidad", "TODOS"),
+        sort=request.args.get("ordenar", "CODIGO"),
+        limit=request.args.get("limite", 25),
+        cursor=request.args.get("cursor"),
+    ))
+
+
 @scm_bp.get("/inventario/movimientos")
 def inventario_movimientos_listar():
     return jsonify(list_inventory_movements(
@@ -580,6 +635,362 @@ def material_premezcla_confirmar(run_id):
         db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
         run_id=run_id, data=_json_body(),
     )), 201
+
+
+@scm_bp.post("/requerimientos-preparacion/calcular")
+def requerimiento_preparacion_calcular():
+    payload = _json_body()
+    try:
+        run_id = UUID(str(payload.get("corrida_fabricacion_id")))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise ScmServiceError(
+            "INVALID_FABRICATION_RUN_ID",
+            "corrida_fabricacion_id debe ser un UUID valido.",
+            status_code=400,
+        ) from error
+    if set(payload) != {"corrida_fabricacion_id"}:
+        raise ScmServiceError(
+            "UNKNOWN_FIELDS",
+            "La solicitud solo admite corrida_fabricacion_id.",
+            status_code=400,
+            details={
+                "fields": sorted(set(payload) - {"corrida_fabricacion_id"})
+            },
+        )
+    return jsonify(generate_prepared_requirement(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        run_id=run_id,
+    ))
+
+
+@scm_bp.get("/corridas-fabricacion/elegibles-preparacion")
+def corridas_fabricacion_elegibles_preparacion():
+    return jsonify(list_eligible_preparation_runs(
+        db.session,
+        actor_id=_actor_id(),
+        limit=request.args.get("limit", 25),
+        cursor=request.args.get("cursor"),
+    ))
+
+
+@scm_bp.get("/requerimientos-preparacion")
+def requerimientos_preparacion_listar():
+    return jsonify(list_prepared_requirements(
+        db.session,
+        actor_id=_actor_id(),
+        limit=request.args.get("limit", 25),
+        cursor=request.args.get("cursor"),
+        state=request.args.get("estado"),
+    ))
+
+
+@scm_bp.get(
+    "/requerimientos-preparacion/<uuid:requirement_id>/stock-compatible"
+)
+def requerimiento_preparacion_stock_compatible(requirement_id):
+    return jsonify(list_compatible_prepared_stock(
+        db.session,
+        actor_id=_actor_id(),
+        requirement_id=requirement_id,
+        limit=request.args.get("limit", 25),
+        cursor=request.args.get("cursor"),
+    ))
+
+
+@scm_bp.post(
+    "/requerimientos-preparacion/<uuid:requirement_id>/asignaciones-stock"
+)
+def requerimiento_preparacion_asignar_stock(requirement_id):
+    return jsonify(assign_prepared_stock_to_requirement(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        requirement_id=requirement_id,
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.post(
+    "/asignaciones-stock-material-preparado/<uuid:assignment_id>/liberar"
+)
+def asignacion_stock_material_preparado_liberar(assignment_id):
+    return jsonify(release_prepared_stock_assignment(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        assignment_id=assignment_id,
+        data=_json_body(),
+    ))
+
+
+@scm_bp.get(
+    "/trabajos-color/<uuid:work_id>/reservas-material-preparado"
+)
+def trabajo_color_reservas_material_preparado_listar(work_id):
+    return jsonify(list_work_prepared_material_reservations(
+        db.session,
+        actor_id=_actor_id(),
+        work_id=work_id,
+        limit=request.args.get("limit", 25),
+        cursor=request.args.get("cursor"),
+    ))
+
+
+@scm_bp.post(
+    "/trabajos-color/<uuid:work_id>/reservas-material-preparado"
+)
+def trabajo_color_reserva_material_preparado_crear(work_id):
+    return jsonify(reserve_prepared_material_for_work(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        work_id=work_id,
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.post(
+    "/reservas-material-preparado/<uuid:reservation_id>/preparar-entrega"
+)
+def reserva_material_preparado_preparar_entrega(reservation_id):
+    return jsonify(prepare_prepared_material_delivery(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        reservation_id=reservation_id,
+        data=_json_body(),
+    )), 201
+
+
+@scm_bp.post(
+    "/entregas-material-preparado/<uuid:delivery_id>/despachar"
+)
+def emision_material_preparado_despachar(delivery_id):
+    return jsonify(dispatch_prepared_material_delivery(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        delivery_id=delivery_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/entregas-material-preparado/<uuid:delivery_id>/recibir-maquina"
+)
+def emision_material_preparado_recibir_maquina(delivery_id):
+    return jsonify(receive_prepared_material_at_machine(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        delivery_id=delivery_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/recepciones-material-preparado/resolver-qr")
+def recepcion_material_preparado_resolver_qr():
+    return jsonify(resolve_prepared_material_machine_qr(
+        db.session, actor_id=_actor_id(), data=_json_body(),
+    ))
+
+
+@scm_bp.post("/recepciones-material-preparado/confirmar-qr")
+def recepcion_material_preparado_confirmar_qr():
+    return jsonify(confirm_prepared_material_machine_qr(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post("/trabajos-color/<uuid:work_id>/consumos-material-preparado")
+def trabajo_color_consumo_material_preparado(work_id):
+    return jsonify(consume_prepared_material_delivery(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        work_id=work_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/entregas-material-preparado/<uuid:delivery_id>/retornar"
+)
+def emision_material_preparado_devolver(delivery_id):
+    return jsonify(return_prepared_material_delivery(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        delivery_id=delivery_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/reservas-material-preparado/<uuid:reservation_id>/liberar"
+)
+def reserva_material_preparado_liberar(reservation_id):
+    return jsonify(release_prepared_material_reservation(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        reservation_id=reservation_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-preparacion-material/proponer")
+def orden_preparacion_material_proponer():
+    payload = create_preparation_order(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )
+    return jsonify(payload), 201
+
+
+@scm_bp.get("/ordenes-preparacion-material")
+def ordenes_preparacion_material_listar():
+    return jsonify(list_preparation_orders(
+        db.session,
+        actor_id=_actor_id(),
+        limit=request.args.get("limit", 25),
+        cursor=request.args.get("cursor"),
+        state=request.args.get("estado"),
+    ))
+
+
+@scm_bp.get("/ordenes-preparacion-material/<uuid:order_id>")
+def orden_preparacion_material_detalle(order_id):
+    return jsonify(get_preparation_order(
+        db.session, actor_id=_actor_id(), order_id=order_id,
+    ))
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/liberar")
+def orden_preparacion_material_liberar(order_id):
+    return jsonify(release_preparation_order(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/anular")
+def orden_preparacion_material_anular(order_id):
+    return jsonify(cancel_preparation_order(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/reservar-insumos")
+def orden_preparacion_material_reservar_insumos(order_id):
+    return jsonify(reserve_preparation_inputs(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/ordenes-preparacion-material/<uuid:order_id>/"
+    "reservas-insumo/<uuid:reservation_id>/emitir"
+)
+def orden_preparacion_material_emitir_insumo(order_id, reservation_id):
+    return jsonify(emit_preparation_input(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, reservation_id=reservation_id, data=_json_body(),
+    )), 201
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/iniciar")
+def orden_preparacion_material_iniciar(order_id):
+    return jsonify(start_preparation_order(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/lecturas")
+def orden_preparacion_material_lectura_registrar(order_id):
+    return jsonify(record_preparation_reading(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    )), 201
+
+
+@scm_bp.post("/lecturas-preparacion/<uuid:reading_id>/confirmar-segundo-actor")
+def lectura_preparacion_confirmar(reading_id):
+    return jsonify(confirm_preparation_reading(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        reading_id=reading_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/lecturas-preparacion/<uuid:reading_id>/invalidar")
+def lectura_preparacion_invalidar(reading_id):
+    return jsonify(invalidate_preparation_reading(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        reading_id=reading_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/aportes")
+def orden_preparacion_material_aporte(order_id):
+    return jsonify(incorporate_preparation_input(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    )), 201
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/conciliar")
+def orden_preparacion_material_conciliar(order_id):
+    return jsonify(reconcile_preparation_order(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-preparacion-material/<uuid:order_id>/cerrar")
+def orden_preparacion_material_cerrar(order_id):
+    return jsonify(close_preparation_order(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, data=_json_body(),
+    )), 201
+
+
+@scm_bp.get("/lotes-material-preparado/<uuid:lot_id>")
+def lote_material_preparado_detalle(lot_id):
+    return jsonify(get_prepared_material_lot(
+        db.session, actor_id=_actor_id(), lot_id=lot_id,
+    ))
+
+
+@scm_bp.get("/lotes-material-preparado")
+def lotes_material_preparado_listar():
+    return jsonify(list_prepared_material_lots(
+        db.session,
+        actor_id=_actor_id(),
+        limit=request.args.get("limit", 25),
+        cursor=request.args.get("cursor"),
+        state=request.args.get("estado"),
+    ))
+
+
+@scm_bp.get("/ubicaciones-material-preparado/destinos")
+def ubicaciones_material_preparado_destinos():
+    return jsonify(list_prepared_material_destinations(
+        db.session,
+        actor_id=_actor_id(),
+    ))
+
+
+@scm_bp.post(
+    "/lotes-material-preparado/<uuid:lot_id>/bolsas/<uuid:bag_id>/recibir"
+)
+def lote_material_preparado_bolsa_recibir(lot_id, bag_id):
+    return jsonify(receive_prepared_bag(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        lot_id=lot_id, bag_id=bag_id, data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/lotes-material-preparado/<uuid:lot_id>/bolsas/<uuid:bag_id>/calidad"
+)
+def lote_material_preparado_bolsa_calidad(lot_id, bag_id):
+    return jsonify(decide_prepared_bag_quality(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        lot_id=lot_id, bag_id=bag_id, data=_json_body(),
+    ))
 
 
 @scm_bp.post("/ordenes-produccion")
@@ -1265,6 +1676,14 @@ def ots_iniciar(public_id):
     ))
 
 
+@scm_bp.post("/ots/<uuid:public_id>/anular")
+def ots_anular(public_id):
+    return jsonify(annul_empty_fabrication_ot(
+        db.session, actor_id=_actor_id(), public_id=public_id,
+        operation_id=_idempotency_key(), data=_json_body(),
+    ))
+
+
 @scm_bp.post("/ots/<uuid:public_id>/cerrar")
 def ots_cerrar(public_id):
     return jsonify(transition_ot(
@@ -1371,6 +1790,17 @@ def mangas_pesaje_detalle(manga_id):
         db.session,
         actor_id=_actor_id(),
         manga_id=manga_id,
+    ))
+
+
+@scm_bp.post("/mangas/<uuid:manga_id>/reabrir")
+def mangas_reabrir_cierre_accidental(manga_id):
+    return jsonify(reopen_manga_after_accidental_close(
+        db.session,
+        actor_id=_actor_id(),
+        manga_id=manga_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
     ))
 
 

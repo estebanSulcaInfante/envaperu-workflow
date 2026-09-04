@@ -82,6 +82,9 @@ def test_lote_apertura_exige_cuatro_ojos_y_aplica_lineas_atomicamente(
         preparer.roles.append(
             RolOperativo.query.filter_by(codigo="JEFE_PRODUCCION").one()
         )
+        preparer.roles.append(
+            RolOperativo.query.filter_by(codigo="GERENTE_GENERAL").one()
+        )
         category_id = ScmCategoriaRecepcion.query.filter_by(
             codigo="LEGACY_POR_CONFIGURAR"
         ).one().id
@@ -117,6 +120,7 @@ def test_lote_apertura_exige_cuatro_ojos_y_aplica_lineas_atomicamente(
         json={
             "fecha_corte": "2026-08-03",
             "motivo": "Conteo fisico de puesta en marcha",
+            "metodo": "TABULAR_CONTINGENCIA",
             "lineas": [
                 {
                     "articulo_scm_id": released_id,
@@ -195,3 +199,115 @@ def test_lote_apertura_exige_cuatro_ojos_y_aplica_lineas_atomicamente(
     assert balances["MP-APERTURA-PEN"]["cantidad_fisica"] == "25.500"
     assert balances["MP-APERTURA-PEN"]["cantidad_no_disponible"] == "25.500"
     assert balances["MP-APERTURA-PEN"]["cantidad_libre"] == "0.000"
+
+
+def test_carga_tabular_de_apertura_es_exclusiva_de_gerencia(
+    app, client, scm_config,
+):
+    from app.models.trabajador import RolOperativo, Trabajador
+
+    with app.app_context():
+        warehouse_actor = Trabajador.query.filter_by(codigo="TRB-01").one()
+        warehouse_actor.roles.append(
+            RolOperativo.query.filter_by(codigo="ALMACEN_RECEPCION").one()
+        )
+        db.session.commit()
+        actor_id = warehouse_actor.id
+
+    response = client.post(
+        "/api/scm/v1/inventario/aperturas",
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+        json={
+            "fecha_corte": "2026-08-20",
+            "motivo": "Intento tabular sin autorización excepcional",
+            "metodo": "TABULAR_CONTINGENCIA",
+            "lineas": [],
+        },
+    )
+    assert response.status_code == 403
+    assert response.get_json()["error"]["code"] == (
+        "INVENTORY_OPENING_CONTINGENCY_FORBIDDEN"
+    )
+
+
+def test_apertura_fisica_deriva_saldo_de_bolsas_pesadas_con_qr(
+    app, client, scm_config,
+):
+    from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial
+    from app.models.scm_inventory import ScmUbicacionInventario
+    from app.models.scm_inventory_operations import ScmAlmacen
+    from app.models.trabajador import RolOperativo, Trabajador
+    from app.services.scm_inventory_opening_service import capture_physical_opening_unit
+
+    with app.app_context():
+        preparer = Trabajador.query.filter_by(codigo="TRB-01").one()
+        preparer.roles.append(RolOperativo.query.filter_by(codigo="ALMACEN_RECEPCION").one())
+        approver = Trabajador(codigo="TRB-FISICO-JP", nombres="Jefe", apellidos="Fisico", activo=True)
+        db.session.add(approver)
+        approver.roles.append(RolOperativo.query.filter_by(codigo="JEFE_PRODUCCION").one())
+        category = ScmCategoriaRecepcion.query.filter_by(codigo="LEGACY_POR_CONFIGURAR").one()
+        material = ScmMaterial(
+            codigo="MP-FISICA-QR", nombre="Resina de apertura física",
+            clase="MATERIA_PRIMA", unidad_base="KG", categoria_recepcion_id=category.id,
+        )
+        warehouse = ScmAlmacen(
+            codigo="A-FIS", nombre="Almacén físico", tipo="MATERIAS_PRIMAS", activo=True,
+        )
+        location = ScmUbicacionInventario(
+            codigo="A-FIS-B01", nombre="Bloque físico 1", almacen=warehouse, activo=True,
+        )
+        db.session.add_all([approver, material, warehouse, location])
+        db.session.commit()
+        preparer_id, approver_id, material_id = preparer.id, approver.id, material.id
+
+    created = client.post(
+        "/api/scm/v1/inventario/aperturas",
+        headers={"X-Actor-Id": str(preparer_id), "Idempotency-Key": str(uuid4())},
+        json={
+            "fecha_corte": "2026-08-20", "motivo": "Conteo pesado de bolsas",
+            "metodo": "CONTEO_FISICO_QR", "lineas": [],
+        },
+    )
+    assert created.status_code == 201
+    opening = created.get_json()
+    assert opening["total_lineas"] == 0
+    assert opening["creado_por"]["id"] == preparer_id
+    assert opening["creado_por"]["nombre"]
+
+    with app.app_context():
+        first = capture_physical_opening_unit(
+            db.session, station_id="PESAJE-UAT", operation_id=uuid4(), data={
+                "opening_id": opening["id"], "material_scm_id": material_id,
+                "ubicacion_codigo": "A-FIS-B01", "peso_bruto_kg": "25.100",
+                "tara_kg": "0.100", "estado_calidad": "PENDIENTE",
+                "pesado_por_id": preparer_id, "reading_stable": True,
+            },
+        )
+        second = capture_physical_opening_unit(
+            db.session, station_id="PESAJE-UAT", operation_id=uuid4(), data={
+                "opening_id": opening["id"], "material_scm_id": material_id,
+                "ubicacion_codigo": "A-FIS-B01", "peso_bruto_kg": "25.100",
+                "tara_kg": "0.100", "estado_calidad": "PENDIENTE",
+                "pesado_por_id": preparer_id, "reading_stable": True,
+            },
+        )
+    assert first["lineas"][0]["cantidad"] == "25.000"
+    assert second["lineas"][0]["cantidad"] == "50.000"
+    assert second["total_unidades_logisticas"] == 2
+    assert all(item["qr_value"].startswith("SCM:UL:") for item in second["unidades_logisticas"])
+
+    submitted = client.post(
+        f"/api/scm/v1/inventario/aperturas/{opening['id']}/enviar",
+        headers={"X-Actor-Id": str(preparer_id), "Idempotency-Key": str(uuid4())},
+        json={"version": second["version"]},
+    ).get_json()
+    approved = client.post(
+        f"/api/scm/v1/inventario/aperturas/{opening['id']}/resolver",
+        headers={"X-Actor-Id": str(approver_id), "Idempotency-Key": str(uuid4())},
+        json={
+            "version": submitted["version"], "decision": "APROBAR",
+            "motivo_resolucion": "Dos bolsas y pesos revisados",
+        },
+    )
+    assert approved.status_code == 200
+    assert {item["estado"] for item in approved.get_json()["unidades_logisticas"]} == {"BLOQUEADA"}

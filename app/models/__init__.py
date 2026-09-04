@@ -53,6 +53,7 @@ from app.models.scm_ot import (
     ScmTrabajoColor,
     ScmTrabajoOt,
     ScmPesajeManga,
+    ScmReaperturaManga,
     ScmAnulacionPesajeManga,
     ScmCorreccionPesajeManga,
 )
@@ -74,6 +75,8 @@ from app.models.scm_inventory import (
     ScmReservaInventario,
     ScmSaldoInventario,
     ScmSaldoMaterialInventario,
+    ScmUnidadLogisticaInventario,
+    ScmUsoUnidadLogisticaPreparacion,
     ScmUbicacionInventario,
 )
 from app.models.scm_inventory_operations import (
@@ -114,6 +117,22 @@ from app.models.scm_material_execution import (
     ScmLotePremezclaInput,
     ScmRequerimientoMaterial,
     ScmReservaMaterial,
+)
+from app.models.scm_prepared_material import (
+    ScmAportePreparacionMaterial,
+    ScmAprobacionLecturaPesoPreparacion,
+    ScmBolsaMaterialPreparado,
+    ScmAsignacionRequerimientoPreparacion,
+    ScmDecisionCalidadMaterialPreparado,
+    ScmEmisionMaterialPreparado,
+    ScmLoteMaterialPreparado,
+    ScmLecturaPesoPreparacion,
+    ScmMovimientoMaterialPreparado,
+    ScmOrdenPreparacionMaterial,
+    ScmRecepcionBolsaMaterialPreparado,
+    ScmRequerimientoMaterialPreparado,
+    ScmReservaMaterialPreparado,
+    ScmSaldoMaterialPreparado,
 )
 from app.models.scm_reproceso import (
     ScmAlertaEvento,

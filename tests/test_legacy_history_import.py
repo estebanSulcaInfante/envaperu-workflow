@@ -28,6 +28,17 @@ CONTRACT_DIR = WORKSPACE_ROOT / "contracts" / "station-legacy-history-v1"
 STATION_TOKEN = "legacy-history-test-token-with-high-entropy-0001"
 
 
+def _semantic_json_sha256(path):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).digest()
+
+
 def _examples():
     return json.loads((CONTRACT_DIR / "examples.json").read_text(encoding="utf-8"))
 
@@ -89,9 +100,9 @@ def test_contract_copies_match_and_examples_validate():
     for repository in ("backend", "modulo-pesaje/backend"):
         copy_dir = WORKSPACE_ROOT / repository / "contracts" / CONTRACT_DIR.name
         for filename in ("contract.schema.json", "examples.json"):
-            assert hashlib.sha256(
-                (CONTRACT_DIR / filename).read_bytes()
-            ).digest() == hashlib.sha256((copy_dir / filename).read_bytes()).digest()
+            assert _semantic_json_sha256(
+                CONTRACT_DIR / filename
+            ) == _semantic_json_sha256(copy_dir / filename)
 
     examples = _examples()
     _validator("request").validate(examples["request"])

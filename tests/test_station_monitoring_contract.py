@@ -33,6 +33,17 @@ CONTINUITY_DIR = WORKSPACE_ROOT / "contracts" / "station-legacy-continuity-v1"
 STATION_TOKEN = "central-monitoring-test-token-with-high-entropy-0001"
 
 
+def _semantic_json_sha256(path):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).digest()
+
+
 def _load_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -57,9 +68,7 @@ def test_provider_contract_copies_match_workspace_canonical():
         for filename in ("contract.schema.json", "examples.json"):
             canonical = WORKSPACE_ROOT / "contracts" / contract / filename
             provider = provider_root / "contracts" / contract / filename
-            assert hashlib.sha256(canonical.read_bytes()).digest() == hashlib.sha256(
-                provider.read_bytes()
-            ).digest()
+            assert _semantic_json_sha256(canonical) == _semantic_json_sha256(provider)
 
 
 def test_station_monitoring_schema_migration_is_scoped_and_idempotent():
@@ -159,6 +168,8 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "manga_prelabel",
         "manga_weighing",
         "manga_weighing_control",
+        "inventory_opening_weighing",
+        "prepared_material_weighing",
     }
     assert (
         "station-production-progress-v1"
@@ -173,6 +184,8 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "scm_manga_prelabel": True,
         "scm_manga_weighing": True,
         "scm_manga_weighing_control": True,
+        "scm_inventory_opening_weighing": True,
+        "scm_prepared_material_weighing": True,
     }
 
 

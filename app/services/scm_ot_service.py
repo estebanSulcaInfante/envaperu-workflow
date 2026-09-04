@@ -6,11 +6,10 @@ import json
 import math
 import re
 import uuid
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal, InvalidOperation
-from zoneinfo import ZoneInfo
 
-from sqlalchemy import String, func, or_, select
+from sqlalchemy import String, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -44,6 +43,7 @@ from app.models.scm_ot import (
     utc_now,
 )
 from app.models.scm_internal_supply import ScmSolicitudAbastecimiento
+from app.models.scm_inventory import ScmUbicacionInventario
 from app.models.scm_inline_wip import (
     ScmReservaWipSalida,
     ScmSaldoWipSalida,
@@ -58,6 +58,18 @@ from app.models.trabajador import Trabajador
 from app.services.catalog_code_generator import generar_codigo_catalogo
 from app.services.scm_color_identity import serialize_color_identity
 from app.services.scm_packaging_service import calculate_packaging_capacity
+from app.services.scm_fulfillment_service import (
+    project_production_orders_for_operation,
+)
+from app.models.scm_prepared_material import (
+    ScmAsignacionRequerimientoPreparacion,
+    ScmBolsaMaterialPreparado,
+    ScmEmisionMaterialPreparado,
+    ScmMovimientoMaterialPreparado,
+    ScmReservaMaterialPreparado,
+    ScmRequerimientoMaterialPreparado,
+    ScmSaldoMaterialPreparado,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -140,6 +152,23 @@ def _reserve_operation(session, operation_id, endpoint, actor, data):
 def _complete_operation(operation, response, status=201):
     operation.response_json = copy.deepcopy(response)
     operation.estado_http = status
+
+
+def _fabrication_run_for_update_query(*, run_id, order_id):
+    """Lock only the fabrication run, not its eagerly joined color row.
+
+    ``ScmCorridaFabricacion.color_produccion`` is loaded with a nullable outer
+    join. PostgreSQL rejects an unqualified ``FOR UPDATE`` on that query
+    because it would also try to lock the nullable side of the join.
+    """
+    return (
+        select(ScmCorridaFabricacion)
+        .where(
+            ScmCorridaFabricacion.id == run_id,
+            ScmCorridaFabricacion.orden_fabricacion_id == order_id,
+        )
+        .with_for_update(of=ScmCorridaFabricacion)
+    )
 
 
 def _event(aggregate_type, aggregate_id, event_type, actor, operation, after):
@@ -285,7 +314,7 @@ def _serialize_manga(manga):
     current_label = next(
         (
             label for label in reversed(manga.etiquetas)
-            if label.estado != "INVALIDADA"
+            if label.tipo == "PREPESAJE" and label.estado != "INVALIDADA"
         ),
         None,
     )
@@ -299,10 +328,20 @@ def _serialize_manga(manga):
         iter(reversed(list(getattr(manga, "controles_peso", ()) or ()))),
         None,
     )
+    latest_shift_control = next(
+        (
+            control
+            for control in reversed(
+                list(getattr(manga, "controles_peso", ()) or ())
+            )
+            if control.tipo == "CORTE_TURNO"
+        ),
+        None,
+    )
     assigned = Decimal(manga.cantidad_asignada_un)
     accumulated = (
-        Decimal(latest_control.conteo_acumulado_un)
-        if latest_control is not None else Decimal("0")
+        Decimal(latest_shift_control.conteo_acumulado_un)
+        if latest_shift_control is not None else Decimal("0")
     )
     return {
         "id": manga.id,
@@ -355,6 +394,9 @@ def _serialize_manga(manga):
         "maquinista_actual": (
             current_assignment.trabajador.nombre_completo
             if current_assignment and current_assignment.trabajador else None
+        ),
+        "maquinista_actual_id": (
+            current_assignment.trabajador_id if current_assignment else None
         ),
         "motivo_extra": manga.motivo_extra,
         "version": manga.version,
@@ -432,7 +474,14 @@ def _work_confirmed_quantity(work):
         ),
         Decimal("0"),
     )
-    return segmented + direct
+    inline = sum(
+        (
+            Decimal(item.cantidad_acreditada or 0)
+            for item in (getattr(work, "saldos_wip_salida", ()) or ())
+        ),
+        Decimal("0"),
+    )
+    return segmented + direct + inline
 
 
 def _serialize_manga_for_work(manga, work):
@@ -774,6 +823,19 @@ def _serialize_ot(
             ScmManga.secuencia_ot
         ).all()
     payload = ot.to_dict()
+    payload["bloqueo_anulacion"] = _empty_ot_annulment_blocker(ot)
+    payload["anulacion"] = None
+    if ot.estado == "ANULADA":
+        annulment = ScmEvento.query.filter_by(
+            aggregate_type="ORDEN_TRABAJO", aggregate_id=str(ot.id),
+            tipo="FABRICATION_OT_HEADER_ANNULLED",
+        ).order_by(ScmEvento.id.desc()).first()
+        if annulment is not None:
+            payload["anulacion"] = {
+                "motivo": annulment.motivo,
+                "actor": annulment.actor_snapshot,
+                "fecha": annulment.occurred_at.isoformat(),
+            }
     payload["orden_id"] = ot.orden_id
     contextual_work = (
         ot.trabajo_color_contexto
@@ -1954,166 +2016,24 @@ _CONTINUITY_SHIFT_ORDER = {
     "EXTRA": 30,
 }
 
-_CONTINUITY_DAY_START_HOUR = 6
-_CONTINUITY_NIGHT_START_HOUR = 18
-
-
-def _continuity_ot_slot(ot):
-    rank = _CONTINUITY_SHIFT_ORDER.get(
-        str(ot.turno or "").strip().upper()
-    )
-    if rank is None or ot.fecha is None:
-        return None
-    return ot.fecha, rank
-
-
-def _continuity_control_slot(control):
-    """Map the physical cut to the operational shift containing it.
-
-    The pilot uses 06:00/18:00 boundaries. A cut before 06:00 belongs to
-    the previous operational night's slot.
-    """
-    weighed_at = control.pesado_at
-    timezone_name = control.timezone_snapshot or "America/Lima"
-    if weighed_at.tzinfo is not None:
-        local_cut = weighed_at.astimezone(ZoneInfo(timezone_name))
-        local_date = local_cut.date()
-        local_hour = local_cut.hour
-    else:
-        # SQLite drops timezone offsets. fecha_local_pesaje is the canonical
-        # local date captured at ingestion, while the stored wall time remains
-        # suitable for directed tests and local UAT.
-        local_date = control.fecha_local_pesaje
-        local_hour = weighed_at.hour
-    if local_hour < _CONTINUITY_DAY_START_HOUR:
-        return local_date - timedelta(days=1), _CONTINUITY_SHIFT_ORDER["NOCHE"]
-    if local_hour < _CONTINUITY_NIGHT_START_HOUR:
-        return local_date, _CONTINUITY_SHIFT_ORDER["DIA"]
-    return local_date, _CONTINUITY_SHIFT_ORDER["NOCHE"]
-
 
 def _continuity_target_is_later(source_ot, target_ot):
-    source_slot = _continuity_ot_slot(source_ot)
-    target_slot = _continuity_ot_slot(target_ot)
+    if target_ot.fecha != source_ot.fecha:
+        return target_ot.fecha > source_ot.fecha
+    source_rank = _CONTINUITY_SHIFT_ORDER.get(
+        str(source_ot.turno or "").strip().upper()
+    )
+    target_rank = _CONTINUITY_SHIFT_ORDER.get(
+        str(target_ot.turno or "").strip().upper()
+    )
     return (
-        source_slot is not None
-        and target_slot is not None
-        and target_slot > source_slot
+        source_rank is not None
+        and target_rank is not None
+        and target_rank > source_rank
     )
 
 
-def _continuity_target_is_after_cut(*, segment, target_ot):
-    target_slot = _continuity_ot_slot(target_ot)
-    control = segment.control_peso
-    return (
-        target_slot is not None
-        and control is not None
-        and target_slot >= _continuity_control_slot(control)
-    )
-
-
-def _work_matches_manga_continuity(work, *, manga, segment):
-    source_work = segment.trabajo
-    source_color = source_work.trabajo_color
-    return (
-        work.estado in {"PLANIFICADO", "EN_EJECUCION", "PAUSADO"}
-        and work.orden_operacion_id == source_work.orden_operacion_id
-        and work.trabajo_color is not None
-        and source_color is not None
-        and work.trabajo_color.corrida_fabricacion_id
-        == source_color.corrida_fabricacion_id
-        and work.trabajo_color.color_id_snapshot
-        == source_color.color_id_snapshot
-        and work.trabajo_color.receta_revision_id_snapshot
-        == source_color.receta_revision_id_snapshot
-        and work.trabajo_color.receta_hash_snapshot
-        == source_color.receta_hash_snapshot
-        and _plan_line_belongs_to_work(manga.plan_linea, work)
-    )
-
-
-def _ot_can_host_continuity(ot, *, manga, segment):
-    works = list(getattr(ot, "trabajos_ot", ()) or ())
-    return not works or any(
-        _work_matches_manga_continuity(
-            work, manga=manga, segment=segment
-        )
-        for work in works
-    )
-
-
-def _next_linkable_continuity_ot(
-    session, *, manga, segment, target_ot, target_work=None
-):
-    """Return the earliest compatible OT that can still accept the manga.
-
-    Closed or annulled historical OTs do not block continuity because they can
-    no longer be linked. The destination work is evaluated explicitly: its OT
-    relationship collection may already be loaded without that just-created
-    work in a multi-color request.
-    """
-    source_ot = segment.trabajo.orden_trabajo
-    source_slot = _continuity_ot_slot(source_ot)
-    target_slot = _continuity_ot_slot(target_ot)
-    if source_slot is None or target_slot is None:
-        return None
-    cut_slot = _continuity_control_slot(segment.control_peso)
-    lower_date = min(source_slot[0], cut_slot[0])
-    candidates = session.scalars(
-        select(RegistroDiarioProduccion)
-        .options(
-            selectinload(RegistroDiarioProduccion.trabajos_ot)
-            .selectinload(ScmTrabajoOt.trabajo_color)
-        )
-        .where(
-            RegistroDiarioProduccion.tipo_ot == "FABRICACION",
-            RegistroDiarioProduccion.codigo_ot_sintetico.is_(False),
-            RegistroDiarioProduccion.maquina_id == target_ot.maquina_id,
-            RegistroDiarioProduccion.estado.in_(
-                {"PLANIFICADA", "EN_EJECUCION"}
-            ),
-            RegistroDiarioProduccion.fecha >= lower_date,
-            RegistroDiarioProduccion.fecha <= target_ot.fecha,
-            RegistroDiarioProduccion.id != source_ot.id,
-        )
-    ).unique().all()
-    eligible = [
-        candidate
-        for candidate in candidates
-        if (
-            (slot := _continuity_ot_slot(candidate)) is not None
-            and candidate.estado in {"PLANIFICADA", "EN_EJECUCION"}
-            and slot > source_slot
-            and slot >= cut_slot
-            and slot <= target_slot
-            and (
-                (
-                    candidate.id == target_ot.id
-                    and target_work is not None
-                    and _work_matches_manga_continuity(
-                        target_work, manga=manga, segment=segment
-                    )
-                )
-                or _ot_can_host_continuity(
-                    candidate, manga=manga, segment=segment
-                )
-            )
-        )
-    ]
-    if not eligible:
-        return None
-    return min(
-        eligible,
-        key=lambda candidate: (
-            *_continuity_ot_slot(candidate),
-            candidate.id,
-        ),
-    )
-
-
-def _validate_continuity_target(
-    *, manga, segment, target_work, session=None
-):
+def _validate_continuity_target(*, manga, segment, target_work):
     source_work = segment.trabajo
     source_ot = source_work.orden_trabajo
     target_ot = target_work.orden_trabajo
@@ -2128,20 +2048,6 @@ def _validate_continuity_target(
             "CONTINUITY_TARGET_PRECEDES_SOURCE",
             "La OT destino debe pertenecer a una fecha/turno posterior al corte.",
             status_code=409,
-        )
-    if not _continuity_target_is_after_cut(
-        segment=segment, target_ot=target_ot
-    ):
-        raise ScmServiceError(
-            "CONTINUITY_TARGET_PRECEDES_CUT",
-            "La OT destino ocurre antes del corte fisico registrado.",
-            status_code=409,
-            details={
-                "corte_pesado_at": segment.control_peso.pesado_at.isoformat(),
-                "fecha_local_corte": (
-                    segment.control_peso.fecha_local_pesaje.isoformat()
-                ),
-            },
         )
     if source_ot.maquina_id != target_ot.maquina_id:
         raise ScmServiceError(
@@ -2168,28 +2074,6 @@ def _validate_continuity_target(
             "La OT destino no conserva la misma OF, corrida, color, receta y salida.",
             status_code=409,
         )
-    if session is not None:
-        next_ot = _next_linkable_continuity_ot(
-            session,
-            manga=manga,
-            segment=segment,
-            target_ot=target_ot,
-            target_work=target_work,
-        )
-        if next_ot is None or next_ot.id != target_ot.id:
-            raise ScmServiceError(
-                "CONTINUITY_NEXT_OT_REQUIRED",
-                "La manga debe vincularse a la primera OT compatible posterior al corte.",
-                status_code=409,
-                details={
-                    "ot_siguiente_id": (
-                        str(next_ot.public_id) if next_ot is not None else None
-                    ),
-                    "ot_siguiente_codigo": (
-                        next_ot.codigo_ot if next_ot is not None else None
-                    ),
-                },
-            )
 
 
 def _continuity_candidate_payload(manga):
@@ -2271,15 +2155,7 @@ def list_pending_manga_continuities(
             or not _continuity_target_is_later(
                 segment.trabajo.orden_trabajo, target_ot
             )
-            or not _continuity_target_is_after_cut(
-                segment=segment, target_ot=target_ot
-            )
         ):
-            continue
-        next_ot = _next_linkable_continuity_ot(
-            session, manga=manga, segment=segment, target_ot=target_ot
-        )
-        if next_ot is None or next_ot.id != target_ot.id:
             continue
         items.append(_continuity_candidate_payload(manga))
     return {"items": items}
@@ -2331,10 +2207,7 @@ def _attach_continuity_mangas(
                 status_code=409,
             )
         _validate_continuity_target(
-            manga=manga,
-            segment=segment,
-            target_work=work,
-            session=session,
+            manga=manga, segment=segment, target_work=work
         )
         boundary = Decimal(segment.cantidad_fin_un)
         remaining = Decimal(manga.cantidad_asignada_un) - boundary
@@ -2603,6 +2476,12 @@ def add_color_work(
         if order.estado == "LIBERADA":
             order.estado = "PROGRAMADA"
             order.version += 1
+            project_production_orders_for_operation(
+                session,
+                operation_order=order,
+                actor=actor,
+                operation=operation,
+            )
         session.flush()
         session.expire(ot, ["trabajos_ot"])
         response = {
@@ -2761,6 +2640,193 @@ def _recompute_parent_state(session, work):
     parent.version += 1
 
 
+def _active_prepared_reservations_for_work(session, work_id):
+    return session.scalars(
+        select(ScmReservaMaterialPreparado)
+        .where(
+            ScmReservaMaterialPreparado.trabajo_ot_id == work_id,
+            ScmReservaMaterialPreparado.estado == "ACTIVA",
+        )
+        .order_by(ScmReservaMaterialPreparado.id)
+        .with_for_update(of=ScmReservaMaterialPreparado)
+    ).unique().all()
+
+
+def _lock_prepared_reservations_for_work_cancel(session, work_id):
+    previews = session.scalars(
+        select(ScmReservaMaterialPreparado)
+        .where(
+            ScmReservaMaterialPreparado.trabajo_ot_id == work_id,
+            ScmReservaMaterialPreparado.estado == "ACTIVA",
+        )
+        .order_by(ScmReservaMaterialPreparado.id)
+    ).unique().all()
+    if not previews:
+        return []
+    requirement_ids = sorted({value.requerimiento_id for value in previews})
+    assignment_ids = sorted({value.asignacion_id for value in previews})
+    location_ids = sorted({value.ubicacion_origen_id for value in previews})
+    bag_ids = sorted({value.bolsa_id for value in previews})
+    delivery_ids = sorted({
+        value.emision.id for value in previews if value.emision is not None
+    })
+    session.scalars(
+        select(ScmRequerimientoMaterialPreparado)
+        .where(ScmRequerimientoMaterialPreparado.id.in_(requirement_ids))
+        .order_by(ScmRequerimientoMaterialPreparado.id)
+        .with_for_update(of=ScmRequerimientoMaterialPreparado)
+    ).all()
+    session.scalars(
+        select(ScmAsignacionRequerimientoPreparacion)
+        .where(ScmAsignacionRequerimientoPreparacion.id.in_(assignment_ids))
+        .order_by(ScmAsignacionRequerimientoPreparacion.id)
+        .with_for_update(of=ScmAsignacionRequerimientoPreparacion)
+    ).all()
+    session.scalars(
+        select(ScmUbicacionInventario)
+        .where(ScmUbicacionInventario.id.in_(location_ids))
+        .order_by(ScmUbicacionInventario.id)
+        .with_for_update(of=ScmUbicacionInventario)
+    ).all()
+    balance_filters = [
+        and_(
+            ScmSaldoMaterialPreparado.receta_revision_id
+            == value.requerimiento.receta_revision_id,
+            ScmSaldoMaterialPreparado.ubicacion_id
+            == value.ubicacion_origen_id,
+        )
+        for value in previews
+    ]
+    session.scalars(
+        select(ScmSaldoMaterialPreparado)
+        .where(or_(*balance_filters))
+        .order_by(ScmSaldoMaterialPreparado.id)
+        .with_for_update(of=ScmSaldoMaterialPreparado)
+    ).all()
+    session.scalars(
+        select(ScmBolsaMaterialPreparado)
+        .where(ScmBolsaMaterialPreparado.id.in_(bag_ids))
+        .order_by(ScmBolsaMaterialPreparado.id)
+        .with_for_update(of=ScmBolsaMaterialPreparado)
+    ).all()
+    reservations = session.scalars(
+        select(ScmReservaMaterialPreparado)
+        .where(
+            ScmReservaMaterialPreparado.id.in_([value.id for value in previews]),
+            ScmReservaMaterialPreparado.estado == "ACTIVA",
+        )
+        .order_by(ScmReservaMaterialPreparado.id)
+        .with_for_update(of=ScmReservaMaterialPreparado)
+    ).unique().all()
+    if delivery_ids:
+        session.scalars(
+            select(ScmEmisionMaterialPreparado)
+            .where(ScmEmisionMaterialPreparado.id.in_(delivery_ids))
+            .order_by(ScmEmisionMaterialPreparado.id)
+            .with_for_update(of=ScmEmisionMaterialPreparado)
+        ).all()
+    return reservations
+
+
+def _cancel_prepared_reservations_before_dispatch(
+    session, *, work, actor, operation, reason,
+):
+    reservations = _lock_prepared_reservations_for_work_cancel(
+        session, work.id
+    )
+    in_custody = [
+        reservation
+        for reservation in reservations
+        if reservation.emision is not None
+        and reservation.emision.estado in ("EN_TRANSITO", "RECIBIDA_MAQUINA")
+    ]
+    if in_custody:
+        raise ScmServiceError(
+            "PREPARED_RESERVATION_RETURN_REQUIRED",
+            "Retorna las bolsas despachadas antes de anular el trabajo.",
+            status_code=409,
+            details={
+                "reservas": [str(value.id) for value in in_custody],
+                "entregas": [
+                    str(value.emision.id) for value in in_custody
+                ],
+            },
+        )
+    for reservation in reservations:
+        delivery = reservation.emision
+        if delivery is not None and delivery.estado not in (
+            "PREPARADA", "CANCELADA"
+        ):
+            raise ScmServiceError(
+                "PREPARED_RESERVATION_NOT_RELEASABLE",
+                "La reserva de material preparado requiere resolucion previa.",
+                status_code=409,
+                details={"reserva_id": str(reservation.id)},
+            )
+        requirement = reservation.requerimiento
+        bag = session.scalar(
+            select(ScmBolsaMaterialPreparado)
+            .where(ScmBolsaMaterialPreparado.id == reservation.bolsa_id)
+            .with_for_update(of=ScmBolsaMaterialPreparado)
+        )
+        balance = session.scalar(
+            select(ScmSaldoMaterialPreparado)
+            .where(
+                ScmSaldoMaterialPreparado.receta_revision_id
+                == requirement.receta_revision_id,
+                ScmSaldoMaterialPreparado.ubicacion_id
+                == reservation.ubicacion_origen_id,
+            )
+            .with_for_update(of=ScmSaldoMaterialPreparado)
+        )
+        quantity = Decimal(reservation.cantidad_kg)
+        if (
+            bag is None
+            or bag.estado != "RESERVADA"
+            or bag.ubicacion_id != reservation.ubicacion_origen_id
+            or balance is None
+            or Decimal(balance.cantidad_reservada_kg) < quantity
+        ):
+            raise ScmServiceError(
+                "PREPARED_MATERIAL_BALANCE_INCONSISTENT",
+                "La reserva no conserva una bolsa y saldo liberables.",
+                status_code=409,
+                details={"reserva_id": str(reservation.id)},
+            )
+        balance.cantidad_reservada_kg = (
+            Decimal(balance.cantidad_reservada_kg) - quantity
+        )
+        balance.version += 1
+        bag.estado = "DISPONIBLE"
+        bag.version += 1
+        reservation.estado = "CANCELADA"
+        reservation.version += 1
+        if delivery is not None:
+            delivery.estado = "CANCELADA"
+            delivery.closed_by_id = actor.id
+            delivery.cancelled_at = utc_now()
+            delivery.version += 1
+        session.add(ScmMovimientoMaterialPreparado(
+            saldo_id=balance.id,
+            bolsa_id=bag.id,
+            tipo="LIBERACION_RESERVA",
+            delta_fisico_kg=Decimal("0.000"),
+            delta_reservado_kg=-quantity,
+            delta_no_disponible_kg=Decimal("0.000"),
+            saldo_fisico_resultante_kg=balance.cantidad_fisica_kg,
+            saldo_reservado_resultante_kg=balance.cantidad_reservada_kg,
+            saldo_no_disponible_resultante_kg=(
+                balance.cantidad_no_disponible_kg
+            ),
+            motivo=reason,
+                actor_id=actor.id,
+                operation_id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{operation.operation_id}:AUTO-RELEASE:{reservation.id}",
+                ),
+            ))
+
+
 def _pending_inline_reservations_for_work(
     session, work_id, *, lock=False
 ):
@@ -2866,14 +2932,17 @@ def transition_color_work(
                     "Concilia o libera las reservas de producción en línea antes de anular el trabajo.",
                     status_code=409,
                     details={
-                        "reservas": [str(item.id) for item in pending_inline],
+                        "reservas": [
+                            str(item.id) for item in pending_inline
+                        ],
                     },
                 )
             applied_inline = session.scalars(
                 select(ScmReservaWipSalida)
                 .join(
                     ScmSaldoWipSalida,
-                    ScmSaldoWipSalida.id == ScmReservaWipSalida.saldo_id,
+                    ScmSaldoWipSalida.id
+                    == ScmReservaWipSalida.saldo_id,
                 )
                 .where(
                     ScmSaldoWipSalida.trabajo_color_id == work.id,
@@ -2888,11 +2957,20 @@ def transition_color_work(
                     "El trabajo ya acreditó salidas consumidas en Armado y no puede anularse.",
                     status_code=409,
                     details={
-                        "reservas": [str(item.id) for item in applied_inline],
+                        "reservas": [
+                            str(item.id) for item in applied_inline
+                        ],
                     },
                 )
             reason = required_text(
                 data.get("motivo"), field="motivo", max_length=500
+            )
+            _cancel_prepared_reservations_before_dispatch(
+                session,
+                work=work,
+                actor=actor,
+                operation=operation,
+                reason=reason,
             )
             for manga in work.mangas:
                 if manga.estado != "ANULADA":
@@ -3012,16 +3090,20 @@ def transition_color_work(
                 )
                 event_type = "COLOR_WORK_PAUSED"
             else:
-                pending = [
-                    manga for manga in _work_mangas(work)
-                    if not _manga_resolved_for_work(manga, work)
-                ]
-                if pending:
+                active_prepared = _active_prepared_reservations_for_work(
+                    session, work.id
+                )
+                if active_prepared:
                     raise ScmServiceError(
-                        "WORK_HAS_PENDING_MANGAS",
-                        "El trabajo conserva mangas sin pesar o anular.",
+                        "WORK_HAS_ACTIVE_PREPARED_MATERIAL",
+                        "Libera, consume o retorna el material preparado antes "
+                        "de completar el trabajo.",
                         status_code=409,
-                        details={"pending": len(pending)},
+                        details={
+                            "reservas": [
+                                str(value.id) for value in active_prepared
+                            ],
+                        },
                     )
                 pending_inline = _pending_inline_reservations_for_work(
                     session, work.id, lock=True
@@ -3037,6 +3119,17 @@ def transition_color_work(
                             ],
                         },
                     )
+                pending = [
+                    manga for manga in _work_mangas(work)
+                    if not _manga_resolved_for_work(manga, work)
+                ]
+                if pending:
+                    raise ScmServiceError(
+                        "WORK_HAS_PENDING_MANGAS",
+                        "El trabajo conserva mangas sin pesar o anular.",
+                        status_code=409,
+                        details={"pending": len(pending)},
+                    )
                 work.completada_at = now
                 work.cantidad_confirmada_un = _work_confirmed_quantity(work)
                 _close_work_assignment(work, actor=actor, terminal=True)
@@ -3044,6 +3137,13 @@ def transition_color_work(
             work.estado = target_state
         work.version += 1
         _recompute_parent_state(session, work)
+        if action in {"iniciar", "reanudar"}:
+            project_production_orders_for_operation(
+                session,
+                operation_order=work.orden_operacion,
+                actor=actor,
+                operation=operation,
+            )
         session.flush()
         after = _serialize_color_work(work)
         response = {
@@ -3789,14 +3889,10 @@ def create_fabrication_ot(
                 "La OT debe indicar una corrida valida.",
                 status_code=422,
             ) from error
-        run = session.scalar(
-            select(ScmCorridaFabricacion)
-            .where(
-                ScmCorridaFabricacion.id == run_id,
-                ScmCorridaFabricacion.orden_fabricacion_id == order.id,
-            )
-            .with_for_update()
-        )
+        run = session.scalar(_fabrication_run_for_update_query(
+            run_id=run_id,
+            order_id=order.id,
+        ))
         if run is None or run.estado not in ("LIBERADA", "EN_EJECUCION"):
             raise ScmServiceError(
                 "OF_CORRIDA_REQUIRED",
@@ -3930,6 +4026,12 @@ def create_fabrication_ot(
         if order.estado == "LIBERADA":
             order.estado = "PROGRAMADA"
             order.version += 1
+            project_production_orders_for_operation(
+                session,
+                operation_order=order,
+                actor=actor,
+                operation=operation,
+            )
         session.flush()
         session.expire(ot, ["trabajos_ot"])
         response = {
@@ -4096,6 +4198,73 @@ def list_ots(
     }
 
 
+def _empty_ot_annulment_blocker(ot):
+    if (ot.tipo_ot != "FABRICACION" or ot.codigo_ot_sintetico
+            or ot.orden_id is not None or ot.orden_operacion_id is not None
+            or ot.corrida_fabricacion_id is not None):
+        return "Solo se pueden anular OT de fabricación normalizadas y vacías."
+    if ot.estado != "PLANIFICADA" or ot.iniciada_at or ot.cerrada_at:
+        return "Solo se puede anular una OT planificada que nunca haya iniciado."
+    if ot.trabajos_ot:
+        return "La OT tiene trabajos vinculados; no se anula en cascada."
+    return None
+
+
+def annul_empty_fabrication_ot(session, *, actor_id, public_id, operation_id, data):
+    """M4: keep identity and journal; never cancel operational children."""
+    try:
+        actor = load_actor(session, actor_id, capability="OT_ANULAR")
+        reject_unknown_fields(data, allowed={"version", "motivo"})
+        version = expected_version(data.get("version"))
+        reason = required_text(data.get("motivo"), field="motivo", max_length=250)
+        operation, replay = _reserve_operation(
+            session, operation_id, f"/ots/{public_id}/anular", actor, data,
+        )
+        if replay is not None:
+            return replay
+        ot = session.scalar(select(RegistroDiarioProduccion).where(
+            RegistroDiarioProduccion.public_id == public_id,
+        ).with_for_update(of=RegistroDiarioProduccion).execution_options(populate_existing=True))
+        if ot is None:
+            raise ScmServiceError("OT_NOT_FOUND", "La OT no existe.", status_code=404)
+        if ot.version != version:
+            raise ScmServiceError("VERSION_CONFLICT", "La OT cambió. Actualiza y revisa antes de anular.", status_code=409)
+        blocker = _empty_ot_annulment_blocker(ot)
+        if blocker:
+            raise ScmServiceError("OT_ANNULMENT_BLOCKED", blocker, status_code=409)
+        # Fail closed for every operational FK, including future incoming links.
+        # The journal references aggregate identity, not an operational FK.
+        target = RegistroDiarioProduccion.__table__
+        for table in target.metadata.tables.values():
+            for foreign_key in table.foreign_keys:
+                if foreign_key.column is target.c.id:
+                    linked = session.scalar(select(foreign_key.parent).where(
+                        foreign_key.parent == ot.id,
+                    ).limit(1))
+                    if linked is not None:
+                        raise ScmServiceError(
+                            "OT_ANNULMENT_BLOCKED",
+                            "La OT tiene registros operativos vinculados. Conserva la jornada y revisa su historial.",
+                            status_code=409,
+                        )
+        before = ot.to_dict()
+        ot.estado = "ANULADA"
+        ot.version += 1
+        event = _event("ORDEN_TRABAJO", ot.id, "FABRICATION_OT_HEADER_ANNULLED",
+                       actor, operation, ot.to_dict())
+        event.before_json = before
+        event.motivo = reason
+        session.add(event)
+        session.flush()
+        response = {"ot": _serialize_ot(ot)}
+        _complete_operation(operation, response)
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+
 def list_plant_journeys(
     session,
     *,
@@ -4103,7 +4272,7 @@ def list_plant_journeys(
     operational_date,
     shift,
 ):
-    """Aggregate the daily board in one authenticated HTTP request."""
+    """Aggregate both plant journey families in one authenticated request."""
     load_actor(session, actor_id, capability="OT_VER")
     parsed_date = _parse_date(operational_date)
     normalized_shift = required_text(
@@ -4573,7 +4742,6 @@ def approve_extra_manga(
 
 def _label_payload(manga, label_id, version):
     work = manga.trabajo
-    aggregate_header = work is not None and manga.ot.orden_operacion_id is None
     canonical = work is not None or manga.ot.orden_operacion_id is not None
     operation_order = (
         work.orden_operacion if work is not None else manga.ot.orden_operacion
@@ -4583,13 +4751,44 @@ def _label_payload(manga, label_id, version):
         if canonical
         else manga.ot.orden_id
     )
-    template_version = (
-        "PREPESAJE_TSPL_3"
-        if aggregate_header
-        else ("PREPESAJE_TSPL_2" if canonical else "PREPESAJE_TSPL_1")
-    )
+    template_version = "PREPESAJE_TSPL_5"
     personal = manga.asignacion_personal_trabajo
     worker = personal.trabajador if personal is not None else manga.maquinista_previsto
+    resource_ot = (
+        manga.ot.ot_fabricacion_contexto
+        if manga.ot.tipo_ot == "ENSAMBLE"
+        and manga.ot.ot_fabricacion_contexto is not None
+        else manga.ot
+    )
+    machine = resource_ot.maquina
+    machine_name = (
+        resource_ot.maquina_nombre_snapshot
+        or (machine.nombre if machine is not None else None)
+        or resource_ot.maquina_codigo_snapshot
+        or (machine.codigo if machine is not None else None)
+    )
+    estimated_kg = (
+        Decimal(manga.cantidad_planificada_un)
+        * Decimal(manga.peso_unitario_snapshot_g)
+        / Decimal("1000")
+    )
+    piece_name = manga.articulo_nombre_snapshot
+    article = manga.lote_articulo.articulo if manga.lote_articulo else None
+    piece_link = article.pieza_color if article is not None else None
+    piece_color = piece_link.pieza_color if piece_link is not None else None
+    if piece_color is not None and piece_color.pieza_rel is not None:
+        piece_name = piece_color.pieza_rel.nombre
+    production_order = (
+        operation_order.plan_produccion.orden_produccion
+        if canonical
+        and operation_order.plan_produccion is not None
+        else None
+    )
+    op_code = (
+        production_order.codigo
+        if production_order is not None
+        else (manga.ot.orden_id if not canonical else None)
+    )
     qr = {
         "v": 1,
         "type": "SCM_MANGA_LABEL",
@@ -4602,6 +4801,7 @@ def _label_payload(manga, label_id, version):
     return {
         "template": {
             "version": template_version,
+            "qr_contract": "LABEL_REF_V1",
             "dpi": 203,
             "sheet_width_mm": 109,
             "sheet_height_mm": 50,
@@ -4614,10 +4814,14 @@ def _label_payload(manga, label_id, version):
         "generated_at": utc_now().isoformat(),
         "fecha_ot": manga.ot.fecha.isoformat(),
         "maquinista": worker.nombre_completo if worker else None,
+        "operador": worker.nombre_completo if worker else None,
+        "maquina": machine_name,
+        "turno": manga.ot.turno or resource_ot.turno,
         "ot": {
             "id": str(manga.ot.public_id),
             "codigo": manga.ot.codigo_ot,
         },
+        "op": op_code,
         "trabajo_color": (
             {
                 "id": str(work.id),
@@ -4640,12 +4844,15 @@ def _label_payload(manga, label_id, version):
             if manga.pieza_color_sku_snapshot
             else manga.articulo_nombre_snapshot
         ),
+        "pieza": piece_name,
         "color": manga.color_snapshot,
         "codigo_manga": manga.codigo,
         "tipo_manga": manga.tipo,
         "cantidad_planificada_un": _compact_number(
             manga.cantidad_planificada_un
         ),
+        "kg_estimados": format(estimated_kg, ".3f"),
+        "kg_teoricos": format(estimated_kg, ".3f"),
         "qr": qr,
         **(
             {
@@ -4848,7 +5055,8 @@ def annul_manga(
                 or assignment is None
                 or assignment.trabajo_ot_id != source_work.id
                 or reservation is None
-                or reservation.estado != "CREDITO_EN_LINEA_PENDIENTE"
+                or reservation.estado
+                != "CREDITO_EN_LINEA_PENDIENTE"
             ):
                 raise ScmServiceError(
                     "INLINE_RESERVATION_CONTEXT_MISMATCH",
@@ -4889,10 +5097,10 @@ def annul_manga(
                     str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
                 ),
                 "cantidad_devuelta_un": _compact_number(returned),
-                "reservas_produccion_linea_canceladas": [
-                    str(item.id) for item in inline_reservations
-                ],
             },
+            "reservas_produccion_linea_canceladas": [
+                str(item.id) for item in inline_reservations
+            ],
         }
         event = _event(
             "MANGA", manga.id, "MANGA_CANCELLED",
@@ -5236,15 +5444,7 @@ def get_station_print_job(session, *, station_id, print_job_id):
 
 
 def claim_station_print_job(session, *, station_id, print_job_id):
-    """Atomically reserve a job immediately before physical printing.
-
-    A replay from the owning station returns the same immutable job until its
-    result is acknowledged. That replay is transport idempotency, not reprint
-    authorization: the station must persist its per-label emission attempt
-    before talking to the spooler and retry only the acknowledgement after an
-    emitted or uncertain result. A physical retry is valid solely after the
-    station has durably classified the previous attempt FALLIDA_SIN_EMISION.
-    """
+    """Atomically reserve a job immediately before physical printing."""
     job = session.scalar(
         select(ScmTrabajoImpresionManga)
         .where(ScmTrabajoImpresionManga.public_id == print_job_id)

@@ -264,7 +264,8 @@ def _route_target(session, product_id, *, lock=False):
     if target.clase != CLASE_PRODUCTO_TERMINADO:
         raise ScmServiceError(
             "ARTICLE_SUBTYPE_MISMATCH",
-            "La ruta del producto requiere un articulo PRODUCTO_TERMINADO.",
+            "La ruta del producto requiere un articulo "
+            "PRODUCTO_TERMINADO.",
             status_code=422,
         )
     return _validate_route_target(

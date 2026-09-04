@@ -33,7 +33,8 @@ WORKSPACE_CATALOG_TEXT_REVISION = "f80c9d5e1a42"
 PRODUCT_ONBOARDING_REVISION = "f81d0e6f2b53"
 UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
 PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
-HEAD_REVISION = PRODUCTION_PROGRESS_VIEW_REVISION
+OPM_PREPARED_MATERIAL_REVISION = "c3a91f6e2d47"
+HEAD_REVISION = "f93d4e6a8c02"
 
 
 def _isolated_postgres_url():
@@ -197,6 +198,20 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 "scm_devolucion_material",
                 "scm_lote_premezcla",
                 "scm_lote_premezcla_input",
+                "scm_requerimiento_material_preparado",
+                "scm_orden_preparacion_material",
+                "scm_asignacion_requerimiento_preparacion",
+                "scm_lectura_peso_preparacion",
+                "scm_aprobacion_lectura_peso_preparacion",
+                "scm_aporte_preparacion_material",
+                "scm_lote_material_preparado",
+                "scm_bolsa_material_preparado",
+                "scm_decision_calidad_material_preparado",
+                "scm_reserva_material_preparado",
+                "scm_emision_material_preparado",
+                "scm_recepcion_bolsa_material_preparado",
+                "scm_saldo_material_preparado",
+                "scm_movimiento_material_preparado",
                 "scm_trabajo_ot",
                 "scm_trabajo_color",
                 "scm_asignacion_personal_trabajo_ot",
@@ -304,6 +319,20 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                     "OA_LIBERAR",
                     "OA_EJECUTAR",
                     "OA_ANULAR",
+                    "OPM_VER",
+                    "OPM_CREAR",
+                    "OPM_LIBERAR",
+                    "OPM_EJECUTAR",
+                    "OPM_PESO_CONFIRMAR",
+                    "OPM_CERRAR",
+                    "MATERIAL_PREPARADO_RECIBIR",
+                    "MATERIAL_PREPARADO_CALIDAD_RESOLVER",
+                    "MATERIAL_PREPARADO_RESERVAR",
+                    "MATERIAL_PREPARADO_EMITIR",
+                    "MATERIAL_PREPARADO_RECIBIR_MAQUINA",
+                    "MATERIAL_PREPARADO_CONSUMIR",
+                    "MATERIAL_PREPARADO_DEVOLVER",
+                    "MATERIAL_PREPARADO_GENEALOGIA_VER",
                 } <= capacidades
                 assert not any(code.startswith("OE_") for code in capacidades)
                 assert connection.execute(

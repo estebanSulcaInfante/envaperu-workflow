@@ -37,6 +37,10 @@ from app.services.scm_operation_schedule_projection import (
     operation_schedule_projection,
     operation_schedule_projections,
 )
+from app.services.scm_fulfillment_service import (
+    credit_output_allocations,
+    project_production_orders_for_operation,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -287,7 +291,11 @@ def create_exceptional_assembly_order(
     operation_id,
     data,
 ):
-    """Create a governed WIP replenishment OA without a parent OP."""
+    """Create a governed WIP replenishment OA without a parent OP.
+
+    The returned boolean distinguishes a new `201` response from an exact
+    idempotent replay (`200`) without exposing transport metadata in the OA.
+    """
 
     try:
         actor = load_actor(session, actor_id)
@@ -588,6 +596,9 @@ def transition_assembly_order(
                             "ots": [item.codigo_ot for item in pending_ots],
                         },
                     )
+                # Armado acredita la salida al cerrar cada manga. El cierre de
+                # OA reconcilia ese total; nunca acepta un conteo digitado que
+                # pueda contradecir la genealogía ya registrada.
                 accepted = Decimal(output.cantidad_real or 0)
                 rejected = Decimal(output.cantidad_rechazada or 0)
             else:
@@ -649,26 +660,19 @@ def transition_assembly_order(
             )
             lot.event_time = order.closed_at
             lot.actor_id = actor.id
-            remaining = accepted
-            for allocation in output.asignaciones:
-                satisfied = min(
-                    Decimal(allocation.cantidad_planificada),
-                    remaining,
-                )
-                remaining -= satisfied
-                allocation.cantidad_comprometida = satisfied
-                allocation.cantidad_satisfecha = satisfied
-                if satisfied >= allocation.cantidad_planificada:
-                    allocation.estado = "SATISFECHA"
-                elif satisfied > 0:
-                    allocation.estado = "COMPROMETIDA"
-                else:
-                    allocation.estado = "PLANIFICADA"
-                allocation.version += 1
+            credit_output_allocations(output, accepted)
         order.estado = next_state
         order.version += 1
+        op_projections = project_production_orders_for_operation(
+            session,
+            operation_order=order,
+            actor=actor,
+            operation=audit,
+        )
         session.flush()
         response = _serialize(session, order)
+        if op_projections:
+            response["ordenes_produccion"] = op_projections
         audit.response_json = copy.deepcopy(response)
         audit.estado_http = 200
         session.add(ScmEvento(

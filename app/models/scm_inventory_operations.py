@@ -57,6 +57,12 @@ class ScmAlmacenTrabajador(db.Model):
     __tablename__ = "scm_almacen_trabajador"
     __table_args__ = (
         db.UniqueConstraint("almacen_id", "trabajador_id", name="uq_scm_almacen_trabajador"),
+        db.Index(
+            "ix_scm_almacen_trabajador_scope",
+            "trabajador_id",
+            "activo",
+            "almacen_id",
+        ),
     )
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

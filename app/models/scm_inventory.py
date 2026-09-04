@@ -16,6 +16,16 @@ class ScmUbicacionInventario(db.Model):
     __tablename__ = "scm_ubicacion_inventario"
     __table_args__ = (
         db.UniqueConstraint("codigo", name="uq_scm_ubicacion_inventario_codigo"),
+        db.UniqueConstraint(
+            "maquina_id", name="uq_scm_ubicacion_inventario_maquina"
+        ),
+        db.Index("ix_scm_ubicacion_almacen", "almacen_id", "tipo"),
+        db.Index(
+            "ix_scm_ubicacion_almacen_codigo_id",
+            "almacen_id",
+            "codigo",
+            "id",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -27,6 +37,11 @@ class ScmUbicacionInventario(db.Model):
     parent_id = db.Column(
         db.Integer,
         db.ForeignKey("scm_ubicacion_inventario.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    maquina_id = db.Column(
+        db.Integer,
+        db.ForeignKey("maquina.id", ondelete="RESTRICT"),
         nullable=True,
     )
     tipo = db.Column(db.String(24), nullable=True)
@@ -57,6 +72,7 @@ class ScmUbicacionInventario(db.Model):
 
     almacen = db.relationship("ScmAlmacen", back_populates="ubicaciones")
     parent = db.relationship("ScmUbicacionInventario", remote_side=[id])
+    maquina = db.relationship("Maquina")
 
     def to_dict(self):
         return {
@@ -68,6 +84,16 @@ class ScmUbicacionInventario(db.Model):
             "almacen_id": str(self.almacen_id) if self.almacen_id else None,
             "tipo": self.tipo,
             "parent_id": self.parent_id,
+            "maquina": (
+                {
+                    "id": self.maquina.id,
+                    "codigo": self.maquina.codigo,
+                    "nombre": self.maquina.nombre,
+                    "estado": self.maquina.estado,
+                    "activo": self.maquina.activo,
+                }
+                if self.maquina is not None else None
+            ),
             "permite_saldo_libre": self.permite_saldo_libre,
             "version": self.version,
         }
@@ -155,6 +181,11 @@ class ScmMovimientoInventario(db.Model):
             "operation_id",
             name="uq_scm_movimiento_inventario_operation",
         ),
+        db.Index(
+            "ix_scm_movimiento_inventario_created_id",
+            "created_at",
+            "id",
+        ),
     )
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -241,6 +272,11 @@ class ScmMovimientoMaterialInventario(db.Model):
         db.UniqueConstraint(
             "operation_id", name="uq_scm_movimiento_material_operation",
         ),
+        db.Index(
+            "ix_scm_movimiento_material_created_id",
+            "created_at",
+            "id",
+        ),
     )
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -294,6 +330,10 @@ class ScmLoteAperturaInventario(db.Model):
     codigo = db.Column(db.String(40), nullable=False)
     fecha_corte = db.Column(db.Date, nullable=False)
     motivo = db.Column(db.String(500), nullable=False)
+    metodo = db.Column(
+        db.String(32), nullable=False, default="TABULAR_CONTINGENCIA",
+        server_default="TABULAR_CONTINGENCIA",
+    )
     estado = db.Column(
         db.String(28), nullable=False, default="BORRADOR",
         server_default="BORRADOR",
@@ -324,6 +364,10 @@ class ScmLoteAperturaInventario(db.Model):
     lineas = db.relationship(
         "ScmLoteAperturaLinea", back_populates="lote",
         cascade="all, delete-orphan", order_by="ScmLoteAperturaLinea.id",
+    )
+    unidades_logisticas = db.relationship(
+        "ScmUnidadLogisticaInventario", back_populates="lote_apertura",
+        lazy="select", order_by="ScmUnidadLogisticaInventario.created_at",
     )
     creado_por = db.relationship("Trabajador", foreign_keys=[creado_por_id])
     enviado_por = db.relationship("Trabajador", foreign_keys=[enviado_por_id])
@@ -392,6 +436,119 @@ class ScmLoteAperturaLinea(db.Model):
     material = db.relationship("ScmMaterial")
     movimiento = db.relationship("ScmMovimientoInventario")
     movimiento_material = db.relationship("ScmMovimientoMaterialInventario")
+
+
+class ScmUnidadLogisticaInventario(db.Model):
+    """Bolsa, manga o bulto físico identificado por un QR persistente."""
+
+    __tablename__ = "scm_unidad_logistica_inventario"
+    __table_args__ = (
+        db.CheckConstraint(
+            "(articulo_scm_id IS NOT NULL) <> (material_scm_id IS NOT NULL)",
+            name="ck_scm_unidad_logistica_item_unico",
+        ),
+        db.CheckConstraint(
+            "peso_bruto_kg > 0 AND tara_kg >= 0 AND peso_neto_kg > 0 "
+            "AND peso_neto_kg = peso_bruto_kg - tara_kg",
+            name="ck_scm_unidad_logistica_pesos",
+        ),
+        db.CheckConstraint(
+            "estado IN ('REGISTRADA', 'DISPONIBLE', 'BLOQUEADA', 'CONSUMIDA', 'ANULADA')",
+            name="ck_scm_unidad_logistica_estado",
+        ),
+        db.UniqueConstraint("codigo", name="uq_scm_unidad_logistica_codigo"),
+        db.UniqueConstraint("qr_value", name="uq_scm_unidad_logistica_qr"),
+        db.UniqueConstraint("capture_operation_id", name="uq_scm_unidad_logistica_capture"),
+        db.Index("ix_scm_unidad_logistica_apertura", "lote_apertura_id"),
+        db.Index("ix_scm_unidad_logistica_linea", "apertura_linea_id"),
+        db.Index("ix_scm_unidad_logistica_ubicacion", "ubicacion_id", "estado"),
+    )
+
+    id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    codigo = db.Column(db.String(64), nullable=False)
+    qr_value = db.Column(db.String(100), nullable=False)
+    lote_apertura_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_lote_apertura_inventario.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    apertura_linea_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_lote_apertura_linea.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    articulo_scm_id = db.Column(
+        db.Integer, db.ForeignKey("scm_articulo.id", ondelete="RESTRICT"), nullable=True,
+    )
+    material_scm_id = db.Column(
+        db.Integer, db.ForeignKey("scm_material.id", ondelete="RESTRICT"), nullable=True,
+    )
+    ubicacion_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_ubicacion_inventario.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    peso_bruto_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    tara_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    peso_neto_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    cantidad_disponible_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    estado_calidad = db.Column(db.String(16), nullable=False)
+    estado = db.Column(
+        db.String(20), nullable=False, default="REGISTRADA", server_default="REGISTRADA",
+    )
+    station_id = db.Column(db.String(64), nullable=False)
+    capturado_por_id = db.Column(
+        db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False,
+    )
+    capture_operation_id = db.Column(Uuid(as_uuid=True), nullable=False)
+    reading_stable = db.Column(db.Boolean, nullable=False, default=True, server_default="true")
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now, server_default=db.func.now(),
+    )
+
+    lote_apertura = db.relationship(
+        "ScmLoteAperturaInventario", back_populates="unidades_logisticas"
+    )
+    apertura_linea = db.relationship("ScmLoteAperturaLinea")
+    articulo = db.relationship("ScmArticulo")
+    material = db.relationship("ScmMaterial")
+    ubicacion = db.relationship("ScmUbicacionInventario")
+    capturado_por = db.relationship("Trabajador")
+
+
+class ScmUsoUnidadLogisticaPreparacion(db.Model):
+    """Asignación trazable de kg de una bolsa origen a una lectura de OPM."""
+
+    __tablename__ = "scm_uso_unidad_logistica_preparacion"
+    __table_args__ = (
+        db.CheckConstraint("cantidad_kg > 0", name="ck_scm_uso_ul_prep_cantidad"),
+        db.CheckConstraint(
+            "estado IN ('RESERVADA', 'CONSUMIDA', 'LIBERADA')",
+            name="ck_scm_uso_ul_prep_estado",
+        ),
+        db.UniqueConstraint("lectura_id", "unidad_logistica_id", name="uq_scm_uso_ul_prep_fuente"),
+        db.Index("ix_scm_uso_ul_prep_unidad", "unidad_logistica_id", "estado"),
+    )
+
+    id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    lectura_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_lectura_peso_preparacion.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    unidad_logistica_id = db.Column(
+        Uuid(as_uuid=True),
+        db.ForeignKey("scm_unidad_logistica_inventario.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    cantidad_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    estado = db.Column(db.String(16), nullable=False, default="RESERVADA", server_default="RESERVADA")
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now, server_default=db.func.now(),
+    )
+
+    lectura = db.relationship("ScmLecturaPesoPreparacion")
+    unidad_logistica = db.relationship("ScmUnidadLogisticaInventario")
 
 
 class ScmReservaInventario(db.Model):

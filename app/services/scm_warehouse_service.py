@@ -182,7 +182,10 @@ def _resolve_code(session, code):
 
 def _candidate_payload(session, manga, label, resolution):
     weighing = session.scalar(
-        select(ScmPesajeManga).where(ScmPesajeManga.manga_id == manga.id)
+        select(ScmPesajeManga).where(
+            ScmPesajeManga.manga_id == manga.id,
+            ScmPesajeManga.estado == "VIGENTE",
+        )
     )
     if weighing is None:
         raise ScmServiceError(

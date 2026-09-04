@@ -2,8 +2,12 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Uuid
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.extensions import db
+
+
+PRODUCT_ONBOARDING_JSON = db.JSON().with_variant(JSONB(), "postgresql")
 
 
 def utc_now():
@@ -98,49 +102,49 @@ class ScmAltaProductoSesion(db.Model):
         server_default="IDENTIDAD",
     )
     borrador_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=dict,
         server_default="{}",
     )
     estados_paso_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=dict,
         server_default="{}",
     )
     bloqueos_paso_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=dict,
         server_default="{}",
     )
     fuentes_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=dict,
         server_default="{}",
     )
     referencias_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=dict,
         server_default="{}",
     )
     readiness_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=dict,
         server_default="{}",
     )
     invalidated_steps_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=list,
         server_default="[]",
     )
     application_journal_json = db.Column(
-        db.JSON,
+        PRODUCT_ONBOARDING_JSON,
         nullable=False,
         default=dict,
         server_default="{}",

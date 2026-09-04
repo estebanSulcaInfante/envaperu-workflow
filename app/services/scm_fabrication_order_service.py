@@ -3,14 +3,17 @@
 import copy
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from sqlalchemy import select
-from sqlalchemy.orm import joinedload, load_only, selectinload
 
 from app.models.maquina import Maquina
 from app.models.molde import Molde, MoldePieza
-from app.models.producto import ColorProduccion, PiezaColor
+from app.models.producto import ColorProduccion
 from app.models.receta_color import RecetaColorMaestra
-from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
+from app.models.scm_articulos import (
+    CLASE_PRODUCTO_TERMINADO,
+    ScmArticulo,
+)
 from app.models.scm_auditoria import ScmEvento
+from app.models.scm_estructuras import ScmEstructuraComponente
 from app.models.scm_inline_wip import (
     ScmReservaWipSalida,
     ScmSaldoWipSalida,
@@ -32,6 +35,10 @@ from app.services.scm_operation_schedule_projection import (
 from app.services.scm_production_order_service import (
     _iso,
     _reserve_operation,
+)
+from app.services.scm_fulfillment_service import (
+    credit_output_allocations,
+    project_production_orders_for_operation,
 )
 from app.services.scm_service_support import (
     ScmServiceError,
@@ -75,54 +82,100 @@ def _decimal_text(value, scale):
     return format(Decimal(value).quantize(quantum), "f")
 
 
-def _credit_output_allocations(output, accepted_quantity):
-    """Project the authoritative output total without additive replay."""
+def _output_piece_color(session, output):
+    """Resolve the physical mold piece behind an operational output.
 
-    remaining = max(Decimal(accepted_quantity), Decimal("0"))
-    changes = []
-    active = sorted(
-        (
-            item for item in output.asignaciones
-            if item.estado != "CANCELADA"
-        ),
-        key=lambda item: (item.created_at, str(item.id)),
+    A PieceColor is direct. A terminal PT can only inherit mold data when its
+    frozen demand structure proves it is exactly one unit of one PieceColor.
+    Multi-piece PTs must keep separate physical outputs and an assembly step.
+    """
+    article = output.articulo
+    if article is None:
+        return None, None
+    if article.pieza_color is not None:
+        return article.pieza_color.pieza_color, "PIEZA_COLOR"
+    if article.clase != CLASE_PRODUCTO_TERMINADO:
+        return None, None
+
+    structure_ids = {
+        allocation.orden_produccion_linea.estructura_revision_id
+        for allocation in output.asignaciones
+        if allocation.estado != "CANCELADA"
+        and allocation.orden_produccion_linea is not None
+        and allocation.orden_produccion_linea.estructura_revision_id is not None
+    }
+    if len(structure_ids) != 1:
+        return None, None
+    components = session.scalars(
+        select(ScmEstructuraComponente).where(
+            ScmEstructuraComponente.revision_id == next(iter(structure_ids))
+        )
+    ).all()
+    if len(components) != 1 or Decimal(components[0].cantidad) != Decimal("1"):
+        return None, None
+    component_article = components[0].articulo_componente
+    if component_article is None or component_article.pieza_color is None:
+        return None, None
+    return component_article.pieza_color.pieza_color, "PT_MONOPIEZA"
+
+
+def _mold_output_spec(session, output, mold):
+    piece_color, derivation = _output_piece_color(session, output)
+    if piece_color is None:
+        return None
+    composition = session.scalar(
+        select(MoldePieza).where(
+            MoldePieza.molde_id == mold.codigo,
+            MoldePieza.pieza_id == piece_color.pieza_id,
+            MoldePieza.activo.is_(True),
+        )
     )
-    for allocation in active:
-        planned = Decimal(allocation.cantidad_planificada)
-        satisfied = min(planned, remaining)
-        remaining -= satisfied
-        next_state = (
-            "SATISFECHA" if satisfied >= planned
-            else "COMPROMETIDA" if satisfied > 0
-            else "PLANIFICADA"
+    if composition is None:
+        raise ScmServiceError(
+            "MOLD_OUTPUT_INCOMPATIBLE",
+            "El molde no fabrica la salida fisica requerida por la OF.",
+            status_code=422,
+            details={"salida_id": str(output.id)},
         )
-        before = (
-            Decimal(allocation.cantidad_comprometida),
-            Decimal(allocation.cantidad_satisfecha),
-            allocation.estado,
-        )
-        after = (satisfied, satisfied, next_state)
-        if before != after:
-            allocation.cantidad_comprometida = satisfied
-            allocation.cantidad_satisfecha = satisfied
-            allocation.estado = next_state
-            allocation.version += 1
-        changes.append({
-            "id": str(allocation.id),
-            "planificada": format(planned, "f"),
-            "satisfecha": format(satisfied, "f"),
-            "estado": next_state,
-        })
     return {
-        "asignaciones": changes,
-        "excedente_no_asignado": format(remaining, "f"),
+        "piece_color": piece_color,
+        "derivation": derivation,
+        "per_cycle": Decimal(composition.cavidades),
+        "unit_weight": Decimal(str(composition.peso_unitario_gr)),
     }
 
 
-def _serialize_output(output):
-    piece_id = None
-    if output.articulo and output.articulo.pieza_color is not None:
-        piece_id = output.articulo.pieza_color.pieza_color.pieza_id
+def _default_recipe_for_run(session, run, outputs):
+    candidates = session.scalars(
+        select(RecetaColorMaestra).where(
+            RecetaColorMaestra.color_produccion_id == run.color_produccion_id,
+            RecetaColorMaestra.estado == "APROBADA",
+            RecetaColorMaestra.es_default.is_(True),
+        )
+    ).all()
+    product_scopes = {
+        output.articulo.producto.producto_terminado_id
+        for output in outputs
+        if output.articulo is not None
+        and output.articulo.producto is not None
+    }
+    exact = [
+        recipe for recipe in candidates
+        if recipe.producto_scope in product_scopes
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    generic = [recipe for recipe in candidates if recipe.producto_scope == "*"]
+    if not exact and len(generic) == 1:
+        return generic[0]
+    if not product_scopes and len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _serialize_output(session, output):
+    piece_color, derivation = _output_piece_color(session, output)
+    piece_id = piece_color.pieza_id if piece_color is not None else None
     return {
         "id": str(output.id),
         "articulo_scm_id": output.articulo_scm_id,
@@ -131,6 +184,7 @@ def _serialize_output(output):
             "nombre": output.articulo.nombre,
             "clase": output.articulo.clase,
             "pieza_id": piece_id,
+            "derivacion_molde": derivation,
         } if output.articulo else None,
         "cantidad_por_ciclo_snapshot": (
             _decimal_text(output.cantidad_por_ciclo_snapshot, 4)
@@ -143,6 +197,14 @@ def _serialize_output(output):
             else None
         ),
         "cantidad_objetivo": _decimal_text(output.cantidad_objetivo, 3),
+        "cantidad_real": (
+            _decimal_text(output.cantidad_real, 3)
+            if output.cantidad_real is not None else None
+        ),
+        "cantidad_rechazada": (
+            _decimal_text(output.cantidad_rechazada, 3)
+            if output.cantidad_rechazada is not None else None
+        ),
         "kg_estandar_objetivo": (
             _decimal_text(output.kg_estandar_objetivo, 6)
             if output.kg_estandar_objetivo is not None
@@ -153,7 +215,7 @@ def _serialize_output(output):
     }
 
 
-def _serialize_run(run):
+def _serialize_run(session, run):
     color_identity = serialize_color_identity(
         run.color_produccion,
         color_id=run.color_produccion_id,
@@ -172,6 +234,15 @@ def _serialize_run(run):
         "color_identidad": color_identity,
         "receta_revision_id": run.receta_revision_id,
         "receta_hash": run.receta_hash,
+        "receta": (
+            {
+                "id": run.receta_revision.id,
+                "nombre": run.receta_revision.nombre_variante,
+                "revision": run.receta_revision.revision,
+                "estado": run.receta_revision.estado,
+            }
+            if run.receta_revision is not None else None
+        ),
         "ciclos_objetivo": run.ciclos_objetivo,
         "estado": run.estado,
         "lote_color_legacy_id": run.lote_color_legacy_id,
@@ -180,7 +251,7 @@ def _serialize_run(run):
             if run.meta_kg_legacy is not None
             else None
         ),
-        "salidas": [_serialize_output(output) for output in run.salidas],
+        "salidas": [_serialize_output(session, output) for output in run.salidas],
     }
 
 
@@ -235,7 +306,9 @@ def _serialize(session, operation, *, schedule_projection=None):
             else None
         ),
         "codigo_legacy_op": fabrication.codigo_legacy_op,
-        "corridas": [_serialize_run(run) for run in fabrication.corridas],
+        "corridas": [
+            _serialize_run(session, run) for run in fabrication.corridas
+        ],
     }
 
 
@@ -308,34 +381,9 @@ def _load_fabrication(session, operation_id, *, lock=False):
 
 def list_fabrication_orders(session, *, actor_id):
     load_actor(session, actor_id, capability="OF_VER")
-    fabrication_runs = (
-        selectinload(ScmOrdenOperacion.fabricacion)
-        .selectinload(ScmOrdenFabricacion.corridas)
-    )
-    run_outputs = fabrication_runs.selectinload(
-        ScmCorridaFabricacion.salidas
-    )
-    output_articles = run_outputs.selectinload(
-        ScmOrdenOperacionSalida.articulo
-    )
     operations = session.scalars(
         select(ScmOrdenOperacion)
         .where(ScmOrdenOperacion.tipo == "FABRICACION")
-        .options(
-            selectinload(ScmOrdenOperacion.fabricacion),
-            selectinload(ScmOrdenOperacion.operacion_ruta_revision),
-            fabrication_runs
-            .joinedload(ScmCorridaFabricacion.color_produccion)
-            .joinedload(ColorProduccion.color_base_rel),
-            fabrication_runs
-            .joinedload(ScmCorridaFabricacion.color_produccion)
-            .joinedload(ColorProduccion.familia_color_rel),
-            output_articles,
-            output_articles
-            .selectinload(ScmArticulo.pieza_color)
-            .selectinload(ScmArticuloPiezaColor.pieza_color)
-            .load_only(PiezaColor.pieza_id),
-        )
         .order_by(ScmOrdenOperacion.created_at.desc())
     ).all()
     projections = operation_schedule_projections(session, operations)
@@ -747,24 +795,11 @@ def update_fabrication_order(
                 article = output.articulo
                 per_cycle = None
                 unit_weight = None
-                if article.pieza_color is not None:
-                    piece_color = article.pieza_color.pieza_color
-                    composition = session.scalar(
-                        select(MoldePieza).where(
-                            MoldePieza.molde_id == mold.codigo,
-                            MoldePieza.pieza_id == piece_color.pieza_id,
-                            MoldePieza.activo.is_(True),
-                        )
-                    )
-                    if composition is None:
-                        raise ScmServiceError(
-                            "MOLD_OUTPUT_INCOMPATIBLE",
-                            "El molde no fabrica una salida PiezaColor de la OF.",
-                            status_code=422,
-                            details={"salida_id": str(output.id)},
-                        )
-                    per_cycle = Decimal(composition.cavidades)
-                    unit_weight = Decimal(str(composition.peso_unitario_gr))
+                mold_spec = _mold_output_spec(session, output, mold)
+                if mold_spec is not None:
+                    piece_color = mold_spec["piece_color"]
+                    per_cycle = mold_spec["per_cycle"]
+                    unit_weight = mold_spec["unit_weight"]
                     if piece_color.color_produccion_id is not None:
                         derived_colors.add(piece_color.color_produccion_id)
                 else:
@@ -824,6 +859,14 @@ def update_fabrication_order(
                     )
                 run.color_produccion_id = requested_color
             recipe_id = raw_run.get("receta_revision_id")
+            if recipe_id is None:
+                default_recipe = _default_recipe_for_run(
+                    session,
+                    run,
+                    [item[0] for item in prepared],
+                )
+                if default_recipe is not None:
+                    recipe_id = default_recipe.id
             if recipe_id is not None:
                 recipe = session.get(RecetaColorMaestra, recipe_id)
                 if (
@@ -969,6 +1012,7 @@ def release_fabrication_order(
     except Exception:
         session.rollback()
         raise
+
 
 def close_fabrication_order(
     session,
@@ -1188,7 +1232,7 @@ def close_fabrication_order(
                 "salida_id": str(output.id),
                 "articulo": output.articulo.codigo,
                 "cantidad_real": format(actual, "f"),
-                **_credit_output_allocations(output, actual),
+                **credit_output_allocations(output, actual),
             })
         for run in order.fabricacion.corridas:
             if run.estado != "ANULADA":
@@ -1197,6 +1241,12 @@ def close_fabrication_order(
         order.closed_by_id = actor.id
         order.closed_at = closed_at
         order.version += 1
+        op_projections = project_production_orders_for_operation(
+            session,
+            operation_order=order,
+            actor=actor,
+            operation=operation,
+        )
         session.flush()
         response = {
             **_serialize(session, order),
@@ -1204,6 +1254,7 @@ def close_fabrication_order(
                 "motivo": command["motivo"],
                 "diferencias": differences,
                 "salidas": fulfillment,
+                "ordenes_produccion": op_projections,
             },
         }
         operation.response_json = copy.deepcopy(response)

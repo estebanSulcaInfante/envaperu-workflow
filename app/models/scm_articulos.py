@@ -47,6 +47,12 @@ class ScmArticulo(db.Model):
         db.CheckConstraint("version > 0", name="ck_scm_articulo_version"),
         db.UniqueConstraint("public_id", name="uq_scm_articulo_public_id"),
         db.UniqueConstraint("codigo", name="uq_scm_articulo_codigo"),
+        db.Index(
+            "ix_scm_articulo_clase_codigo_id",
+            "clase",
+            "codigo",
+            "id",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
