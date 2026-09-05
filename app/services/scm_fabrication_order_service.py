@@ -1,6 +1,7 @@
 """Services for canonical fabrication orders introduced by TS-010P."""
 
 import copy
+from app.services.scm_draft_order_annulment import annulment_summary
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
@@ -103,7 +104,7 @@ def _output_piece_color(session, output):
     structure_ids = {
         allocation.orden_produccion_linea.estructura_revision_id
         for allocation in output.asignaciones
-        if allocation.estado != "CANCELADA"
+        if (allocation.estado != "CANCELADA" or output.orden_operacion.estado == "ANULADA")
         and allocation.orden_produccion_linea is not None
         and allocation.orden_produccion_linea.estructura_revision_id is not None
     }
@@ -354,6 +355,7 @@ def _serialize(session, operation, *, schedule_projection=None):
         "origen_demanda": operation.origen_demanda,
         "motivo": operation.motivo,
         "estado": operation.estado,
+        "anulacion": annulment_summary(session, operation),
         "version": operation.version,
         "plan_produccion_id": (
             str(operation.plan_produccion_id)
@@ -448,7 +450,7 @@ def _load_fabrication(session, operation_id, *, lock=False):
         ScmOrdenOperacion.tipo == "FABRICACION",
     )
     if lock:
-        statement = statement.with_for_update(of=ScmOrdenOperacion)
+        statement = statement.with_for_update(of=ScmOrdenOperacion).execution_options(populate_existing=True)
     operation = session.scalar(statement)
     if (
         operation is None
@@ -1011,7 +1013,7 @@ def release_fabrication_order(
         )
         if replay is not None:
             return replay
-        order = _load_fabrication(session, operation_order_id)
+        order = _load_fabrication(session, operation_order_id, lock=True)
         if order.version != data["version"]:
             raise ScmServiceError(
                 "VERSION_CONFLICT",

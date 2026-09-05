@@ -143,6 +143,7 @@ from app.services.scm_production_order_service import (
     list_production_orders,
     refresh_production_order_routes,
 )
+from app.services.scm_draft_order_annulment import annul_draft_order
 from app.services.scm_fabrication_order_service import (
     close_fabrication_order,
     create_exceptional_fabrication_order,
@@ -1135,6 +1136,22 @@ def orden_fabricacion_liberar(order_id):
         operation_id=_idempotency_key(),
         operation_order_id=order_id,
         expected_resource_version=payload.get("version"),
+    ))
+
+
+@scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/anular")
+def orden_fabricacion_anular(order_id):
+    return jsonify(annul_draft_order(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, kind="FABRICACION", data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-armado/<uuid:order_id>/anular")
+def orden_armado_anular(order_id):
+    return jsonify(annul_draft_order(
+        db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
+        order_id=order_id, kind="ENSAMBLE", data=_json_body(),
     ))
 
 

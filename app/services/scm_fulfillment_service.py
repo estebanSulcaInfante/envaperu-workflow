@@ -126,10 +126,14 @@ def project_production_orders_for_outputs(
     output_ids,
     actor,
     operation,
+    affected_order_ids=None,
 ):
     """Project line and OP states after an operational state/result change."""
 
-    order_ids = _affected_order_ids(session, output_ids)
+    order_ids = (
+        affected_order_ids if affected_order_ids is not None
+        else _affected_order_ids(session, output_ids)
+    )
     if not order_ids:
         return []
     orders = session.scalars(

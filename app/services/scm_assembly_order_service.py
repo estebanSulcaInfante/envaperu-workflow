@@ -1,6 +1,7 @@
 """Lifecycle services for canonical assembly/operation orders."""
 
 import copy
+from app.services.scm_draft_order_annulment import annulment_summary
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 from sqlalchemy import select
@@ -166,6 +167,7 @@ def _serialize(session, order, *, schedule_projection=None):
         "codigo": order.codigo,
         "tipo": order.tipo,
         "estado": order.estado,
+        "anulacion": annulment_summary(session, order),
         "version": order.version,
         "origen_demanda": order.origen_demanda,
         "motivo": order.motivo,
