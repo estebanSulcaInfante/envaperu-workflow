@@ -1181,6 +1181,29 @@ def generate_prepared_requirement(session, *, actor_id, operation_id, run_id):
         if replay is not None:
             return replay
         run = _load_run(session, run_id, lock=True)
+        # Keep the existing corrida -> OF lock order, then refresh and
+        # revalidate the parent before creating/updating the child plan.
+        order = session.scalar(
+            select(ScmOrdenOperacion)
+            .where(
+                ScmOrdenOperacion.id == run.orden_fabricacion_id,
+                ScmOrdenOperacion.tipo == "FABRICACION",
+            )
+            .with_for_update(of=ScmOrdenOperacion)
+            .execution_options(populate_existing=True)
+        )
+        if order is None or order.fabricacion is None:
+            raise ScmServiceError(
+                "OF_NOT_FOUND", "La orden de fabricacion no existe.", status_code=404
+            )
+        # The parent refresh also expires relationship state; use the locked
+        # row's current status for the eligibility check below.
+        if order.estado not in ("LIBERADA", "PROGRAMADA", "EN_EJECUCION"):
+            raise ScmServiceError(
+                "OF_NOT_RELEASED",
+                "La OF debe estar liberada antes de requerir materiales.",
+                status_code=409,
+            )
         legacy_premix = session.scalar(
             select(ScmLotePremezcla)
             .where(

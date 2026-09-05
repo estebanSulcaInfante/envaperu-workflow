@@ -214,7 +214,17 @@ def generate_material_requirements(session, *, actor_id, operation_id, fabricati
         )
         if replay is not None:
             return replay
-        order = session.get(ScmOrdenOperacion, fabrication_order_id)
+        # Lock and refresh the parent OF before deriving any child requirements.
+        # This preserves the OF as the serialization point for release changes.
+        order = session.scalar(
+            select(ScmOrdenOperacion)
+            .where(
+                ScmOrdenOperacion.id == fabrication_order_id,
+                ScmOrdenOperacion.tipo == "FABRICACION",
+            )
+            .with_for_update(of=ScmOrdenOperacion)
+            .execution_options(populate_existing=True)
+        )
         if order is None or order.tipo != "FABRICACION" or order.fabricacion is None:
             raise ScmServiceError("OF_NOT_FOUND", "La orden de fabricacion no existe.", status_code=404)
         if order.estado not in ("LIBERADA", "PROGRAMADA", "EN_EJECUCION"):

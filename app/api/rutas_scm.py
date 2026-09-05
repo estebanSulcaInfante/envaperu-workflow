@@ -150,6 +150,7 @@ from app.services.scm_fabrication_order_service import (
     get_fabrication_order,
     list_fabrication_orders,
     release_fabrication_order,
+    replace_fabrication_order,
     update_fabrication_order,
 )
 from app.services.scm_assembly_order_service import (
@@ -1145,6 +1146,17 @@ def orden_fabricacion_anular(order_id):
         db.session, actor_id=_actor_id(), operation_id=_idempotency_key(),
         order_id=order_id, kind="FABRICACION", data=_json_body(),
     ))
+
+
+@scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/reemplazar")
+def orden_fabricacion_reemplazar(order_id):
+    return jsonify(replace_fabrication_order(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        operation_order_id=order_id,
+        data=_json_body(),
+    )), 201
 
 
 @scm_bp.post("/ordenes-armado/<uuid:order_id>/anular")

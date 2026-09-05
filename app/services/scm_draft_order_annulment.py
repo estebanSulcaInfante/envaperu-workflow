@@ -2,7 +2,7 @@
 
 import copy
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from app.models.scm_auditoria import ScmEvento
 from app.models.scm_production_orders import (
@@ -24,6 +24,33 @@ def annulment_summary(session, order):
         ScmEvento.tipo.in_(("OF_ANNULLED", "OA_ANNULLED")),
     ))
     return event.after_json.get("anulacion") if event else None
+
+
+def replacement_summary(session, order):
+    """Return the auditable predecessor/successor link for an OF.
+
+    The current schema already has an append-only event journal, so the link
+    is intentionally projected from ``OF_REPLACED`` instead of adding a
+    nullable relationship that could be edited independently of the audit.
+    """
+    events = session.scalars(select(ScmEvento).where(
+        ScmEvento.aggregate_type == "ORDEN_FABRICACION",
+        ScmEvento.tipo == "OF_REPLACED",
+        or_(
+            ScmEvento.aggregate_id == str(order.id),
+            ScmEvento.after_json["reemplazo"]["sucesora"]["id"].as_string() == str(order.id),
+        ),
+    )).all()
+    order_id = str(order.id)
+    for event in events:
+        replacement = (event.after_json or {}).get("reemplazo")
+        if not replacement:
+            continue
+        predecessor = replacement.get("anterior") or {}
+        successor = replacement.get("sucesora") or {}
+        if order_id in {str(predecessor.get("id")), str(successor.get("id"))}:
+            return replacement
+    return None
 
 
 def _ensure_unused(session, order):

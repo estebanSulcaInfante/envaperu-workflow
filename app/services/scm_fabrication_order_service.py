@@ -1,11 +1,15 @@
 """Services for canonical fabrication orders introduced by TS-010P."""
 
 import copy
-from app.services.scm_draft_order_annulment import annulment_summary
+from app.services.scm_draft_order_annulment import (
+    annulment_summary,
+    replacement_summary,
+)
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.maquina import Maquina
 from app.models.molde import Molde, MoldePieza
@@ -15,7 +19,7 @@ from app.models.scm_articulos import (
     CLASE_PRODUCTO_TERMINADO,
     ScmArticulo,
 )
-from app.models.scm_auditoria import ScmEvento
+from app.models.scm_auditoria import ScmEvento, ScmOperacion
 from app.models.scm_estructuras import ScmEstructuraComponente
 from app.models.scm_inline_wip import (
     ScmReservaWipSalida,
@@ -23,6 +27,7 @@ from app.models.scm_inline_wip import (
 )
 from app.models.scm_ot import ScmLoteArticulo, ScmManga, ScmTrabajoOt
 from app.models.scm_production_orders import (
+    ScmAsignacionDemandaSuministro,
     ScmCorridaFabricacion,
     ScmOrdenFabricacion,
     ScmOrdenOperacion,
@@ -343,6 +348,8 @@ def _serialize_run(session, run):
 def _serialize(session, operation, *, schedule_projection=None):
     fabrication = operation.fabricacion
     route_operation = operation.operacion_ruta_revision
+    replacement = replacement_summary(session, operation)
+    origin_op = operation.plan_produccion.orden_produccion if operation.plan_produccion else None
     return {
         **(
             schedule_projection
@@ -356,6 +363,20 @@ def _serialize(session, operation, *, schedule_projection=None):
         "motivo": operation.motivo,
         "estado": operation.estado,
         "anulacion": annulment_summary(session, operation),
+        "reemplazo": replacement,
+        "procedencia": {
+            "op_id": str(origin_op.id) if origin_op else None,
+            "op_codigo": origin_op.codigo if origin_op else None,
+            "plan_id": (
+                str(operation.plan_produccion_id)
+                if operation.plan_produccion_id else None
+            ),
+            "tipo": operation.origen_demanda,
+            "orden_anterior_id": (
+                replacement or {}
+            ).get("anterior", {}).get("id")
+            if operation.origen_demanda == "REEMPLAZO_OF" else None,
+        },
         "version": operation.version,
         "plan_produccion_id": (
             str(operation.plan_produccion_id)
@@ -487,7 +508,308 @@ def list_fabrication_orders(session, *, actor_id):
 
 def get_fabrication_order(session, *, actor_id, operation_id):
     load_actor(session, actor_id, capability="OF_VER")
-    return _serialize(session, _load_fabrication(session, operation_id))
+    order = _load_fabrication(session, operation_id)
+    payload = _serialize(session, order)
+    if order.estado == "LIBERADA":
+        try:
+            _ensure_replacement_eligible(session, order)
+            payload["reemplazo_disponibilidad"] = {"permitido": True}
+        except ScmServiceError as error:
+            payload["reemplazo_disponibilidad"] = {"permitido": False, "motivo": str(error)}
+    return payload
+
+
+def _ensure_replacement_eligible(session, order):
+    """Fail closed before changing a released intermediate OF."""
+    if order.estado != "LIBERADA":
+        raise ScmServiceError(
+            "INVALID_REPLACEMENT_STATE",
+            "Solo una OF LIBERADA puede reemplazarse por este flujo.",
+            status_code=409,
+        )
+    if order.started_at is not None or order.closed_at is not None:
+        raise ScmServiceError(
+            "ORDER_HAS_ACTIVITY",
+            "La OF conserva actividad operativa y no puede reemplazarse.",
+            status_code=409,
+        )
+    if order.plan_produccion_id is None or order.plan_produccion is None:
+        raise ScmServiceError(
+            "REPLACEMENT_ORIGIN_REQUIRED",
+            "El reemplazo solo procede para una OF proveniente de un plan.",
+            status_code=409,
+        )
+    if order.plan_produccion.estado != "CONFIRMADO":
+        raise ScmServiceError(
+            "REPLACEMENT_PLAN_NOT_CONFIRMED",
+            "El plan de origen debe permanecer CONFIRMADO.",
+            status_code=409,
+        )
+    if not order.propuesta_clave:
+        raise ScmServiceError(
+            "REPLACEMENT_ORIGIN_AMBIGUOUS",
+            "La OF no conserva una propuesta de origen verificable.",
+            status_code=409,
+        )
+    proposal = order.plan_produccion.propuesta_json or {}
+    reservations = proposal.get("reservas_stock", [])
+    if not isinstance(reservations, list) or any(
+        not isinstance(item, dict)
+        or item.get("propuesta_consumidora_clave") in (None, order.propuesta_clave)
+        for item in reservations
+    ):
+        raise ScmServiceError(
+            "REPLACEMENT_STOCK_REQUIRES_RECONCILIATION",
+            "El plan conserva reservas para esta propuesta o de origen ambiguo; concilie antes de reemplazar.",
+            status_code=409,
+        )
+    documents = [
+        item for item in proposal.get("documentos", [])
+        if isinstance(item, dict) and item.get("clave") == order.propuesta_clave
+    ]
+    if len(documents) != 1 or documents[0].get("tipo") != "FABRICACION":
+        raise ScmServiceError(
+            "REPLACEMENT_ORIGIN_AMBIGUOUS",
+            "La propuesta de origen no identifica una única OF de fabricación.",
+            status_code=409,
+        )
+    document = documents[0]
+    if (
+        document.get("operacion_ruta_id") != order.operacion_ruta_revision_id
+        or document.get("ruta_hash") != order.operacion_ruta_hash
+        or not document.get("articulo_scm_id")
+    ):
+        raise ScmServiceError(
+            "REPLACEMENT_ORIGIN_AMBIGUOUS",
+            "La ruta o salida de la propuesta de origen no coincide con la OF.",
+            status_code=409,
+        )
+    output_article_ids = {
+        output.articulo_scm_id for output in order.salidas
+    }
+    if output_article_ids != {document.get("articulo_scm_id")}:
+        raise ScmServiceError(
+            "REPLACEMENT_ORIGIN_AMBIGUOUS",
+            "La salida de la OF no coincide con la propuesta confirmada.",
+            status_code=409,
+        )
+    runs = order.fabricacion.corridas
+    if not runs or any(run.estado != "LIBERADA" for run in runs):
+        raise ScmServiceError(
+            "ORDER_HAS_ACTIVITY",
+            "La OF conserva una corrida iniciada o en un estado no reemplazable.",
+            status_code=409,
+        )
+    if any(run.trabajos_color for run in runs):
+        raise ScmServiceError(
+            "ORDER_HAS_DEPENDENCIES",
+            "La OF tiene trabajos de color vinculados; no se anula parcialmente.",
+            status_code=409,
+        )
+    outputs = list(order.salidas)
+    if any(
+        output.cantidad_real is not None
+        or output.cantidad_rechazada is not None
+        for output in outputs
+    ):
+        raise ScmServiceError(
+            "ORDER_HAS_ACTIVITY",
+            "La OF conserva resultados y no puede reemplazarse.",
+            status_code=409,
+        )
+    assignments = session.scalars(select(ScmAsignacionDemandaSuministro).where(
+        ScmAsignacionDemandaSuministro.orden_operacion_salida_id.in_(
+            [output.id for output in outputs]
+        ),
+    )).all()
+    if assignments:
+        raise ScmServiceError(
+            "DIRECT_DEMAND_ASSIGNMENT",
+            "La OF tiene asignaciones directas de demanda; primero concilia su cobertura.",
+            status_code=409,
+            details={"asignaciones": [str(item.id) for item in assignments]},
+        )
+
+    # Operational references are not part of the OF's structural children.
+    # Inspect every FK in the current metadata so new OT/manga dependencies
+    # fail closed until this command explicitly supports them.
+    structural = {
+        "scm_orden_operacion", "scm_orden_fabricacion",
+        "scm_corrida_fabricacion", "scm_orden_operacion_salida",
+        "scm_asignacion_demanda_suministro",
+    }
+    targets = {
+        "scm_orden_operacion": [order.id],
+        "scm_orden_fabricacion": [order.id],
+        "scm_corrida_fabricacion": [run.id for run in runs],
+        "scm_orden_operacion_salida": [output.id for output in outputs],
+    }
+    for table in ScmOrdenOperacion.metadata.tables.values():
+        if table.name in structural:
+            continue
+        for foreign_key in table.foreign_keys:
+            ids = targets.get(foreign_key.column.table.name)
+            if ids and session.scalar(
+                select(foreign_key.parent).where(
+                    foreign_key.parent.in_(ids)
+                ).limit(1)
+            ) is not None:
+                raise ScmServiceError(
+                    "ORDER_HAS_DEPENDENCIES",
+                    "La OF tiene actividad o dependencia operativa vinculada.",
+                    status_code=409,
+                    details={"table": table.name},
+                )
+
+
+def replace_fabrication_order(
+    session,
+    *,
+    actor_id,
+    operation_id,
+    operation_order_id,
+    data,
+):
+    """Atomically annul an unused released OF and create its draft successor."""
+    try:
+        actor = load_actor(session, actor_id, capability="OF_ANULAR")
+        if not actor.tiene_capacidad("OF_EDITAR_BORRADOR"):
+            raise ScmServiceError(
+                "CAPABILITY_REQUIRED",
+                "El actor requiere la capacidad OF_EDITAR_BORRADOR.",
+                status_code=403,
+                details={"capability": "OF_EDITAR_BORRADOR"},
+            )
+        reject_unknown_fields(data, allowed={"version", "motivo"})
+        version = expected_version(data.get("version"))
+        reason = required_text(data.get("motivo"), field="motivo", max_length=500)
+        request = {"order_id": str(operation_order_id), "version": version, "motivo": reason}
+        endpoint = "POST /ordenes-fabricacion/{id}/reemplazar"
+        try:
+            with session.begin_nested():
+                operation, replay = _reserve_operation(session, operation_id, endpoint, actor, request)
+        except IntegrityError:
+            if session.get(ScmOperacion, operation_id) is None:
+                raise
+            operation, replay = _reserve_operation(session, operation_id, endpoint, actor, request)
+        if replay is not None:
+            return replay
+        order = _load_fabrication(session, operation_order_id, lock=True)
+        if order.version != version:
+            raise ScmServiceError(
+                "VERSION_CONFLICT",
+                "La OF fue modificada por otro usuario.",
+                status_code=409,
+            )
+        _ensure_replacement_eligible(session, order)
+        successor_key = f"REEMPLAZO:{order.id}"
+        existing_successor = session.scalar(select(ScmOrdenOperacion).where(
+            ScmOrdenOperacion.plan_produccion_id == order.plan_produccion_id,
+            ScmOrdenOperacion.propuesta_clave == successor_key,
+        ))
+        if existing_successor is not None:
+            raise ScmServiceError(
+                "REPLACEMENT_ALREADY_EXISTS",
+                "La OF ya tiene una sucesora preparada.",
+                status_code=409,
+                details={"sucesora_id": str(existing_successor.id)},
+            )
+
+        successor_code = generar_codigo_catalogo("ORDEN_FABRICACION", session=session)
+        successor = ScmOrdenOperacion(
+            codigo=successor_code,
+            tipo="FABRICACION",
+            origen_demanda="REEMPLAZO_OF",
+            motivo=reason,
+            plan_produccion_id=order.plan_produccion_id,
+            propuesta_clave=successor_key,
+            estado="BORRADOR",
+            operacion_ruta_revision_id=order.operacion_ruta_revision_id,
+            operacion_ruta_hash=order.operacion_ruta_hash,
+            created_by_id=actor.id,
+        )
+        successor_fabrication = ScmOrdenFabricacion(
+            orden_operacion=successor,
+            molde_id=order.fabricacion.molde_id,
+            maquina_prevista_id=order.fabricacion.maquina_prevista_id,
+            snapshot_tiempo_ciclo_seg=order.fabricacion.snapshot_tiempo_ciclo_seg,
+            snapshot_horas_turno=order.fabricacion.snapshot_horas_turno,
+            snapshot_peso_colada_gr=order.fabricacion.snapshot_peso_colada_gr,
+            # codigo_legacy_op is intentionally not cloned: it is unique legacy identity.
+        )
+        for run in order.fabricacion.corridas:
+            successor_run = ScmCorridaFabricacion(
+                codigo=f"{successor_code}-C{run.secuencia:02d}",
+                secuencia=run.secuencia,
+                color_produccion_id=run.color_produccion_id,
+                # Recipe selection is an explicit decision on the successor.
+                receta_revision_id=None,
+                receta_hash=None,
+                ciclos_objetivo=run.ciclos_objetivo,
+                estado="BORRADOR",
+                meta_kg_legacy=run.meta_kg_legacy,
+            )
+            successor_fabrication.corridas.append(successor_run)
+            for output in run.salidas:
+                successor_run.salidas.append(ScmOrdenOperacionSalida(
+                    orden_operacion=successor,
+                    articulo_scm_id=output.articulo_scm_id,
+                    cantidad_por_ciclo_snapshot=output.cantidad_por_ciclo_snapshot,
+                    peso_unitario_snapshot_g=output.peso_unitario_snapshot_g,
+                    cantidad_objetivo=output.cantidad_objetivo,
+                    kg_estandar_objetivo=output.kg_estandar_objetivo,
+                    excedente_objetivo=output.excedente_objetivo,
+                    # legacy output identity is never copied.
+                ))
+        session.add(successor)
+        order.estado = "ANULADA"
+        order.version += 1
+        for run in order.fabricacion.corridas:
+            run.estado = "ANULADA"
+        session.flush()
+        link = {
+            "anterior": {
+                "id": str(order.id),
+                "codigo": order.codigo,
+                "estado": order.estado,
+                "version": order.version,
+            },
+            "sucesora": {
+                "id": str(successor.id),
+                "codigo": successor.codigo,
+                "estado": successor.estado,
+                "version": successor.version,
+            },
+            "plan_id": str(order.plan_produccion_id),
+            "propuesta_clave": successor_key,
+            "motivo": reason,
+            "receta_pendiente": True,
+        }
+        event = ScmEvento(
+            aggregate_type="ORDEN_FABRICACION",
+            aggregate_id=str(order.id),
+            tipo="OF_REPLACED",
+            actor_id=actor.id,
+            actor_snapshot=actor_snapshot(actor),
+            motivo=reason,
+            before_json={"estado": "LIBERADA", "version": version},
+            after_json={"reemplazo": link},
+            operation_id=operation.operation_id,
+        )
+        session.add(event)
+        session.flush()
+        response = {
+            "anterior": _serialize(session, order),
+            "sucesora": _serialize(session, successor),
+            "vinculo": link,
+        }
+        operation.response_json = copy.deepcopy(response)
+        operation.estado_http = 201
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
 
 
 def create_exceptional_fabrication_order(
@@ -786,6 +1108,59 @@ def update_fabrication_order(
                 "Solo una OF en borrador admite configuración.",
                 status_code=409,
             )
+        # A replacement carries immutable technical snapshots. Its only
+        # editable decision in this increment is the approved recipe; using
+        # the normal configuration path here would recalculate from current
+        # mold masters and silently change the successor's target.
+        if order.origen_demanda == "REEMPLAZO_OF":
+            reject_unknown_fields(data, allowed={"version", "corridas"})
+            raw_runs = data.get("corridas")
+            runs_by_id = {str(item.id): item for item in order.fabricacion.corridas}
+            if not isinstance(raw_runs, list) or {
+                str(item.get("id")) for item in raw_runs
+            } != set(runs_by_id):
+                raise ScmServiceError(
+                    "OF_CORRIDA_MISMATCH",
+                    "Deben configurarse exactamente las corridas existentes.",
+                    status_code=422,
+                )
+            for raw_run in raw_runs:
+                reject_unknown_fields(
+                    raw_run,
+                    allowed={"id", "receta_revision_id"},
+                )
+                run = runs_by_id[str(raw_run["id"])]
+                recipe_id = raw_run.get("receta_revision_id")
+                if recipe_id is None:
+                    raise ScmServiceError(
+                        "APPROVED_RECIPE_REQUIRED",
+                        "La sucesora requiere una formulación aprobada explícita.",
+                        status_code=422,
+                    )
+                _validated_approved_recipe(
+                    session,
+                    recipe_id,
+                    run.color_produccion_id,
+                    outputs=run.salidas,
+                )
+                run.receta_revision_id = recipe_id
+                run.receta_hash = None
+            order.version += 1
+            session.flush()
+            response = _serialize(session, order)
+            audit.response_json = copy.deepcopy(response)
+            audit.estado_http = 200
+            session.add(ScmEvento(
+                aggregate_type="ORDEN_FABRICACION",
+                aggregate_id=str(order.id),
+                tipo="OF_REPLACEMENT_RECIPE_SELECTED",
+                actor_id=actor.id,
+                actor_snapshot=actor_snapshot(actor),
+                after_json=response,
+                operation_id=audit.operation_id,
+            ))
+            session.commit()
+            return response
         mold_id = required_text(
             data.get("molde_id"),
             field="molde_id",
@@ -1058,6 +1433,12 @@ def release_fabrication_order(
                 status_code=422,
             )
         for run in fabrication.corridas:
+            if run.receta_revision_id is None and order.origen_demanda == "REEMPLAZO_OF":
+                raise ScmServiceError(
+                    "APPROVED_RECIPE_REQUIRED",
+                    "La OF requiere una formulación aprobada antes de liberarse.",
+                    status_code=422,
+                )
             if run.receta_revision_id is not None:
                 recipe = _validated_approved_recipe(
                     session,
