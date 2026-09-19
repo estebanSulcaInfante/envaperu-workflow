@@ -146,6 +146,10 @@ class ScmReservaWipSalida(db.Model):
         db.Index("ix_scm_reserva_wip_salida_saldo", "saldo_id"),
         db.Index("ix_scm_reserva_wip_salida_manga", "manga_id"),
         db.Index(
+            "ix_scm_reserva_wip_salida_asignacion_plan",
+            "asignacion_plan_id",
+        ),
+        db.Index(
             "ix_scm_reserva_wip_salida_articulo",
             "articulo_componente_id",
         ),

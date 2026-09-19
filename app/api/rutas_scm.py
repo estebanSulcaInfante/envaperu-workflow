@@ -131,6 +131,7 @@ from app.services.scm_weighing_service import (
     request_weighing_correction,
     reopen_manga_after_accidental_close,
 )
+from app.services.scm_kg_production_service import close_kg_from_last_control
 from app.services.scm_production_order_service import (
     adjust_production_plan_targets,
     approve_production_order,
@@ -497,6 +498,9 @@ def presentacion_comercial_actualizar(presentation_id):
 
 @scm_bp.get("/inventario/saldos")
 def inventario_saldos_listar():
+    if request.args.get("unidad", "UN").strip().upper() == "KG":
+        from app.services.scm_kg_service import list_kg_balances
+        return jsonify(list_kg_balances(db.session, actor_id=_actor_id()))
     return jsonify(list_inventory_balances(
         db.session,
         actor_id=_actor_id(),
@@ -505,6 +509,13 @@ def inventario_saldos_listar():
 
 @scm_bp.get("/inventario/explorador")
 def inventario_explorador():
+    if request.args.get("unidad", "UN").strip().upper() == "KG":
+        from app.services.scm_kg_service import explore_kg_balances
+        return jsonify(explore_kg_balances(
+            db.session, actor_id=_actor_id(), query=request.args.get("q"),
+            location=request.args.get("ubicacion"), stock_filter=request.args.get("disponibilidad", "TODOS"),
+            sort=request.args.get("ordenar", "CODIGO"), limit=request.args.get("limite", 25), cursor=request.args.get("cursor"),
+        ))
     return jsonify(explore_inventory_balances(
         db.session,
         actor_id=_actor_id(),
@@ -520,6 +531,11 @@ def inventario_explorador():
 
 @scm_bp.get("/inventario/movimientos")
 def inventario_movimientos_listar():
+    if request.args.get("unidad", "UN").strip().upper() == "KG":
+        from app.services.scm_kg_service import list_kg_movements
+        return jsonify(list_kg_movements(
+            db.session, actor_id=_actor_id(), limit=request.args.get("limite", 100),
+        ))
     return jsonify(list_inventory_movements(
         db.session,
         actor_id=_actor_id(),
@@ -1825,6 +1841,22 @@ def mangas_pesaje_detalle(manga_id):
 @scm_bp.post("/mangas/<uuid:manga_id>/reabrir")
 def mangas_reabrir_cierre_accidental(manga_id):
     return jsonify(reopen_manga_after_accidental_close(
+        db.session,
+        actor_id=_actor_id(),
+        manga_id=manga_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post("/mangas/<uuid:manga_id>/cerrar-desde-control")
+def mangas_cerrar_desde_control(manga_id):
+    """Close a KG manga from its last measured KG control.
+
+    This endpoint never accepts a new reading or a UN count.  The service
+    records the selected control as the source of the administrative close.
+    """
+    return jsonify(close_kg_from_last_control(
         db.session,
         actor_id=_actor_id(),
         manga_id=manga_id,

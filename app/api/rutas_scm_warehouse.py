@@ -39,6 +39,20 @@ from app.services.scm_inventory_transfer_service import (
     start_transfer_return,
     trace_logistic_unit,
 )
+from app.services.scm_kg_custody_service import (
+    divide_kg_unit,
+    configure_kg_measurement_context,
+    acknowledge_kg_label,
+    get_kg_label,
+    get_kg_retiro,
+    list_kg_retiros,
+    prepare_kg_return,
+    receive_kg_return,
+    release_kg_reservation,
+    reserve_kg_unit,
+    resolve_kg_return,
+    withdraw_kg_unit,
+)
 
 
 scm_warehouse_bp = Blueprint("scm_warehouse", __name__)
@@ -181,6 +195,8 @@ def transfer_return(transfer_id):
 @scm_warehouse_bp.get("/inventario/resumen")
 def inventory_summary_route():
     payload = inventory_summary(db.session, actor_id=_actor_id())
+    from app.services.scm_kg_service import kg_summary
+    payload["piezas_kg"] = kg_summary(db.session, actor_id=_actor_id())
     payload["as_of"] = db.session.scalar(db.func.now()).isoformat()
     return jsonify(payload)
 
@@ -274,3 +290,70 @@ def receiving_reversal_resolve(reversal_id):
         db.session, actor_id=_actor_id(), reversal_id=reversal_id,
         operation_id=_operation_id(), data=_body(),
     ))
+
+
+@scm_warehouse_bp.get("/unidades-kg/resolver-identidad/<string:code>")
+def kg_identity_resolve(code):
+    return jsonify(resolve_kg_return(db.session, actor_id=_actor_id(), code=code))
+
+
+@scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/reservas")
+def kg_unit_reserve(unit_id):
+    return jsonify(reserve_kg_unit(db.session, actor_id=_actor_id(), unit_id=unit_id, operation_id=_operation_id(), data=_body())), 201
+
+
+@scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/reservas/liberar")
+def kg_unit_reservation_release(unit_id):
+    return jsonify(release_kg_reservation(db.session, actor_id=_actor_id(), unit_id=unit_id, operation_id=_operation_id(), data=_body()))
+
+
+@scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/retiro")
+def kg_unit_withdraw(unit_id):
+    return jsonify(withdraw_kg_unit(db.session, actor_id=_actor_id(), unit_id=unit_id, operation_id=_operation_id(), data=_body())), 201
+
+
+@scm_warehouse_bp.get("/retiros-armado-kg")
+def kg_withdrawals_list():
+    return jsonify(list_kg_retiros(db.session, actor_id=_actor_id()))
+
+
+@scm_warehouse_bp.get("/retiros-armado-kg/<uuid:retiro_id>")
+def kg_withdrawal_detail(retiro_id):
+    return jsonify(get_kg_retiro(db.session, actor_id=_actor_id(), retiro_id=retiro_id))
+
+
+@scm_warehouse_bp.post("/retiros-armado-kg/<uuid:retiro_id>/divisiones")
+def kg_withdrawal_divide(retiro_id):
+    return jsonify(divide_kg_unit(db.session, actor_id=_actor_id(), retiro_id=retiro_id, operation_id=_operation_id(), data=_body())), 201
+
+
+@scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/retorno/recibir")
+def kg_return_receive(unit_id):
+    return jsonify(receive_kg_return(db.session, actor_id=_actor_id(), unit_id=unit_id, operation_id=_operation_id(), data=_body())), 201
+
+
+@scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/retorno/preparar")
+def kg_return_prepare(unit_id):
+    return jsonify(prepare_kg_return(
+        db.session,
+        actor_id=_actor_id(),
+        unit_id=unit_id,
+        operation_id=_operation_id(),
+        data=_body(),
+    ))
+
+
+@scm_warehouse_bp.get("/unidades-kg/<uuid:unit_id>/etiquetas")
+def kg_unit_label(unit_id):
+    return jsonify(get_kg_label(db.session, actor_id=_actor_id(), unit_id=unit_id))
+
+
+@scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/measurement-context")
+def kg_measurement_context(unit_id):
+    return jsonify(configure_kg_measurement_context(db.session, actor_id=_actor_id(), unit_id=unit_id, operation_id=_operation_id(), data=_body()))
+
+
+@scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/etiquetas/<uuid:label_id>/ack")
+def kg_label_ack(unit_id, label_id):
+    body = _body()
+    return jsonify(acknowledge_kg_label(db.session, actor_id=_actor_id(), station_id=str(body.get("station_id") or ""), unit_id=unit_id, label_id=label_id, operation_id=_operation_id(), data=body))

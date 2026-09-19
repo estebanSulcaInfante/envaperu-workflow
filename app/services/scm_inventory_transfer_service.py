@@ -293,6 +293,12 @@ def _move_existence(
     session, *, existence, destination, root_operation_id, actor, reference,
     logistic_state,
 ):
+    if getattr(existence.articulo, "unidad_inventario", "UN") == "KG":
+        raise ScmServiceError(
+            "KG_OPERATION_NOT_ENABLED",
+            "Las transferencias UN no operan sobre una existencia KG.",
+            status_code=409,
+        )
     quantity = Decimal(existence.cantidad_fisica)
     origin_balance = session.get(ScmSaldoInventario, existence.saldo_id)
     destination_balance = _balance(session, existence.articulo_scm_id, destination.id)

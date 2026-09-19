@@ -25,7 +25,7 @@ from app.models.scm_inline_wip import (
     ScmReservaWipSalida,
     ScmSaldoWipSalida,
 )
-from app.models.scm_ot import ScmLoteArticulo, ScmManga, ScmTrabajoOt
+from app.models.scm_ot import ScmCierreProductivoKg, ScmLoteArticulo, ScmManga, ScmTrabajoOt
 from app.models.scm_production_orders import (
     ScmAsignacionDemandaSuministro,
     ScmCorridaFabricacion,
@@ -271,6 +271,7 @@ def _serialize_output(session, output):
             "codigo": output.articulo.codigo,
             "nombre": output.articulo.nombre,
             "clase": output.articulo.clase,
+            "unidad_inventario": output.articulo.unidad_inventario,
             "pieza_id": piece_id,
             "producto_sku": (
                 output.articulo.producto.producto_terminado_id
@@ -350,6 +351,14 @@ def _serialize(session, operation, *, schedule_projection=None):
     route_operation = operation.operacion_ruta_revision
     replacement = replacement_summary(session, operation)
     origin_op = operation.plan_produccion.orden_produccion if operation.plan_produccion else None
+    kg_closure = session.scalar(
+        select(ScmCierreProductivoKg)
+        .where(
+            ScmCierreProductivoKg.documento_tipo == "OF",
+            ScmCierreProductivoKg.documento_id == str(operation.id),
+        )
+        .order_by(ScmCierreProductivoKg.created_at.desc(), ScmCierreProductivoKg.id.desc())
+    )
     return {
         **(
             schedule_projection
@@ -395,6 +404,7 @@ def _serialize(session, operation, *, schedule_projection=None):
         "closed_at": _iso(operation.closed_at),
         "created_at": _iso(operation.created_at),
         "updated_at": _iso(operation.updated_at),
+        "cierre_kg": kg_closure.to_dict() if kg_closure is not None else None,
         "molde_id": fabrication.molde_id,
         "maquina_prevista_id": fabrication.maquina_prevista_id,
         "snapshot_tiempo_ciclo_seg": (
@@ -1486,6 +1496,41 @@ def close_fabrication_order(
     the sole authority for Kardex; the close only reconciles operational output
     and the OP allocations that output satisfies.
     """
+
+    # KG production closes are evidence-only.  Route the existing OF action
+    # before the UN reconciliation below so a KG output cannot be coerced into
+    # ``cantidad_real`` units or credited to an OP.
+    actor_probe = load_actor(session, actor_id, capability="OF_CERRAR")
+    probe = _load_fabrication(session, operation_order_id, lock=False)
+    has_kg_output = any(
+        getattr(output.articulo, "unidad_inventario", None) == "KG"
+        for output in probe.salidas
+    )
+    inline_works = session.scalars(
+        select(ScmTrabajoOt).where(
+            ScmTrabajoOt.orden_operacion_id == operation_order_id
+        )
+    ).all()
+    has_kg_inline_context = any(
+        reservation.manga is not None
+        and reservation.manga.lote_articulo is not None
+        and reservation.manga.lote_articulo.articulo is not None
+        and reservation.manga.lote_articulo.articulo.unidad_inventario == "KG"
+        for work in inline_works
+        for saldo in getattr(work, "saldos_wip_salida", ())
+        for reservation in getattr(saldo, "reservas", ())
+    )
+    if has_kg_output or has_kg_inline_context:
+        from app.services.scm_kg_production_service import close_productive_document_kg
+
+        return close_productive_document_kg(
+            session,
+            actor_id=actor_probe.id,
+            documento_tipo="OF",
+            documento_id=operation_order_id,
+            operation_id=operation_id,
+            data=data,
+        )
 
     try:
         actor = load_actor(session, actor_id, capability="OF_CERRAR")

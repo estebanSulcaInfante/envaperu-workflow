@@ -22,12 +22,20 @@ from app.models.scm_ot import (
     ScmControlPesoManga,
     ScmManga,
     ScmPesajeManga,
+    ScmAtribucionProduccionKg,
     ScmReaperturaManga,
     ScmTrabajoImpresionManga,
     ScmTramoMangaTrabajo,
     utc_now,
 )
 from app.models.scm_warehouse import ScmExistenciaManga
+from app.models.scm_inventory_kg import (
+    ScmExistenciaMangaKg,
+    ScmMovimientoInventarioKg,
+    ScmSaldoInventarioKg,
+    ScmUnidadFisicaKg,
+)
+from app.models.scm_articulos import ScmArticulo
 from app.services.scm_ot_service import (
     _complete_operation,
     _event,
@@ -55,6 +63,56 @@ from app.services.scm_service_support import (
 
 KG_QUANTUM = Decimal("0.001")
 UNIT_QUANTUM = Decimal("0.001")
+
+
+def _active_kg_existence(session, manga_id):
+    """Lock and return an active KG receipt for a manga, if one exists."""
+    return session.scalar(
+        select(ScmExistenciaMangaKg)
+        .where(
+            ScmExistenciaMangaKg.manga_id == manga_id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        )
+        .with_for_update()
+    )
+
+
+def _reject_active_kg_receipt(session, manga_id):
+    existence = _active_kg_existence(session, manga_id)
+    if existence is not None and existence.estado_logistico == "RECIBIDA_ALMACEN":
+        raise ScmServiceError(
+            "KG_OPERATION_NOT_ENABLED",
+            "La manga ya fue recibida en KG; la correccion requiere su ruta compensatoria.",
+            status_code=409,
+            details={"existencia_id": str(existence.id)},
+        )
+    return None
+
+
+def _lock_manga_inventory_authority(session, *, manga_id=None, manga_public_id=None):
+    """Acquire article then manga locks, matching KG receipt lock order."""
+    probe = session.scalar(
+        select(ScmManga).where(
+            ScmManga.id == manga_id if manga_id is not None
+            else ScmManga.public_id == manga_public_id
+        )
+    )
+    if probe is None:
+        return None, None
+    article_id = probe.lote_articulo.articulo.id
+    article = session.scalar(
+        select(ScmArticulo)
+        .where(ScmArticulo.id == article_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    manga = session.scalar(
+        select(ScmManga)
+        .where(ScmManga.id == probe.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return article, manga
 
 
 def _elapsed_hours(later, earlier):
@@ -709,6 +767,11 @@ def register_manga_weighing_control(
             .where(ScmManga.id == label.manga_id)
             .with_for_update()
         )
+        is_kg = (
+            manga.lote_articulo is not None
+            and manga.lote_articulo.articulo is not None
+            and manga.lote_articulo.articulo.unidad_inventario == "KG"
+        )
         if (
             label.tipo != "PREPESAJE"
             or label.estado != "IMPRESA"
@@ -757,6 +820,8 @@ def register_manga_weighing_control(
                 estado="ACTIVO",
                 cantidad_inicio_un=Decimal("0"),
                 cantidad_atribuida_un=Decimal("0"),
+                cantidad_inicio_kg=Decimal("0") if is_kg else None,
+                cantidad_atribuida_kg=Decimal("0") if is_kg else None,
                 iniciada_at=personal.iniciada_at or work.iniciada_at or utc_now(),
                 created_by_id=actor.id,
                 operation_id=operation.operation_id,
@@ -780,7 +845,7 @@ def register_manga_weighing_control(
             )
 
         count = None
-        if not is_weight_progress:
+        if not is_weight_progress and not is_kg:
             count = _units(
                 data.get("conteo_acumulado_un"), "conteo_acumulado_un"
             )
@@ -892,6 +957,8 @@ def register_manga_weighing_control(
             aporte_desde_control_anterior_kg=contribution,
             tara_fuente=tare_source,
             conteo_acumulado_un=count,
+            unidad_evidencia="KG" if is_kg else "UN",
+            calidad_evidencia="MEDIDA_DIRECTA",
             motivo=reason,
             pesado_at=weighed_at,
             timezone_snapshot=timezone_name,
@@ -903,7 +970,14 @@ def register_manga_weighing_control(
             manga.estado = "EN_LLENADO"
         else:
             segment.estado = "CERRADO"
-            segment.cantidad_fin_un = count
+            if is_kg:
+                segment.cantidad_fin_kg = net
+                segment.cantidad_atribuida_kg = (
+                    net - Decimal(segment.cantidad_inicio_kg or 0)
+                ).quantize(KG_QUANTUM)
+                segment.calidad_evidencia_kg = "MEDIDA_DIRECTA"
+            else:
+                segment.cantidad_fin_un = count
             segment.cerrada_at = weighed_at
             segment.motivo_cierre = reason
             manga.estado = "CONTINUIDAD_PENDIENTE"
@@ -953,11 +1027,33 @@ def register_manga_weighing_control(
         session.flush()
         control.etiqueta_id = control_label.id
         session.flush()
+        kg_inventory = None
+        if is_kg:
+            from app.services.scm_kg_production_service import sync_kg_production_inventory
+            kg_inventory = sync_kg_production_inventory(
+                session,
+                actor_id=actor.id,
+                manga=manga,
+                net_kg=net,
+                operation_id=operation.operation_id,
+                source_type="CONTROL_PESO",
+                source_id=control.public_id,
+                source_at=weighed_at,
+                final=False,
+            )
         response = {
             "control": control.to_dict(),
             "manga": _serialize_manga(manga),
             "produccion_confirmada_un": "0",
-            "inventario_creado": False,
+            "inventario_creado": bool(kg_inventory),
+            "inventario_kg": (
+                {
+                    "delta_kg": kg_inventory["delta_kg"],
+                    "ubicacion_codigo": kg_inventory["ubicacion_codigo"],
+                    "atributo_proceso": kg_inventory["atributo_proceso"],
+                }
+                if kg_inventory else None
+            ),
             "print_job_id": str(job.public_id),
             "print_template_version": payload["template"]["version"],
             "control_label": _serialize_label(control_label),
@@ -1118,6 +1214,11 @@ def _post_label_payload(manga, weighing, label_id, version):
             manga.cantidad_confirmada_un or manga.cantidad_asignada_un,
         )
     )
+    is_kg = (
+        manga.lote_articulo is not None
+        and manga.lote_articulo.articulo is not None
+        and manga.lote_articulo.articulo.unidad_inventario == "KG"
+    )
     fabricated_theoretical_kg = _fabricated_theoretical_kg(manga, weighing)
     previous_reference = _latest_weight_reference(manga)
     payload = {
@@ -1150,19 +1251,20 @@ def _post_label_payload(manga, weighing, label_id, version):
         "cantidad_planificada_un": format(
             Decimal(manga.cantidad_planificada_un).normalize(), "f"
         ),
-        "cantidad_confirmada_un": format(
-            confirmed_quantity.normalize(), "f"
+        "cantidad_confirmada_un": (
+            None if is_kg else format(confirmed_quantity.normalize(), "f")
         ),
         "fuente_cantidad": weighing.fuente_cantidad,
         "cierre_parcial": (
+            False if is_kg else
             manga.tipo == "NORMAL"
             and confirmed_quantity < Decimal(manga.cantidad_asignada_un)
         ),
         "kg_fisico": format(weighing.peso_fisico_neto_kg, "f"),
         "kg_produccion_ot": format(weighing.kg_produccion_ot, "f"),
         "peso_neto_real_kg": format(weighing.peso_fisico_neto_kg, "f"),
-        "peso_estandar_segun_unidades_kg": format(
-            weighing.kg_produccion_ot, "f"
+        "peso_estandar_segun_unidades_kg": (
+            None if is_kg else format(weighing.kg_produccion_ot, "f")
         ),
         "aporte_desde_control_anterior_kg": format(
             (
@@ -1243,6 +1345,11 @@ def confirm_manga_weighing(
                 "Se requiere una etiqueta PREPESAJE impresa y vigente.",
                 status_code=409,
             )
+        is_kg = (
+            manga.lote_articulo is not None
+            and manga.lote_articulo.articulo is not None
+            and manga.lote_articulo.articulo.unidad_inventario == "KG"
+        )
         is_assembly = manga.ot.tipo_ot == "ENSAMBLE"
         segments = session.scalars(
             select(ScmTramoMangaTrabajo)
@@ -1262,15 +1369,18 @@ def confirm_manga_weighing(
         )
         expected_state = (
             "CERRADA_ARMADO_PENDIENTE_PESAJE"
-            if is_assembly else "PREETIQUETADA"
+            if is_assembly and not is_kg else "PREETIQUETADA"
         )
+        kg_assembly_state = is_kg and is_assembly and manga.estado in {
+            "PREETIQUETADA", "EN_ARMADO", "CERRADA_ARMADO_PENDIENTE_PESAJE"
+        }
         continuity_ready = (
             not is_assembly
             and manga.estado == "EN_LLENADO"
             and current_segment is not None
             and current_segment.estado == "ACTIVO"
         )
-        if manga.estado != expected_state and not continuity_ready:
+        if manga.estado != expected_state and not continuity_ready and not kg_assembly_state:
             code = (
                 "MANGA_ALREADY_WEIGHED"
                 if manga.estado in {
@@ -1354,13 +1464,21 @@ def confirm_manga_weighing(
             session, "PESAJE_FECHA_OPERATIVA_DIFERENTE", drift
         )
 
-        assigned_quantity = Decimal(
-            manga.cantidad_confirmada_un
-            if is_assembly else manga.cantidad_asignada_un
-        ).quantize(UNIT_QUANTUM)
+        assigned_quantity = (
+            Decimal("0") if is_kg else Decimal(
+                manga.cantidad_confirmada_un
+                if is_assembly else manga.cantidad_asignada_un
+            ).quantize(UNIT_QUANTUM)
+        )
         requested_quantity = data.get("cantidad_confirmada_un")
         partial_reason_value = data.get("motivo_cierre_parcial")
-        if is_assembly and (
+        if is_kg and requested_quantity is not None:
+            raise ScmServiceError(
+                "KG_UNITS_NOT_ALLOWED",
+                "El pesaje KG no acepta ni confirma cantidades UN.",
+                status_code=422,
+            )
+        if is_assembly and not is_kg and (
             requested_quantity is not None or partial_reason_value is not None
         ):
             raise ScmServiceError(
@@ -1368,7 +1486,9 @@ def confirm_manga_weighing(
                 "El cierre parcial supervisado solo aplica a mangas de fabricación.",
                 status_code=422,
             )
-        if requested_quantity is None:
+        if is_kg:
+            quantity = Decimal("0.000")
+        elif requested_quantity is None:
             if partial_reason_value is not None:
                 raise ScmServiceError(
                     "PARTIAL_QUANTITY_REQUIRED",
@@ -1380,7 +1500,7 @@ def confirm_manga_weighing(
             quantity = _units(
                 requested_quantity, "cantidad_confirmada_un"
             )
-        if quantity > assigned_quantity:
+        if not is_kg and quantity > assigned_quantity:
             raise ScmServiceError(
                 "QUANTITY_EXCEEDS_ASSIGNED",
                 "La cantidad confirmada no puede superar la cantidad asignada a la manga.",
@@ -1389,7 +1509,7 @@ def confirm_manga_weighing(
                     "cantidad_asignada_un": format(assigned_quantity, "f"),
                 },
             )
-        partial_close = not is_assembly and quantity < assigned_quantity
+        partial_close = not is_kg and not is_assembly and quantity < assigned_quantity
         if partial_close and current_segment is not None:
             raise ScmServiceError(
                 "PARTIAL_CLOSE_NOT_AVAILABLE_AFTER_CONTINUITY",
@@ -1438,7 +1558,7 @@ def confirm_manga_weighing(
         else:
             load_actor(session, actor_id, capability="MANGA_PESAR")
         production_kg = (
-            quantity * Decimal(manga.peso_unitario_snapshot_g) / 1000
+            net if is_kg else quantity * Decimal(manga.peso_unitario_snapshot_g) / 1000
         ).quantize(KG_QUANTUM)
         weighing = ScmPesajeManga(
             manga_id=manga.id,
@@ -1453,7 +1573,7 @@ def confirm_manga_weighing(
             cantidad_confirmada=quantity,
             fuente_cantidad=(
                 "RESPONSABLE_ARMADO"
-                if is_assembly
+                if is_assembly or is_kg
                 else (
                     "CIERRE_PARCIAL_SUPERVISADO"
                     if partial_close
@@ -1502,9 +1622,10 @@ def confirm_manga_weighing(
             },
         )
         session.add(weighing)
-        if not is_assembly:
+        if not is_assembly and not is_kg:
             manga.cantidad_confirmada_un = quantity
-        manga.cantidad_contenida_un = quantity
+        if not is_kg:
+            manga.cantidad_contenida_un = quantity
         manga.estado = "PESADA"
         manga.version += 1
         if partial_close:
@@ -1518,12 +1639,34 @@ def confirm_manga_weighing(
             )
         if current_segment is not None:
             current_segment.estado = "CERRADO"
-            current_segment.cantidad_fin_un = quantity
+            if is_kg:
+                current_segment.cantidad_fin_kg = net
+                current_segment.cantidad_atribuida_kg = (
+                    net - Decimal(current_segment.cantidad_inicio_kg or 0)
+                ).quantize(KG_QUANTUM)
+                current_segment.calidad_evidencia_kg = "MEDIDA_DIRECTA"
+            else:
+                current_segment.cantidad_fin_un = quantity
             current_segment.cerrada_at = weighed_at
             current_segment.motivo_cierre = "PESAJE_FINAL"
             expected_start = Decimal("0.000")
             attributed_total = Decimal("0.000")
             for segment in segments:
+                if is_kg:
+                    start = Decimal(segment.cantidad_inicio_kg or 0).quantize(KG_QUANTUM)
+                    end = Decimal(segment.cantidad_fin_kg or 0).quantize(KG_QUANTUM)
+                    if start != expected_start or end <= start:
+                        raise ScmServiceError(
+                            "CONTINUITY_SEGMENTS_INCONSISTENT",
+                            "Los tramos KG no forman una secuencia acumulada valida.",
+                            status_code=409,
+                        )
+                    delta = end - start
+                    segment.cantidad_atribuida_kg = delta
+                    segment.calidad_evidencia_kg = "MEDIDA_DIRECTA"
+                    attributed_total += delta
+                    expected_start = end
+                    continue
                 start = Decimal(segment.cantidad_inicio_un).quantize(
                     UNIT_QUANTUM
                 )
@@ -1545,18 +1688,98 @@ def confirm_manga_weighing(
                 segment.trabajo.version += 1
                 attributed_total += delta
                 expected_start = end
-            if attributed_total != quantity:
+            if attributed_total != (net if is_kg else quantity):
                 raise ScmServiceError(
                     "CONTINUITY_ATTRIBUTION_MISMATCH",
                     "La atribucion por turnos no coincide con el total final de la manga.",
                     status_code=409,
                 )
-        elif manga.trabajo is not None:
+        elif manga.trabajo is not None and not is_kg:
             manga.trabajo.cantidad_confirmada_un = (
                 Decimal(manga.trabajo.cantidad_confirmada_un or 0) + quantity
             )
             manga.trabajo.version += 1
         session.flush()
+        if is_kg:
+            # The physical weighing itself is the authoritative NET evidence.
+            # BOM attribution, when an approved concurrent structure can be
+            # resolved later, enriches this row without creating inventory or
+            # UN facts.
+            session.add(ScmAtribucionProduccionKg(
+                manga_id=manga.id,
+                pesaje_id=weighing.id,
+                tramo_id=(current_segment.id if current_segment is not None else None),
+                trabajo_ot_id=(
+                    current_segment.trabajo_ot_id
+                    if current_segment is not None else manga.trabajo_ot_id
+                ),
+                tipo="NETO_MEDIDO",
+                cantidad_kg=net,
+                calidad="MEDIDA_DIRECTA",
+                base_json={
+                    "fuente": "PESAJE_FINAL",
+                    "pesaje_public_id": str(weighing.public_id),
+                    "pesada_at": weighed_at.isoformat(),
+                    "bom": "PENDIENTE",
+                },
+                actor_id=actor.id,
+                operation_id=operation.operation_id,
+            ))
+            weighing.atribucion_kg_estado = "PENDIENTE_BOM"
+            weighing.atribucion_kg_base_json = {
+                "neto_medido_kg": format(net, "f"),
+                "base": "PENDIENTE_BOM",
+            }
+            # When the approved OA/WIP structure is resolvable, enrich the
+            # same transaction with estimates.  The measured NET row remains
+            # append-only; only the projection and separate estimate rows are
+            # added, so a retry cannot double-credit production.
+            from app.services.scm_kg_production_service import (
+                _persist_bom_estimate,
+                _resolve_frozen_bom_basis,
+                preview_kg_attribution,
+            )
+
+            try:
+                attribution = preview_kg_attribution(
+                    net_kg=net,
+                    # The station command never supplies a BOM snapshot.  The
+                    # approved OA/OT structure is the only source of truth;
+                    # ad-hoc client proportions cannot authorize attribution.
+                    bom_basis=_resolve_frozen_bom_basis(session, manga, {}),
+                )
+            except ScmServiceError as error:
+                if error.code != "KG_BOM_ATTRIBUTION_PENDING":
+                    raise
+                attribution = {
+                    "estado": "PENDIENTE_BOM",
+                    "kg_fabricacion_estimado": None,
+                    "kg_previo_estimado": None,
+                }
+            _persist_bom_estimate(
+                session,
+                weighing=weighing,
+                manga=manga,
+                actor_id=actor.id,
+                operation_id=operation.operation_id,
+                attribution=attribution,
+            )
+        session.flush()
+
+        kg_inventory = None
+        if is_kg:
+            from app.services.scm_kg_production_service import sync_kg_production_inventory
+            kg_inventory = sync_kg_production_inventory(
+                session,
+                actor_id=actor.id,
+                manga=manga,
+                net_kg=net,
+                operation_id=operation.operation_id,
+                source_type="PESAJE_FINAL",
+                source_id=weighing.public_id,
+                source_at=weighed_at,
+                final=True,
+            )
 
         label_version = max(
             (
@@ -1646,6 +1869,15 @@ def confirm_manga_weighing(
             "atribucion_turnos": [
                 segment.to_dict() for segment in segments
             ],
+            "inventario_creado": bool(kg_inventory),
+            "inventario_kg": (
+                {
+                    "delta_kg": kg_inventory["delta_kg"],
+                    "ubicacion_codigo": kg_inventory["ubicacion_codigo"],
+                    "atributo_proceso": kg_inventory["atributo_proceso"],
+                }
+                if kg_inventory else None
+            ),
             "idempotent_replay": False,
         }
         session.add(
@@ -1683,18 +1915,21 @@ def annul_manga_weighing(
         return replay
     try:
         weighing = session.scalar(
-            select(ScmPesajeManga)
-            .where(ScmPesajeManga.public_id == weighing_id)
-            .with_for_update()
+            select(ScmPesajeManga).where(ScmPesajeManga.public_id == weighing_id)
         )
         if weighing is None:
             raise ScmServiceError(
                 "WEIGHING_NOT_FOUND", "El pesaje SCM no existe.", status_code=404
             )
-        manga = session.scalar(
-            select(ScmManga)
-            .where(ScmManga.id == weighing.manga_id)
+        article, manga = _lock_manga_inventory_authority(
+            session, manga_id=weighing.manga_id
+        )
+        is_kg = article is not None and article.unidad_inventario == "KG"
+        weighing = session.scalar(
+            select(ScmPesajeManga)
+            .where(ScmPesajeManga.id == weighing.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         _ensure_operational_order_mutable(manga)
         if (
@@ -1707,6 +1942,7 @@ def annul_manga_weighing(
                 "El pesaje ya fue anulado.",
                 status_code=409,
             )
+        _reject_active_kg_receipt(session, manga.id)
         existence = session.scalar(
             select(ScmExistenciaManga)
             .where(
@@ -1722,6 +1958,137 @@ def annul_manga_weighing(
                 status_code=409,
                 details={"existencia_id": str(existence.id)},
             )
+        kg_existence = session.scalar(
+            select(ScmExistenciaMangaKg)
+            .where(
+                ScmExistenciaMangaKg.manga_id == manga.id,
+                ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+            )
+            .with_for_update()
+        )
+        kg_inventory_reversal = None
+        if kg_existence is not None:
+            if kg_existence.estado_logistico == "RECIBIDA_ALMACEN":
+                raise ScmServiceError(
+                    "RECEIPT_REVERSAL_REQUIRED",
+                    "La manga KG ya ingresó a Almacén; primero debe aprobarse la reversa de recepción.",
+                    status_code=409,
+                    details={"existencia_id": str(kg_existence.id)},
+                )
+            balance_kg = session.scalar(
+                select(ScmSaldoInventarioKg).where(ScmSaldoInventarioKg.id == kg_existence.saldo_id).with_for_update()
+            )
+            amount_kg = Decimal(kg_existence.cantidad_fisica_kg).quantize(KG_QUANTUM)
+            if balance_kg is None:
+                raise ScmServiceError("INVENTORY_CONFLICT", "El saldo KG de la manga no existe.", status_code=409)
+            resulting_kg = (Decimal(balance_kg.cantidad_fisica_kg) - amount_kg).quantize(KG_QUANTUM)
+            if resulting_kg < 0 or Decimal(balance_kg.cantidad_reservada_kg) > resulting_kg:
+                raise ScmServiceError("INVENTORY_CONFLICT", "El saldo KG no permite anular la producción.", status_code=409)
+            balance_kg.cantidad_fisica_kg = resulting_kg
+            balance_kg.version += 1
+            movement_kg = ScmMovimientoInventarioKg(
+                saldo_id=balance_kg.id,
+                tipo="AJUSTE_NEGATIVO",
+                cantidad_delta_kg=-amount_kg,
+                saldo_fisico_resultante_kg=resulting_kg,
+                motivo=f"Anulación del pesaje KG de {manga.codigo}: {reason}",
+                referencia_tipo="ANULACION_PESAJE_MANGA",
+                referencia_id=str(weighing.public_id),
+                actor_id=actor.id,
+                operation_id=operation.operation_id,
+                pesaje_public_id=weighing.public_id,
+                projection_sha256="0" * 64,
+                peso_neto_snapshot_kg=amount_kg,
+                pesada_at_snapshot=weighing.pesada_at,
+                fuente_tipo="KG_ANULACION",
+                atributo_proceso=kg_existence.atributo_proceso,
+            )
+            session.add(movement_kg)
+            kg_existence.estado_logistico = "REVERSADA"
+            kg_existence.version += 1
+            unit_kg = kg_existence.unidad_fisica_kg
+            if unit_kg is not None:
+                unit_kg.estado = "HISTORICA"
+                unit_kg.estado_logistico = "REVERSADA"
+                unit_kg.saldo_id = None
+                unit_kg.ubicacion_id = None
+                unit_kg.version += 1
+                kg_inventory_reversal = {
+                    "movimiento_id": movement_kg.id,
+                    "cantidad_delta_kg": amount_kg,
+                }
+            if is_kg:
+                # KG availability has no UN plan credit to return.  Keep the
+                # measured reversal and append-only audit, then finish the
+                # same weighing annulment lifecycle without touching UN
+                # segment/assignment quantities (which are intentionally zero
+                # for KG articles).
+                now = utc_now()
+                manga.estado = "ANULADA"
+                manga.anulada_at = now
+                manga.anulada_por_id = actor.id
+                manga.motivo_anulacion = reason
+                manga.version += 1
+                weighing.estado = "ANULADO"
+                for label in manga.etiquetas:
+                    if label.estado != "INVALIDADA":
+                        label.estado = "INVALIDADA"
+                        label.invalidada_por_id = actor.id
+                        label.invalidada_at = now
+                        label.motivo_invalidacion = f"Pesaje anulado: {reason}"
+                pending_corrections = session.scalars(
+                    select(ScmCorreccionPesajeManga).where(
+                        ScmCorreccionPesajeManga.pesaje_id == weighing.id,
+                        ScmCorreccionPesajeManga.estado == "PENDIENTE",
+                    )
+                ).all()
+                for correction in pending_corrections:
+                    correction.estado = "RECHAZADA"
+                    correction.resolved_by_id = actor.id
+                    correction.resolved_at = now
+                    correction.resolution_reason = (
+                        "Rechazada automaticamente por anulacion del pesaje."
+                    )
+                annulment = ScmAnulacionPesajeManga(
+                    pesaje_id=weighing.id,
+                    motivo=reason,
+                    evidencia=evidence,
+                    anulada_por_id=actor.id,
+                    operation_id=operation.operation_id,
+                    cantidad_devuelta_plan_un=Decimal("0"),
+                    ot_reabierta=False,
+                )
+                session.add(annulment)
+                session.flush()
+                response = {
+                    "anulacion": annulment.to_dict(),
+                    "manga": _serialize_manga(manga),
+                    "plan": {
+                        "cantidad_devuelta_un": "0.000",
+                        "cantidad_asignada_un": "0.000",
+                        "mangas_asignadas": 0,
+                        "asignaciones": [],
+                    },
+                    "ot_reabierta": False,
+                    "trabajo_color_reabierto": False,
+                    "trabajo_color_id": (
+                        str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
+                    ),
+                    "anulacion_inventario_kg": (
+                        {
+                            "movimiento_id": str(kg_inventory_reversal["movimiento_id"]),
+                            "cantidad_delta_kg": format(kg_inventory_reversal["cantidad_delta_kg"], "f"),
+                        }
+                        if kg_inventory_reversal else None
+                    ),
+                }
+                session.add(_event(
+                    "PESAJE_MANGA", weighing.id, "MANGA_WEIGHING_ANNULLED",
+                    actor, operation, response,
+                ))
+                _complete_operation(operation, response)
+                session.commit()
+                return response
         if manga.tipo != "NORMAL" or manga.asignacion_id is None:
             raise ScmServiceError(
                 "NORMAL_REPLACEMENT_NOT_AVAILABLE",
@@ -1895,6 +2262,13 @@ def annul_manga_weighing(
             "trabajo_color_id": (
                 str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
             ),
+            "anulacion_inventario_kg": (
+                {
+                    "movimiento_id": str(kg_inventory_reversal["movimiento_id"]),
+                    "cantidad_delta_kg": format(kg_inventory_reversal["cantidad_delta_kg"], "f"),
+                }
+                if kg_inventory_reversal else None
+            ),
         }
         session.add(_event(
             "PESAJE_MANGA", weighing.id, "MANGA_WEIGHING_ANNULLED",
@@ -2029,10 +2403,8 @@ def reopen_manga_after_accidental_close(
         return replay
 
     try:
-        manga = session.scalar(
-            select(ScmManga)
-            .where(ScmManga.public_id == manga_id)
-            .with_for_update()
+        article, manga = _lock_manga_inventory_authority(
+            session, manga_public_id=manga_id
         )
         if manga is None:
             raise ScmServiceError(
@@ -2052,6 +2424,22 @@ def reopen_manga_after_accidental_close(
                 "Este corte solo permite reabrir mangas normales de Fabricación.",
                 status_code=409,
             )
+        weighing = session.scalar(
+            select(ScmPesajeManga)
+            .where(
+                ScmPesajeManga.manga_id == manga.id,
+                ScmPesajeManga.estado == "VIGENTE",
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if weighing is None:
+            raise ScmServiceError(
+                "WEIGHING_NOT_ACTIVE",
+                "La manga no tiene un pesaje final vigente para reabrir.",
+                status_code=409,
+            )
+        _reject_active_kg_receipt(session, manga.id)
         existence = session.scalar(
             select(ScmExistenciaManga)
             .where(
@@ -2076,26 +2464,16 @@ def reopen_manga_after_accidental_close(
                 status_code=409,
             )
 
-        weighing = session.scalar(
-            select(ScmPesajeManga)
-            .where(
-                ScmPesajeManga.manga_id == manga.id,
-                ScmPesajeManga.estado == "VIGENTE",
-            )
-            .with_for_update()
-        )
-        if weighing is None:
-            raise ScmServiceError(
-                "WEIGHING_NOT_ACTIVE",
-                "La manga no tiene un pesaje final vigente para reabrir.",
-                status_code=409,
-            )
-        if weighing.fuente_cantidad != "PLAN_CONFIRMADO_POR_PESAJE":
-            raise ScmServiceError(
-                "MANGA_REOPEN_NOT_AVAILABLE",
-                "El cierre no es normal; use la recuperación supervisada de su origen.",
-                status_code=409,
-            )
+            is_kg = article is not None and article.unidad_inventario == "KG"
+            if (
+                not is_kg
+                and weighing.fuente_cantidad != "PLAN_CONFIRMADO_POR_PESAJE"
+            ):
+                raise ScmServiceError(
+                    "MANGA_REOPEN_NOT_AVAILABLE",
+                    "El cierre no es normal; use la recuperación supervisada de su origen.",
+                    status_code=409,
+                )
         segments = session.scalars(
             select(ScmTramoMangaTrabajo)
             .where(ScmTramoMangaTrabajo.manga_id == manga.id)
@@ -2202,6 +2580,34 @@ def reopen_manga_after_accidental_close(
             )
 
         weighing.estado = "REABIERTO"
+        # A production KG existence follows the reopened manga back into the
+        # filling state.  This preserves the withdrawal guard and avoids
+        # leaving a stale DISPONIBLE_PRODUCCION identity while a new control
+        # is still pending.
+        kg_existence_reopen = session.scalar(
+            select(ScmExistenciaMangaKg)
+            .where(
+                ScmExistenciaMangaKg.manga_id == manga.id,
+                ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+            )
+            .with_for_update()
+        )
+        if kg_existence_reopen is not None:
+            kg_existence_reopen.estado_logistico = "EN_PRODUCCION"
+            kg_existence_reopen.estado_calidad = "SIN_CONTROL"
+            kg_existence_reopen.atributo_proceso = "PROCESO"
+            kg_existence_reopen.version += 1
+            if kg_existence_reopen.unidad_fisica_kg_id:
+                kg_unit_reopen = session.scalar(
+                    select(ScmUnidadFisicaKg)
+                    .where(ScmUnidadFisicaKg.id == kg_existence_reopen.unidad_fisica_kg_id)
+                    .with_for_update()
+                )
+                if kg_unit_reopen is not None:
+                    kg_unit_reopen.estado_logistico = "EN_PRODUCCION"
+                    kg_unit_reopen.estado_calidad = "SIN_CONTROL"
+                    kg_unit_reopen.atributo_proceso = "PROCESO"
+                    kg_unit_reopen.version += 1
         manga.estado = "EN_LLENADO"
         manga.cantidad_confirmada_un = None
         manga.cantidad_contenida_un = None
@@ -2337,7 +2743,17 @@ def request_weighing_correction(
                 "El pesaje SCM no existe.",
                 status_code=404,
             )
-        _ensure_operational_order_mutable(weighing.manga)
+        _article, manga = _lock_manga_inventory_authority(
+            session, manga_id=weighing.manga_id
+        )
+        weighing = session.scalar(
+            select(ScmPesajeManga)
+            .where(ScmPesajeManga.id == weighing.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        _ensure_operational_order_mutable(manga)
+        _reject_active_kg_receipt(session, manga.id)
         proposed = data.get("proposed")
         if (
             weighing.estado != "VIGENTE"
@@ -2446,7 +2862,6 @@ def approve_weighing_correction(
         correction = session.scalar(
             select(ScmCorreccionPesajeManga)
             .where(ScmCorreccionPesajeManga.public_id == correction_id)
-            .with_for_update()
         )
         if correction is None:
             raise ScmServiceError(
@@ -2454,6 +2869,27 @@ def approve_weighing_correction(
                 "La correccion no existe.",
                 status_code=404,
             )
+        weighing_probe = session.get(ScmPesajeManga, correction.pesaje_id)
+        if weighing_probe is None:
+            raise ScmServiceError(
+                "WEIGHING_NOT_FOUND", "El pesaje SCM no existe.", status_code=404
+            )
+        article, manga = _lock_manga_inventory_authority(
+            session, manga_id=weighing_probe.manga_id
+        )
+        is_kg = article is not None and article.unidad_inventario == "KG"
+        weighing = session.scalar(
+            select(ScmPesajeManga)
+            .where(ScmPesajeManga.id == weighing_probe.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        correction = session.scalar(
+            select(ScmCorreccionPesajeManga)
+            .where(ScmCorreccionPesajeManga.id == correction.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if correction.estado != "PENDIENTE":
             raise ScmServiceError(
                 "CORRECTION_ALREADY_RESOLVED",
@@ -2466,13 +2902,8 @@ def approve_weighing_correction(
                 "Solicitante y aprobador deben ser distintos.",
                 status_code=409,
             )
-        weighing = correction.pesaje
-        manga = session.scalar(
-            select(ScmManga)
-            .where(ScmManga.id == weighing.manga_id)
-            .with_for_update()
-        )
         _ensure_operational_order_mutable(manga)
+        _reject_active_kg_receipt(session, manga.id)
         current = _effective_projection(weighing)
         previous_manga_quantity = Decimal(
             manga.cantidad_confirmada_un or current["cantidad_confirmada"]
@@ -2516,6 +2947,7 @@ def approve_weighing_correction(
                 "cantidad_confirmada", current["cantidad_confirmada"]
             ),
             "cantidad_confirmada",
+            allow_zero=is_kg,
         )
         weighed_at = _aware_datetime(
             proposed.get("pesada_at", current["pesada_at"])
@@ -2544,6 +2976,22 @@ def approve_weighing_correction(
             "dias_desfase_operativo": drift,
             "alerta_fecha": drift > 1,
         }
+        kg_inventory_adjustment = None
+        kg_existence = _active_kg_existence(session, manga.id)
+        if kg_existence is not None and kg_existence.estado_logistico != "RECIBIDA_ALMACEN":
+            from app.services.scm_kg_production_service import sync_kg_production_inventory
+            kg_inventory_adjustment = sync_kg_production_inventory(
+                session,
+                actor_id=actor.id,
+                manga=manga,
+                net_kg=net,
+                operation_id=operation.operation_id,
+                source_type="PESAJE_FINAL",
+                source_id=weighing.public_id,
+                source_at=weighed_at,
+                correction_id=correction.public_id,
+                final=True,
+            )
         existence = session.scalar(
             select(ScmExistenciaManga)
             .where(
@@ -2721,6 +3169,14 @@ def approve_weighing_correction(
             "post_label": _serialize_label(label),
             "alertas_generadas": generated_alerts,
             "ajuste_inventario": inventory_adjustment,
+            "ajuste_inventario_kg": (
+                {
+                    "delta_kg": kg_inventory_adjustment["delta_kg"],
+                    "ubicacion_codigo": kg_inventory_adjustment["ubicacion_codigo"],
+                    "atributo_proceso": kg_inventory_adjustment["atributo_proceso"],
+                }
+                if kg_inventory_adjustment else None
+            ),
         }
         session.add(_event(
             "PESAJE_MANGA",

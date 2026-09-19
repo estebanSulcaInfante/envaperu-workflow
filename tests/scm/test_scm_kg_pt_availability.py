@@ -1,0 +1,303 @@
+"""Scenario tests for KG availability and PT manual Kardex projection."""
+
+from datetime import date
+from uuid import uuid4
+
+import pytest
+
+from app.extensions import db
+from app.models.scm_articulos import ScmArticulo
+from app.models.scm_articulos import ScmArticuloPiezaColor
+from app.models.scm_catalogos import ScmCapacidad
+from app.models.scm_estructuras import ScmEstructuraComponente, ScmEstructuraRevision
+from app.models.scm_inventory import ScmMovimientoInventario, ScmSaldoInventario, ScmUbicacionInventario
+from app.models.scm_inventory_kg import ScmSaldoInventarioKg
+from app.models.scm_inventory_operations import ScmAlmacen, ScmAlmacenTrabajador
+from app.models.trabajador import Trabajador
+from app.models.producto import PiezaColor
+from app.services.scm_kg_pt_availability_service import (
+    list_piece_kg_availability,
+    list_pt_availability,
+    list_pt_manual_movements,
+    register_pt_manual_movement,
+)
+from app.services.scm_service_support import ScmServiceError
+
+
+def _actor_with_caps():
+    from flask import current_app
+
+    current_app.config["PT_MANUAL_WRITE_ENABLED"] = True
+    actor = Trabajador.query.first()
+    role = actor.roles[0]
+    for code in ("INVENTARIO_VER", "INVENTARIO_AJUSTAR", "INVENTARIO_PT_MOVIMIENTO"):
+        capability = ScmCapacidad.query.filter_by(codigo=code).first()
+        if capability is None:
+            capability = ScmCapacidad(codigo=code, nombre=code)
+            db.session.add(capability)
+            db.session.flush()
+        if capability not in role.capacidades:
+            role.capacidades.append(capability)
+    db.session.commit()
+    return actor
+
+
+def _article(code, name, article_class):
+    item = ScmArticulo(
+        codigo=code,
+        nombre=name,
+        clase=article_class,
+        unidad_base="UN",
+        unidad_inventario="UN",
+    )
+    db.session.add(item)
+    db.session.flush()
+    return item
+
+
+def test_pt_manual_uses_canonical_un_ledger_and_replays(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        product = _article("PT-MAN-01", "PT manual de prueba", "PRODUCTO_TERMINADO")
+        location = ScmUbicacionInventario(codigo="PT-MESA", nombre="Mesa PT")
+        db.session.add(location)
+        db.session.commit()
+
+        with pytest.raises(ScmServiceError) as error:
+            register_pt_manual_movement(
+                db.session,
+                actor_id=actor.id,
+                operation_id=uuid4(),
+                data={
+                    "articulo_scm_id": product.id,
+                    "ubicacion_id": location.id,
+                    "tipo": "SALDO_INICIAL",
+                    "cantidad": 2,
+                    "fecha_operativa": "2026-09-19",
+                    "motivo": "No debe saltar el mecanismo de apertura",
+                },
+            )
+        assert error.value.code == "PT_MANUAL_MOVEMENT_TYPE_INVALID"
+
+        operation_id = uuid4()
+        command = {
+            "articulo_scm_id": product.id,
+            "ubicacion_id": location.id,
+            "tipo": "ENTRADA",
+            "cantidad": 5,
+            "fecha_operativa": "2026-09-19",
+            "motivo": "Entrada PT manual del piloto",
+            "referencia": "ACTA-PT-01",
+            "version": 1,
+        }
+        first = register_pt_manual_movement(
+            db.session, actor_id=actor.id, operation_id=operation_id, data=command,
+        )
+        replay = register_pt_manual_movement(
+            db.session, actor_id=actor.id, operation_id=operation_id, data=command,
+        )
+        assert first == replay
+        balance = db.session.scalar(db.select(ScmSaldoInventario).where(ScmSaldoInventario.articulo_scm_id == product.id))
+        assert balance.cantidad_fisica == 5
+        movement = db.session.scalar(db.select(ScmMovimientoInventario).where(ScmMovimientoInventario.saldo_id == balance.id))
+        assert movement.tipo == "ENTRADA_MANUAL_PT"
+        assert movement.fecha_operativa == date(2026, 9, 19)
+        assert movement.referencia == "ACTA-PT-01"
+
+        history = list_pt_manual_movements(db.session, actor_id=actor.id, balance_id=balance.id)
+        assert len(history["items"]) == 1
+        assert history["items"][0]["saldo_resultante"] == "5.000"
+
+
+def test_piece_availability_is_empty_honestly_without_kg_projection(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        payload = list_piece_kg_availability(db.session, actor_id=actor.id)
+        assert payload["items"] == []
+        assert payload["politica_piloto"] == "SIN_CONTROL_CALIDAD_DESDE_PESAJE"
+
+
+def test_pt_manual_rejects_stale_version_and_kg_uses_authoritative_saldo(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        product = _article("PT-VERSION-01", "PT versionado", "PRODUCTO_TERMINADO")
+        piece = _article("PC-AUTH-01", "Pieza autoridad", "PIEZA_COLOR")
+        location = ScmUbicacionInventario(codigo="PT-VERSION", nombre="Ubicacion version")
+        db.session.add(location)
+        db.session.flush()
+        db.session.add(ScmSaldoInventarioKg(
+            articulo_scm_id=piece.id, ubicacion_id=location.id,
+            cantidad_fisica_kg=10, cantidad_reservada_kg=2,
+            cantidad_no_disponible_kg=1, cantidad_retirada_kg=3,
+            atributo_proceso="PROCESO",
+        ))
+        db.session.commit()
+        first = register_pt_manual_movement(
+            db.session, actor_id=actor.id, operation_id=uuid4(), data={
+                "articulo_scm_id": product.id, "ubicacion_id": location.id,
+                "tipo": "ENTRADA", "cantidad": 2, "version": 1,
+                "fecha_operativa": "2026-09-19", "motivo": "Alta PT",
+            },
+        )
+        assert first["saldo"]["version"] == 2
+        with pytest.raises(ScmServiceError) as error:
+            register_pt_manual_movement(
+                db.session, actor_id=actor.id, operation_id=uuid4(), data={
+                    "articulo_scm_id": product.id, "ubicacion_id": location.id,
+                    "tipo": "SALIDA", "cantidad": 1, "version": 1,
+                    "fecha_operativa": "2026-09-19", "motivo": "Version vieja",
+                },
+            )
+        assert error.value.code == "VERSION_CONFLICT"
+        db.session.rollback()
+        payload = list_piece_kg_availability(db.session, actor_id=actor.id, query="PC-AUTH")
+        assert payload["items"][0]["kg_medidos"] == "10.000"
+        assert payload["items"][0]["kg_retirados"] == "3.000"
+        assert payload["items"][0]["kg_disponibles"] == "7.000"
+        assert payload["as_of"].endswith("+00:00")
+
+
+def test_pt_projection_shared_stock_wip_missing_weight_floor_and_pt_query(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        actor_id = actor.id
+        location = ScmUbicacionInventario(codigo="PT-BOM-LOC", nombre="Ubicacion BOM")
+        db.session.add(location)
+        db.session.flush()
+        piece = _article("PC-BOM-01", "Pieza BOM", "PIEZA_COLOR")
+        missing_weight = _article("PC-BOM-NO-WEIGHT", "Pieza sin peso", "PIEZA_COLOR")
+        wip = _article("WIP-BOM-01", "WIP atomico", "SUBENSAMBLE_WIP")
+        pt_one = _article("PT-BOM-ONE", "PT compartido uno", "PRODUCTO_TERMINADO")
+        pt_two = _article("PT-BOM-TWO", "PT compartido dos", "PRODUCTO_TERMINADO")
+        pt_missing = _article("PT-BOM-MISSING", "PT sin peso", "PRODUCTO_TERMINADO")
+        pt_wip = _article("PT-BOM-WIP", "PT WIP atomico", "PRODUCTO_TERMINADO")
+        color = db.session.get(PiezaColor, "PC-BOM-01")
+        if color is None:
+            color = PiezaColor(sku="PC-BOM-01", peso=2000.0)
+            db.session.add(color)
+            db.session.flush()
+        else:
+            color.peso = 2000.0
+        piece_link = db.session.query(ScmArticuloPiezaColor).filter_by(articulo_id=piece.id).one_or_none()
+        if piece_link is None:
+            db.session.add(ScmArticuloPiezaColor(articulo_id=piece.id, pieza_color_sku=color.sku))
+        else:
+            piece_link.pieza_color_sku = color.sku
+
+        def bom(product, component, qty):
+            revision = ScmEstructuraRevision(
+                articulo_resultado_id=product.id, numero_revision=1,
+                estado="APROBADA", content_hash="a" * 64, creada_por_id=actor_id,
+            )
+            revision.componentes.append(ScmEstructuraComponente(
+                secuencia=1, articulo_componente_id=component.id, cantidad=qty,
+            ))
+            db.session.add(revision)
+
+        bom(pt_one, piece, 3)
+        bom(pt_two, piece, 1)
+        bom(pt_missing, missing_weight, 1)
+        bom(pt_wip, wip, 1)
+        db.session.add(ScmSaldoInventarioKg(
+            articulo_scm_id=piece.id, ubicacion_id=location.id,
+            cantidad_fisica_kg=10, cantidad_reservada_kg=0,
+            cantidad_no_disponible_kg=0, cantidad_retirada_kg=0,
+            atributo_proceso="PROCESO",
+        ))
+        db.session.commit()
+
+        payload = list_pt_availability(
+            db.session, actor_id=actor_id, query="PT-BOM-ONE", location="PT-BOM-LOC",
+        )
+        assert len(payload["items"]) == 1
+        item = payload["items"][0]
+        assert item["potencial_un_estimado"] == "1.000"
+        assert item["potencial_sumable"] is False
+        assert item["componentes"][0]["es_limitante"] is True
+        assert item["componentes"][0]["faltante_kg"] == "0.000"
+
+        all_items = list_pt_availability(db.session, actor_id=actor_id)
+        by_code = {item["pt"]["codigo"]: item for item in all_items["items"]}
+        assert by_code[pt_two.codigo]["componentes"][0]["grupo_stock_compartido"] == f"articulo:{piece.id}"
+        assert by_code[pt_two.codigo]["potencial_sumable"] is False
+        assert by_code[pt_missing.codigo]["potencial_un_estimado"] is None
+        assert by_code[pt_missing.codigo]["potencial_motivo"] == "SIN_REFERENCIA_PESO"
+        assert by_code[pt_wip.codigo]["componentes"][0]["naturaleza"] == "SUBENSAMBLE_WIP"
+        assert len(by_code[pt_wip.codigo]["componentes"]) == 1
+
+
+def test_pt_manual_requires_routine_capability_and_history_honors_location_scope(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        routine = ScmCapacidad.query.filter_by(codigo="INVENTARIO_PT_MOVIMIENTO").one()
+        actor.roles[0].capacidades.remove(routine)
+        product = _article("PT-SCOPE-01", "PT scope", "PRODUCTO_TERMINADO")
+        kg_piece = _article("PC-SCOPE-01", "Pieza fuera de clase", "PIEZA_COLOR")
+        warehouse_allowed = ScmAlmacen(codigo="W2-ALLOWED", nombre="Permitido", tipo="PRODUCTO_TERMINADO")
+        warehouse_hidden = ScmAlmacen(codigo="W2-HIDDEN", nombre="Oculto", tipo="PRODUCTO_TERMINADO")
+        db.session.add_all([warehouse_allowed, warehouse_hidden])
+        db.session.flush()
+        allowed_location = ScmUbicacionInventario(codigo="W2-ALLOWED-LOC", nombre="Permitida", almacen_id=warehouse_allowed.id)
+        hidden_location = ScmUbicacionInventario(codigo="W2-HIDDEN-LOC", nombre="Oculta", almacen_id=warehouse_hidden.id)
+        db.session.add_all([allowed_location, hidden_location])
+        db.session.add(ScmAlmacenTrabajador(
+            almacen_id=warehouse_allowed.id, trabajador_id=actor.id,
+            asignado_por_id=actor.id, clases_articulo_json=["PRODUCTO_TERMINADO"],
+        ))
+        db.session.flush()
+        balance = ScmSaldoInventario(articulo_scm_id=product.id, ubicacion_id=hidden_location.id, cantidad_fisica=1)
+        db.session.add_all([
+            balance,
+            ScmSaldoInventarioKg(
+                articulo_scm_id=kg_piece.id, ubicacion_id=allowed_location.id,
+                cantidad_fisica_kg=3, atributo_proceso="PROCESO",
+            ),
+        ])
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as error:
+            register_pt_manual_movement(
+                db.session, actor_id=actor.id, operation_id=uuid4(), data={
+                    "articulo_scm_id": product.id, "ubicacion_id": allowed_location.id,
+                    "tipo": "ENTRADA", "cantidad": 1, "version": 1,
+                    "fecha_operativa": "2026-09-19", "motivo": "Sin capacidad rutinaria",
+                },
+            )
+        assert error.value.code == "CAPABILITY_REQUIRED"
+        db.session.rollback()
+        with pytest.raises(ScmServiceError) as error:
+            list_pt_manual_movements(db.session, actor_id=actor.id, balance_id=balance.id)
+        assert error.value.code == "PT_MANUAL_BALANCE_NOT_FOUND"
+        assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
+
+
+def test_piece_scope_filters_each_article_class_inside_same_warehouse(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        warehouse = ScmAlmacen(codigo="W2-MIXED", nombre="Mixto", tipo="MATERIAS_PRIMAS")
+        db.session.add(warehouse)
+        db.session.flush()
+        location = ScmUbicacionInventario(
+            codigo="W2-MIXED-LOC", nombre="Mixto", almacen_id=warehouse.id,
+        )
+        piece = _article("PC-MIXED-01", "Pieza permitida", "PIEZA_COLOR")
+        wip = _article("WIP-MIXED-01", "WIP no permitido", "SUBENSAMBLE_WIP")
+        db.session.add(location)
+        db.session.flush()
+        db.session.add(ScmAlmacenTrabajador(
+            almacen_id=warehouse.id, trabajador_id=actor.id,
+            asignado_por_id=actor.id, clases_articulo_json=["PIEZA_COLOR"],
+        ))
+        db.session.add_all([
+            ScmSaldoInventarioKg(
+                articulo_scm_id=piece.id, ubicacion_id=location.id,
+                cantidad_fisica_kg=4, atributo_proceso="PROCESO",
+            ),
+            ScmSaldoInventarioKg(
+                articulo_scm_id=wip.id, ubicacion_id=location.id,
+                cantidad_fisica_kg=9, atributo_proceso="PROCESO",
+            ),
+        ])
+        db.session.commit()
+        payload = list_piece_kg_availability(db.session, actor_id=actor.id)
+        codes = {item["articulo"]["codigo"] for item in payload["items"]}
+        assert codes == {"PC-MIXED-01"}

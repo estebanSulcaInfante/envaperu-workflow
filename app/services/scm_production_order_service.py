@@ -979,6 +979,8 @@ def _inventory_pool(session):
     pool = defaultdict(list)
     snapshot = []
     for row in rows:
+        if getattr(row.articulo, "unidad_inventario", "UN") == "KG":
+            continue
         free = max(
             Decimal(row.cantidad_fisica)
             - Decimal(row.cantidad_reservada)

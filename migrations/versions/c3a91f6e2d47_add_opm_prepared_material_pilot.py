@@ -132,6 +132,16 @@ def _seed_authorization(connection):
 
 
 def _remove_authorization(connection):
+    # PREPARADOR_MATERIAL also carries the pre-existing INVENTARIO_VER
+    # capability, which is intentionally outside this migration's capability
+    # list.  Remove every edge for the role before deleting it; otherwise the
+    # role FK prevents a clean downgrade on PostgreSQL.
+    connection.execute(sa.text("""
+        DELETE FROM scm_rol_capacidad
+        WHERE rol_operativo_id IN (
+            SELECT id FROM rol_operativo WHERE codigo = 'PREPARADOR_MATERIAL'
+        )
+    """))
     capability_codes = tuple(code for code, _name in CAPABILITIES)
     for code in capability_codes:
         connection.execute(sa.text("""

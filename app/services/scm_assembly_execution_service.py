@@ -380,6 +380,9 @@ def _article_weight_g(session, article, *, preferred_structure=None, visited=Non
         structure = session.scalar(select(ScmEstructuraRevision).where(
             ScmEstructuraRevision.articulo_resultado_id == article.id,
             ScmEstructuraRevision.estado == "APROBADA",
+        ).order_by(
+            ScmEstructuraRevision.numero_revision.desc(),
+            ScmEstructuraRevision.id.desc(),
         ))
     if structure is None:
         return None
@@ -740,6 +743,12 @@ def request_assembly_quantity_correction(
         return replay
     try:
         manga = _load_manga(session, manga_id, lock=True)
+        if getattr(manga.lote_articulo.articulo, "unidad_inventario", "UN") == "KG":
+            raise ScmServiceError(
+                "KG_OPERATION_NOT_ENABLED",
+                "El cierre por unidades no opera sobre una manga KG.",
+                status_code=409,
+            )
         confirmation = manga.confirmacion_armado
         if confirmation is None or manga.estado != "CERRADA_ARMADO_PENDIENTE_PESAJE":
             raise ScmServiceError(
@@ -1153,7 +1162,7 @@ def close_assembly_manga(
     command = {
         "manga_id": str(manga_id),
         "version": data.get("version"),
-        "cantidad_real": format(_quantity(data.get("cantidad_real")), "f"),
+        "cantidad_real": data.get("cantidad_real"),
         "motivo_diferencia": str(data.get("motivo_diferencia") or "").strip(),
     }
     endpoint = f"/mangas/{manga_id}/cerrar-armado"
@@ -1164,6 +1173,19 @@ def close_assembly_manga(
         return replay
     try:
         manga = _load_manga(session, manga_id, lock=True)
+        if (
+            manga.lote_articulo is not None
+            and manga.lote_articulo.articulo is not None
+            and manga.lote_articulo.articulo.unidad_inventario == "KG"
+        ):
+            raise ScmServiceError(
+                "KG_OPERATION_NOT_ENABLED",
+                "Una manga KG se confirma con el pesaje final; no se cierra con cantidad UN.",
+                status_code=409,
+            )
+        command["cantidad_real"] = format(
+            _quantity(command["cantidad_real"]), "f"
+        )
         if manga.version != expected_version(command["version"]):
             raise ScmServiceError(
                 "VERSION_CONFLICT", "La manga fue modificada por otro usuario.", status_code=409

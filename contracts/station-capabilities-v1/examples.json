@@ -4,22 +4,37 @@
     "server_time_utc": "2026-07-17T15:00:00Z",
     "minimum_station_version": "1.1.0",
     "supported_contracts": {
-      "heartbeat": ["station-heartbeat-v1"],
-      "catalog": ["station-catalog-v1"],
+      "heartbeat": [
+        "station-heartbeat-v1"
+      ],
+      "catalog": [
+        "station-catalog-v1"
+      ],
       "weight_event": [
         "sync-pesajes-legacy-v1",
         "station-production-progress-v1",
         "station-legacy-history-v1",
         "station-legacy-continuity-v1"
       ],
-      "manga_prelabel": ["scm-manga-prelabel-v1"],
-      "manga_weighing": ["scm-manga-weighing-v1"],
+      "manga_prelabel": [
+        "scm-manga-prelabel-v1"
+      ],
+      "manga_weighing": [
+        "scm-manga-weighing-v1"
+      ],
       "manga_weighing_control": [
         "scm-manga-weighing-control-v1",
         "scm-manga-weight-progress-v2"
       ],
-      "inventory_opening_weighing": ["scm-inventory-opening-weighing-v1"],
-      "prepared_material_weighing": ["scm-prepared-material-weighing-v1"]
+      "inventory_opening_weighing": [
+        "scm-inventory-opening-weighing-v1"
+      ],
+      "prepared_material_weighing": [
+        "scm-prepared-material-weighing-v1"
+      ],
+      "kg_return_weighing": [
+        "scm-kg-return-weighing-v1"
+      ]
     },
     "features": {
       "monitoring": true,
@@ -31,7 +46,8 @@
       "scm_manga_weighing": true,
       "scm_manga_weighing_control": true,
       "scm_inventory_opening_weighing": true,
-      "scm_prepared_material_weighing": true
+      "scm_prepared_material_weighing": true,
+      "scm_kg_return_weighing": false
     }
   }
 }

@@ -170,7 +170,9 @@ class ScmMovimientoInventario(db.Model):
             "tipo IN ('SALDO_INICIAL', 'INGRESO_PRODUCCION', "
             "'AJUSTE_POSITIVO', 'AJUSTE_NEGATIVO', 'CONSUMO', "
             "'TRASLADO_SALIDA', 'TRASLADO_ENTRADA', "
-            "'RETORNO_SALIDA', 'RETORNO_ENTRADA')",
+            "'RETORNO_SALIDA', 'RETORNO_ENTRADA', "
+            "'ENTRADA_MANUAL_PT', 'SALIDA_MANUAL_PT', "
+            "'AJUSTE_POSITIVO_MANUAL_PT', 'AJUSTE_NEGATIVO_MANUAL_PT')",
             name="ck_scm_movimiento_inventario_tipo",
         ),
         db.CheckConstraint(
@@ -200,6 +202,8 @@ class ScmMovimientoInventario(db.Model):
     motivo = db.Column(db.String(240), nullable=False)
     referencia_tipo = db.Column(db.String(40), nullable=True)
     referencia_id = db.Column(db.String(100), nullable=True)
+    fecha_operativa = db.Column(db.Date, nullable=True)
+    referencia = db.Column(db.String(120), nullable=True)
     actor_id = db.Column(
         db.Integer,
         db.ForeignKey("trabajador.id", ondelete="RESTRICT"),

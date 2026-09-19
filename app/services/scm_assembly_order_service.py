@@ -15,7 +15,7 @@ from app.models.scm_estructuras import (
     ESTADO_ESTRUCTURA_APROBADA,
     ScmEstructuraRevision,
 )
-from app.models.scm_ot import ScmLoteArticulo
+from app.models.scm_ot import ScmCierreProductivoKg, ScmLoteArticulo
 from app.models.scm_production_orders import (
     ScmOrdenOperacion,
     ScmOrdenOperacionSalida,
@@ -157,6 +157,14 @@ def _serialize(session, order, *, schedule_projection=None):
     lot = session.scalar(select(ScmLoteArticulo).where(
         ScmLoteArticulo.orden_operacion_salida_id == output.id,
     ))
+    kg_closure = session.scalar(
+        select(ScmCierreProductivoKg)
+        .where(
+            ScmCierreProductivoKg.documento_tipo == "OA",
+            ScmCierreProductivoKg.documento_id == str(order.id),
+        )
+        .order_by(ScmCierreProductivoKg.created_at.desc(), ScmCierreProductivoKg.id.desc())
+    )
     return {
         **(
             schedule_projection
@@ -195,6 +203,7 @@ def _serialize(session, order, *, schedule_projection=None):
             "codigo": output.articulo.codigo,
             "nombre": output.articulo.nombre,
             "clase": output.articulo.clase,
+            "unidad_inventario": output.articulo.unidad_inventario,
             "cantidad_objetivo": format(output.cantidad_objetivo, "f"),
             "cantidad_real": (
                 format(output.cantidad_real, "f")
@@ -205,6 +214,7 @@ def _serialize(session, order, *, schedule_projection=None):
                 if output.cantidad_rechazada is not None else None
             ),
         },
+        "cierre_kg": kg_closure.to_dict() if kg_closure is not None else None,
         "entradas_planificadas": _planned_inputs(
             operation,
             output.cantidad_objetivo,
@@ -527,6 +537,24 @@ def transition_assembly_order(
 ):
     capability = "OA_LIBERAR" if action == "liberar" else "OA_EJECUTAR"
     actor = load_actor(session, actor_id, capability=capability)
+    if action == "cerrar":
+        # A KG OA closes from measured manga evidence.  Keep the existing
+        # endpoint and permissions, but bypass the UN output credit path.
+        probe = _load(session, order_id, lock=False)
+        if any(
+            getattr(output.articulo, "unidad_inventario", None) == "KG"
+            for output in probe.salidas
+        ):
+            from app.services.scm_kg_production_service import close_productive_document_kg
+
+            return close_productive_document_kg(
+                session,
+                actor_id=actor.id,
+                documento_tipo="OA",
+                documento_id=order_id,
+                operation_id=operation_id,
+                data=data,
+            )
     allowed = {"version"}
     if action == "cerrar":
         allowed |= {"cantidad_real", "cantidad_rechazada", "motivo"}

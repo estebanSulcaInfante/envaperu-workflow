@@ -14,6 +14,8 @@ from app.services.scm_demo_seed_service import (
 
 
 def register_scm_commands(app):
+    from app.cli.kg_pilot_commands import register_kg_pilot_commands
+    register_kg_pilot_commands(app)
     @app.cli.command("seed-scm-config")
     def seed_scm_config():
         """Crea catálogos técnicos y roles SCM sin asignar personas."""

@@ -122,7 +122,8 @@ class ScmSesionOperacionItem(db.Model):
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     sesion_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_sesion_operacion_almacen.id", ondelete="CASCADE"), nullable=False)
-    existencia_manga_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_existencia_manga.id", ondelete="RESTRICT"), nullable=False)
+    existencia_manga_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_existencia_manga.id", ondelete="RESTRICT"), nullable=True)
+    unidad_fisica_kg_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_unidad_fisica_kg.id", ondelete="RESTRICT"), nullable=True)
     codigo_escaneado = db.Column(db.String(120), nullable=False)
     cantidad_snapshot = db.Column(db.Numeric(15, 3), nullable=False)
     estado = db.Column(db.String(16), nullable=False, default="VALIDA", server_default="VALIDA")
@@ -132,6 +133,7 @@ class ScmSesionOperacionItem(db.Model):
 
     sesion = db.relationship("ScmSesionOperacionAlmacen", back_populates="items")
     existencia = db.relationship("ScmExistenciaManga")
+    unidad_fisica_kg = db.relationship("ScmUnidadFisicaKg")
 
 
 class ScmTransferenciaInventario(db.Model):
@@ -151,6 +153,9 @@ class ScmTransferenciaInventario(db.Model):
     modalidad = db.Column(db.String(16), nullable=False)
     estado = db.Column(db.String(20), nullable=False)
     custodio_id = db.Column(db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=True)
+    unidad_inventario = db.Column(db.String(10), nullable=False, default="UN", server_default="UN")
+    almacen_responsable_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_almacen.id", ondelete="RESTRICT"), nullable=True)
+    tenedor_fisico_id = db.Column(db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=True)
     actor_id = db.Column(db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False)
     operation_id = db.Column(Uuid(as_uuid=True), nullable=False)
     version = db.Column(db.Integer, nullable=False, default=1, server_default="1")
@@ -172,7 +177,8 @@ class ScmTransferenciaItem(db.Model):
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     transferencia_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_transferencia_inventario.id", ondelete="CASCADE"), nullable=False)
-    existencia_manga_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_existencia_manga.id", ondelete="RESTRICT"), nullable=False)
+    existencia_manga_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_existencia_manga.id", ondelete="RESTRICT"), nullable=True)
+    unidad_fisica_kg_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_unidad_fisica_kg.id", ondelete="RESTRICT"), nullable=True)
     cantidad = db.Column(db.Numeric(15, 3), nullable=False)
     movimiento_salida_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_movimiento_inventario.id", ondelete="RESTRICT"), nullable=True)
     movimiento_transito_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_movimiento_inventario.id", ondelete="RESTRICT"), nullable=True)
@@ -180,3 +186,4 @@ class ScmTransferenciaItem(db.Model):
 
     transferencia = db.relationship("ScmTransferenciaInventario", back_populates="items")
     existencia = db.relationship("ScmExistenciaManga")
+    unidad_fisica_kg = db.relationship("ScmUnidadFisicaKg")

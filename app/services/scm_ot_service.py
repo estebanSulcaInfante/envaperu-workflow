@@ -31,6 +31,7 @@ from app.models.scm_ot import (
     ScmAsignacionPlanMangaOt,
     ScmEtiquetaManga,
     ScmControlPesoManga,
+    ScmCierreProductivoKg,
     ScmLoteArticulo,
     ScmManga,
     ScmPlanMangaOp,
@@ -340,7 +341,7 @@ def _serialize_manga(manga):
     )
     assigned = Decimal(manga.cantidad_asignada_un)
     accumulated = (
-        Decimal(latest_shift_control.conteo_acumulado_un)
+        Decimal(latest_shift_control.conteo_acumulado_un or 0)
         if latest_shift_control is not None else Decimal("0")
     )
     return {
@@ -371,6 +372,16 @@ def _serialize_manga(manga):
         ),
         "tipo": manga.tipo,
         "estado": manga.estado,
+        "unidad_inventario": (
+            manga.lote_articulo.articulo.unidad_inventario
+            if manga.lote_articulo is not None and manga.lote_articulo.articulo is not None
+            else None
+        ),
+        "kg_medido": (
+            format(current_segment.cantidad_fin_kg, "f")
+            if current_segment is not None and current_segment.cantidad_fin_kg is not None
+            else None
+        ),
         "secuencia_ot": manga.secuencia_ot,
         "cantidad_planificada_un": _compact_number(
             manga.cantidad_planificada_un
@@ -855,6 +866,49 @@ def _serialize_ot(
         else None
     )
     payload["mangas"] = [_serialize_manga(manga) for manga in mangas]
+    units = {
+        str(item.lote_articulo.articulo.unidad_inventario).upper()
+        for item in mangas
+        if item.lote_articulo is not None and item.lote_articulo.articulo is not None
+    }
+    # A concurrent source TrabajoColor can have no own manga.  Its WIP saldo
+    # reservations still point at the downstream OA manga, whose KG article
+    # is the authoritative productive context for the OT selector.
+    if "KG" not in units:
+        for work in ot.trabajos_ot:
+            for saldo in getattr(work, "saldos_wip_salida", ()):
+                if any(
+                    getattr(
+                        getattr(
+                            getattr(reservation, "manga", None),
+                            "lote_articulo",
+                            None,
+                        ),
+                        "articulo",
+                        None,
+                    ) is not None
+                    and getattr(
+                        reservation.manga.lote_articulo.articulo,
+                        "unidad_inventario",
+                        None,
+                    ) == "KG"
+                    for reservation in getattr(saldo, "reservas", ())
+                ):
+                    units.add("KG")
+                    break
+    payload["unidad_inventario"] = next(iter(units)) if len(units) == 1 else None
+    closure_query = ScmCierreProductivoKg.query.filter_by(
+        documento_tipo="OT",
+        documento_id=str(ot.public_id),
+    )
+    payload["cierre_kg"] = closure_query.order_by(
+        ScmCierreProductivoKg.created_at.desc(),
+        ScmCierreProductivoKg.id.desc(),
+    ).first()
+    payload["cierre_kg"] = (
+        payload["cierre_kg"].to_dict()
+        if payload["cierre_kg"] is not None else None
+    )
     color_works = [
         item for item in ot.trabajos_ot if item.tipo == "COLOR"
     ]
@@ -2084,8 +2138,17 @@ def _continuity_candidate_payload(manga):
         if segment else manga.asignacion_personal_trabajo
     )
     control = segment.control_peso if segment else None
+    is_kg = (
+        manga.lote_articulo is not None
+        and manga.lote_articulo.articulo is not None
+        and manga.lote_articulo.articulo.unidad_inventario == "KG"
+    )
     assigned = Decimal(manga.cantidad_asignada_un)
-    boundary = Decimal(segment.cantidad_fin_un) if segment else Decimal("0")
+    boundary = (
+        Decimal(segment.cantidad_fin_kg)
+        if is_kg and segment and segment.cantidad_fin_kg is not None
+        else Decimal(segment.cantidad_fin_un or 0) if segment else Decimal("0")
+    )
     return {
         "manga": _serialize_manga(manga),
         "origen": {
@@ -2101,8 +2164,10 @@ def _continuity_candidate_payload(manga):
             ),
         },
         "control_frontera": control.to_dict() if control else None,
-        "conteo_acumulado_un": _compact_number(boundary),
-        "cantidad_pendiente_un": _compact_number(assigned - boundary),
+        "unidad_evidencia": "KG" if is_kg else "UN",
+        "conteo_acumulado_un": None if is_kg else _compact_number(boundary),
+        "cantidad_pendiente_un": None if is_kg else _compact_number(assigned - boundary),
+        "frontera_kg": _compact_number(boundary) if is_kg else None,
         "qr_preservado": True,
     }
 
@@ -2146,16 +2211,21 @@ def list_pending_manga_continuities(
     items = []
     for manga in candidates:
         segment = _latest_manga_segment(manga)
-        if (
-            segment is None
-            or segment.estado != "CERRADO"
-            or segment.control_peso is None
-            or Decimal(segment.cantidad_fin_un or 0)
-            >= Decimal(manga.cantidad_asignada_un)
-            or not _continuity_target_is_later(
-                segment.trabajo.orden_trabajo, target_ot
-            )
+        is_kg = (
+            manga.lote_articulo is not None
+            and manga.lote_articulo.articulo is not None
+            and manga.lote_articulo.articulo.unidad_inventario == "KG"
+        )
+        if segment is None or segment.estado != "CERRADO" or segment.control_peso is None:
+            continue
+        boundary = Decimal(
+            segment.cantidad_fin_kg if is_kg else segment.cantidad_fin_un or 0
+        )
+        if (is_kg and boundary <= 0) or (
+            not is_kg and boundary >= Decimal(manga.cantidad_asignada_un)
         ):
+            continue
+        if not _continuity_target_is_later(segment.trabajo.orden_trabajo, target_ot):
             continue
         items.append(_continuity_candidate_payload(manga))
     return {"items": items}
@@ -2209,17 +2279,31 @@ def _attach_continuity_mangas(
         _validate_continuity_target(
             manga=manga, segment=segment, target_work=work
         )
-        boundary = Decimal(segment.cantidad_fin_un)
-        remaining = Decimal(manga.cantidad_asignada_un) - boundary
-        if remaining <= 0:
+        is_kg = (
+            manga.lote_articulo is not None
+            and manga.lote_articulo.articulo is not None
+            and manga.lote_articulo.articulo.unidad_inventario == "KG"
+        )
+        boundary = (
+            Decimal(segment.cantidad_fin_kg)
+            if is_kg else Decimal(segment.cantidad_fin_un)
+        )
+        remaining = (
+            None if is_kg
+            else Decimal(manga.cantidad_asignada_un) - boundary
+        )
+        if not is_kg and remaining <= 0:
             raise ScmServiceError(
                 "MANGA_ALREADY_COMPLETE",
                 "El conteo de frontera ya completo la manga.",
                 status_code=409,
             )
         source_plan_id = segment.asignacion_plan_id or manga.asignacion_id
-        source_plan = session.get(ScmAsignacionPlanMangaOt, source_plan_id)
-        if (
+        source_plan = (
+            session.get(ScmAsignacionPlanMangaOt, source_plan_id)
+            if not is_kg and source_plan_id is not None else None
+        )
+        if not is_kg and (
             source_plan is None
             or Decimal(source_plan.cantidad_asignada_un) < remaining
             or Decimal(segment.trabajo.cantidad_objetivo_un) < remaining
@@ -2237,7 +2321,7 @@ def _attach_continuity_mangas(
             )
             .with_for_update()
         )
-        if target_plan is None:
+        if target_plan is None and not is_kg:
             target_plan = ScmAsignacionPlanMangaOt(
                 plan_linea_id=manga.plan_linea_id,
                 ot_id=work.orden_trabajo_id,
@@ -2248,28 +2332,32 @@ def _attach_continuity_mangas(
             )
             session.add(target_plan)
             session.flush()
-        source_plan.cantidad_asignada_un = (
-            Decimal(source_plan.cantidad_asignada_un) - remaining
-        )
-        target_plan.cantidad_asignada_un = (
-            Decimal(target_plan.cantidad_asignada_un) + remaining
-        )
-        segment.trabajo.cantidad_objetivo_un = (
-            Decimal(segment.trabajo.cantidad_objetivo_un) - remaining
-        )
-        segment.trabajo.version += 1
-        work.cantidad_objetivo_un = (
-            Decimal(work.cantidad_objetivo_un or 0) + remaining
-        )
+        if not is_kg:
+            source_plan.cantidad_asignada_un = (
+                Decimal(source_plan.cantidad_asignada_un) - remaining
+            )
+            target_plan.cantidad_asignada_un = (
+                Decimal(target_plan.cantidad_asignada_un) + remaining
+            )
+            segment.trabajo.cantidad_objetivo_un = (
+                Decimal(segment.trabajo.cantidad_objetivo_un) - remaining
+            )
+            segment.trabajo.version += 1
+            work.cantidad_objetivo_un = (
+                Decimal(work.cantidad_objetivo_un or 0) + remaining
+            )
         next_segment = ScmTramoMangaTrabajo(
             manga=manga,
             trabajo=work,
             asignacion_personal_trabajo=personal_assignment,
-            asignacion_plan_id=target_plan.id,
+            asignacion_plan_id=target_plan.id if target_plan is not None else None,
             secuencia=segment.secuencia + 1,
             estado="PROGRAMADO",
-            cantidad_inicio_un=boundary,
+            cantidad_inicio_un=Decimal("0") if is_kg else boundary,
             cantidad_atribuida_un=0,
+            cantidad_inicio_kg=boundary if is_kg else None,
+            cantidad_atribuida_kg=Decimal("0") if is_kg else None,
+            calidad_evidencia_kg="MEDIDA_DIRECTA" if is_kg else None,
             created_by_id=actor.id,
             operation_id=operation.operation_id,
         )
@@ -3363,6 +3451,7 @@ def assign_color_work_worker(
             "manga_ids",
             "manga_abierta",
             "conteo_frontera",
+            "frontera_kg",
             "confirmacion_stickers_vacios",
         },
     )
@@ -3433,9 +3522,16 @@ def assign_color_work_worker(
                         status_code=409,
                         details={"manga_id": str(manga.public_id)},
                     )
-                if Decimal(segment.control_peso.conteo_acumulado_un) >= Decimal(
-                    manga.cantidad_asignada_un
-                ):
+                is_kg = (
+                    manga.lote_articulo is not None
+                    and manga.lote_articulo.articulo is not None
+                    and manga.lote_articulo.articulo.unidad_inventario == "KG"
+                )
+                boundary = Decimal(
+                    segment.cantidad_fin_kg
+                    if is_kg else segment.control_peso.conteo_acumulado_un
+                )
+                if not is_kg and boundary >= Decimal(manga.cantidad_asignada_un):
                     raise ScmServiceError(
                         "OPEN_MANGA_RELIEF_NOT_READY",
                         "La frontera ya alcanzó el total; corresponde cierre final.",
@@ -3468,6 +3564,25 @@ def assign_color_work_worker(
                                 persisted_count
                             )
                         },
+                    )
+            if data.get("frontera_kg") is not None:
+                if len(selected) != 1:
+                    raise ScmServiceError(
+                        "INVALID_SHIFT_BOUNDARY_KG",
+                        "No redigite una frontera común para varias mangas.",
+                        status_code=422,
+                    )
+                persisted_kg = Decimal(
+                    _latest_manga_segment(selected[0]).cantidad_fin_kg or 0
+                )
+                supplied_kg = Decimal(str(data["frontera_kg"])).quantize(
+                    Decimal("0.001")
+                )
+                if supplied_kg != persisted_kg:
+                    raise ScmServiceError(
+                        "KG_BOUNDARY_VERSION_CONFLICT",
+                        "La frontera no coincide con el último control.",
+                        status_code=409,
                     )
         elif raw_ids is not None:
             if not isinstance(raw_ids, list):
@@ -3535,7 +3650,10 @@ def assign_color_work_worker(
                 "El relevo sin stickers requiere un trabajo en ejecución y una asignación activa.",
                 status_code=409,
             )
-        if not open_relief and data.get("conteo_frontera") is not None:
+        if not open_relief and (
+            data.get("conteo_frontera") is not None
+            or data.get("frontera_kg") is not None
+        ):
             raise ScmServiceError(
                 "OPEN_MANGA_RELIEF_NOT_ALLOWED",
                 "La frontera solo se usa al relevar una manga abierta ya controlada.",
@@ -3614,8 +3732,14 @@ def assign_color_work_worker(
             opened_segments = []
             for manga in selected:
                 previous_segment = _latest_manga_segment(manga)
+                is_kg = (
+                    manga.lote_articulo is not None
+                    and manga.lote_articulo.articulo is not None
+                    and manga.lote_articulo.articulo.unidad_inventario == "KG"
+                )
                 frontier = Decimal(
-                    previous_segment.control_peso.conteo_acumulado_un
+                    previous_segment.cantidad_fin_kg
+                    if is_kg else previous_segment.control_peso.conteo_acumulado_un
                 )
                 next_segment = ScmTramoMangaTrabajo(
                     manga_id=manga.id,
@@ -3624,8 +3748,11 @@ def assign_color_work_worker(
                     asignacion_plan_id=previous_segment.asignacion_plan_id,
                     secuencia=previous_segment.secuencia + 1,
                     estado="ACTIVO",
-                    cantidad_inicio_un=frontier,
+                    cantidad_inicio_un=Decimal("0") if is_kg else frontier,
                     cantidad_atribuida_un=Decimal("0"),
+                    cantidad_inicio_kg=frontier if is_kg else None,
+                    cantidad_atribuida_kg=Decimal("0") if is_kg else None,
+                    calidad_evidencia_kg="MEDIDA_DIRECTA" if is_kg else None,
                     iniciada_at=assignment.iniciada_at,
                     created_by_id=actor.id,
                     operation_id=operation.operation_id,
@@ -4314,6 +4441,44 @@ def transition_ot(
 ):
     capability = "OT_INICIAR" if action == "iniciar" else "OT_CERRAR"
     actor = load_actor(session, actor_id, capability=capability)
+    if action == "cerrar":
+        # Preserve the existing OT endpoint while selecting the kg evidence
+        # closure before any UN projection can run.
+        probe = session.scalar(
+            select(RegistroDiarioProduccion)
+            .where(RegistroDiarioProduccion.public_id == public_id)
+        )
+        has_kg_manga = bool(
+            probe and any(
+                manga.lote_articulo is not None
+                and manga.lote_articulo.articulo is not None
+                and manga.lote_articulo.articulo.unidad_inventario == "KG"
+                for work in probe.trabajos_ot
+                for manga in work.mangas
+            )
+        )
+        has_kg_inline_context = bool(
+            probe and any(
+                reservation.manga is not None
+                and reservation.manga.lote_articulo is not None
+                and reservation.manga.lote_articulo.articulo is not None
+                and reservation.manga.lote_articulo.articulo.unidad_inventario == "KG"
+                for work in probe.trabajos_ot
+                for saldo in getattr(work, "saldos_wip_salida", ())
+                for reservation in getattr(saldo, "reservas", ())
+            )
+        )
+        if has_kg_manga or has_kg_inline_context:
+            from app.services.scm_kg_production_service import close_productive_document_kg
+
+            return close_productive_document_kg(
+                session,
+                actor_id=actor.id,
+                documento_tipo="OT",
+                documento_id=public_id,
+                operation_id=operation_id,
+                data=data,
+            )
     endpoint = f"/ots/{public_id}/{action}"
     operation, replay = _reserve_operation(
         session, operation_id, endpoint, actor, data

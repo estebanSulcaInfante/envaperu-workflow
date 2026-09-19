@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "captureRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_id",
+        "actor_id",
+        "version",
+        "reading_id",
+        "captured_at_utc",
+        "reading_stable",
+        "modo_lectura",
+        "label_id",
+        "expected_unit_source_nonce",
+        "station_version",
+        "scale_snapshot"
+      ],
+      "properties": {
+        "unit_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "actor_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reading_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "captured_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reading_stable": {
+          "const": true
+        },
+        "modo_lectura": {
+          "enum": [
+            "NET_DIRECTO",
+            "BRUTO_MENOS_TARA_CONFIGURADA"
+          ]
+        },
+        "label_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "expected_unit_source_nonce": {
+          "type": "string",
+          "minLength": 1
+        },
+        "station_version": {
+          "type": "string"
+        },
+        "scale_snapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "peso_kg",
+            "reading_id",
+            "received_at_utc",
+            "stable",
+            "sequence",
+            "source"
+          ],
+          "properties": {
+            "peso_kg": {
+              "type": "string",
+              "pattern": "^\\d+\\.\\d{3}$"
+            },
+            "reading_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "received_at_utc": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "stable": {
+              "const": true
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "source": {
+              "const": "SERIAL"
+            }
+          }
+        }
+      }
+    },
+    "resolveRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actor_id",
+        "code"
+      ],
+      "properties": {
+        "actor_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      }
+    }
+  }
+}

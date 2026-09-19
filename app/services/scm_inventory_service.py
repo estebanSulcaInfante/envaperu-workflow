@@ -174,7 +174,7 @@ def _article_explorer(session, *, ledger, classes, scope, query, location, stock
         updated=ScmSaldoInventario.updated_at,
         row_id=ScmSaldoInventario.id,
     )
-    conditions = [ScmArticulo.clase.in_(classes)]
+    conditions = [ScmArticulo.clase.in_(classes), ScmArticulo.unidad_inventario == "UN"]
     scoped = _scope_condition(scope, ScmArticulo.clase)
     if scoped is not None:
         conditions.append(scoped)
@@ -206,7 +206,7 @@ def _article_explorer(session, *, ledger, classes, scope, query, location, stock
         ScmArticulo.codigo.label("code"),
         ScmArticulo.nombre.label("name"),
         ScmArticulo.clase.label("class_name"),
-        ScmArticulo.unidad_base.label("unit"),
+        ScmArticulo.unidad_inventario.label("unit"),
         ScmUbicacionInventario.id.label("location_id"),
         ScmUbicacionInventario.codigo.label("location_code"),
         ScmUbicacionInventario.nombre.label("location_name"),
@@ -509,7 +509,8 @@ def _balance_payload(item):
             "codigo": item.articulo.codigo,
             "nombre": item.articulo.nombre,
             "clase": item.articulo.clase,
-            "unidad": item.articulo.unidad_base,
+            "unidad": item.articulo.unidad_inventario,
+            "unidad_inventario": item.articulo.unidad_inventario,
         },
         "ubicacion": {
             "id": item.ubicacion.id,
@@ -557,6 +558,7 @@ def list_inventory_balances(session, *, actor_id):
             item for item in material_items
             if item.material.clase in allowed_by_warehouse.get(item.ubicacion.almacen_id, set())
         ]
+    items = [item for item in items if item.articulo.unidad_inventario == "UN"]
     return {
         "items": [_balance_payload(item) for item in items],
         "materiales": [_material_balance_payload(item) for item in material_items],
@@ -611,6 +613,7 @@ def list_inventory_movements(session, *, actor_id, limit=100):
         material_query = material_query.where(ScmSaldoMaterialInventario.ubicacion_id.in_(location_ids))
     items = session.scalars(article_query).all()
     material_items = session.scalars(material_query).all()
+    items = [item for item in items if item.saldo.articulo.unidad_inventario == "UN"]
     if scope["configured"] and not scope["transversal"]:
         items = [item for item in items if item.saldo.articulo.clase in scope["classes"].get(item.saldo.ubicacion.almacen_id, set())]
         material_items = [item for item in material_items if item.saldo.material.clase in scope["classes"].get(item.saldo.ubicacion.almacen_id, set())]
@@ -718,6 +721,12 @@ def register_inventory_movement(
                 "ARTICLE_NOT_FOUND",
                 "El articulo SCM no existe o esta inactivo.",
                 status_code=422,
+            )
+        if article.unidad_inventario == "KG":
+            raise ScmServiceError(
+                "KG_OPERATION_NOT_ENABLED",
+                "Los ajustes UN no operan sobre un articulo KG.",
+                status_code=409,
             )
         location = session.scalar(
             select(ScmUbicacionInventario)

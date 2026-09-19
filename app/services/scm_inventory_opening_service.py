@@ -422,6 +422,12 @@ def resolve_inventory_opening(session, *, actor_id, opening_id, operation_id, da
             for line in item.lineas:
                 is_material = line.material_scm_id is not None
                 target = line.material if is_material else line.articulo
+                if not is_material and target.unidad_inventario == "KG":
+                    raise ScmServiceError(
+                        "KG_OPERATION_NOT_ENABLED",
+                        "La apertura UN no opera sobre un articulo KG.",
+                        status_code=409,
+                    )
                 source_filter = (
                     ScmLoteAperturaLinea.material_scm_id == line.material_scm_id
                     if is_material else

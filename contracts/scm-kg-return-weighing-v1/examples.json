@@ -1,0 +1,26 @@
+{
+  "captureRequest": {
+    "unit_id": "c249887b-9f06-4487-ae73-df7121cdd9db",
+    "actor_id": 7,
+    "version": 2,
+    "reading_id": "c249887b-9f06-4487-ae73-df7121cdd9db",
+    "captured_at_utc": "2026-09-18T20:00:00Z",
+    "reading_stable": true,
+    "modo_lectura": "NET_DIRECTO",
+    "label_id": "c249887b-9f06-4487-ae73-df7121cdd9db",
+    "expected_unit_source_nonce": "123abc",
+    "station_version": "1.1.0",
+    "scale_snapshot": {
+      "peso_kg": "3.125",
+      "reading_id": "c249887b-9f06-4487-ae73-df7121cdd9db",
+      "received_at_utc": "2026-09-18T20:00:00Z",
+      "stable": true,
+      "sequence": 2,
+      "source": "SERIAL"
+    }
+  },
+  "resolveRequest": {
+    "actor_id": 7,
+    "code": "KG-RET-1"
+  }
+}

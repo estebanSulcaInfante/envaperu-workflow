@@ -170,6 +170,7 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "manga_weighing_control",
         "inventory_opening_weighing",
         "prepared_material_weighing",
+        "kg_return_weighing",
     }
     assert (
         "station-production-progress-v1"
@@ -186,6 +187,7 @@ def test_capabilities_requires_station_auth_and_matches_contract(
         "scm_manga_weighing_control": True,
         "scm_inventory_opening_weighing": True,
         "scm_prepared_material_weighing": True,
+        "scm_kg_return_weighing": False,
     }
 
 

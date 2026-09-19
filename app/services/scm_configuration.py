@@ -131,6 +131,7 @@ CAPACIDADES_SCM_INICIALES = (
     ("PLANIFICACION_CALCULAR", "Calcular cobertura y propuestas"),
     ("PLANIFICACION_CONFIRMAR", "Confirmar el plan de suministro"),
     ("INVENTARIO_VER", "Consultar Kardex normalizado"),
+    ("INVENTARIO_PT_MOVIMIENTO", "Registrar entradas y salidas manuales de PT"),
     ("INVENTARIO_SALDO_INICIAL", "Registrar saldos iniciales"),
     ("INVENTARIO_AJUSTAR", "Registrar ajustes auditados de inventario"),
     ("ALMACEN_CONFIG_ADMINISTRAR", "Administrar almacenes y ubicaciones"),
@@ -259,6 +260,7 @@ ROLES_SCM_INICIALES = (
         tuple(
             codigo
             for codigo, _nombre in CAPACIDADES_SCM_INICIALES
+            if codigo != "INVENTARIO_PT_MOVIMIENTO"
         ),
     ),
     (

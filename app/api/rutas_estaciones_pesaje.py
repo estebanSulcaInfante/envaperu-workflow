@@ -62,6 +62,112 @@ integration_station_bp = Blueprint("integration_station", __name__)
 monitoring_station_bp = Blueprint("monitoring_station", __name__)
 
 
+def _kg_station_payload(station_id, allowed):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return None, error
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ScmServiceError("JSON_OBJECT_REQUIRED", "Se requiere un objeto JSON.", status_code=400)
+    if set(payload) - set(allowed):
+        raise ScmServiceError("UNKNOWN_FIELDS", "La captura contiene campos no admitidos.", status_code=422)
+    try:
+        actor_id = payload["actor_id"]
+        if isinstance(actor_id, bool) or not str(actor_id).isdigit() or int(actor_id) <= 0:
+            raise ValueError()
+        actor_id = int(actor_id)
+    except (KeyError, ValueError, TypeError):
+        raise ScmServiceError("ACTOR_REQUIRED", "El responsable de Almacén es obligatorio.", status_code=400)
+    return (dict(payload), actor_id), None
+
+
+@integration_station_bp.post("/stations/<station_id>/kg-return-units/resolve")
+@require_station_auth
+def kg_return_resolve(station_id):
+    from app.services.scm_kg_custody_service import resolve_kg_return
+    try:
+        value, error = _kg_station_payload(station_id, {"actor_id", "code"})
+        if error:
+            return error
+        payload, actor_id = value
+        return jsonify(resolve_kg_return(db.session, actor_id=actor_id, code=payload.get("code")))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/stations/<station_id>/kg-return-measurements")
+@require_station_auth
+def kg_return_capture(station_id):
+    from app.services.scm_kg_custody_service import capture_kg_measurement
+    try:
+        value, error = _kg_station_payload(station_id, {
+            "actor_id", "unit_id", "version", "reading_id", "captured_at_utc",
+            "reading_stable", "modo_lectura", "label_id", "expected_unit_source_nonce",
+            "station_version", "scale_snapshot",
+        })
+        if error:
+            return error
+        payload, actor_id = value
+        try:
+            operation_id = UUID(str(request.headers.get("Idempotency-Key")))
+            unit_id = UUID(str(payload.pop("unit_id")))
+        except (KeyError, ValueError, TypeError):
+            raise ScmServiceError("INVALID_UUID", "Operación e identidad UUID requeridas.", status_code=400)
+        snapshot = payload.pop("scale_snapshot", None)
+        payload.pop("actor_id", None)
+        # The authenticated station backend attests its hardware snapshot.
+        payload["station_version"] = g.station_version
+        return jsonify(capture_kg_measurement(db.session, actor_id=actor_id,
+            station_id=g.authenticated_station.station_id, unit_id=unit_id,
+            operation_id=operation_id, data=payload, snapshot=snapshot))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/stations/<station_id>/kg-return-labels/resolve")
+@require_station_auth
+def kg_return_label(station_id):
+    from app.services.scm_kg_custody_service import get_kg_label
+    try:
+        value, error = _kg_station_payload(station_id, {"actor_id", "unit_id"})
+        if error:
+            return error
+        payload, actor_id = value
+        try:
+            unit_id = UUID(str(payload.get("unit_id")))
+        except (ValueError, TypeError):
+            raise ScmServiceError("INVALID_UUID", "Identidad UUID requerida.", status_code=422)
+        return jsonify(get_kg_label(db.session, actor_id=actor_id, unit_id=unit_id))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+@integration_station_bp.post("/stations/<station_id>/kg-return-labels/ack")
+@require_station_auth
+def kg_return_label_ack(station_id):
+    from app.services.scm_kg_custody_service import acknowledge_kg_label
+    try:
+        value, error = _kg_station_payload(station_id, {
+            "actor_id", "unit_id", "label_id", "estado", "payload_hash", "printer_name", "job_id",
+        })
+        if error:
+            return error
+        payload, actor_id = value
+        try:
+            unit_id = UUID(str(payload.pop("unit_id")))
+            label_id = UUID(str(payload.pop("label_id")))
+            operation_id = UUID(str(request.headers.get("Idempotency-Key")))
+        except (KeyError, ValueError, TypeError):
+            raise ScmServiceError("INVALID_UUID", "Operación, etiqueta e identidad UUID requeridas.", status_code=422)
+        payload.pop("actor_id", None)
+        return jsonify(acknowledge_kg_label(db.session, actor_id=actor_id,
+            station_id=g.authenticated_station.station_id, unit_id=unit_id,
+            label_id=label_id, operation_id=operation_id, data=payload))
+    except ScmServiceError as exc:
+        return _integration_error(exc)
+
+
+
 def _utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -94,6 +200,7 @@ def capabilities():
                 ],
                 "inventory_opening_weighing": ["scm-inventory-opening-weighing-v1"],
                 "prepared_material_weighing": ["scm-prepared-material-weighing-v1"],
+                "kg_return_weighing": ["scm-kg-return-weighing-v1"],
             },
             "features": {
                 "monitoring": True,
@@ -108,6 +215,7 @@ def capabilities():
                 "scm_manga_weighing_control": True,
                 "scm_inventory_opening_weighing": True,
                 "scm_prepared_material_weighing": True,
+                "scm_kg_return_weighing": bool(current_app.config.get("KG_CUSTODY_WRITE_ENABLED", False)),
             },
         }
     )

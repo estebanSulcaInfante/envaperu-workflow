@@ -41,6 +41,14 @@ class ScmArticulo(db.Model):
             name="ck_scm_articulo_unidad_base",
         ),
         db.CheckConstraint(
+            "unidad_inventario IN ('UN', 'KG')",
+            name="ck_scm_articulo_unidad_inventario",
+        ),
+        db.CheckConstraint(
+            "unidad_inventario <> 'KG' OR clase IN ('PIEZA_COLOR', 'SUBENSAMBLE_WIP')",
+            name="ck_scm_articulo_kg_class",
+        ),
+        db.CheckConstraint(
             "codigo = upper(trim(codigo)) AND length(codigo) > 0",
             name="ck_scm_articulo_codigo_normalizado",
         ),
@@ -65,6 +73,15 @@ class ScmArticulo(db.Model):
     nombre = db.Column(db.String(200), nullable=False)
     clase = db.Column(db.String(32), nullable=False)
     unidad_base = db.Column(
+        db.String(10),
+        nullable=False,
+        default="UN",
+        server_default="UN",
+    )
+    # unidad_base conserva la magnitud de planificación heredada.  La
+    # autoridad física del Kardex se elige explícitamente aquí para evitar que
+    # los consumidores UN interpreten kg como unidades.
+    unidad_inventario = db.Column(
         db.String(10),
         nullable=False,
         default="UN",
@@ -139,6 +156,8 @@ class ScmArticulo(db.Model):
             "nombre": self.nombre,
             "clase": self.clase,
             "unidad_base": self.unidad_base,
+            "unidad_inventario": self.unidad_inventario,
+            "unidad": self.unidad_inventario,
             "activo": self.activo,
             "version": self.version,
             "wip": subtype if self.clase == CLASE_SUBENSAMBLE_WIP else None,

@@ -79,6 +79,18 @@ from app.models.scm_inventory import (
     ScmUsoUnidadLogisticaPreparacion,
     ScmUbicacionInventario,
 )
+from app.models.scm_inventory_kg import (
+    ScmSaldoInventarioKg,
+    ScmMovimientoInventarioKg,
+    ScmExistenciaMangaKg,
+    ScmUnidadFisicaKg,
+    ScmReservaUnidadKg,
+    ScmRetiroArmadoKg,
+    ScmRetiroArmadoKgItem,
+    ScmMedicionUnidadKg,
+    ScmDivisionUnidadKg,
+    ScmEtiquetaUnidadKg,
+)
 from app.models.scm_inventory_operations import (
     ScmAlmacen,
     ScmAlmacenTrabajador,

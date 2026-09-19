@@ -14,9 +14,17 @@
         "features"
       ],
       "properties": {
-        "api_version": {"const": "integration-v1"},
-        "server_time_utc": {"type": "string", "format": "date-time"},
-        "minimum_station_version": {"type": "string", "minLength": 1},
+        "api_version": {
+          "const": "integration-v1"
+        },
+        "server_time_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "minimum_station_version": {
+          "type": "string",
+          "minLength": 1
+        },
         "supported_contracts": {
           "type": "object",
           "additionalProperties": false,
@@ -33,29 +41,57 @@
           "properties": {
             "heartbeat": {
               "type": "array",
-              "contains": {"const": "station-heartbeat-v1"}
+              "contains": {
+                "const": "station-heartbeat-v1"
+              }
             },
-            "catalog": {"type": "array", "items": {"type": "string"}},
-            "weight_event": {"type": "array", "items": {"type": "string"}},
+            "catalog": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "weight_event": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "manga_prelabel": {
               "type": "array",
-              "contains": {"const": "scm-manga-prelabel-v1"}
+              "contains": {
+                "const": "scm-manga-prelabel-v1"
+              }
             },
             "manga_weighing": {
               "type": "array",
-              "contains": {"const": "scm-manga-weighing-v1"}
+              "contains": {
+                "const": "scm-manga-weighing-v1"
+              }
             },
             "manga_weighing_control": {
               "type": "array",
-              "contains": {"const": "scm-manga-weighing-control-v1"}
+              "contains": {
+                "const": "scm-manga-weighing-control-v1"
+              }
             },
             "inventory_opening_weighing": {
               "type": "array",
-              "contains": {"const": "scm-inventory-opening-weighing-v1"}
+              "contains": {
+                "const": "scm-inventory-opening-weighing-v1"
+              }
             },
             "prepared_material_weighing": {
               "type": "array",
-              "contains": {"const": "scm-prepared-material-weighing-v1"}
+              "contains": {
+                "const": "scm-prepared-material-weighing-v1"
+              }
+            },
+            "kg_return_weighing": {
+              "type": "array",
+              "contains": {
+                "const": "scm-kg-return-weighing-v1"
+              }
             }
           }
         },
@@ -75,16 +111,39 @@
             "scm_prepared_material_weighing"
           ],
           "properties": {
-            "monitoring": {"type": "boolean"},
-            "catalog_snapshot": {"type": "boolean"},
-            "legacy_weight_ingest_enabled": {"type": "boolean"},
-            "remote_hardware_commands": {"type": "boolean"},
-            "pilot_data_commands": {"type": "boolean"},
-            "scm_manga_prelabel": {"type": "boolean"},
-            "scm_manga_weighing": {"type": "boolean"},
-            "scm_manga_weighing_control": {"type": "boolean"},
-            "scm_inventory_opening_weighing": {"type": "boolean"},
-            "scm_prepared_material_weighing": {"type": "boolean"}
+            "monitoring": {
+              "type": "boolean"
+            },
+            "catalog_snapshot": {
+              "type": "boolean"
+            },
+            "legacy_weight_ingest_enabled": {
+              "type": "boolean"
+            },
+            "remote_hardware_commands": {
+              "type": "boolean"
+            },
+            "pilot_data_commands": {
+              "type": "boolean"
+            },
+            "scm_manga_prelabel": {
+              "type": "boolean"
+            },
+            "scm_manga_weighing": {
+              "type": "boolean"
+            },
+            "scm_manga_weighing_control": {
+              "type": "boolean"
+            },
+            "scm_inventory_opening_weighing": {
+              "type": "boolean"
+            },
+            "scm_prepared_material_weighing": {
+              "type": "boolean"
+            },
+            "scm_kg_return_weighing": {
+              "type": "boolean"
+            }
           }
         }
       }

@@ -70,6 +70,7 @@ def create_app():
     from app.api.rutas_scm import scm_bp
     from app.api.rutas_scm_reproceso import scm_reprocessing_bp
     from app.api.rutas_scm_warehouse import scm_warehouse_bp
+    from app.api.rutas_scm_kg_pt import scm_kg_pt_bp
     from app.api.rutas_estaciones_pesaje import (
         integration_station_bp,
         monitoring_station_bp,
@@ -84,6 +85,7 @@ def create_app():
     app.register_blueprint(scm_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(scm_reprocessing_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(scm_warehouse_bp, url_prefix='/api/scm/v1')
+    app.register_blueprint(scm_kg_pt_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(talonarios_bp)
     app.register_blueprint(sync_bp, url_prefix='/api')
     app.register_blueprint(

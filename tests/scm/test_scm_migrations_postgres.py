@@ -34,7 +34,7 @@ PRODUCT_ONBOARDING_REVISION = "f81d0e6f2b53"
 UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
 PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
 OPM_PREPARED_MATERIAL_REVISION = "c3a91f6e2d47"
-HEAD_REVISION = "f93d4e6a8c02"
+HEAD_REVISION = "f98a1b2c3d08"
 
 
 def _isolated_postgres_url():
@@ -179,6 +179,9 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 "scm_saldo_inventario",
                 "scm_movimiento_inventario",
                 "scm_existencia_manga",
+                "scm_saldo_inventario_kg",
+                "scm_movimiento_inventario_kg",
+                "scm_existencia_manga_kg",
                 "scm_solicitud_abastecimiento",
                 "scm_solicitud_abastecimiento_linea",
                 "scm_asignacion_abastecimiento",
@@ -246,8 +249,8 @@ def test_migrations_crean_una_base_nueva_y_no_dejan_drift():
                 assert "search_path=pg_catalog" in function_config
                 assert schema in function_config
                 assert connection.execute(
-                    text("SELECT version_num FROM alembic_version")
-                ).scalar_one() == HEAD_REVISION
+                        text("SELECT version_num FROM alembic_version")
+                    ).scalar_one() == HEAD_REVISION
                 assert connection.execute(text("""
                     SELECT relrowsecurity
                     FROM pg_class
@@ -1825,6 +1828,12 @@ def _run_color_work_concurrency_scenario(*, include_weighing_annulment):
                 "cantidad_devuelta_un": "100.000",
                 "cantidad_asignada_un": "0.000",
                 "mangas_asignadas": 0,
+                "asignaciones": [{
+                    "asignacion_plan_id": plan_assignment_id,
+                    "cantidad_asignada_un": "0.000",
+                    "cantidad_devuelta_un": "100.000",
+                    "mangas_asignadas": 0,
+                }],
             }
 
             with schema_engine.connect() as connection:

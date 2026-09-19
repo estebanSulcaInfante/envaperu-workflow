@@ -59,6 +59,23 @@ class Config:
     SCM_RECEPCION_ENABLED = (
         os.getenv('SCM_RECEPCION_ENABLED', 'false').lower() == 'true'
     )
+    KG_RECEIPT_WRITE_ENABLED = (
+        os.getenv('KG_RECEIPT_WRITE_ENABLED', 'false').lower() == 'true'
+    )
+    KG_CUSTODY_WRITE_ENABLED = (
+        os.getenv('KG_CUSTODY_WRITE_ENABLED', 'false').lower() == 'true'
+    )
+    # W1 pilot switch.  No automatic production intake is possible without
+    # both an explicit opt-in and a normalized location code.
+    KG_AUTOMATIC_INTAKE_ENABLED = (
+        os.getenv('KG_AUTOMATIC_INTAKE_ENABLED', 'false').strip().lower() == 'true'
+    )
+    PT_MANUAL_WRITE_ENABLED = (
+        os.getenv('PT_MANUAL_WRITE_ENABLED', 'false').strip().lower() == 'true'
+    )
+    KG_PRODUCTION_LOCATION_CODE = os.getenv(
+        'KG_PRODUCTION_LOCATION_CODE', ''
+    ).strip().upper()
     SCM_AUTH_MODE = os.getenv('SCM_AUTH_MODE', 'local_actor').strip().lower()
     SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip().rstrip('/')
     SUPABASE_JWT_AUDIENCE = os.getenv(

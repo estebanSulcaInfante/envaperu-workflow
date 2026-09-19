@@ -16,6 +16,12 @@ from app.models.scm_inventory import (
     ScmSaldoInventario,
     ScmUbicacionInventario,
 )
+from app.models.scm_inventory_kg import (
+    ScmExistenciaMangaKg,
+    ScmMovimientoInventarioKg,
+    ScmSaldoInventarioKg,
+    ScmUnidadFisicaKg,
+)
 from app.models.scm_ot import ScmEtiquetaManga, ScmManga, ScmPesajeManga
 from app.models.scm_warehouse import (
     ScmExistenciaManga,
@@ -31,6 +37,14 @@ from app.services.scm_service_support import (
     required_text,
 )
 from app.services.scm_weighing_service import _effective_projection
+from app.services.scm_kg_service import (
+    assert_kg_article,
+    assert_kg_write_enabled,
+    expected_source_payload,
+    is_kg_article,
+    validate_expected_source,
+    source_token,
+)
 
 
 QUANTUM = Decimal("0.001")
@@ -156,6 +170,15 @@ def _resolve_label(session, label_id):
         return label.manga, label, "QR_FINAL"
     final_label = _active_final_label(session, label.manga_id)
     if final_label is None:
+        control_closure = session.scalar(
+            select(ScmExistenciaMangaKg).where(
+                ScmExistenciaMangaKg.manga_id == label.manga_id,
+                ScmExistenciaMangaKg.estado_logistico == "DISPONIBLE_PRODUCCION",
+                ScmExistenciaMangaKg.pesaje_public_id.is_(None),
+            )
+        )
+        if control_closure is not None:
+            return label.manga, label, "QR_CONTROL_CIERRE"
         raise ScmServiceError(
             "PESAJE_FINAL_REQUERIDO",
             "La preetiqueta identifica la manga, pero falta su etiqueta final impresa.",
@@ -180,7 +203,90 @@ def _resolve_code(session, code):
     return manga, final_label, "CODIGO_MANUAL"
 
 
+def _assert_existing_kg_location_scope(session, actor_id, manga):
+    """Do not disclose a persisted KG receipt outside the actor's scope."""
+    existing = session.scalar(
+        select(ScmExistenciaMangaKg).where(
+            ScmExistenciaMangaKg.manga_id == manga.id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        )
+    )
+    if existing is None:
+        return
+    from app.services.scm_warehouse_scope_service import warehouse_scope
+
+    scope = warehouse_scope(session, actor_id=actor_id)
+    if not scope["configured"] or scope["transversal"]:
+        return
+    warehouse_id = existing.ubicacion.almacen_id
+    classes = scope["classes"].get(warehouse_id, set())
+    if warehouse_id not in scope["warehouse_ids"] or (
+        manga.lote_articulo.articulo.clase not in classes
+    ):
+        raise ScmServiceError(
+            "INVENTORY_SCOPE_FORBIDDEN",
+            "La existencia no pertenece al alcance del almacén del actor.",
+            status_code=403,
+        )
+
+
 def _candidate_payload(session, manga, label, resolution):
+    article = manga.lote_articulo.articulo
+    kg_existing = session.scalar(
+        select(ScmExistenciaMangaKg).where(
+            ScmExistenciaMangaKg.manga_id == manga.id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        )
+    )
+    if kg_existing is not None:
+        # A completed KG fact is recoverable without resolving a newer source
+        # first. The caller has already reauthorized capability and scope.
+        quantity = Decimal(manga.cantidad_confirmada_un or 0).quantize(QUANTUM)
+        logistics_state = kg_existing.estado_logistico
+        return {
+            "manga_id": str(manga.public_id),
+            "manga_codigo": manga.codigo,
+            "estado": manga.estado,
+            "resuelta_por": resolution,
+            "etiqueta_id": str(label.public_id),
+            "etiqueta_tipo": label.tipo,
+            "articulo": article.to_dict(),
+            "cantidad_confirmada": format(quantity, "f"),
+            "peso_bruto_kg": None,
+            "tara_kg": None,
+            "peso_neto_kg": format(kg_existing.peso_neto_snapshot_kg, "f"),
+            "pesada_at": kg_existing.pesada_at_snapshot.isoformat() if kg_existing.pesada_at_snapshot else None,
+            "expected_weighing_source": {
+                "pesaje_public_id": str(kg_existing.pesaje_public_id) if kg_existing.pesaje_public_id else None,
+                "correccion_aplicada_public_id": str(kg_existing.correccion_aplicada_public_id) if kg_existing.correccion_aplicada_public_id else None,
+                "projection_sha256": kg_existing.projection_sha256,
+            },
+            "existencia": kg_existing.to_dict(),
+            "ot": {
+                "id": str(manga.ot.public_id),
+                "codigo": manga.ot.codigo_ot,
+                "fecha_operativa": manga.ot.fecha.isoformat(),
+                "turno": manga.ot.turno,
+            },
+            "trabajo_color": (
+                {
+                    "id": str(manga.trabajo.id),
+                    "codigo": manga.trabajo.codigo,
+                    "estado": manga.trabajo.estado,
+                    "orden_fabricacion_id": str(manga.trabajo.orden_operacion_id),
+                    "orden_fabricacion_codigo": manga.trabajo.orden_operacion.codigo,
+                    "corrida_fabricacion_id": str(manga.trabajo.trabajo_color.corrida_fabricacion_id),
+                }
+                if manga.trabajo is not None else None
+            ),
+            "asignacion_personal_trabajo_id": (
+                str(manga.asignacion_personal_trabajo_id)
+                if manga.asignacion_personal_trabajo_id else None
+            ),
+            "color": manga.color_snapshot,
+            "received": logistics_state == "RECIBIDA_ALMACEN",
+            "recibible": logistics_state in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"},
+        }
     weighing = session.scalar(
         select(ScmPesajeManga).where(
             ScmPesajeManga.manga_id == manga.id,
@@ -240,7 +346,7 @@ def _candidate_payload(session, manga, label, resolution):
             details={"estado": manga.estado},
         )
     projection = _effective_projection(weighing)
-    article = manga.lote_articulo.articulo
+    expected_source = expected_source_payload(session, weighing, projection)
     return {
         "manga_id": str(manga.public_id),
         "manga_codigo": manga.codigo,
@@ -282,6 +388,7 @@ def _candidate_payload(session, manga, label, resolution):
             if manga.asignacion_personal_trabajo_id else None
         ),
         "color": manga.color_snapshot,
+        "expected_weighing_source": expected_source,
     }
 
 
@@ -312,6 +419,24 @@ def list_warehouse_receiving(session, *, actor_id):
         existence_query = existence_query.where(ScmExistenciaManga.ubicacion_id.in_(location_ids))
         location_query = location_query.where(ScmUbicacionInventario.id.in_(location_ids))
     existences = session.scalars(existence_query).all()
+    # A KG receipt is visible only through the identity's current projection;
+    # historical receipt facts remain queryable by audit services.
+    kg_existence_query = (
+        select(ScmExistenciaMangaKg)
+        .join(ScmUnidadFisicaKg, ScmUnidadFisicaKg.recepcion_vigente_id == ScmExistenciaMangaKg.id)
+        .where(ScmUnidadFisicaKg.recepcion_vigente_id == ScmExistenciaMangaKg.id)
+        .order_by(ScmExistenciaMangaKg.recibida_at.desc())
+    )
+    if location_ids is not None:
+        kg_existence_query = kg_existence_query.where(ScmExistenciaMangaKg.ubicacion_id.in_(location_ids))
+    kg_existences = session.scalars(kg_existence_query).all()
+    if scope["configured"] and not scope["transversal"]:
+        def in_scope(item):
+            warehouse_id = item.ubicacion.almacen_id
+            return item.articulo.clase in scope["classes"].get(warehouse_id, set())
+
+        existences = [item for item in existences if in_scope(item)]
+        kg_existences = [item for item in kg_existences if in_scope(item)]
     rejections = session.scalars(
         select(ScmRechazoRecepcionManga)
         .order_by(ScmRechazoRecepcionManga.created_at.desc())
@@ -323,9 +448,14 @@ def list_warehouse_receiving(session, *, actor_id):
         .limit(100)
     ).all()
     locations = session.scalars(location_query).all()
+    all_existences = sorted(
+        [*existences, *kg_existences],
+        key=lambda item: item.recibida_at.timestamp() if item.recibida_at else 0,
+        reverse=True,
+    )
     return {
         "pendientes": pending_items,
-        "existencias": [item.to_dict() for item in existences],
+        "existencias": [item.to_dict() for item in all_existences],
         "rechazos": [item.to_dict() for item in rejections],
         "reversiones": [item.to_dict() for item in reversals],
         "ubicaciones": [item.to_dict() for item in locations],
@@ -340,6 +470,7 @@ def resolve_receiving_label(session, *, actor_id, label_id):
         session, actor_id=actor_id,
         article_class=manga.lote_articulo.articulo.clase,
     )
+    _assert_existing_kg_location_scope(session, actor_id, manga)
     return _candidate_payload(session, manga, label, resolution)
 
 
@@ -352,6 +483,7 @@ def resolve_receiving_code(session, *, actor_id, code):
         session, actor_id=actor_id,
         article_class=manga.lote_articulo.articulo.clase,
     )
+    _assert_existing_kg_location_scope(session, actor_id, manga)
     return _candidate_payload(session, manga, label, resolution)
 
 
@@ -466,6 +598,7 @@ def receive_manga(session, *, actor_id, operation_id, data):
     reject_unknown_fields(data, allowed={
         "label_id", "manga_codigo", "sesion_id", "ubicacion_codigo",
         "presencia_confirmada", "bolsa_cerrada", "coincidencia_etiquetas",
+        "expected_weighing_source",
     })
     actor = load_actor(session, actor_id, capability="RECEPCION_MANGA_CONFIRMAR")
     _validate_physical_checks(data)
@@ -481,6 +614,17 @@ def receive_manga(session, *, actor_id, operation_id, data):
     else:
         raise ScmServiceError(
             "MANGA_IDENTITY_REQUIRED", "Escanea una etiqueta o indica un código autorizado.", status_code=422
+        )
+    if is_kg_article(manga.lote_articulo.articulo):
+        from app.services.scm_kg_receipt_service import receive_manga_kg
+        return receive_manga_kg(
+            session,
+            actor=actor,
+            operation_id=operation_id,
+            data=data,
+            manga=manga,
+            label=label,
+            resolution=resolution,
         )
     location_code = required_text(
         data.get("ubicacion_codigo"), field="ubicacion_codigo", max_length=40
@@ -675,6 +819,11 @@ def reject_manga_receiving(session, *, actor_id, operation_id, data):
 
 
 def decide_manga_quality(session, *, actor_id, existence_id, operation_id, data):
+    from app.models.scm_inventory_kg import ScmExistenciaMangaKg
+    if session.get(ScmExistenciaMangaKg, existence_id) is not None:
+        from app.services.scm_kg_custody_service import decide_kg_quality
+        return decide_kg_quality(session, actor_id=actor_id, existence_id=existence_id,
+                                 operation_id=operation_id, data=data)
     reject_unknown_fields(data, allowed={"decision", "motivo", "evidencia", "version"})
     decision = str(data.get("decision") or "").strip().upper()
     capability = {

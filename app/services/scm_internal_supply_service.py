@@ -25,6 +25,7 @@ from app.models.scm_inventory import (
     ScmUbicacionInventario,
 )
 from app.models.scm_inline_wip import ScmReservaWipSalida
+from app.models.scm_articulos import ScmArticulo
 from app.models.scm_ot import ScmEtiquetaManga, ScmManga, ScmTrabajoOt
 from app.models.scm_production_orders import ScmOrdenOperacion
 from app.models.scm_rutas import ScmCentroTrabajo, ScmOperacionRuta
@@ -961,6 +962,12 @@ def _balance(session, article_id, location_id):
 
 def _move(session, assignment, destination, *, operation_id, prefix, actor, reference):
     existence = assignment.existencia
+    if getattr(existence.articulo, "unidad_inventario", "UN") == "KG":
+        raise ScmServiceError(
+            "KG_OPERATION_NOT_ENABLED",
+            "El abastecimiento UN no opera sobre una manga KG.",
+            status_code=409,
+        )
     quantity = Decimal(assignment.saldo)
     if quantity <= 0:
         raise ScmServiceError(
@@ -1006,6 +1013,13 @@ def _move(session, assignment, destination, *, operation_id, prefix, actor, refe
 
 
 def _move_pool(session, assignment, destination, *, operation_id, prefix, actor, reference):
+    article = session.get(ScmArticulo, assignment.linea.articulo_scm_id)
+    if getattr(article, "unidad_inventario", "UN") == "KG":
+        raise ScmServiceError(
+            "KG_OPERATION_NOT_ENABLED",
+            "El abastecimiento UN no opera sobre un pool de artículo KG.",
+            status_code=409,
+        )
     quantity = Decimal(assignment.saldo_cantidad)
     if quantity <= 0:
         raise ScmServiceError(

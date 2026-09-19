@@ -1152,6 +1152,14 @@ class ScmTramoMangaTrabajo(db.Model):
     cantidad_atribuida_un = db.Column(
         db.Numeric(15, 3), nullable=False, default=0, server_default="0"
     )
+    # KG is a separate evidence axis.  These fields never backfill or replace
+    # the historical UN quantities above.
+    cantidad_inicio_kg = db.Column(db.Numeric(15, 3), nullable=True)
+    cantidad_fin_kg = db.Column(db.Numeric(15, 3), nullable=True)
+    cantidad_atribuida_kg = db.Column(
+        db.Numeric(15, 3), nullable=True, default=0, server_default="0"
+    )
+    calidad_evidencia_kg = db.Column(db.String(32), nullable=True)
     iniciada_at = db.Column(db.DateTime(timezone=True), nullable=True)
     cerrada_at = db.Column(db.DateTime(timezone=True), nullable=True)
     motivo_cierre = db.Column(db.String(500), nullable=True)
@@ -1228,6 +1236,10 @@ class ScmTramoMangaTrabajo(db.Model):
             "cantidad_inicio_un": _decimal_text(self.cantidad_inicio_un),
             "cantidad_fin_un": _decimal_text(self.cantidad_fin_un),
             "cantidad_atribuida_un": _decimal_text(self.cantidad_atribuida_un),
+            "cantidad_inicio_kg": _decimal_text(self.cantidad_inicio_kg),
+            "cantidad_fin_kg": _decimal_text(self.cantidad_fin_kg),
+            "cantidad_atribuida_kg": _decimal_text(self.cantidad_atribuida_kg),
+            "calidad_evidencia_kg": self.calidad_evidencia_kg,
             "iniciada_at": _isoformat(self.iniciada_at),
             "cerrada_at": _isoformat(self.cerrada_at),
             "motivo_cierre": self.motivo_cierre,
@@ -1252,8 +1264,10 @@ class ScmControlPesoManga(db.Model):
             name="ck_scm_control_peso_manga_neto",
         ),
         db.CheckConstraint(
-            "(tipo = 'CORTE_TURNO' AND conteo_acumulado_un > 0) OR "
-            "(tipo = 'AVANCE_KG' AND conteo_acumulado_un IS NULL)",
+            "(unidad_evidencia = 'KG' AND conteo_acumulado_un IS NULL) OR "
+            "(unidad_evidencia = 'UN' AND "
+            "((tipo = 'CORTE_TURNO' AND conteo_acumulado_un > 0) OR "
+            "(tipo = 'AVANCE_KG' AND conteo_acumulado_un IS NULL)))",
             name="ck_scm_control_peso_manga_conteo",
         ),
         db.UniqueConstraint("public_id", name="uq_scm_control_peso_manga_public"),
@@ -1310,6 +1324,13 @@ class ScmControlPesoManga(db.Model):
     )
     tara_fuente = db.Column(db.String(28), nullable=False)
     conteo_acumulado_un = db.Column(db.Numeric(15, 3), nullable=True)
+    unidad_evidencia = db.Column(
+        db.String(4), nullable=False, default="UN", server_default="UN"
+    )
+    calidad_evidencia = db.Column(
+        db.String(32), nullable=False, default="MEDIDA_DIRECTA",
+        server_default="MEDIDA_DIRECTA",
+    )
     motivo = db.Column(db.String(500), nullable=False)
     pesado_at = db.Column(db.DateTime(timezone=True), nullable=False)
     timezone_snapshot = db.Column(
@@ -1357,6 +1378,8 @@ class ScmControlPesoManga(db.Model):
             ),
             "tara_fuente": self.tara_fuente,
             "conteo_acumulado_un": _decimal_text(self.conteo_acumulado_un),
+            "unidad_evidencia": self.unidad_evidencia,
+            "calidad_evidencia": self.calidad_evidencia,
             "motivo": self.motivo,
             "pesado_at": _isoformat(self.pesado_at),
             "fecha_local_pesaje": self.fecha_local_pesaje.isoformat(),
@@ -1751,6 +1774,13 @@ class ScmPesajeManga(db.Model):
         server_default="VIGENTE",
     )
     kg_produccion_ot = db.Column(db.Numeric(15, 3), nullable=False)
+    kg_fabricacion_estimado = db.Column(db.Numeric(15, 3), nullable=True)
+    kg_previo_estimado = db.Column(db.Numeric(15, 3), nullable=True)
+    atribucion_kg_estado = db.Column(
+        db.String(24), nullable=False, default="PENDIENTE",
+        server_default="PENDIENTE",
+    )
+    atribucion_kg_base_json = db.Column(db.JSON, nullable=True)
     pesada_at = db.Column(db.DateTime(timezone=True), nullable=False)
     timezone_snapshot = db.Column(
         db.String(64), nullable=False, server_default="America/Lima"
@@ -1815,6 +1845,10 @@ class ScmPesajeManga(db.Model):
             "fuente_cantidad": self.fuente_cantidad,
             "estado": self.estado,
             "kg_produccion_ot": _decimal_text(self.kg_produccion_ot),
+            "kg_fabricacion_estimado": _decimal_text(self.kg_fabricacion_estimado),
+            "kg_previo_estimado": _decimal_text(self.kg_previo_estimado),
+            "atribucion_kg_estado": self.atribucion_kg_estado,
+            "atribucion_kg_base": self.atribucion_kg_base_json,
             "pesada_at": _isoformat(self.pesada_at),
             "fecha_local_pesaje": self.fecha_local_pesaje.isoformat(),
             "dias_desfase_operativo": self.dias_desfase_operativo,
@@ -2040,4 +2074,170 @@ class ScmCorreccionPesajeManga(db.Model):
             "resolved_at": _isoformat(self.resolved_at),
             "resolution_reason": self.resolution_reason,
             "result_projection": self.result_projection_json,
+        }
+
+
+class ScmAtribucionProduccionKg(db.Model):
+    """Append-only kg evidence tied to a weighing and its OT segment.
+
+    ``NETO_MEDIDO`` is physical evidence.  BOM-derived values are explicitly
+    marked as estimates and are never inventory movements or UN quantities.
+    """
+
+    __tablename__ = "scm_atribucion_produccion_kg"
+    __table_args__ = (
+        db.CheckConstraint(
+            "tipo IN ('NETO_MEDIDO', 'FABRICACION_ESTIMADA', "
+            "'COMPONENTE_PREVIO_ESTIMADO', 'FRONTERA_KG')",
+            name="ck_scm_atribucion_kg_tipo",
+        ),
+        db.CheckConstraint(
+            "calidad IN ('MEDIDA_DIRECTA', 'ESTIMADA_BOM', 'PENDIENTE')",
+            name="ck_scm_atribucion_kg_calidad",
+        ),
+        db.CheckConstraint("cantidad_kg > 0", name="ck_scm_atribucion_kg_cantidad"),
+        db.UniqueConstraint("public_id", name="uq_scm_atribucion_kg_public"),
+        db.UniqueConstraint(
+            "operation_id", "tipo", name="uq_scm_atribucion_kg_operation_tipo"
+        ),
+        db.Index("ix_scm_atribucion_kg_manga", "manga_id"),
+        db.Index("ix_scm_atribucion_kg_trabajo", "trabajo_ot_id"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(Uuid(as_uuid=True), nullable=False, default=uuid.uuid4)
+    manga_id = db.Column(
+        db.Integer, db.ForeignKey("scm_manga.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    pesaje_id = db.Column(
+        db.Integer, db.ForeignKey("scm_pesaje_manga.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    tramo_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_tramo_manga_trabajo.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_trabajo_ot.id", ondelete="RESTRICT"),
+        # OA output mangas do not belong to the source TrabajoColor.  Their
+        # canonical trace is manga/pesaje -> assembly OT; forcing this FK
+        # would invent a TrabajoColor owner for a concurrent WIP output.
+        nullable=True,
+    )
+    tipo = db.Column(db.String(32), nullable=False)
+    cantidad_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    calidad = db.Column(db.String(24), nullable=False)
+    base_json = db.Column(db.JSON, nullable=True)
+    actor_id = db.Column(
+        db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    operation_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now,
+        server_default=db.func.now(),
+    )
+
+    manga = db.relationship("ScmManga")
+    pesaje = db.relationship("ScmPesajeManga")
+    tramo = db.relationship("ScmTramoMangaTrabajo")
+    trabajo = db.relationship("ScmTrabajoOt")
+    actor = db.relationship("Trabajador")
+
+    def to_dict(self):
+        return {
+            "id": str(self.public_id),
+            "manga_id": str(self.manga.public_id) if self.manga else None,
+            "pesaje_id": str(self.pesaje.public_id) if self.pesaje else None,
+            "tramo_id": str(self.tramo_id) if self.tramo_id else None,
+            "trabajo_ot_id": (
+                str(self.trabajo_ot_id) if self.trabajo_ot_id else None
+            ),
+            "tipo": self.tipo,
+            "cantidad_kg": _decimal_text(self.cantidad_kg),
+            "calidad": self.calidad,
+            "base": self.base_json,
+            "actor_id": self.actor_id,
+            "operation_id": str(self.operation_id),
+            "created_at": _isoformat(self.created_at),
+        }
+
+
+class ScmCierreProductivoKg(db.Model):
+    """Audit-only closure summary for OT, OF or OA documents."""
+
+    __tablename__ = "scm_cierre_productivo_kg"
+    __table_args__ = (
+        db.CheckConstraint(
+            "documento_tipo IN ('OT', 'OF', 'OA')",
+            name="ck_scm_cierre_kg_documento_tipo",
+        ),
+        db.CheckConstraint(
+            "tipo_cierre IN ('NORMAL', 'PARCIAL')",
+            name="ck_scm_cierre_kg_tipo",
+        ),
+        db.CheckConstraint(
+            "kg_medido >= 0",
+            name="ck_scm_cierre_kg_cantidad",
+        ),
+        db.UniqueConstraint("public_id", name="uq_scm_cierre_kg_public"),
+        db.UniqueConstraint(
+            "documento_tipo", "documento_id", name="uq_scm_cierre_kg_documento"
+        ),
+        db.UniqueConstraint("operation_id", name="uq_scm_cierre_kg_operation"),
+        db.Index("ix_scm_cierre_kg_ot", "ot_id"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(Uuid(as_uuid=True), nullable=False, default=uuid.uuid4)
+    documento_tipo = db.Column(db.String(2), nullable=False)
+    documento_id = db.Column(db.String(64), nullable=False)
+    ot_id = db.Column(
+        db.Integer, db.ForeignKey("registro_diario_produccion.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    tipo_cierre = db.Column(db.String(8), nullable=False)
+    kg_medido = db.Column(db.Numeric(15, 3), nullable=False, default=0, server_default="0")
+    kg_fabricacion_estimado = db.Column(db.Numeric(15, 3), nullable=True)
+    kg_previo_estimado = db.Column(db.Numeric(15, 3), nullable=True)
+    desviacion_plan_kg = db.Column(db.Numeric(15, 3), nullable=True)
+    motivo = db.Column(db.String(500), nullable=True)
+    pendientes_json = db.Column(db.JSON, nullable=False, default=list, server_default="[]")
+    evidencia_json = db.Column(db.JSON, nullable=False, default=dict, server_default="{}")
+    actor_id = db.Column(
+        db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False,
+    )
+    operation_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now,
+        server_default=db.func.now(),
+    )
+
+    ot = db.relationship("RegistroDiarioProduccion")
+    actor = db.relationship("Trabajador")
+
+    def to_dict(self):
+        return {
+            "id": str(self.public_id),
+            "documento_tipo": self.documento_tipo,
+            "documento_id": self.documento_id,
+            "ot_id": self.ot_id,
+            "tipo_cierre": self.tipo_cierre,
+            "kg_medido": _decimal_text(self.kg_medido),
+            "kg_fabricacion_estimado": _decimal_text(self.kg_fabricacion_estimado),
+            "kg_previo_estimado": _decimal_text(self.kg_previo_estimado),
+            "desviacion_plan_kg": _decimal_text(self.desviacion_plan_kg),
+            "motivo": self.motivo,
+            "pendientes": self.pendientes_json,
+            "evidencia": self.evidencia_json,
+            "actor_id": self.actor_id,
+            "operation_id": str(self.operation_id),
+            "created_at": _isoformat(self.created_at),
         }

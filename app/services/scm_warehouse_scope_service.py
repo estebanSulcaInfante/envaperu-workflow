@@ -97,15 +97,23 @@ def warehouse_scope(session, *, actor_id):
     }
 
 
-def allowed_location_ids(session, *, actor_id):
+def allowed_location_ids(session, *, actor_id, article_class=None):
     scope = warehouse_scope(session, actor_id=actor_id)
     if not scope["configured"] or scope["transversal"]:
         return None, scope
     if not scope["warehouse_ids"]:
         return set(), scope
+    if article_class is not None:
+        requested_classes = {article_class} if isinstance(article_class, str) else set(article_class)
+        permitted_warehouse_ids = {
+            warehouse_id for warehouse_id, classes in scope["classes"].items()
+            if requested_classes.intersection(classes)
+        }
+    else:
+        permitted_warehouse_ids = scope["warehouse_ids"]
     values = session.scalars(
         select(ScmUbicacionInventario.id).where(
-            ScmUbicacionInventario.almacen_id.in_(scope["warehouse_ids"])
+            ScmUbicacionInventario.almacen_id.in_(permitted_warehouse_ids)
         )
     ).all()
     return set(values), scope
