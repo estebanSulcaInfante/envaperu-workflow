@@ -56,6 +56,7 @@ from app.models.scm_ot import (
     ScmReaperturaManga,
     ScmAnulacionPesajeManga,
     ScmCorreccionPesajeManga,
+    ScmCorreccionAsignacionManga,
 )
 from app.models.scm_production_orders import (
     ScmAsignacionDemandaSuministro,

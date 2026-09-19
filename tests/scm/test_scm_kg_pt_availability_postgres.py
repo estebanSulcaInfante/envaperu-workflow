@@ -43,6 +43,7 @@ KG_PILOT_TABLES = (
     "scm_etiqueta_unidad_kg",
     "scm_atribucion_produccion_kg",
     "scm_cierre_productivo_kg",
+    "scm_correccion_asignacion_manga",
 )
 
 KG_FUNCTIONS = (
@@ -52,6 +53,7 @@ KG_FUNCTIONS = (
     "scm_kg_article_marker_guard",
     "scm_kg_custody_append_only",
     "scm_guard_pt_manual_movement_immutable",
+    "scm_guard_assignment_correction_immutable",
 )
 
 
@@ -73,7 +75,7 @@ def _upgrade(schema_url):
     environment = os.environ.copy()
     environment["DATABASE_URL"] = schema_url.render_as_string(hide_password=False)
     result = subprocess.run(
-        [sys.executable, "-m", "flask", "--app", "app", "db", "upgrade", "f98a1b2c3d08"],
+        [sys.executable, "-m", "flask", "--app", "app", "db", "upgrade", "f99a1b2c3d09"],
         cwd=BACKEND_ROOT, env=environment, capture_output=True, text=True,
         timeout=180, check=False,
     )
@@ -141,6 +143,18 @@ def test_postgres_kg_pilot_tables_and_functions_are_locked_down(postgres_w2_app)
                         text("SELECT has_table_privilege(:role, :table, 'SELECT')"),
                         {"role": role, "table": qualified(table)},
                     ).scalar_one()
+
+        trigger_enabled = db.session.execute(text("""
+            SELECT t.tgenabled
+            FROM pg_trigger AS t
+            JOIN pg_class AS c ON c.oid = t.tgrelid
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = :schema
+              AND c.relname = 'scm_correccion_asignacion_manga'
+              AND t.tgname = 'trg_scm_assignment_correction_immutable'
+              AND NOT t.tgisinternal
+        """), {"schema": schema}).scalar_one()
+        assert trigger_enabled == "O"
 
         for function in KG_FUNCTIONS:
             function_security = db.session.execute(text("""

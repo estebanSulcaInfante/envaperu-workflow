@@ -132,6 +132,10 @@ from app.services.scm_weighing_service import (
     reopen_manga_after_accidental_close,
 )
 from app.services.scm_kg_production_service import close_kg_from_last_control
+from app.services.scm_assignment_correction_service import (
+    apply_assignment_correction,
+    preview_assignment_correction,
+)
 from app.services.scm_production_order_service import (
     adjust_production_plan_targets,
     approve_production_order,
@@ -1835,6 +1839,31 @@ def mangas_pesaje_detalle(manga_id):
         db.session,
         actor_id=_actor_id(),
         manga_id=manga_id,
+    ))
+
+
+@scm_bp.get("/mangas/<uuid:manga_id>/correccion-asignacion/preview")
+def mangas_correccion_asignacion_preview(manga_id):
+    return jsonify(preview_assignment_correction(
+        db.session,
+        actor_id=_actor_id(),
+        manga_id=manga_id,
+        data={
+            key: request.args.get(key)
+            for key in ("destino_trabajo_ot_id", "destino_asignacion_id")
+            if request.args.get(key) is not None
+        },
+    ))
+
+
+@scm_bp.post("/mangas/<uuid:manga_id>/correcciones-asignacion")
+def mangas_correccion_asignacion_aplicar(manga_id):
+    return jsonify(apply_assignment_correction(
+        db.session,
+        actor_id=_actor_id(),
+        manga_id=manga_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
     ))
 
 

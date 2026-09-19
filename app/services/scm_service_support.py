@@ -6,6 +6,21 @@ from app.models.trabajador import Trabajador
 KG_QUANTUM = Decimal("0.001")
 KG_MAX = Decimal("999999999999.999")
 
+# The KG pilot has few concurrent writers and prioritizes deterministic
+# accounting over write throughput. Every productive KG mutation takes this
+# transaction-scoped lock before row locks.
+KG_PRODUCTIVE_WRITE_LOCK_KEY = 20260919005
+
+
+def acquire_kg_productive_write_lock(session):
+    bind = session.get_bind()
+    if bind.dialect.name == "postgresql":
+        from sqlalchemy import text
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": KG_PRODUCTIVE_WRITE_LOCK_KEY},
+        )
+
 
 class ScmServiceError(RuntimeError):
     def __init__(

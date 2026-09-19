@@ -19,6 +19,7 @@ from app.models.scm_ot import (
     ScmAsignacionPlanMangaOt,
     ScmEtiquetaManga,
     ScmCorreccionPesajeManga,
+    ScmCorreccionAsignacionManga,
     ScmControlPesoManga,
     ScmManga,
     ScmPesajeManga,
@@ -54,10 +55,18 @@ from app.services.scm_alert_service import (
 from app.services.scm_color_identity import serialize_color_identity
 from app.services.scm_service_support import (
     ScmServiceError,
+    acquire_kg_productive_write_lock,
     expected_version,
     load_actor,
     reject_unknown_fields,
     required_text,
+)
+from app.services.scm_manga_assignment_projection import (
+    effective_assignment,
+    effective_assignment_for_segment,
+    effective_plan_assignment,
+    effective_work,
+    effective_work_for_segment,
 )
 
 
@@ -465,14 +474,9 @@ def _resolve_payload(label):
         if is_assembly else manga.cantidad_asignada_un
     )
     current_segment = _latest_manga_segment(manga)
-    current_work = (
-        current_segment.trabajo if current_segment is not None else manga.trabajo
-    )
+    current_work = effective_work(manga)
     current_ot = current_work.orden_trabajo if current_work else manga.ot
-    personal = (
-        current_segment.asignacion_personal_trabajo
-        if current_segment is not None else manga.asignacion_personal_trabajo
-    )
+    personal = effective_assignment(manga)
     worker = personal.trabajador if personal is not None else manga.maquinista_previsto
     work_ready = (
         current_work is None
@@ -711,6 +715,7 @@ def register_manga_weighing_control(
         if str(data.get("control_type") or "").strip().upper() == "AVANCE_KG":
             return {**replay, "idempotent_replay": True}
         return replay
+    acquire_kg_productive_write_lock(session)
     reject_unknown_fields(
         data,
         allowed={
@@ -803,8 +808,8 @@ def register_manga_weighing_control(
                     "La manga no esta abierta para registrar un control.",
                     status_code=409,
                 )
-            work = manga.trabajo
-            personal = manga.asignacion_personal_trabajo
+            work = effective_work(manga)
+            personal = effective_assignment(manga)
             if work is None or personal is None:
                 raise ScmServiceError(
                     "ASSIGNMENT_WORK_MISMATCH",
@@ -815,7 +820,10 @@ def register_manga_weighing_control(
                 manga=manga,
                 trabajo=work,
                 asignacion_personal_trabajo=personal,
-                asignacion_plan_id=manga.asignacion_id,
+                asignacion_plan_id=(
+                    effective_plan_assignment(manga).id
+                    if effective_plan_assignment(manga) is not None else manga.asignacion_id
+                ),
                 secuencia=1,
                 estado="ACTIVO",
                 cantidad_inicio_un=Decimal("0"),
@@ -829,8 +837,8 @@ def register_manga_weighing_control(
             session.add(segment)
             session.flush()
         else:
-            work = segment.trabajo
-            personal = segment.asignacion_personal_trabajo
+            work = effective_work(manga)
+            personal = effective_assignment(manga)
             if manga.estado != "EN_LLENADO" or segment.estado != "ACTIVO":
                 raise ScmServiceError(
                     "MANGA_CONTINUITY_NOT_ACTIVE",
@@ -1083,8 +1091,8 @@ def register_manga_weighing_control(
 
 def _control_label_payload(manga, control, label_id, version):
     segment = control.tramo
-    work = segment.trabajo
-    personal = segment.asignacion_personal_trabajo
+    work = effective_work_for_segment(manga, segment)
+    personal = effective_assignment_for_segment(manga, segment)
     worker = personal.trabajador if personal is not None else None
     current_ot = work.orden_trabajo
     order_identity = _order_ot_identity(manga)
@@ -1193,19 +1201,12 @@ def _fabricated_theoretical_kg(manga, weighing=None):
 
 def _post_label_payload(manga, weighing, label_id, version):
     latest_segment = _latest_manga_segment(manga)
-    closing_work = (
-        latest_segment.trabajo
-        if latest_segment is not None else manga.trabajo
-    )
+    closing_work = effective_work(manga)
     closing_ot = (
         closing_work.orden_trabajo
         if closing_work is not None else manga.ot
     )
-    personal = (
-        latest_segment.asignacion_personal_trabajo
-        if latest_segment is not None
-        else manga.asignacion_personal_trabajo
-    )
+    personal = effective_assignment(manga)
     worker = personal.trabajador if personal is not None else manga.maquinista_previsto
     confirmed_quantity = Decimal(
         getattr(
@@ -1239,10 +1240,10 @@ def _post_label_payload(manga, weighing, label_id, version):
         "maquinista": worker.nombre_completo if worker else None,
         "trabajo_color": (
             {
-                "id": str(manga.trabajo.id),
-                "codigo": manga.trabajo.codigo,
+                "id": str(closing_work.id),
+                "codigo": closing_work.codigo,
             }
-            if manga.trabajo is not None else None
+            if closing_work is not None else None
         ),
         "pieza_color": _piece_color_label(manga),
         "color": manga.color_snapshot,
@@ -1303,6 +1304,7 @@ def confirm_manga_weighing(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
     try:
         if data.get("reading_stable") is not True:
             raise ScmServiceError(
@@ -1358,15 +1360,11 @@ def confirm_manga_weighing(
             .with_for_update()
         ).all()
         current_segment = segments[-1] if segments else None
-        current_work = (
-            current_segment.trabajo
-            if current_segment is not None else manga.trabajo
-        )
-        current_personal = (
-            current_segment.asignacion_personal_trabajo
-            if current_segment is not None
-            else manga.asignacion_personal_trabajo
-        )
+        # A correction is an overlay.  The physical segment remains the
+        # original ledger row, while every new weighing snapshots the
+        # effective destination work and assignment.
+        current_work = effective_work(manga)
+        current_personal = effective_assignment(manga)
         expected_state = (
             "CERRADA_ARMADO_PENDIENTE_PESAJE"
             if is_assembly and not is_kg else "PREETIQUETADA"
@@ -1681,11 +1679,15 @@ def confirm_manga_weighing(
                     )
                 delta = end - start
                 segment.cantidad_atribuida_un = delta
-                segment.trabajo.cantidad_confirmada_un = (
-                    Decimal(segment.trabajo.cantidad_confirmada_un or 0)
+                segment_work = (
+                    effective_work_for_segment(manga, segment)
+                    or segment.trabajo
+                )
+                segment_work.cantidad_confirmada_un = (
+                    Decimal(segment_work.cantidad_confirmada_un or 0)
                     + delta
                 )
-                segment.trabajo.version += 1
+                segment_work.version += 1
                 attributed_total += delta
                 expected_start = end
             if attributed_total != (net if is_kg else quantity):
@@ -1694,11 +1696,11 @@ def confirm_manga_weighing(
                     "La atribucion por turnos no coincide con el total final de la manga.",
                     status_code=409,
                 )
-        elif manga.trabajo is not None and not is_kg:
-            manga.trabajo.cantidad_confirmada_un = (
-                Decimal(manga.trabajo.cantidad_confirmada_un or 0) + quantity
+        elif current_work is not None and not is_kg:
+            current_work.cantidad_confirmada_un = (
+                Decimal(current_work.cantidad_confirmada_un or 0) + quantity
             )
-            manga.trabajo.version += 1
+            current_work.version += 1
         session.flush()
         if is_kg:
             # The physical weighing itself is the authoritative NET evidence.
@@ -1710,8 +1712,8 @@ def confirm_manga_weighing(
                 pesaje_id=weighing.id,
                 tramo_id=(current_segment.id if current_segment is not None else None),
                 trabajo_ot_id=(
-                    current_segment.trabajo_ot_id
-                    if current_segment is not None else manga.trabajo_ot_id
+                    current_work.id
+                    if current_work is not None else manga.trabajo_ot_id
                 ),
                 tipo="NETO_MEDIDO",
                 cantidad_kg=net,
@@ -1913,6 +1915,7 @@ def annul_manga_weighing(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
     try:
         weighing = session.scalar(
             select(ScmPesajeManga).where(ScmPesajeManga.public_id == weighing_id)
@@ -1924,6 +1927,14 @@ def annul_manga_weighing(
         article, manga = _lock_manga_inventory_authority(
             session, manga_id=weighing.manga_id
         )
+        if session.scalar(select(ScmCorreccionAsignacionManga.id).where(
+            ScmCorreccionAsignacionManga.manga_id == manga.id
+        )) is not None:
+            raise ScmServiceError(
+                "MANGA_ASSIGNMENT_ALREADY_CORRECTED",
+                "El pesaje pertenece a una manga ya reatribuida; no puede anularse.",
+                status_code=409,
+            )
         is_kg = article is not None and article.unidad_inventario == "KG"
         weighing = session.scalar(
             select(ScmPesajeManga)
@@ -2402,6 +2413,7 @@ def reopen_manga_after_accidental_close(
     if replay is not None:
         return replay
 
+    acquire_kg_productive_write_lock(session)
     try:
         article, manga = _lock_manga_inventory_authority(
             session, manga_public_id=manga_id
@@ -2481,14 +2493,13 @@ def reopen_manga_after_accidental_close(
             .with_for_update()
         ).all()
         current_segment = segments[-1] if segments else None
-        current_work = current_segment.trabajo if current_segment else manga.trabajo
-        current_personal = (
-            current_segment.asignacion_personal_trabajo
-            if current_segment else manga.asignacion_personal_trabajo
-        )
+        current_work = effective_work(manga)
+        current_personal = effective_assignment(manga)
+        current_plan = effective_plan_assignment(manga)
         if (
             current_work is None
             or current_personal is None
+            or current_plan is None
             or current_work.estado not in {"EN_EJECUCION", "PAUSADO"}
         ):
             raise ScmServiceError(
@@ -2545,7 +2556,7 @@ def reopen_manga_after_accidental_close(
                 manga=manga,
                 trabajo=current_work,
                 asignacion_personal_trabajo=current_personal,
-                asignacion_plan_id=manga.asignacion_id,
+                asignacion_plan_id=current_plan.id,
                 secuencia=1,
                 estado="ACTIVO",
                 cantidad_inicio_un=Decimal("0.000"),
@@ -2711,6 +2722,10 @@ def get_manga_weighing(session, *, actor_id, manga_id):
             for item in weighings
         ],
         "correcciones": [item.to_dict() for item in corrections],
+        "correccion_asignacion": (
+            manga.correccion_asignacion.to_dict()
+            if manga.correccion_asignacion else None
+        ),
         "etiquetas_postpesaje": [
             _serialize_label(label)
             for label in manga.etiquetas
@@ -2731,6 +2746,7 @@ def request_weighing_correction(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
     try:
         weighing = session.scalar(
             select(ScmPesajeManga).where(
@@ -2746,6 +2762,14 @@ def request_weighing_correction(
         _article, manga = _lock_manga_inventory_authority(
             session, manga_id=weighing.manga_id
         )
+        if session.scalar(select(ScmCorreccionAsignacionManga.id).where(
+            ScmCorreccionAsignacionManga.manga_id == manga.id
+        )) is not None:
+            raise ScmServiceError(
+                "MANGA_ASSIGNMENT_ALREADY_CORRECTED",
+                "La manga ya fue reatribuida; no admite una nueva correccion de pesaje.",
+                status_code=409,
+            )
         weighing = session.scalar(
             select(ScmPesajeManga)
             .where(ScmPesajeManga.id == weighing.id)
@@ -2858,6 +2882,7 @@ def approve_weighing_correction(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
     try:
         correction = session.scalar(
             select(ScmCorreccionPesajeManga)
@@ -2877,6 +2902,14 @@ def approve_weighing_correction(
         article, manga = _lock_manga_inventory_authority(
             session, manga_id=weighing_probe.manga_id
         )
+        if session.scalar(select(ScmCorreccionAsignacionManga.id).where(
+            ScmCorreccionAsignacionManga.manga_id == manga.id
+        )) is not None:
+            raise ScmServiceError(
+                "MANGA_ASSIGNMENT_ALREADY_CORRECTED",
+                "La manga ya fue reatribuida; la correccion de pesaje no puede aprobarse.",
+                status_code=409,
+            )
         is_kg = article is not None and article.unidad_inventario == "KG"
         weighing = session.scalar(
             select(ScmPesajeManga)

@@ -16,6 +16,7 @@ from app.models.scm_ot import (
     ScmAtribucionProduccionKg,
     ScmCierreProductivoKg,
     ScmControlPesoManga,
+    ScmCorreccionAsignacionManga,
     ScmManga,
     ScmPesajeManga,
     ScmTramoMangaTrabajo,
@@ -31,13 +32,26 @@ from app.services.scm_ot_service import (
 )
 from app.services.scm_service_support import (
     ScmServiceError,
+    acquire_kg_productive_write_lock,
     load_actor,
     reject_unknown_fields,
+)
+from app.services.scm_manga_assignment_projection import (
+    effective_work,
+    effective_work_for_segment,
 )
 
 
 KG_QUANTUM = Decimal("0.001")
 REFERENCE_KG_QUANTUM = Decimal("0.000001")
+
+
+def _effective_attribution_work(row):
+    manga = getattr(row, "manga", None)
+    segment = getattr(row, "tramo", None)
+    if manga is not None and segment is not None:
+        return effective_work_for_segment(manga, segment)
+    return effective_work(manga) if manga is not None else None
 
 
 def automatic_kg_intake_enabled():
@@ -301,9 +315,24 @@ def close_kg_from_last_control(
         )
     requested_version = int(raw_version)
     command["version"] = requested_version
-    manga = session.scalar(select(ScmManga).where(ScmManga.public_id == manga_id).with_for_update())
-    if manga is None:
+    acquire_kg_productive_write_lock(session)
+    manga_probe = session.scalar(select(ScmManga).where(ScmManga.public_id == manga_id))
+    if manga_probe is None:
         raise ScmServiceError("MANGA_NOT_FOUND", "La manga no existe.", status_code=404)
+    session.scalars(
+        select(ScmTrabajoOt)
+        .where(ScmTrabajoOt.id == manga_probe.trabajo_ot_id)
+        .with_for_update()
+    ).all()
+    session.scalars(
+        select(ScmTramoMangaTrabajo)
+        .where(ScmTramoMangaTrabajo.manga_id == manga_probe.id)
+        .order_by(ScmTramoMangaTrabajo.secuencia)
+        .with_for_update()
+    ).all()
+    manga = session.scalar(
+        select(ScmManga).where(ScmManga.id == manga_probe.id).with_for_update()
+    )
     operation, replay = _reserve_operation(
         session, operation_id, f"/kg/mangas/{manga_id}/cierre-desde-control", actor,
         {"manga_id": str(manga_id), "motivo": reason, "version": requested_version},
@@ -457,7 +486,7 @@ def _resolve_frozen_bom_basis(session, manga, command=None):
     """
     # A color manga owns ``trabajo``.  An OA output manga intentionally does
     # not: its frozen BOM is reached through the assembly OT's operation.
-    work = manga.trabajo
+    work = effective_work(manga)
     order = (
         work.orden_operacion
         if work is not None
@@ -686,10 +715,8 @@ def _persist_bom_estimate(session, *, weighing, manga, actor_id, operation_id, a
             source_work_id = UUID(str(source_work_id))
         except (TypeError, ValueError, AttributeError):
             source_work_id = None
-    current_work_id = (
-        current_segment.trabajo_ot_id
-        if current_segment is not None else manga.trabajo_ot_id
-    )
+    current_work = effective_work_for_segment(manga, current_segment)
+    current_work_id = current_work.id if current_work is not None else manga.trabajo_ot_id
     fabrication_work_id = source_work_id or current_work_id
     if "FABRICACION_ESTIMADA" not in existing_types:
         rows.append(ScmAtribucionProduccionKg(
@@ -738,6 +765,7 @@ def record_kg_production_evidence(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
     try:
         try:
             weighing_key = UUID(str(weighing_id))
@@ -809,8 +837,9 @@ def record_kg_production_evidence(
             # an OT by list order: continuity may have several tramos and
             # the production fact must retain the manga's canonical owner.
             trabajo_ot_id=(
-                current_segment.trabajo_ot_id
-                if current_segment is not None else manga.trabajo_ot_id
+                effective_work_for_segment(manga, current_segment).id
+                if effective_work_for_segment(manga, current_segment) is not None
+                else manga.trabajo_ot_id
             ),
             tipo="NETO_MEDIDO",
             cantidad_kg=net,
@@ -924,6 +953,7 @@ def close_productive_document_kg(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
     try:
         aggregate, works = _document_aggregate(
             session, documento_tipo=tipo, documento_id=documento_id
@@ -1012,7 +1042,83 @@ def close_productive_document_kg(
                 manga for manga in aggregate_mangas
                 if manga.id not in {item.id for item in mangas}
             )
+        # A correction keeps the source segment and manga immutable.  Make
+        # the destination OT see the same physical manga through the overlay;
+        # the source OT is filtered below so its closure cannot count it twice.
+        work_ids = {item.id for item in works}
+        if work_ids:
+            corrected_mangas = session.scalars(
+                select(ScmManga)
+                .join(ScmCorreccionAsignacionManga, ScmCorreccionAsignacionManga.manga_id == ScmManga.id)
+                .where(ScmCorreccionAsignacionManga.destino_trabajo_ot_id.in_(work_ids))
+                .with_for_update()
+            ).all()
+            mangas.extend(
+                manga for manga in corrected_mangas
+                if manga.id not in {item.id for item in mangas}
+            )
+            # The destination OT does not own the immutable source segment
+            # through its FK.  Project each physical segment explicitly so
+            # the anchored segment can close B while a later segment closes C.
+            known_segment_ids = {segment.id for segment in ot_segments}
+            for manga in corrected_mangas:
+                for segment in manga.tramos_trabajo:
+                    owner = effective_work_for_segment(manga, segment)
+                    if owner is not None and owner.id in work_ids and segment.id not in known_segment_ids:
+                        ot_segments.append(segment)
+                        known_segment_ids.add(segment.id)
         mangas = list({manga.id: manga for manga in mangas}.values())
+        if tipo == "OT" and work_ids:
+            # The source segment remains the historical ledger row, but its
+            # effective owner is the destination after correction.
+            ot_segments = [
+                segment for segment in ot_segments
+                if segment.manga is None
+                or getattr(segment.manga, "correccion_asignacion", None) is None
+                or (effective_work_for_segment(segment.manga, segment) is not None
+                    and effective_work_for_segment(segment.manga, segment).id in work_ids)
+            ]
+            mangas = [
+                manga for manga in mangas
+                if getattr(manga, "correccion_asignacion", None) is None
+                or (
+                    bool(manga.tramos_trabajo)
+                    and any(
+                        effective_work_for_segment(manga, segment) is not None
+                        and effective_work_for_segment(manga, segment).id in work_ids
+                        for segment in manga.tramos_trabajo
+                    )
+                )
+                or (
+                    not manga.tramos_trabajo
+                    and effective_work(manga) is not None
+                    and effective_work(manga).id in work_ids
+                )
+            ]
+            resolved_effective_work_ids = {
+                effective_work_for_segment(manga, segment).id
+                for manga in mangas
+                for segment in manga.tramos_trabajo
+                if effective_work_for_segment(manga, segment) is not None
+                and (
+                    segment.estado in {"CERRADO", "ANULADO"}
+                    or manga.estado in {
+                        "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN",
+                        "RECIBIDA", "ANULADA",
+                    }
+                )
+            }
+            resolved_effective_work_ids.update(
+                effective_work(manga).id
+                for manga in mangas
+                if not manga.tramos_trabajo and effective_work(manga) is not None
+            )
+            # A corrected manga has no destination segment by design.  Its
+            # terminal weighing resolves the destination work for OT closure.
+            pending_works = [
+                work for work in pending_works
+                if work.id not in resolved_effective_work_ids
+            ]
         units = set()
         for manga in mangas:
             article = manga.lote_articulo.articulo if manga.lote_articulo is not None else None
@@ -1052,23 +1158,38 @@ def close_productive_document_kg(
                 },
             )
         weighed_ids = [manga.id for manga in mangas]
+        weighings = session.scalars(
+            select(ScmPesajeManga).where(
+                ScmPesajeManga.manga_id.in_(weighed_ids),
+                ScmPesajeManga.estado == "VIGENTE",
+            )
+        ).all() if weighed_ids else []
+        weighing_by_manga_id = {item.manga_id: item for item in weighings}
         measured = Decimal("0")
-        if tipo == "OT" and ot_segments:
-            measured = Decimal(session.scalar(
-                select(func.coalesce(func.sum(ScmTramoMangaTrabajo.cantidad_atribuida_kg), 0))
-                .where(
-                    ScmTramoMangaTrabajo.id.in_([segment.id for segment in ot_segments]),
-                    ScmTramoMangaTrabajo.estado != "ANULADO",
+        ot_segments_by_manga = {}
+        if tipo == "OT":
+            for segment in ot_segments:
+                if segment.estado != "ANULADO":
+                    ot_segments_by_manga.setdefault(segment.manga_id, []).append(segment)
+        for manga in mangas:
+            physical_segments = (
+                ot_segments_by_manga.get(manga.id, [])
+                if tipo == "OT" else [
+                    segment for segment in manga.tramos_trabajo
+                    if segment.estado != "ANULADO"
+                ]
+            )
+            if physical_segments:
+                measured += sum(
+                    (Decimal(segment.cantidad_atribuida_kg or 0)
+                     for segment in physical_segments),
+                    Decimal("0"),
                 )
-            )).quantize(KG_QUANTUM)
-        if weighed_ids and (tipo != "OT" or not ot_segments):
-            measured = Decimal(session.scalar(
-                select(func.coalesce(func.sum(ScmPesajeManga.peso_fisico_neto_kg), 0))
-                .where(
-                    ScmPesajeManga.manga_id.in_(weighed_ids),
-                    ScmPesajeManga.estado == "VIGENTE",
-                )
-            )).quantize(KG_QUANTUM)
+                continue
+            final_weighing = weighing_by_manga_id.get(manga.id)
+            if final_weighing is not None:
+                measured += Decimal(final_weighing.peso_fisico_neto_kg)
+        measured = measured.quantize(KG_QUANTUM)
         planned = command.get("kg_objetivo")
         planned_kg = _kg(planned, "kg_objetivo") if planned is not None else None
         close_type = str(command.get("tipo_cierre") or "NORMAL").upper()
@@ -1078,12 +1199,6 @@ def close_productive_document_kg(
         if close_type == "PARCIAL" and not reason:
             raise ScmServiceError("KG_PARTIAL_CLOSE_REASON_REQUIRED", "El cierre parcial requiere motivo.", status_code=422)
         deviation = (measured - planned_kg).quantize(KG_QUANTUM) if planned_kg is not None else None
-        weighings = session.scalars(
-            select(ScmPesajeManga).where(
-                ScmPesajeManga.manga_id.in_(weighed_ids),
-                ScmPesajeManga.estado == "VIGENTE",
-            )
-        ).all() if weighed_ids else []
         # An OA output manga is deliberately not owned by the source
         # TrabajoColor.  Its frozen BOM rows still carry that source owner;
         # include those rows when closing the source OT/OF, while excluding
@@ -1106,6 +1221,13 @@ def close_productive_document_kg(
                     else True,
                 )
             ).all()
+            if tipo == "OT" and owner_work_ids:
+                source_estimate_rows = [
+                    row for row in source_estimate_rows
+                    if row.manga is None
+                    or _effective_attribution_work(row) is None
+                    or _effective_attribution_work(row).id in owner_work_ids
+                ]
         fabrication_estimated = sum(
             (Decimal(item.kg_fabricacion_estimado or 0) for item in weighings),
             Decimal("0"),

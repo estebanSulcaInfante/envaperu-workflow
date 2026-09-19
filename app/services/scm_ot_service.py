@@ -73,11 +73,18 @@ from app.models.scm_prepared_material import (
 )
 from app.services.scm_service_support import (
     ScmServiceError,
+    acquire_kg_productive_write_lock,
     actor_snapshot,
     expected_version,
     load_actor,
     reject_unknown_fields,
     required_text,
+)
+from app.services.scm_manga_assignment_projection import (
+    effective_assignment,
+    effective_plan_assignment,
+    effective_segment,
+    effective_work,
 )
 
 
@@ -319,12 +326,16 @@ def _serialize_manga(manga):
         ),
         None,
     )
-    current_segment = _latest_manga_segment(manga)
-    current_work = current_segment.trabajo if current_segment else manga.trabajo
-    current_assignment = (
-        current_segment.asignacion_personal_trabajo
-        if current_segment else manga.asignacion_personal_trabajo
+    current_segment = effective_segment(manga)
+    current_work = effective_work(manga)
+    assignment_correction = getattr(manga, "correccion_asignacion", None)
+    origin_work = (
+        assignment_correction.origen_trabajo
+        if assignment_correction is not None
+        else manga.trabajo
     )
+    current_assignment = effective_assignment(manga)
+    current_plan_assignment = effective_plan_assignment(manga)
     latest_control = next(
         iter(reversed(list(getattr(manga, "controles_peso", ()) or ()))),
         None,
@@ -349,16 +360,16 @@ def _serialize_manga(manga):
         "public_id": str(manga.public_id),
         "codigo": manga.codigo,
         "trabajo_color_id": (
-            str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
+            str(current_work.id) if current_work else None
         ),
         "trabajo_color_codigo": (
-            manga.trabajo.codigo if manga.trabajo else None
+            current_work.codigo if current_work else None
         ),
         "trabajo_color_origen_id": (
-            str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
+            str(origin_work.id) if origin_work else None
         ),
         "trabajo_color_origen_codigo": (
-            manga.trabajo.codigo if manga.trabajo else None
+            origin_work.codigo if origin_work else None
         ),
         "trabajo_color_actual_id": (
             str(current_work.id) if current_work else None
@@ -367,8 +378,10 @@ def _serialize_manga(manga):
             current_work.codigo if current_work else None
         ),
         "asignacion_personal_trabajo_id": (
-            str(manga.asignacion_personal_trabajo_id)
-            if manga.asignacion_personal_trabajo_id else None
+            str(current_assignment.id) if current_assignment else None
+        ),
+        "asignacion_plan_id": (
+            current_plan_assignment.id if current_plan_assignment else None
         ),
         "tipo": manga.tipo,
         "estado": manga.estado,
@@ -411,6 +424,10 @@ def _serialize_manga(manga):
         ),
         "motivo_extra": manga.motivo_extra,
         "version": manga.version,
+        "correccion_asignacion": (
+            assignment_correction.to_dict()
+            if assignment_correction is not None else None
+        ),
         "etiqueta_vigente": _serialize_label(current_label)
         if current_label else None,
         "continuidad": {
@@ -2384,6 +2401,10 @@ def add_color_work(
     )
     if replay is not None:
         return replay
+    # Continuity can change the physical segment that an audited KG
+    # correction projects.  Serialize both writers before either reads its
+    # eligibility state.
+    acquire_kg_productive_write_lock(session)
     reject_unknown_fields(
         data,
         allowed={
@@ -2961,6 +2982,10 @@ def transition_color_work(
     )
     if replay is not None:
         return replay
+    # A terminal Trabajo state is a correction blocker.  Share the same
+    # transaction lock so correction and transition cannot both validate an
+    # obsolete state.
+    acquire_kg_productive_write_lock(session)
     reject_unknown_fields(data, allowed={"version", "motivo"})
     try:
         work = _load_color_work(session, work_id, lock=True)
@@ -3442,6 +3467,10 @@ def assign_color_work_worker(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
+    # A relief may append a new physical segment and supersede the correction
+    # overlay; serialize that decision with assignment correction.
+    acquire_kg_productive_write_lock(session)
     reject_unknown_fields(
         data,
         allowed={
@@ -4642,6 +4671,7 @@ def add_normal_mangas(
     )
     if replay is not None:
         return replay
+    acquire_kg_productive_write_lock(session)
     try:
         ot = session.scalar(
             select(RegistroDiarioProduccion)

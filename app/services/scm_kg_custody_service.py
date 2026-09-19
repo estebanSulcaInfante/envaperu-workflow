@@ -22,7 +22,7 @@ from app.models.scm_auditoria import ScmOperacion
 from app.services.scm_kg_receipt_service import _assert_kg_location_scope
 from app.services.scm_service_support import (
     ScmServiceError, actor_snapshot, expected_version, load_actor,
-    reject_unknown_fields, required_text,
+    acquire_kg_productive_write_lock, reject_unknown_fields, required_text,
 )
 
 
@@ -44,6 +44,7 @@ def decide_kg_quality(session, *, actor_id, existence_id, operation_id, data):
     evidence = str(data.get("evidencia") or "").strip()[:500] or None
     version = expected_version(data.get("version"))
     try:
+        acquire_kg_productive_write_lock(session)
         reference = session.get(ScmExistenciaMangaKg, existence_id)
         if reference is None:
             raise ScmServiceError("EXISTENCIA_MANGA_NO_ENCONTRADA", "La manga recibida no existe.", status_code=404)
@@ -210,6 +211,7 @@ def prepare_kg_return(session, *, actor_id, unit_id, operation_id, data):
     assert_custody_enabled()
     actor = load_actor(session, actor_id, capability="RETORNO_RECIBIR")
     reject_unknown_fields(data, allowed={"version", "motivo", "evidencia"})
+    acquire_kg_productive_write_lock(session)
     unit = session.scalar(select(ScmUnidadFisicaKg).where(
         ScmUnidadFisicaKg.id == unit_id
     ))
@@ -379,6 +381,7 @@ def reserve_kg_unit(session, *, actor_id, unit_id, operation_id, data):
     assert_custody_enabled()
     actor = load_actor(session, actor_id, capability="PICKING_PREPARAR")
     reject_unknown_fields(data, allowed={"version", "documento_destino_tipo", "documento_destino_id", "motivo_operativo"})
+    acquire_kg_productive_write_lock(session)
     unit = _scope_unit(session, actor, session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit_id)))
     unit = _lock_unit_custody(session, unit)
     version = expected_version(data.get("version")); destination_type = str(data.get("documento_destino_tipo") or "").strip() or None; destination_id = str(data.get("documento_destino_id") or "").strip() or None
@@ -409,6 +412,7 @@ def reserve_kg_unit(session, *, actor_id, unit_id, operation_id, data):
 
 def release_kg_reservation(session, *, actor_id, unit_id, operation_id, data):
     assert_custody_enabled(); actor = load_actor(session, actor_id, capability="PICKING_PREPARAR")
+    acquire_kg_productive_write_lock(session)
     unit = _scope_unit(session, actor, session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit_id)))
     unit = _lock_unit_custody(session, unit)
     operation, replay = _reserve_operation(session, operation_id, f"POST /unidades-kg/{unit_id}/reservas/liberar", actor, {"unit_id": str(unit_id), "version": data.get("version")})
@@ -425,6 +429,7 @@ def release_kg_reservation(session, *, actor_id, unit_id, operation_id, data):
 
 def withdraw_kg_unit(session, *, actor_id, unit_id, operation_id, data):
     assert_custody_enabled(); actor = load_actor(session, actor_id, capability="PICKING_DESPACHAR")
+    acquire_kg_productive_write_lock(session)
     unit = _scope_unit(session, actor, session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit_id)))
     unit = _lock_unit_custody(session, unit)
     command = {"unit_id": str(unit_id), "version": data.get("version"), "tenedor_fisico_id": data.get("tenedor_fisico_id") or actor.id, "motivo_operativo": data.get("motivo_operativo"), "documento_destino_tipo": data.get("documento_destino_tipo"), "documento_destino_id": data.get("documento_destino_id")}
@@ -451,6 +456,7 @@ def capture_kg_measurement(session, *, actor_id, station_id, unit_id, operation_
     assert_custody_enabled()
     from app.services.scm_service_support import load_actor_any
     actor = load_actor_any(session, actor_id, capabilities=("RETORNO_RECIBIR", "ABASTECIMIENTO_DEVOLVER"))
+    acquire_kg_productive_write_lock(session)
     unit = session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit_id))
     _scope_unit(session, actor, unit)
     unit = _lock_unit_custody(session, unit)
@@ -564,6 +570,7 @@ def capture_kg_measurement(session, *, actor_id, station_id, unit_id, operation_
 def divide_kg_unit(session, *, actor_id, retiro_id, operation_id, data):
     assert_custody_enabled(); actor = load_actor(session, actor_id, capability="UNIDAD_LOGISTICA_FRACCIONAR")
     reject_unknown_fields(data, allowed={"version", "partes"})
+    acquire_kg_productive_write_lock(session)
     retiro = session.scalar(select(ScmRetiroArmadoKg).where(ScmRetiroArmadoKg.id == retiro_id).with_for_update())
     if retiro is None: raise ScmServiceError("KG_UNIT_NOT_FOUND", "El retiro no existe.", status_code=404)
     parts = data.get("partes") if isinstance(data, dict) else None
@@ -589,6 +596,7 @@ def divide_kg_unit(session, *, actor_id, retiro_id, operation_id, data):
 
 def receive_kg_return(session, *, actor_id, unit_id, operation_id, data):
     assert_custody_enabled(); actor = load_actor(session, actor_id, capability="RETORNO_RECIBIR")
+    acquire_kg_productive_write_lock(session)
     unit = session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit_id)); _scope_unit(session, actor, unit); unit = _lock_unit_custody(session, unit)
     operation, replay = _reserve_operation(session, operation_id, f"POST /unidades-kg/{unit_id}/retorno/recibir", actor, {"unit_id": str(unit_id), **data})
     if replay is not None: _scope_unit(session, actor, unit); return replay
@@ -662,6 +670,7 @@ def get_kg_label(session, *, actor_id, unit_id=None, label_id=None):
 
 def acknowledge_kg_label(session, *, actor_id, station_id, unit_id, label_id, operation_id, data):
     actor = load_actor(session, actor_id, capability="ABASTECIMIENTO_VER")
+    acquire_kg_productive_write_lock(session)
     unit_id = _uuid_value(unit_id)
     label_id = _uuid_value(label_id)
     unit = session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit_id)); _scope_unit(session, actor, unit); unit = _lock_unit_custody(session, unit)

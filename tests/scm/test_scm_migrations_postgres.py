@@ -34,7 +34,7 @@ PRODUCT_ONBOARDING_REVISION = "f81d0e6f2b53"
 UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
 PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
 OPM_PREPARED_MATERIAL_REVISION = "c3a91f6e2d47"
-HEAD_REVISION = "f98a1b2c3d08"
+HEAD_REVISION = "f99a1b2c3d09"
 
 
 def _isolated_postgres_url():
@@ -111,6 +111,162 @@ def _drop_isolated_schema(admin_engine, schema):
             connection.execute(DropSchema(schema, cascade=True))
     finally:
         admin_engine.dispose()
+
+
+def test_assignment_correction_ledger_rejects_real_update_and_delete():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    try:
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        schema_engine = create_engine(schema_url)
+        try:
+            with schema_engine.connect() as connection:
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_rol_capacidad AS relation
+                    JOIN scm_capacidad AS capability
+                      ON capability.id = relation.capacidad_id
+                    WHERE capability.codigo = 'MANGA_REATRIBUIR_TRABAJO'
+                """)).scalar_one() == 0
+            # Seed one structurally complete audit row through the same RLS
+            # policy used by the runtime role.  Only FK triggers are disabled
+            # because this isolated fixture does not create the referenced
+            # production aggregate.
+            with schema_engine.begin() as connection:
+                connection.execute(text(
+                    "ALTER TABLE scm_correccion_asignacion_manga DISABLE TRIGGER ALL"
+                ))
+                connection.execute(text("""
+                    INSERT INTO scm_correccion_asignacion_manga (
+                        id, public_id, manga_id, origen_ot_id,
+                        origen_trabajo_ot_id, destino_ot_id,
+                        destino_trabajo_ot_id, origen_asignacion_id,
+                        destino_asignacion_id, destino_asignacion_plan_id,
+                        tramo_objetivo_id, manga_version_antes,
+                        manga_version_despues, motivo, evidencia_json,
+                        actor_id, operation_id, estado
+                    ) VALUES (
+                        1, :public_id, 1, 1, :source_work, 2,
+                        :target_work, NULL, :target_assignment, 1,
+                        :segment_id, 1, 1, 'fixture inmutable', '{}',
+                        1, :operation_id, 'APLICADA'
+                    )
+                """), {
+                    "public_id": uuid4(),
+                    "source_work": uuid4(),
+                    "target_work": uuid4(),
+                    "target_assignment": uuid4(),
+                    "segment_id": uuid4(),
+                    "operation_id": uuid4(),
+                })
+                connection.execute(text(
+                    "ALTER TABLE scm_correccion_asignacion_manga ENABLE TRIGGER ALL"
+                ))
+                assert connection.execute(text(
+                    "SELECT count(*) FROM scm_correccion_asignacion_manga"
+                )).scalar_one() == 1
+
+            with pytest.raises(DBAPIError, match="append-only"):
+                with schema_engine.begin() as connection:
+                    connection.execute(text("""
+                        UPDATE scm_correccion_asignacion_manga
+                        SET motivo = 'mutado' WHERE id = 1
+                    """))
+            with pytest.raises(DBAPIError, match="append-only"):
+                with schema_engine.begin() as connection:
+                    connection.execute(text(
+                        "DELETE FROM scm_correccion_asignacion_manga WHERE id = 1"
+                    ))
+        finally:
+            schema_engine.dispose()
+    finally:
+        _drop_isolated_schema(admin_engine, schema)
+
+
+def test_assignment_correction_downgrade_preserves_preexisting_capability():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    try:
+        _run_flask_db(schema_url, "upgrade", "f98a1b2c3d08")
+        schema_engine = create_engine(schema_url)
+        try:
+            with schema_engine.begin() as connection:
+                connection.execute(text("""
+                    INSERT INTO scm_capacidad (codigo, nombre, descripcion, activo)
+                    VALUES (
+                        'MANGA_REATRIBUIR_TRABAJO',
+                        'Capacidad preexistente',
+                        'Configurada antes de f99',
+                        true
+                    )
+                """))
+                connection.execute(text("""
+                    INSERT INTO scm_rol_capacidad (rol_operativo_id, capacidad_id)
+                    SELECT role.id, capability.id
+                    FROM rol_operativo AS role
+                    JOIN scm_capacidad AS capability
+                      ON capability.codigo = 'MANGA_REATRIBUIR_TRABAJO'
+                    WHERE role.codigo = 'MAQUINISTA'
+                """))
+                roles_before = {
+                    row[0] for row in connection.execute(text("""
+                        SELECT role.codigo
+                        FROM scm_rol_capacidad AS relation
+                        JOIN rol_operativo AS role
+                          ON role.id = relation.rol_operativo_id
+                        JOIN scm_capacidad AS capability
+                          ON capability.id = relation.capacidad_id
+                        WHERE capability.codigo = 'MANGA_REATRIBUIR_TRABAJO'
+                    """))
+                }
+                assert roles_before == {"MAQUINISTA"}
+            _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+            with schema_engine.connect() as connection:
+                roles_after_upgrade = {
+                    row[0] for row in connection.execute(text("""
+                        SELECT role.codigo
+                        FROM scm_rol_capacidad AS relation
+                        JOIN rol_operativo AS role
+                          ON role.id = relation.rol_operativo_id
+                        JOIN scm_capacidad AS capability
+                          ON capability.id = relation.capacidad_id
+                        WHERE capability.codigo = 'MANGA_REATRIBUIR_TRABAJO'
+                    """))
+                }
+                assert roles_after_upgrade == roles_before
+            _run_flask_db(schema_url, "downgrade", "f98a1b2c3d08")
+            with schema_engine.connect() as connection:
+                assert connection.execute(text("""
+                    SELECT nombre, descripcion
+                    FROM scm_capacidad
+                    WHERE codigo = 'MANGA_REATRIBUIR_TRABAJO'
+                """)).one() == (
+                    "Capacidad preexistente", "Configurada antes de f99"
+                )
+                assert connection.execute(text("""
+                    SELECT count(*)
+                    FROM scm_rol_capacidad AS relation
+                    JOIN rol_operativo AS role
+                      ON role.id = relation.rol_operativo_id
+                    JOIN scm_capacidad AS capability
+                      ON capability.id = relation.capacidad_id
+                    WHERE role.codigo = 'MAQUINISTA'
+                      AND capability.codigo = 'MANGA_REATRIBUIR_TRABAJO'
+                """)).scalar_one() == 1
+                roles_after_downgrade = {
+                    row[0] for row in connection.execute(text("""
+                        SELECT role.codigo
+                        FROM scm_rol_capacidad AS relation
+                        JOIN rol_operativo AS role
+                          ON role.id = relation.rol_operativo_id
+                        JOIN scm_capacidad AS capability
+                          ON capability.id = relation.capacidad_id
+                        WHERE capability.codigo = 'MANGA_REATRIBUIR_TRABAJO'
+                    """))
+                }
+                assert roles_after_downgrade == roles_before
+        finally:
+            schema_engine.dispose()
+    finally:
+        _drop_isolated_schema(admin_engine, schema)
 
 
 def test_migrations_crean_una_base_nueva_y_no_dejan_drift():

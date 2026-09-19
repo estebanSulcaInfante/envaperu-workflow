@@ -1076,6 +1076,12 @@ class ScmManga(db.Model):
         lazy="selectin",
         order_by="ScmReaperturaManga.reabierta_at",
     )
+    correccion_asignacion = db.relationship(
+        "ScmCorreccionAsignacionManga",
+        back_populates="manga",
+        uselist=False,
+        lazy="selectin",
+    )
 
 
 class ScmTramoMangaTrabajo(db.Model):
@@ -1831,6 +1837,12 @@ class ScmPesajeManga(db.Model):
     )
 
     def to_dict(self):
+        weighing_work = (
+            self.asignacion_personal_trabajo.trabajo
+            if self.asignacion_personal_trabajo is not None else None
+        )
+        if weighing_work is None and self.manga is not None:
+            weighing_work = self.manga.trabajo
         return {
             "id": self.id,
             "public_id": str(self.public_id),
@@ -1858,12 +1870,10 @@ class ScmPesajeManga(db.Model):
                 if self.asignacion_personal_trabajo_id else None
             ),
             "trabajo_color_id": (
-                str(self.manga.trabajo_ot_id)
-                if self.manga and self.manga.trabajo_ot_id else None
+                str(weighing_work.id) if weighing_work is not None else None
             ),
             "trabajo_color_codigo": (
-                self.manga.trabajo.codigo
-                if self.manga and self.manga.trabajo else None
+                weighing_work.codigo if weighing_work is not None else None
             ),
             "estado_manga": self.manga.estado if self.manga else None,
             "estado_inventario": "NO_INGRESADA",
@@ -2236,6 +2246,111 @@ class ScmCierreProductivoKg(db.Model):
             "desviacion_plan_kg": _decimal_text(self.desviacion_plan_kg),
             "motivo": self.motivo,
             "pendientes": self.pendientes_json,
+            "evidencia": self.evidencia_json,
+            "actor_id": self.actor_id,
+            "operation_id": str(self.operation_id),
+            "created_at": _isoformat(self.created_at),
+        }
+
+
+class ScmCorreccionAsignacionManga(db.Model):
+    """Append-only audit record for a supervised OT/Trabajo correction.
+
+    The manga, pesajes and KG facts remain the physical source of truth.  The
+    record stores the original and effective work so clients can explain the
+    correction without rewriting snapshots captured at weighing time.
+    """
+
+    __tablename__ = "scm_correccion_asignacion_manga"
+    __table_args__ = (
+        db.CheckConstraint(
+            "estado = 'APLICADA'",
+            name="ck_scm_correccion_asignacion_manga_estado",
+        ),
+        db.UniqueConstraint("public_id", name="uq_scm_correccion_asignacion_manga_public"),
+        db.UniqueConstraint("manga_id", name="uq_scm_correccion_asignacion_manga_manga"),
+        db.UniqueConstraint("operation_id", name="uq_scm_correccion_asignacion_manga_operation"),
+        db.Index("ix_scm_correccion_asignacion_manga_destino", "destino_trabajo_ot_id"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(Uuid(as_uuid=True), nullable=False, default=uuid.uuid4)
+    manga_id = db.Column(
+        db.Integer, db.ForeignKey("scm_manga.id", ondelete="RESTRICT"), nullable=False
+    )
+    origen_ot_id = db.Column(
+        db.Integer, db.ForeignKey("registro_diario_produccion.id", ondelete="RESTRICT"), nullable=False
+    )
+    origen_trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_trabajo_ot.id", ondelete="RESTRICT"), nullable=False
+    )
+    destino_ot_id = db.Column(
+        db.Integer, db.ForeignKey("registro_diario_produccion.id", ondelete="RESTRICT"), nullable=False
+    )
+    destino_trabajo_ot_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_trabajo_ot.id", ondelete="RESTRICT"), nullable=False
+    )
+    origen_asignacion_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_asignacion_personal_trabajo_ot.id", ondelete="RESTRICT"), nullable=True
+    )
+    destino_asignacion_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_asignacion_personal_trabajo_ot.id", ondelete="RESTRICT"), nullable=False
+    )
+    destino_asignacion_plan_id = db.Column(
+        db.Integer, db.ForeignKey("scm_asignacion_plan_manga_ot.id", ondelete="RESTRICT"), nullable=False
+    )
+    tramo_objetivo_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_tramo_manga_trabajo.id", ondelete="RESTRICT"), nullable=True
+    )
+    manga_version_antes = db.Column(db.Integer, nullable=False)
+    manga_version_despues = db.Column(db.Integer, nullable=False)
+    motivo = db.Column(db.String(500), nullable=False)
+    evidencia_json = db.Column(db.JSON, nullable=False, default=dict, server_default="{}")
+    actor_id = db.Column(db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False)
+    operation_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"), nullable=False
+    )
+    estado = db.Column(db.String(16), nullable=False, default="APLICADA", server_default="APLICADA")
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utc_now, server_default=db.func.now())
+
+    manga = db.relationship("ScmManga", back_populates="correccion_asignacion")
+    origen_ot = db.relationship("RegistroDiarioProduccion", foreign_keys=[origen_ot_id])
+    destino_ot = db.relationship("RegistroDiarioProduccion", foreign_keys=[destino_ot_id])
+    origen_trabajo = db.relationship("ScmTrabajoOt", foreign_keys=[origen_trabajo_ot_id])
+    destino_trabajo = db.relationship("ScmTrabajoOt", foreign_keys=[destino_trabajo_ot_id])
+    destino_asignacion = db.relationship(
+        "ScmAsignacionPersonalTrabajoOt", foreign_keys=[destino_asignacion_id]
+    )
+    destino_asignacion_plan = db.relationship(
+        "ScmAsignacionPlanMangaOt", foreign_keys=[destino_asignacion_plan_id]
+    )
+    tramo_objetivo = db.relationship(
+        "ScmTramoMangaTrabajo", foreign_keys=[tramo_objetivo_id]
+    )
+    actor = db.relationship("Trabajador")
+
+    def to_dict(self):
+        return {
+            "id": str(self.public_id),
+            "manga_id": str(self.manga.public_id) if self.manga else None,
+            "estado": self.estado,
+            "origen": {
+                "ot_id": self.origen_ot_id,
+                "trabajo_id": str(self.origen_trabajo_ot_id),
+                "trabajo_codigo": self.origen_trabajo.codigo if self.origen_trabajo else None,
+                "asignacion_id": str(self.origen_asignacion_id) if self.origen_asignacion_id else None,
+            },
+            "destino": {
+                "ot_id": self.destino_ot_id,
+                "trabajo_id": str(self.destino_trabajo_ot_id),
+                "trabajo_codigo": self.destino_trabajo.codigo if self.destino_trabajo else None,
+                "asignacion_id": str(self.destino_asignacion_id),
+                "asignacion_plan_id": self.destino_asignacion_plan_id,
+                "tramo_id": str(self.tramo_objetivo_id) if self.tramo_objetivo_id else None,
+            },
+            "manga_version_antes": self.manga_version_antes,
+            "manga_version_despues": self.manga_version_despues,
+            "motivo": self.motivo,
             "evidencia": self.evidencia_json,
             "actor_id": self.actor_id,
             "operation_id": str(self.operation_id),
