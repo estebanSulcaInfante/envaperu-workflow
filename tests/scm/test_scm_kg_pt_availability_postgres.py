@@ -30,6 +30,30 @@ from app.services.scm_service_support import ScmServiceError
 pytestmark = pytest.mark.postgres
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
+KG_PILOT_TABLES = (
+    "scm_saldo_inventario_kg",
+    "scm_movimiento_inventario_kg",
+    "scm_existencia_manga_kg",
+    "scm_unidad_fisica_kg",
+    "scm_division_unidad_kg",
+    "scm_reserva_unidad_kg",
+    "scm_retiro_armado_kg",
+    "scm_retiro_armado_kg_item",
+    "scm_medicion_unidad_kg",
+    "scm_etiqueta_unidad_kg",
+    "scm_atribucion_produccion_kg",
+    "scm_cierre_productivo_kg",
+)
+
+KG_FUNCTIONS = (
+    "scm_kg_article_guard",
+    "scm_kg_movement_guard",
+    "scm_kg_logistic_unit_guard",
+    "scm_kg_article_marker_guard",
+    "scm_kg_custody_append_only",
+    "scm_guard_pt_manual_movement_immutable",
+)
+
 
 def _schema_fixture():
     raw_url = os.getenv("TEST_DATABASE_URL")
@@ -89,6 +113,52 @@ def test_f98_seeds_pt_manual_capability_without_users(postgres_w2_app):
             role = RolOperativo.query.filter_by(codigo=role_code).one()
             assert capability not in role.capacidades
         assert Trabajador.query.filter(Trabajador.codigo.like("TRB-W2-PG-%")).count() == 0
+
+
+def test_postgres_kg_pilot_tables_and_functions_are_locked_down(postgres_w2_app):
+    with postgres_w2_app.app_context():
+        schema = db.session.execute(text("SELECT current_schema()")).scalar_one()
+        qualified = lambda name: f'"{schema}"."{name}"'
+        for table in KG_PILOT_TABLES:
+            security = db.session.execute(text("""
+                SELECT c.relrowsecurity, c.relforcerowsecurity
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname = :schema AND c.relname = :table
+            """), {"schema": schema, "table": table}).one()
+            assert security == (True, True)
+            assert not db.session.execute(
+                text("SELECT has_table_privilege('public', :table, 'SELECT')"),
+                {"table": qualified(table)},
+            ).scalar_one()
+            for role in ("anon", "authenticated"):
+                exists = db.session.execute(
+                    text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
+                    {"role": role},
+                ).scalar()
+                if exists:
+                    assert not db.session.execute(
+                        text("SELECT has_table_privilege(:role, :table, 'SELECT')"),
+                        {"role": role, "table": qualified(table)},
+                    ).scalar_one()
+
+        for function in KG_FUNCTIONS:
+            function_security = db.session.execute(text("""
+                SELECT p.proconfig
+                FROM pg_proc AS p
+                JOIN pg_namespace AS n ON n.oid = p.pronamespace
+                WHERE n.nspname = :schema AND p.proname = :function
+                  AND pg_get_function_identity_arguments(p.oid) = ''
+            """), {"schema": schema, "function": function}).one()
+            assert any(
+                str(item).startswith("search_path=pg_catalog")
+                and schema in str(item)
+                for item in (function_security[0] or ())
+            )
+            assert not db.session.execute(
+                text("SELECT has_function_privilege('public', :function, 'EXECUTE')"),
+                {"function": f'{qualified(function)}()'},
+            ).scalar_one()
 
 
 def _actor(app):

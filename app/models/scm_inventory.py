@@ -188,6 +188,11 @@ class ScmMovimientoInventario(db.Model):
             "created_at",
             "id",
         ),
+        db.Index(
+            "ix_scm_movimiento_inventario_fecha_operativa_id",
+            "fecha_operativa",
+            "id",
+        ),
     )
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

@@ -5,6 +5,7 @@ station consumer and Flask's test client is the real Central provider.
 """
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import os
 from uuid import UUID, uuid4
 
 import pytest
@@ -25,7 +26,7 @@ from test_scm_kg_custody import _grant_capabilities, _received
 
 
 _CLIENT_PATH = (
-    Path(__file__).resolve().parents[3]
+    Path(os.environ.get("ENVA_WORKSPACE_ROOT", Path(__file__).resolve().parents[3]))
     / "modulo-pesaje"
     / "backend"
     / "app"

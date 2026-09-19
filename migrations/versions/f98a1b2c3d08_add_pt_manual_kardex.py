@@ -22,6 +22,74 @@ _MOVEMENT_CHECK = (
     "'AJUSTE_NEGATIVO_MANUAL_PT')"
 )
 
+KG_PILOT_TABLES = (
+    "scm_saldo_inventario_kg",
+    "scm_movimiento_inventario_kg",
+    "scm_existencia_manga_kg",
+    "scm_unidad_fisica_kg",
+    "scm_division_unidad_kg",
+    "scm_reserva_unidad_kg",
+    "scm_retiro_armado_kg",
+    "scm_retiro_armado_kg_item",
+    "scm_medicion_unidad_kg",
+    "scm_etiqueta_unidad_kg",
+    "scm_atribucion_produccion_kg",
+    "scm_cierre_productivo_kg",
+)
+
+KG_FUNCTIONS = (
+    "scm_kg_article_guard()",
+    "scm_kg_movement_guard()",
+    "scm_kg_logistic_unit_guard()",
+    "scm_kg_article_marker_guard()",
+    "scm_kg_custody_append_only()",
+)
+
+
+def _protect_kg_tables_and_functions_on_postgres(connection):
+    if connection.dialect.name != "postgresql":
+        return
+    schema = connection.execute(sa.text("SELECT current_schema()")).scalar_one()
+    preparer = connection.dialect.identifier_preparer
+    quoted_schema = preparer.quote(schema)
+    for table_name in KG_PILOT_TABLES:
+        qualified = f"{quoted_schema}.{preparer.quote(table_name)}"
+        op.execute(f"ALTER TABLE {qualified} ENABLE ROW LEVEL SECURITY")
+        op.execute(f"ALTER TABLE {qualified} FORCE ROW LEVEL SECURITY")
+        op.execute(sa.text(f"""
+            REVOKE ALL PRIVILEGES ON TABLE {qualified} FROM PUBLIC;
+            DO $body$
+            BEGIN
+              IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE ALL PRIVILEGES ON TABLE {qualified} FROM anon;
+              END IF;
+              IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE ALL PRIVILEGES ON TABLE {qualified} FROM authenticated;
+              END IF;
+            END
+            $body$;
+        """))
+    functions = (*KG_FUNCTIONS, "scm_guard_pt_manual_movement_immutable()")
+    for function in functions:
+        qualified_function = f"{quoted_schema}.{function}"
+        op.execute(
+            f"ALTER FUNCTION {qualified_function} "
+            f"SET search_path = pg_catalog, {quoted_schema}"
+        )
+        op.execute(sa.text(f"""
+            REVOKE ALL PRIVILEGES ON FUNCTION {qualified_function} FROM PUBLIC;
+            DO $body$
+            BEGIN
+              IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE ALL PRIVILEGES ON FUNCTION {qualified_function} FROM anon;
+              END IF;
+              IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE ALL PRIVILEGES ON FUNCTION {qualified_function} FROM authenticated;
+              END IF;
+            END
+            $body$;
+        """))
+
 
 def _seed_pt_manual_capability():
     op.execute(sa.text("""
@@ -81,6 +149,7 @@ def upgrade():
             BEFORE UPDATE OR DELETE ON scm_movimiento_inventario
             FOR EACH ROW EXECUTE FUNCTION scm_guard_pt_manual_movement_immutable()
         """))
+        _protect_kg_tables_and_functions_on_postgres(bind)
     _seed_pt_manual_capability()
 
 

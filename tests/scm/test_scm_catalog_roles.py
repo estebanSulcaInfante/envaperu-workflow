@@ -211,7 +211,7 @@ def test_seed_scm_es_idempotente_y_no_asigna_personas(app, runner):
         assert ROLES_SCM_INICIALES <= set(roles)
         assert {
             item.codigo for item in roles["GERENTE_GENERAL"].capacidades
-        } == capacidades
+        } == capacidades - {"INVENTARIO_PT_MOVIMIENTO"}
         assert "OA_EXCEPCIONAL_CREAR" not in capacidades
         assert {
             item.codigo for item in roles["GERENCIA"].capacidades
