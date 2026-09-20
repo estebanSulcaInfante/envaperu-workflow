@@ -301,3 +301,89 @@ def test_piece_scope_filters_each_article_class_inside_same_warehouse(app):
         payload = list_piece_kg_availability(db.session, actor_id=actor.id)
         codes = {item["articulo"]["codigo"] for item in payload["items"]}
         assert codes == {"PC-MIXED-01"}
+
+
+def test_piece_availability_includes_production_for_scoped_actor(app):
+    with app.app_context():
+        app.config["KG_PRODUCTION_LOCATION_CODE"] = "PRODUCCION_KG"
+        actor = _actor_with_caps()
+        scoped_warehouse = ScmAlmacen(
+            codigo="W2-SCOPED", nombre="Almacen acotado", tipo="PIEZAS_WIP",
+        )
+        production_warehouse = ScmAlmacen(
+            codigo="W2-PRODUCTION", nombre="Produccion", tipo="PIEZAS_WIP",
+        )
+        db.session.add_all([scoped_warehouse, production_warehouse])
+        db.session.flush()
+        scoped_location = ScmUbicacionInventario(
+            codigo="W2-SCOPED-LOC", nombre="Almacen acotado",
+            almacen_id=scoped_warehouse.id,
+        )
+        production_location = ScmUbicacionInventario(
+            codigo="PRODUCCION_KG", nombre="Produccion KG",
+            almacen_id=production_warehouse.id,
+            tipo="PUNTO_PRODUCCION",
+            permite_saldo_libre=True,
+        )
+        piece = _article("PC-PRODUCTION-SCOPE", "Pieza en produccion", "PIEZA_COLOR")
+        db.session.add_all([
+            scoped_location,
+            production_location,
+            ScmAlmacenTrabajador(
+                almacen_id=scoped_warehouse.id,
+                trabajador_id=actor.id,
+                asignado_por_id=actor.id,
+                clases_articulo_json=["PIEZA_COLOR"],
+            ),
+        ])
+        db.session.flush()
+        db.session.add(
+            ScmSaldoInventarioKg(
+                articulo_scm_id=piece.id,
+                ubicacion_id=production_location.id,
+                cantidad_fisica_kg=39.5,
+                cantidad_reservada_kg=0,
+                cantidad_no_disponible_kg=0,
+                cantidad_retirada_kg=0,
+                atributo_proceso="PROCESO",
+            ),
+        )
+        db.session.commit()
+
+        payload = list_piece_kg_availability(db.session, actor_id=actor.id)
+
+        assert [item["articulo"]["codigo"] for item in payload["items"]] == [
+            "PC-PRODUCTION-SCOPE"
+        ]
+        assert payload["items"][0]["ubicaciones"][0]["codigo"] == "PRODUCCION_KG"
+        assert payload["items"][0]["kg_disponibles"] == "39.500"
+
+        assert list_piece_kg_availability(
+            db.session, actor_id=actor.id, location="W2-SCOPED-LOC"
+        )["items"] == []
+        assert list_piece_kg_availability(
+            db.session, actor_id=actor.id, location="PRODUCCION_KG"
+        )["items"][0]["kg_disponibles"] == "39.500"
+
+        app.config["KG_PRODUCTION_LOCATION_CODE"] = ""
+        assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
+        app.config["KG_PRODUCTION_LOCATION_CODE"] = "NO-EXISTE"
+        assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
+        app.config["KG_PRODUCTION_LOCATION_CODE"] = "PRODUCCION_KG"
+
+        production_location.activo = False
+        db.session.commit()
+        assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
+        production_location.activo = True
+        production_location.tipo = "ALMACEN"
+        db.session.commit()
+        assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
+        production_location.tipo = "PUNTO_PRODUCCION"
+
+        assignment = ScmAlmacenTrabajador.query.filter_by(
+            almacen_id=scoped_warehouse.id,
+            trabajador_id=actor.id,
+        ).one()
+        assignment.clases_articulo_json = ["SUBENSAMBLE_WIP"]
+        db.session.commit()
+        assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []

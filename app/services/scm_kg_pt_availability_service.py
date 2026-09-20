@@ -171,7 +171,9 @@ def _availability_state(article, raw_state):
     return "EN_PROCESO" if article.clase == "SUBENSAMBLE_WIP" else "TERMINADA"
 
 
-def _scope_allows_article(scope, location, article_class):
+def _scope_allows_article(
+    scope, location, article_class, *, production_location_ids=None
+):
     """Apply the assignment's exact article class to each projected row.
 
     ``allowed_location_ids`` is intentionally a coarse warehouse prefilter.
@@ -180,6 +182,11 @@ def _scope_allows_article(scope, location, article_class):
     """
     if not scope.get("configured") or scope.get("transversal"):
         return True
+    if location.id in (production_location_ids or set()):
+        return any(
+            article_class in classes
+            for classes in scope.get("classes", {}).values()
+        )
     return article_class in scope.get("classes", {}).get(location.almacen_id, set())
 
 
@@ -191,10 +198,28 @@ def list_piece_kg_availability(session, *, actor_id, query=None, location=None):
     pattern = str(query or "").strip().lower()
     location_code = str(location or "").strip().upper() or None
     location_query = select(ScmUbicacionInventario)
+    configured_production_code = str(
+        current_app.config.get("KG_PRODUCTION_LOCATION_CODE") or ""
+    ).strip().upper()
+    production_location_ids = set()
+    if configured_production_code:
+        production_location_ids = set(session.scalars(
+            select(ScmUbicacionInventario.id).where(
+                ScmUbicacionInventario.codigo == configured_production_code,
+                ScmUbicacionInventario.activo.is_(True),
+                ScmUbicacionInventario.tipo == "PUNTO_PRODUCCION",
+                ScmUbicacionInventario.permite_saldo_libre.is_(True),
+            )
+        ).all())
     if location_code:
         location_query = location_query.where(ScmUbicacionInventario.codigo == location_code)
     if location_ids is not None:
-        location_query = location_query.where(ScmUbicacionInventario.id.in_(location_ids or {-1}))
+        visible_location_ids = set(location_ids)
+        if not location_code or location_code == configured_production_code:
+            visible_location_ids.update(production_location_ids)
+        location_query = location_query.where(
+            ScmUbicacionInventario.id.in_(visible_location_ids or {-1})
+        )
     locations = {item.id: item for item in session.scalars(location_query).all()}
     rows = _model_rows_for_kg(session)
     article_ids = {row["articulo_scm_id"] for row in rows}
@@ -209,7 +234,12 @@ def list_piece_kg_availability(session, *, actor_id, query=None, location=None):
         article = articles.get(row["articulo_scm_id"])
         if loc is None or article is None or article.clase not in {"PIEZA_COLOR", "SUBENSAMBLE_WIP"}:
             continue
-        if not _scope_allows_article(scope, loc, article.clase):
+        if not _scope_allows_article(
+            scope,
+            loc,
+            article.clase,
+            production_location_ids=production_location_ids,
+        ):
             continue
         if pattern and pattern not in f"{article.codigo} {article.nombre}".lower():
             continue

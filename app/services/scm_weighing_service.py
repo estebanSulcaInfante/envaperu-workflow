@@ -682,6 +682,16 @@ def resolve_manga_label(session, *, label_id):
         raise ScmServiceError(
             "LABEL_NOT_FOUND", "La etiqueta no existe.", status_code=404
         )
+    if label.manga is not None and label.manga.estado == "ANULADA":
+        raise ScmServiceError(
+            "MANGA_ANULADA",
+            "La manga fue anulada y no puede utilizarse.",
+            status_code=409,
+            details={
+                "manga_id": str(label.manga.public_id),
+                "manga_codigo": label.manga.codigo,
+            },
+        )
     if label.estado == "INVALIDADA":
         current = _current_label(label.manga, label.tipo)
         raise ScmServiceError(
@@ -772,6 +782,12 @@ def register_manga_weighing_control(
             .where(ScmManga.id == label.manga_id)
             .with_for_update()
         )
+        if manga.estado == "ANULADA":
+            raise ScmServiceError(
+                "MANGA_ANULADA",
+                "La manga fue anulada y no puede utilizarse.",
+                status_code=409,
+            )
         is_kg = (
             manga.lote_articulo is not None
             and manga.lote_articulo.articulo is not None
@@ -1335,6 +1351,12 @@ def confirm_manga_weighing(
             .where(ScmManga.id == label.manga_id)
             .with_for_update()
         )
+        if manga.estado == "ANULADA":
+            raise ScmServiceError(
+                "MANGA_ANULADA",
+                "La manga fue anulada y no puede utilizarse.",
+                status_code=409,
+            )
         if label.estado == "INVALIDADA":
             raise ScmServiceError(
                 "LABEL_INVALIDATED",
@@ -2317,6 +2339,12 @@ def get_label_print_payload(session, *, label_id):
     if label is None:
         raise ScmServiceError(
             "LABEL_NOT_FOUND", "La etiqueta no existe.", status_code=404
+        )
+    if label.manga is not None and label.manga.estado == "ANULADA":
+        raise ScmServiceError(
+            "MANGA_ANULADA",
+            "La manga fue anulada y no puede utilizarse.",
+            status_code=409,
         )
     if label.estado == "INVALIDADA":
         raise ScmServiceError(

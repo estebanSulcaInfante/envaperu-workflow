@@ -5194,6 +5194,7 @@ def annul_manga(
             select(ScmManga)
             .where(ScmManga.public_id == manga_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if manga is None:
             raise ScmServiceError(
@@ -5327,22 +5328,42 @@ def replace_prelabel(
     if replay is not None:
         return replay
     try:
-        old = session.scalar(
+        old_probe = session.scalar(
             select(ScmEtiquetaManga)
             .where(ScmEtiquetaManga.public_id == label_id)
-            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        if old is None:
+        if old_probe is None:
             raise ScmServiceError(
                 "LABEL_NOT_FOUND", "La etiqueta no existe.", status_code=404
             )
+        manga = session.scalar(
+            select(ScmManga)
+            .where(ScmManga.id == old_probe.manga_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        old = session.scalar(
+            select(ScmEtiquetaManga)
+            .where(
+                ScmEtiquetaManga.id == old_probe.id,
+                ScmEtiquetaManga.public_id == label_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if old is None or manga is None:
+            raise ScmServiceError(
+                "LABEL_NOT_FOUND", "La etiqueta no existe.", status_code=404
+            )
+        old.manga = manga
         if old.estado == "INVALIDADA":
             raise ScmServiceError(
                 "LABEL_INVALIDATED",
                 "La etiqueta ya fue invalidada.",
                 status_code=409,
             )
-        if old.manga.estado == "ANULADA":
+        if manga.estado == "ANULADA":
             raise ScmServiceError(
                 "INVALID_STATE_TRANSITION",
                 "Una manga anulada no admite otra etiqueta.",
@@ -5361,13 +5382,13 @@ def replace_prelabel(
         version = max(
             (
                 item.version
-                for item in old.manga.etiquetas
+                for item in manga.etiquetas
                 if item.tipo == old.tipo
             ),
             default=0,
         ) + 1
         if old.tipo == "PREPESAJE":
-            new_payload = _label_payload(old.manga, new_id, version)
+            new_payload = _label_payload(manga, new_id, version)
         else:
             new_payload = copy.deepcopy(old.payload_json)
             new_payload["generated_at"] = utc_now().isoformat()
@@ -5406,8 +5427,8 @@ def replace_prelabel(
         old.motivo_invalidacion = reason
         old.reemplazada_por_id = replacement.id
         if old.tipo == "POSTPESAJE":
-            old.manga.estado = "PESADA"
-            old.manga.version += 1
+            manga.estado = "PESADA"
+            manga.version += 1
         response = {
             "print_job_id": str(job.public_id),
             "label": _serialize_label(replacement),
@@ -5435,6 +5456,10 @@ def _print_job_status(job):
 
 
 def _serialize_print_job(job):
+    printable = [
+        label for label in job.etiquetas
+        if _is_actionable_print_label(label)
+    ]
     return {
         "print_job_id": str(job.public_id),
         "status": _print_job_status(job),
@@ -5446,8 +5471,109 @@ def _serialize_print_job(job):
         "processed_at": (
             job.processed_at.isoformat() if job.processed_at else None
         ),
-        "labels": [_serialize_label(label) for label in job.etiquetas],
+        "labels": [_serialize_label(label) for label in printable],
     }
+
+
+def _ensure_print_job_has_printable_manga(job, *, allow_no_actionable=False):
+    printable = [
+        label for label in job.etiquetas
+        if _is_actionable_print_label(label)
+    ]
+    if printable:
+        return
+    if allow_no_actionable and any(
+        label.manga is not None and label.manga.estado != "ANULADA"
+        for label in job.etiquetas
+    ):
+        return
+    if any(
+        label.manga is not None and label.manga.estado != "ANULADA"
+        for label in job.etiquetas
+    ):
+        raise ScmServiceError(
+            "PRINT_JOB_NOT_ACTIONABLE",
+            "El trabajo no contiene etiquetas pendientes de impresion.",
+            status_code=409,
+        )
+    annulled = [label.manga for label in job.etiquetas if label.manga is not None]
+    raise ScmServiceError(
+        "MANGA_ANULADA",
+        "El trabajo de impresion contiene una manga anulada.",
+        status_code=409,
+        details={"mangas": [
+            {"id": str(manga.public_id), "codigo": manga.codigo}
+            for manga in annulled
+        ]},
+    )
+
+
+def _is_actionable_print_label(label):
+    return (
+        label.manga is not None
+        and label.manga.estado != "ANULADA"
+        and label.estado in {"GENERADA", "FALLIDA_SIN_EMISION"}
+    )
+
+
+def _print_job_has_actionable_labels():
+    return ScmTrabajoImpresionManga.etiquetas.any(
+        and_(
+            ScmEtiquetaManga.estado.in_(
+                ("GENERADA", "FALLIDA_SIN_EMISION")
+            ),
+            ScmEtiquetaManga.manga.has(ScmManga.estado != "ANULADA"),
+        )
+    )
+
+
+def _reload_print_job_labels_for_update(session, job):
+    """Reload the job graph after locking the parent, in a fixed order.
+
+    ACK can arrive after a replacement or manga annulment was committed in a
+    different session.  Eagerly loaded relationships would otherwise leave
+    the identity map with the old label/manga state.  We discover the foreign
+    keys without locks, lock mangas in id order, then lock labels in id order;
+    this matches the manga-first mutation path used by annulment.
+    """
+    rows = session.execute(
+        select(
+            ScmEtiquetaManga.id,
+            ScmEtiquetaManga.manga_id,
+        )
+        .where(ScmEtiquetaManga.trabajo_impresion_id == job.public_id)
+        .order_by(ScmEtiquetaManga.id)
+        .execution_options(populate_existing=True)
+    ).all()
+    mangas = {}
+    for manga_id in sorted({row.manga_id for row in rows}):
+        manga = session.scalar(
+            select(ScmManga)
+            .where(ScmManga.id == manga_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if manga is not None:
+            mangas[manga_id] = manga
+    labels = []
+    for row in rows:
+        label = session.scalar(
+            select(ScmEtiquetaManga)
+            .where(
+                ScmEtiquetaManga.id == row.id,
+                ScmEtiquetaManga.trabajo_impresion_id == job.public_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if label is None:
+            continue
+        manga = mangas.get(label.manga_id)
+        if manga is not None:
+            # Ensure serializers and actionability checks use the locked row.
+            label.manga = manga
+        labels.append(label)
+    return labels
 
 
 def list_control_print_jobs(session, *, actor_id, filters=None):
@@ -5500,7 +5626,8 @@ def list_control_print_jobs(session, *, actor_id, filters=None):
     )
     if normalized_status == "PENDING":
         query = query.where(
-            ScmTrabajoImpresionManga.estado.in_(("GENERADO", "PARCIAL", "FALLIDO"))
+            ScmTrabajoImpresionManga.estado.in_(("GENERADO", "PARCIAL", "FALLIDO")),
+            _print_job_has_actionable_labels(),
         )
     elif normalized_status != "ALL":
         query = query.where(
@@ -5596,7 +5723,8 @@ def list_station_print_jobs(
         query = query.where(
             ScmTrabajoImpresionManga.estado.in_(
                 ("GENERADO", "PARCIAL", "FALLIDO")
-            )
+            ),
+            _print_job_has_actionable_labels(),
         )
     elif normalized_status != "ALL":
         query = query.where(
@@ -5635,6 +5763,7 @@ def get_station_print_job(session, *, station_id, print_job_id):
             "El trabajo pertenece a otra estacion.",
             status_code=403,
         )
+    _ensure_print_job_has_printable_manga(job)
     return _serialize_print_job(job)
 
 
@@ -5643,6 +5772,10 @@ def claim_station_print_job(session, *, station_id, print_job_id):
     job = session.scalar(
         select(ScmTrabajoImpresionManga)
         .where(ScmTrabajoImpresionManga.public_id == print_job_id)
+        .options(
+            selectinload(ScmTrabajoImpresionManga.etiquetas)
+            .selectinload(ScmEtiquetaManga.manga)
+        )
         .with_for_update()
     )
     if job is None:
@@ -5657,6 +5790,7 @@ def claim_station_print_job(session, *, station_id, print_job_id):
             "El trabajo ya fue reservado por otra estacion.",
             status_code=409,
         )
+    _ensure_print_job_has_printable_manga(job)
     if job.estado == "PROCESADO":
         raise ScmServiceError(
             "PRINT_JOB_ALREADY_PROCESSED",
@@ -5676,6 +5810,7 @@ def acknowledge_station_print_job(
         select(ScmTrabajoImpresionManga)
         .where(ScmTrabajoImpresionManga.public_id == print_job_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if job is None:
         raise ScmServiceError(
@@ -5689,20 +5824,67 @@ def acknowledge_station_print_job(
             "El trabajo pertenece a otra estacion.",
             status_code=403,
         )
+    locked_labels = _reload_print_job_labels_for_update(session, job)
+    if not any(_is_actionable_print_label(label) for label in locked_labels):
+        if not any(
+            label.manga is not None and label.manga.estado != "ANULADA"
+            for label in locked_labels
+        ):
+            annulled = [
+                label.manga for label in locked_labels if label.manga is not None
+            ]
+            raise ScmServiceError(
+                "MANGA_ANULADA",
+                "El trabajo de impresion contiene una manga anulada.",
+                status_code=409,
+                details={"mangas": [
+                    {"id": str(manga.public_id), "codigo": manga.codigo}
+                    for manga in annulled
+                ]},
+            )
     results = data.get("results")
     if not isinstance(results, list) or not results:
         raise ScmServiceError(
             "REQUIRED_FIELD", "Se requieren resultados por etiqueta.",
             status_code=400,
         )
-    labels = {str(label.public_id): label for label in job.etiquetas}
     allowed = {
         "IMPRESA", "FALLIDA_SIN_EMISION", "EMISION_INCIERTA"
     }
     for result in results:
-        label = labels.get(str(result.get("label_id")))
+        label_id = result.get("label_id")
+        try:
+            label_public_id = uuid.UUID(str(label_id))
+        except (TypeError, ValueError, AttributeError):
+            label_public_id = None
+        label = next(
+            (
+                candidate for candidate in locked_labels
+                if candidate.public_id == label_public_id
+            ),
+            None,
+        )
         state = str(result.get("estado", "")).upper()
-        if label is None or state not in allowed:
+        if label is None:
+            raise ScmServiceError(
+                "INVALID_PRINT_RESULT",
+                "El resultado no pertenece al trabajo o es invalido.",
+                status_code=422,
+            )
+        manga = label.manga
+        if manga is not None and manga.estado == "ANULADA":
+            raise ScmServiceError(
+                "MANGA_ANULADA",
+                "La etiqueta pertenece a una manga anulada.",
+                status_code=409,
+            )
+        if label.estado == "INVALIDADA":
+            raise ScmServiceError(
+                "IDEMPOTENCY_CONFLICT",
+                "La etiqueta fue invalidada y no puede imprimirse.",
+                status_code=409,
+            )
+        if state not in allowed:
             raise ScmServiceError(
                 "INVALID_PRINT_RESULT",
                 "El resultado no pertenece al trabajo o es invalido.",
@@ -5716,6 +5898,12 @@ def acknowledge_station_print_job(
                     status_code=409,
                 )
             continue
+        if label.estado not in {"GENERADA", "FALLIDA_SIN_EMISION"}:
+            raise ScmServiceError(
+                "IDEMPOTENCY_CONFLICT",
+                "La etiqueta ya no esta pendiente de impresion.",
+                status_code=409,
+            )
         # FALLIDA_SIN_EMISION confirms that no physical label was emitted.
         # Therefore the same immutable job may be attempted again. Its local
         # station log remains append-only while the central state advances.
@@ -5726,11 +5914,14 @@ def acknowledge_station_print_job(
         if state == "IMPRESA":
             label.printed_at = utc_now()
             if label.tipo == "POSTPESAJE":
-                label.manga.estado = "PENDIENTE_RECEPCION_ALMACEN"
-                label.manga.version += 1
+                manga.estado = "PENDIENTE_RECEPCION_ALMACEN"
+                manga.version += 1
         else:
             label.printed_at = None
-    states = {label.estado for label in job.etiquetas}
+    states = {
+        label.estado for label in locked_labels
+        if label.manga is not None and label.manga.estado != "ANULADA"
+    }
     job.station_id = station_id
     job.processed_at = utc_now()
     if states == {"IMPRESA"}:
@@ -5743,5 +5934,9 @@ def acknowledge_station_print_job(
     return {
         "print_job_id": str(job.public_id),
         "estado": job.estado,
-        "labels": [_serialize_label(label) for label in job.etiquetas],
+        "labels": [
+            _serialize_label(label)
+            for label in locked_labels
+            if _is_actionable_print_label(label)
+        ],
     }

@@ -326,6 +326,7 @@ from app.services.scm_weighing_service import (
     approve_weighing_correction,
     confirm_manga_weighing,
     get_manga_weighing,
+    get_label_print_payload,
     request_weighing_correction,
     register_manga_weighing_control,
     resolve_manga_label,
@@ -1604,7 +1605,15 @@ def test_trabajo_dos_up_conserva_dos_identidades(app):
             ]},
         )
         assert retried["estado"] == "PROCESADO"
-        assert {item["estado"] for item in retried["labels"]} == {"IMPRESA"}
+        # ACK responses expose only labels that remain actionable.  The
+        # durable states are checked in the locked rows below.
+        assert retried["labels"] == []
+        assert {
+            label.estado
+            for label in ScmEtiquetaManga.query.filter_by(
+                trabajo_impresion_id=job_id
+            ).all()
+        } == {"IMPRESA"}
 
         replacement = replace_prelabel(
             db.session,
@@ -1751,6 +1760,195 @@ def test_bandeja_preview_no_reclama_y_claim_es_explicito_e_idempotente(app):
             status="PENDING",
             limit=20,
         )["count"] == 0
+
+
+def test_trabajo_impresion_con_manga_anulada_no_es_accionable(app):
+    with app.app_context():
+        creator, _approver, order, _output = _seed_normalized_order()
+        plan = recalculate_manga_plan(
+            db.session,
+            actor_id=creator.id,
+            op_number=order.numero_op,
+            operation_id=uuid4(),
+            data={},
+        )
+        ot = create_ot(
+            db.session,
+            actor_id=creator.id,
+            op_number=order.numero_op,
+            operation_id=uuid4(),
+            data={
+                "fecha_operativa": "2026-07-28",
+                "turno": "DIA",
+                "maquinista_id": creator.id,
+                "asignaciones": [{
+                    "plan_linea_id": plan["plan"]["lineas"][0]["id"],
+                    "cantidad_un": 150,
+                }],
+            },
+        )["ot"]
+        generated = generate_prelabels(
+            db.session,
+            actor_id=creator.id,
+            manga_id=UUID(ot["mangas"][0]["public_id"]),
+            operation_id=uuid4(),
+            data={"manga_ids": [item["public_id"] for item in ot["mangas"]]},
+        )
+        first_manga = ScmManga.query.filter_by(
+            public_id=UUID(ot["mangas"][0]["public_id"])
+        ).one()
+        second_manga = ScmManga.query.filter_by(
+            public_id=UUID(ot["mangas"][1]["public_id"])
+        ).one()
+        second_manga_state = second_manga.estado
+        first_manga.estado = "ANULADA"
+        db.session.commit()
+        station_id = str(uuid4())
+
+        with pytest.raises(ScmServiceError) as resolve_error:
+            resolve_manga_label(
+                db.session,
+                label_id=UUID(generated["labels"][0]["public_id"]),
+            )
+        assert resolve_error.value.code == "MANGA_ANULADA"
+        with pytest.raises(ScmServiceError) as payload_error:
+            get_label_print_payload(
+                db.session, label_id=UUID(generated["labels"][0]["public_id"])
+            )
+        assert payload_error.value.code == "MANGA_ANULADA"
+
+        # A generated job whose every manga is annulled is excluded from the
+        # actionable inbox and rejected by every mutating/read entry point.
+        second_manga.estado = "ANULADA"
+        db.session.commit()
+        job_id = UUID(generated["print_job_id"])
+        for operation in (
+            lambda: get_station_print_job(
+                db.session, station_id=station_id, print_job_id=job_id,
+            ),
+            lambda: claim_station_print_job(
+                db.session, station_id=station_id, print_job_id=job_id,
+            ),
+            lambda: acknowledge_station_print_job(
+                db.session,
+                station_id=station_id,
+                print_job_id=job_id,
+                data={"results": [{
+                    "label_id": generated["labels"][0]["public_id"],
+                    "estado": "IMPRESA",
+                }]},
+            ),
+        ):
+            with pytest.raises(ScmServiceError) as error:
+                operation()
+            assert error.value.code == "MANGA_ANULADA"
+        second_manga.estado = second_manga_state
+        db.session.commit()
+
+        # Keep the ORM identity map stale while changing the row underneath
+        # it.  ACK must refresh the locked label and reject INVALIDADA.
+        get_station_print_job(
+            db.session, station_id=station_id, print_job_id=job_id,
+        )
+        active_label_id = UUID(generated["labels"][1]["public_id"])
+        db.session.execute(
+            ScmEtiquetaManga.__table__.update()
+            .where(ScmEtiquetaManga.public_id == active_label_id)
+            .values(estado="INVALIDADA")
+        )
+        with pytest.raises(ScmServiceError) as stale_ack_error:
+            acknowledge_station_print_job(
+                db.session,
+                station_id=station_id,
+                print_job_id=job_id,
+                data={"results": [{
+                    "label_id": str(active_label_id), "estado": "IMPRESA",
+                }]},
+            )
+        assert stale_ack_error.value.code == "IDEMPOTENCY_CONFLICT"
+        db.session.rollback()
+        db.session.get(ScmEtiquetaManga, ScmEtiquetaManga.query.filter_by(
+            public_id=active_label_id
+        ).one().id).estado = "GENERADA"
+        db.session.commit()
+
+        assert list_station_print_jobs(
+            db.session, station_id=station_id, status="PENDING", limit=20,
+        )["count"] == 1
+        assert list_control_print_jobs(
+            db.session, actor_id=creator.id, filters={"status": "PENDING"},
+        )["count"] == 1
+
+        preview = get_station_print_job(
+            db.session, station_id=station_id, print_job_id=job_id,
+        )
+        assert [label["manga_id"] for label in preview["labels"]] == [
+            str(second_manga.public_id)
+        ]
+        claimed = claim_station_print_job(
+            db.session, station_id=station_id, print_job_id=job_id,
+        )
+        assert [label["manga_id"] for label in claimed["labels"]] == [
+            str(second_manga.public_id)
+        ]
+        active_label = next(
+            label for label in generated["labels"]
+            if label["manga_id"] == str(second_manga.public_id)
+        )
+        acknowledge_station_print_job(
+            db.session,
+            station_id=station_id,
+            print_job_id=job_id,
+            data={"results": [{
+                "label_id": active_label["public_id"], "estado": "IMPRESA",
+            }]},
+        )
+        assert db.session.get(ScmTrabajoImpresionManga, job_id).estado == "PROCESADO"
+
+        active_label_model = ScmEtiquetaManga.query.filter_by(
+            public_id=UUID(active_label["public_id"])
+        ).one()
+        active_label_model.estado = "INVALIDADA"
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as stale_ack:
+            acknowledge_station_print_job(
+                db.session,
+                station_id=station_id,
+                print_job_id=job_id,
+                data={"results": [{
+                    "label_id": active_label["public_id"],
+                    "estado": "IMPRESA",
+                }]},
+            )
+        assert stale_ack.value.code == "IDEMPOTENCY_CONFLICT"
+        assert ScmEtiquetaManga.query.filter_by(
+            public_id=UUID(active_label["public_id"])
+        ).one().estado == "INVALIDADA"
+
+        second_manga.estado = "ANULADA"
+        db.session.commit()
+        assert list_station_print_jobs(
+            db.session, station_id=station_id, status="PENDING", limit=20,
+        )["count"] == 0
+        for operation in (
+            lambda: get_station_print_job(
+                db.session, station_id=station_id, print_job_id=job_id,
+            ),
+            lambda: claim_station_print_job(
+                db.session, station_id=station_id, print_job_id=job_id,
+            ),
+            lambda: acknowledge_station_print_job(
+                db.session,
+                station_id=station_id,
+                print_job_id=job_id,
+                data={"results": [{
+                    "label_id": active_label["public_id"], "estado": "IMPRESA",
+                }]},
+            ),
+        ):
+            with pytest.raises(ScmServiceError) as error:
+                operation()
+            assert error.value.code == "MANGA_ANULADA"
 
 
 def test_extra_requiere_otro_actor_y_queda_listable(app):
@@ -1932,7 +2130,10 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
                 "printer_name": "TSC",
             }]},
         )
-        assert post_ack["labels"][0]["estado"] == "IMPRESA"
+        assert post_ack["labels"] == []
+        assert ScmEtiquetaManga.query.filter_by(
+            public_id=UUID(result["post_label"]["public_id"])
+        ).one().estado == "IMPRESA"
         assert ScmPesajeManga.query.one().manga.estado == (
             "PENDIENTE_RECEPCION_ALMACEN"
         )
@@ -2608,7 +2809,7 @@ def test_anular_pesaje_exige_reversa_invalida_qr_y_devuelve_cupo(app):
                 db.session,
                 label_id=UUID(weighed["post_label"]["public_id"]),
             )
-        assert invalid_qr.value.code == "LABEL_INVALIDATED"
+        assert invalid_qr.value.code == "MANGA_ANULADA"
         replay = annul_manga_weighing(
             db.session, actor_id=approver.id, weighing_id=weighing_id,
             operation_id=annul_operation, data=command,
