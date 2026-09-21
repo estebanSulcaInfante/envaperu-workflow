@@ -18,6 +18,7 @@ from app.services.scm_kg_custody_service import (
     divide_kg_unit,
     get_kg_retiro,
     receive_kg_return,
+    release_kg_reservation,
     reserve_kg_unit,
     resolve_kg_return,
     withdraw_kg_unit,
@@ -188,6 +189,33 @@ def test_kg_reserve_withdraw_measure_and_receive_keeps_return_out_of_free_stock(
             operation_id=uuid4(), data={"version": valid_second["unit"]["version"],
             "measurement_id": valid_second["measurement"]["id"], "ubicacion_codigo": ctx["location"]})
         assert received_second["existencia"]["cantidad_fisica"] == "2.000"
+
+
+def test_releasing_production_reservation_restores_production_availability(app):
+    with app.app_context():
+        from app.services.scm_configuration import ensure_initial_scm_configuration
+        ensure_initial_scm_configuration()
+        ctx = _received(app)
+        actor = ctx["actor"]
+        _grant_capabilities(actor, ("PICKING_PREPARAR",))
+        unit = db.session.get(ScmUnidadFisicaKg, ctx["existence"].unidad_fisica_kg_id)
+        unit.estado_calidad = "SIN_CONTROL"
+        unit.estado_logistico = "DISPONIBLE_PRODUCCION"
+        unit.saldo.cantidad_no_disponible_kg = Decimal("0")
+        app.config["KG_PRODUCTION_LOCATION_CODE"] = unit.ubicacion.codigo
+        db.session.commit()
+
+        reserved = reserve_kg_unit(
+            db.session, actor_id=actor.id, unit_id=unit.id, operation_id=uuid4(),
+            data={"version": unit.version, "motivo_operativo": "Armado, mesa principal"},
+        )
+        released = release_kg_reservation(
+            db.session, actor_id=actor.id, unit_id=unit.id, operation_id=uuid4(),
+            data={"version": reserved["unit"]["version"]},
+        )
+
+        assert released["unit"]["estado_logistico"] == "DISPONIBLE_PRODUCCION"
+        assert unit.saldo.cantidad_reservada_kg == Decimal("0")
 
 
 def test_kg_division_makes_historical_parent_and_unmeasured_child_has_no_mass(app, client):

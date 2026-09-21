@@ -423,7 +423,13 @@ def release_kg_reservation(session, *, actor_id, unit_id, operation_id, data):
     balance = session.scalar(select(ScmSaldoInventarioKg).where(ScmSaldoInventarioKg.id == unit.saldo_id).with_for_update())
     if balance is None or Decimal(balance.cantidad_reservada_kg) < Decimal(reservation.cantidad_snapshot_kg):
         raise ScmServiceError("INVENTORY_CONFLICT", "El saldo reservado no es consistente.", status_code=409)
-    balance.cantidad_reservada_kg = Decimal(balance.cantidad_reservada_kg) - Decimal(reservation.cantidad_snapshot_kg); balance.version += 1; reservation.estado = "LIBERADA"; reservation.released_at = _now(); unit.estado_logistico = "RECIBIDA_ALMACEN"; unit.version += 1
+    production_location_code = current_app.config.get("KG_PRODUCTION_LOCATION_CODE", "PRODUCCION_KG")
+    restored_state = (
+        "DISPONIBLE_PRODUCCION"
+        if unit.ubicacion and unit.ubicacion.codigo == production_location_code
+        else "RECIBIDA_ALMACEN"
+    )
+    balance.cantidad_reservada_kg = Decimal(balance.cantidad_reservada_kg) - Decimal(reservation.cantidad_snapshot_kg); balance.version += 1; reservation.estado = "LIBERADA"; reservation.released_at = _now(); unit.estado_logistico = restored_state; unit.version += 1
     payload = {"unit": unit.to_dict(), "reserva": {"id": str(reservation.id), "estado": reservation.estado}, "operation_id": str(operation.operation_id)}; _complete(operation, payload); session.commit(); return payload
 
 
