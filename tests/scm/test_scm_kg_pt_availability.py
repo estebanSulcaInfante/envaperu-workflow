@@ -13,9 +13,12 @@ from app.models.scm_estructuras import ScmEstructuraComponente, ScmEstructuraRev
 from app.models.scm_inventory import ScmMovimientoInventario, ScmSaldoInventario, ScmUbicacionInventario
 from app.models.scm_inventory_kg import ScmSaldoInventarioKg
 from app.models.scm_inventory_operations import ScmAlmacen, ScmAlmacenTrabajador
+from app.models.scm_auditoria import ScmOperacion
 from app.models.trabajador import Trabajador
-from app.models.producto import PiezaColor
+from app.models.producto import ColorBase, ColorProduccion, FamiliaColor, PiezaColor
+from app.models.molde import Pieza
 from app.services.scm_kg_pt_availability_service import (
+    _hash,
     list_piece_kg_availability,
     list_pt_availability,
     list_pt_manual_movements,
@@ -75,6 +78,7 @@ def test_pt_manual_uses_canonical_un_ledger_and_replays(app):
                     "cantidad": 2,
                     "fecha_operativa": "2026-09-19",
                     "motivo": "No debe saltar el mecanismo de apertura",
+                    "referencia": "APERTURA-INVALIDA",
                 },
             )
         assert error.value.code == "PT_MANUAL_MOVEMENT_TYPE_INVALID"
@@ -117,6 +121,75 @@ def test_piece_availability_is_empty_honestly_without_kg_projection(app):
         assert payload["politica_piloto"] == "SIN_CONTROL_CALIDAD_DESDE_PESAJE"
 
 
+def test_pt_manual_reference_is_required_bounded_and_has_no_effect_on_rejection(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        product = _article("PT-REF-01", "PT referencia", "PRODUCTO_TERMINADO")
+        location = ScmUbicacionInventario(codigo="PT-REF", nombre="Ubicacion referencia")
+        db.session.add(location)
+        db.session.commit()
+        base = {
+            "articulo_scm_id": product.id, "ubicacion_id": location.id,
+            "tipo": "ENTRADA", "cantidad": 2, "version": 1,
+            "fecha_operativa": "2026-09-19", "motivo": "Prueba referencia",
+        }
+        for reference in (None, "   ", "x" * 121):
+            with pytest.raises(ScmServiceError) as error:
+                register_pt_manual_movement(
+                    db.session, actor_id=actor.id, operation_id=uuid4(),
+                    data={**base, "referencia": reference},
+                )
+            assert error.value.code == "PT_MANUAL_REFERENCE_REQUIRED"
+            assert error.value.status_code == 422
+            db.session.rollback()
+        assert db.session.scalar(db.select(ScmSaldoInventario).where(
+            ScmSaldoInventario.articulo_scm_id == product.id,
+        )) is None
+        assert db.session.scalar(db.select(ScmOperacion).where(
+            ScmOperacion.endpoint == "POST /inventario/pt/movimientos",
+        )) is None
+
+
+def test_pt_manual_replays_completed_legacy_operation_without_reference(app):
+    with app.app_context():
+        actor = _actor_with_caps()
+        product = _article("PT-REF-LEGACY", "PT referencia legacy", "PRODUCTO_TERMINADO")
+        location = ScmUbicacionInventario(codigo="PT-REF-LEGACY", nombre="Ubicacion legacy")
+        db.session.add(location)
+        db.session.flush()
+        operation_id = uuid4()
+        command = {
+            "articulo_scm_id": product.id, "ubicacion_id": location.id,
+            "tipo": "ENTRADA_MANUAL_PT", "cantidad": "2.000",
+            "fecha_operativa": "2026-09-19", "motivo": "Movimiento anterior",
+            "referencia": None, "version": 1,
+        }
+        response = {"movement": {"id": "legacy", "referencia": None}, "saldo": {"version": 2}}
+        db.session.add(ScmOperacion(
+            operation_id=operation_id, endpoint="POST /inventario/pt/movimientos",
+            actor_id=actor.id,
+            request_sha256=_hash({
+                "endpoint": "POST /inventario/pt/movimientos",
+                "actor_id": actor.id,
+                "data": command,
+            }),
+            response_json=response, estado_http=201,
+        ))
+        db.session.commit()
+
+        replay = register_pt_manual_movement(
+            db.session, actor_id=actor.id, operation_id=operation_id, data={
+                "articulo_scm_id": product.id, "ubicacion_id": location.id,
+                "tipo": "ENTRADA", "cantidad": 2, "version": 1,
+                "fecha_operativa": "2026-09-19", "motivo": "Movimiento anterior",
+            },
+        )
+        assert replay == response
+        assert db.session.scalar(db.select(ScmSaldoInventario).where(
+            ScmSaldoInventario.articulo_scm_id == product.id,
+        )) is None
+
+
 def test_pt_manual_rejects_stale_version_and_kg_uses_authoritative_saldo(app):
     with app.app_context():
         actor = _actor_with_caps()
@@ -136,7 +209,7 @@ def test_pt_manual_rejects_stale_version_and_kg_uses_authoritative_saldo(app):
             db.session, actor_id=actor.id, operation_id=uuid4(), data={
                 "articulo_scm_id": product.id, "ubicacion_id": location.id,
                 "tipo": "ENTRADA", "cantidad": 2, "version": 1,
-                "fecha_operativa": "2026-09-19", "motivo": "Alta PT",
+                "fecha_operativa": "2026-09-19", "motivo": "Alta PT", "referencia": "ALTA-PT-01",
             },
         )
         assert first["saldo"]["version"] == 2
@@ -145,7 +218,7 @@ def test_pt_manual_rejects_stale_version_and_kg_uses_authoritative_saldo(app):
                 db.session, actor_id=actor.id, operation_id=uuid4(), data={
                     "articulo_scm_id": product.id, "ubicacion_id": location.id,
                     "tipo": "SALIDA", "cantidad": 1, "version": 1,
-                    "fecha_operativa": "2026-09-19", "motivo": "Version vieja",
+                    "fecha_operativa": "2026-09-19", "motivo": "Version vieja", "referencia": "SALIDA-PT-01",
                 },
             )
         assert error.value.code == "VERSION_CONFLICT"
@@ -178,6 +251,19 @@ def test_pt_projection_shared_stock_wip_missing_weight_floor_and_pt_query(app):
             db.session.flush()
         else:
             color.peso = 2000.0
+        piece_master = Pieza(codigo="PZ-BOM-01", nombre="Tapa BOM", peso_nominal_gr=2000.0)
+        color_base = ColorBase(nombre="Rojo BOM")
+        color_family = FamiliaColor(nombre="Solido BOM")
+        db.session.add_all([piece_master, color_base, color_family])
+        db.session.flush()
+        production_color = ColorProduccion(
+            color_base_id=color_base.id, familia_color_id=color_family.id,
+            hex_referencia="#AA1122",
+        )
+        db.session.add(production_color)
+        db.session.flush()
+        color.pieza_id = piece_master.id
+        color.color_produccion_id = production_color.id
         piece_link = db.session.query(ScmArticuloPiezaColor).filter_by(articulo_id=piece.id).one_or_none()
         if piece_link is None:
             db.session.add(ScmArticuloPiezaColor(articulo_id=piece.id, pieza_color_sku=color.sku))
@@ -215,6 +301,14 @@ def test_pt_projection_shared_stock_wip_missing_weight_floor_and_pt_query(app):
         assert item["potencial_sumable"] is False
         assert item["componentes"][0]["es_limitante"] is True
         assert item["componentes"][0]["faltante_kg"] == "0.000"
+        assert item["componentes"][0]["kg_requeridos_por_un_pt"] == "6.000"
+        assert item["componentes"][0]["identidad_pieza"] == {
+            "pieza_id": piece_master.id,
+            "nombre": "Tapa BOM",
+            "color_id": production_color.id,
+            "color_nombre": production_color.nombre,
+            "color_hex": "#AA1122",
+        }
 
         all_items = list_pt_availability(db.session, actor_id=actor_id)
         by_code = {item["pt"]["codigo"]: item for item in all_items["items"]}
@@ -224,6 +318,7 @@ def test_pt_projection_shared_stock_wip_missing_weight_floor_and_pt_query(app):
         assert by_code[pt_missing.codigo]["potencial_motivo"] == "SIN_REFERENCIA_PESO"
         assert by_code[pt_wip.codigo]["componentes"][0]["naturaleza"] == "SUBENSAMBLE_WIP"
         assert len(by_code[pt_wip.codigo]["componentes"]) == 1
+        assert by_code[pt_wip.codigo]["componentes"][0]["identidad_pieza"] is None
 
 
 def test_pt_manual_requires_routine_capability_and_history_honors_location_scope(app):
@@ -259,7 +354,7 @@ def test_pt_manual_requires_routine_capability_and_history_honors_location_scope
                 db.session, actor_id=actor.id, operation_id=uuid4(), data={
                     "articulo_scm_id": product.id, "ubicacion_id": allowed_location.id,
                     "tipo": "ENTRADA", "cantidad": 1, "version": 1,
-                    "fecha_operativa": "2026-09-19", "motivo": "Sin capacidad rutinaria",
+                    "fecha_operativa": "2026-09-19", "motivo": "Sin capacidad rutinaria", "referencia": "SCOPE-PT-01",
                 },
             )
         assert error.value.code == "CAPABILITY_REQUIRED"

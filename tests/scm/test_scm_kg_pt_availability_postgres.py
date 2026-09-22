@@ -222,6 +222,7 @@ def test_postgres_pt_manual_rows_are_append_only(postgres_w2_app):
                 "articulo_scm_id": article_id, "ubicacion_id": location_id,
                 "tipo": "ENTRADA", "cantidad": 2, "version": 1,
                 "fecha_operativa": "2026-09-19", "motivo": "Prueba append only",
+                "referencia": "APPEND-ONLY-PG",
             },
         )
         movement_id = db.session.scalar(db.select(ScmMovimientoInventario.id))
@@ -249,6 +250,7 @@ def test_postgres_first_pt_manual_row_has_one_winner_and_deterministic_retry(pos
                         "articulo_scm_id": article_id, "ubicacion_id": location_id,
                         "tipo": "ENTRADA", "cantidad": 1, "version": 1,
                         "fecha_operativa": "2026-09-19", "motivo": "Carrera inicial",
+                        "referencia": "CARRERA-INICIAL-PG",
                     },
                 )
                 return "ok", payload["saldo"]["version"]
@@ -281,6 +283,7 @@ def test_postgres_same_idempotency_key_replays_and_conflicting_payload_fails(pos
         "articulo_scm_id": article_id, "ubicacion_id": location_id,
         "tipo": "ENTRADA", "cantidad": 1, "version": 1,
         "fecha_operativa": "2026-09-19", "motivo": "Replay PG",
+        "referencia": "REPLAY-PG",
     }
     with app.app_context():
         first = register_pt_manual_movement(
@@ -308,6 +311,7 @@ def test_postgres_same_idempotency_key_concurrent_requests_have_one_effect(postg
         "articulo_scm_id": article_id, "ubicacion_id": location_id,
         "tipo": "ENTRADA", "cantidad": 1, "version": 1,
         "fecha_operativa": "2026-09-19", "motivo": "Replay PG concurrente",
+        "referencia": "REPLAY-PG-CONCURRENTE",
     }
     start = Barrier(2)
 

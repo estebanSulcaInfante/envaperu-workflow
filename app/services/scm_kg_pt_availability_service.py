@@ -15,6 +15,7 @@ from uuid import UUID
 from flask import current_app
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 
 from app.extensions import db
 from app.models.producto import PiezaColor, ProductoTerminado
@@ -311,6 +312,28 @@ def _weight_kg_for_article(session, article):
     return Decimal(str(piece.peso)) / Decimal("1000")
 
 
+def _piece_identity(article):
+    """Return the normalized piece/color identity for a linked BOM article.
+
+    WIP articles and legacy piece-color rows without the normalized master
+    relationship deliberately return ``None`` so consumers cannot infer an
+    identity that the catalog does not actually contain.
+    """
+    link = getattr(article, "pieza_color", None)
+    pieza_color = getattr(link, "pieza_color", None) if link else None
+    if pieza_color is None or pieza_color.pieza_id is None:
+        return None
+    piece = getattr(pieza_color, "pieza_rel", None)
+    color = getattr(pieza_color, "color_produccion_rel", None)
+    return {
+        "pieza_id": pieza_color.pieza_id,
+        "nombre": piece.nombre if piece is not None else None,
+        "color_id": pieza_color.color_produccion_id,
+        "color_nombre": color.nombre if color is not None else None,
+        "color_hex": color.hex_referencia if color is not None else None,
+    }
+
+
 def list_pt_availability(session, *, actor_id, query=None, location=None):
     load_actor(session, actor_id, capability="INVENTARIO_VER")
     # The PT query filters finished articles.  It must never be reused to
@@ -349,7 +372,16 @@ def list_pt_availability(session, *, actor_id, query=None, location=None):
     items = []
     for item in totals.values():
         product = session.scalar(select(ScmArticulo).where(ScmArticulo.id == item["articulo"]["id"]))
-        revision = session.scalar(select(ScmEstructuraRevision).where(
+        component_article_loader = selectinload(
+            ScmEstructuraRevision.componentes,
+        ).selectinload(ScmEstructuraComponente.articulo_componente)
+        piece_color_loader = component_article_loader.selectinload(
+            ScmArticulo.pieza_color,
+        ).selectinload(ScmArticuloPiezaColor.pieza_color)
+        revision = session.scalar(select(ScmEstructuraRevision).options(
+            piece_color_loader.selectinload(PiezaColor.pieza_rel),
+            piece_color_loader.selectinload(PiezaColor.color_produccion_rel),
+        ).where(
             ScmEstructuraRevision.articulo_resultado_id == product.id,
             ScmEstructuraRevision.estado == "APROBADA",
         ))
@@ -378,8 +410,10 @@ def list_pt_availability(session, *, actor_id, query=None, location=None):
                 ) if required_kg is not None else None
                 components.append({
                     "articulo": component_article.to_dict(),
+                    "identidad_pieza": _piece_identity(component_article),
                     "cantidad_bom_un": _qty(component.cantidad),
                     "kg_disponibles": _qty(available_kg),
+                    "kg_requeridos_por_un_pt": _qty(required_kg) if required_kg is not None else None,
                     "peso_unitario_kg": _qty(weight_kg) if weight_kg is not None else None,
                     "potencial_un_estimado": _qty(estimate.to_integral_value(rounding=ROUND_FLOOR)) if estimate is not None else None,
                     "cobertura_un": _qty(estimate.to_integral_value(rounding=ROUND_FLOOR)) if estimate is not None else None,
@@ -546,13 +580,39 @@ def register_pt_manual_movement(session, *, actor_id, operation_id, data):
     except (TypeError, ValueError) as error:
         raise ScmServiceError("PT_MANUAL_DATE_INVALID", "fecha_operativa debe ser YYYY-MM-DD.", status_code=422) from error
     reason = required_text(data.get("motivo"), field="motivo", max_length=500)
-    reference = str(data.get("referencia") or "").strip()[:120] or None
+    raw_reference = data.get("referencia")
     internal_type = {
         "ENTRADA": "ENTRADA_MANUAL_PT",
         "SALIDA": "SALIDA_MANUAL_PT",
         "AJUSTE_POSITIVO": "AJUSTE_POSITIVO_MANUAL_PT",
         "AJUSTE_NEGATIVO": "AJUSTE_NEGATIVO_MANUAL_PT",
     }[movement_type]
+    # A request accepted by the previous pilot version may have persisted a
+    # null or silently truncated reference. Preserve replay of that exact,
+    # already completed command while requiring the new contract for every
+    # operation key that does not exist yet.
+    legacy_reference = str(raw_reference or "").strip()[:120] or None
+    legacy_command = {
+        "articulo_scm_id": article.id, "ubicacion_id": location.id,
+        "tipo": internal_type, "cantidad": _qty(quantity),
+        "fecha_operativa": operation_date.isoformat(), "motivo": reason,
+        "referencia": legacy_reference,
+        "version": expected,
+    }
+    if session.get(ScmOperacion, operation_id) is not None:
+        _operation, replay = _reserve(
+            session, operation_id, "POST /inventario/pt/movimientos", actor, legacy_command,
+        )
+        if replay is not None:
+            return replay
+    if not isinstance(raw_reference, str) or not raw_reference.strip() or len(raw_reference.strip()) > 120:
+        raise ScmServiceError(
+            "PT_MANUAL_REFERENCE_REQUIRED",
+            "referencia es obligatoria y debe tener entre 1 y 120 caracteres.",
+            status_code=422,
+            details={"field": "referencia", "max_length": 120},
+        )
+    reference = raw_reference.strip()
     command = {
         "articulo_scm_id": article.id, "ubicacion_id": location.id,
         "tipo": internal_type, "cantidad": _qty(quantity),
