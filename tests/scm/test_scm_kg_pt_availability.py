@@ -2,6 +2,7 @@
 
 from datetime import date
 from uuid import uuid4
+from openpyxl import load_workbook
 
 import pytest
 
@@ -23,6 +24,11 @@ from app.services.scm_kg_pt_availability_service import (
     list_pt_availability,
     list_pt_manual_movements,
     register_pt_manual_movement,
+)
+from app.services.scm_kg_pt_availability_export import (
+    MAX_MATRIX_COMPONENTS,
+    _safe_text,
+    generate_pt_availability_xlsx,
 )
 from app.services.scm_service_support import ScmServiceError
 
@@ -462,6 +468,7 @@ def test_piece_availability_includes_production_for_scoped_actor(app):
 
         app.config["KG_PRODUCTION_LOCATION_CODE"] = ""
         assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
+
         app.config["KG_PRODUCTION_LOCATION_CODE"] = "NO-EXISTE"
         assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
         app.config["KG_PRODUCTION_LOCATION_CODE"] = "PRODUCCION_KG"
@@ -482,3 +489,88 @@ def test_piece_availability_includes_production_for_scoped_actor(app):
         assignment.clases_articulo_json = ["SUBENSAMBLE_WIP"]
         db.session.commit()
         assert list_piece_kg_availability(db.session, actor_id=actor.id)["items"] == []
+
+
+def test_pt_availability_export_has_normalized_and_matrix_bom_sheets(app, monkeypatch):
+    with app.app_context():
+        actor = _actor_with_caps()
+        payload = {
+            "items": [{
+                "pt": {"id": 1, "codigo": "PT-01", "nombre": "=Producto prueba"},
+                "revision_bom": {"numero": 2, "content_hash": "bom-sha"}, "saldo_manual_un": "3.000",
+                "potencial_un_estimado": None, "potencial_estado": "NO_CALCULABLE",
+                "potencial_motivo": "SIN_REFERENCIA_PESO",
+                "componentes": [{
+                    "articulo": {"id": 2, "codigo": "WIP-02", "nombre": "WIP armado"},
+                    "identidad_pieza": None, "naturaleza": "SUBENSAMBLE_WIP",
+                    "cantidad_bom_un": "1.000", "kg_disponibles": "4.500",
+                    "peso_unitario_kg": None,
+                    "kg_requeridos_por_un_pt": None, "faltante_kg": None,
+                    "cobertura_un": None, "estado": "NO_CALCULABLE",
+                    "es_limitante": False, "grupo_stock_compartido": "articulo:2",
+                    "potencial_sumable": False,
+                }],
+                "potencial_sumable": False,
+            }],
+            "politica_piloto": "SIN_CONTROL_CALIDAD_DESDE_PESAJE",
+        }
+        import app.services.scm_kg_pt_availability_export as export_module
+        monkeypatch.setattr(export_module, "list_pt_availability", lambda *args, **kwargs: payload)
+        workbook = generate_pt_availability_xlsx(
+            db.session, actor_id=actor.id, query="PT-01", location="PT-LOC"
+        )
+        book = load_workbook(workbook, data_only=False)
+        assert book.sheetnames == ["Resumen PT", "Componentes BOM", "Matriz BOM", "Información"]
+        assert book["Resumen PT"]["A2"].value == "PT-01"
+        assert book["Resumen PT"]["B2"].value == "'=Producto prueba"
+        assert book["Resumen PT"]["F2"].value is None
+        assert book["Componentes BOM"]["I2"].value == "WIP armado"
+        assert book["Componentes BOM"]["J2"].value is None
+        assert book["Componentes BOM"]["O2"].number_format == "0.000"
+        assert book["Matriz BOM"]["I2"].value == "WIP-02"
+        assert book["Matriz BOM"].freeze_panes == "A2"
+        assert book["Información"]["B2"].value
+        assert book["Información"]["B5"].value == "PT-LOC"
+
+
+@pytest.mark.parametrize("value", ["=SUM(A1:A2)", "+1", "-2", "@dato"])
+def test_pt_availability_export_neutralizes_formula_like_text(value):
+    assert _safe_text(value) == f"'{value}"
+
+
+def test_pt_availability_export_rejects_excessive_matrix(app, monkeypatch):
+    with app.app_context():
+        actor = _actor_with_caps()
+        component = {
+            "articulo": {"id": 2, "codigo": "PC-02", "nombre": "Pieza"},
+            "identidad_pieza": None, "naturaleza": "PIEZA_COLOR",
+        }
+        payload = {
+            "items": [{
+                "pt": {"id": 1, "codigo": "PT-01", "nombre": "Producto"},
+                "componentes": [dict(component, articulo={**component["articulo"], "id": index})
+                                for index in range(MAX_MATRIX_COMPONENTS + 1)],
+            }],
+        }
+        import app.services.scm_kg_pt_availability_export as export_module
+        monkeypatch.setattr(export_module, "list_pt_availability", lambda *args, **kwargs: payload)
+        with pytest.raises(ScmServiceError) as error:
+            generate_pt_availability_xlsx(db.session, actor_id=actor.id)
+        assert error.value.code == "PT_EXPORT_TOO_LARGE"
+        assert error.value.status_code == 413
+
+
+def test_pt_availability_export_endpoint_returns_xlsx(app, monkeypatch):
+    with app.app_context():
+        actor = _actor_with_caps()
+        import app.api.rutas_scm_kg_pt as routes
+        from io import BytesIO
+
+        monkeypatch.setattr(routes, "generate_pt_availability_xlsx", lambda *args, **kwargs: BytesIO(b"PK-test"))
+        response = app.test_client().get(
+            "/api/scm/v1/disponibilidad/productos-terminados/export.xlsx?q=PT-01&ubicacion=PT-LOC",
+            headers={"X-Actor-Id": str(actor.id)},
+        )
+        assert response.status_code == 200
+        assert response.mimetype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        assert response.headers["Content-Disposition"].startswith("attachment;")

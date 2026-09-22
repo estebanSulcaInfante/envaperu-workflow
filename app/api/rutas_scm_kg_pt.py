@@ -1,8 +1,9 @@
 """HTTP contract for KG availability and the PT manual Kardex pilot."""
 
+from datetime import datetime, timezone
 from uuid import UUID
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 
 from app.extensions import db
 from app.services.scm_auth import request_actor_id
@@ -13,6 +14,10 @@ from app.services.scm_kg_pt_availability_service import (
     list_pt_manual_movements,
     list_pt_manual_movements_all,
     register_pt_manual_movement,
+)
+from app.services.scm_kg_pt_availability_export import (
+    XLSX_MIMETYPE,
+    generate_pt_availability_xlsx,
 )
 from app.services.scm_service_support import ScmServiceError
 
@@ -76,6 +81,23 @@ def disponibilidad_pt():
         query=request.args.get("q"),
         location=request.args.get("ubicacion"),
     ))
+
+
+@scm_kg_pt_bp.get("/disponibilidad/productos-terminados/export.xlsx")
+def disponibilidad_pt_export():
+    """Download the filtered PT availability projection as an Excel workbook."""
+    workbook = generate_pt_availability_xlsx(
+        db.session,
+        actor_id=_actor_id(),
+        query=request.args.get("q"),
+        location=request.args.get("ubicacion"),
+    )
+    return send_file(
+        workbook,
+        mimetype=XLSX_MIMETYPE,
+        as_attachment=True,
+        download_name=f"disponibilidad-pt-{datetime.now(timezone.utc):%Y%m%d-%H%M}.xlsx",
+    )
 
 
 @scm_kg_pt_bp.get("/kardex-pt-manual")
