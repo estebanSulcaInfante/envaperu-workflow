@@ -480,7 +480,7 @@ def create_contextual_fabrication_recipe(
                 ScmCorridaFabricacion.id == parsed_run_id,
                 ScmCorridaFabricacion.orden_fabricacion_id == order.id,
             )
-            .with_for_update()
+            .with_for_update(of=ScmCorridaFabricacion)
         )
         if run is None:
             raise ScmServiceError(
