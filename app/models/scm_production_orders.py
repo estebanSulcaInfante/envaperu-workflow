@@ -516,6 +516,10 @@ class ScmCorridaFabricacion(db.Model):
             name="ck_scm_corrida_ciclos",
         ),
         db.CheckConstraint(
+            "objetivo_neto_kg IS NULL OR objetivo_neto_kg > 0",
+            name="ck_scm_corrida_objetivo_neto_kg",
+        ),
+        db.CheckConstraint(
             "estado IN "
             "('BORRADOR', 'LIBERADA', 'EN_EJECUCION', 'COMPLETADA', "
             "'ANULADA')",
@@ -560,6 +564,7 @@ class ScmCorridaFabricacion(db.Model):
     )
     receta_hash = db.Column(db.String(64), nullable=True)
     ciclos_objetivo = db.Column(db.Integer, nullable=True)
+    objetivo_neto_kg = db.Column(db.Numeric(15, 6), nullable=True)
     estado = db.Column(
         db.String(24),
         nullable=False,

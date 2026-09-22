@@ -158,6 +158,9 @@ from app.services.scm_fabrication_order_service import (
     replace_fabrication_order,
     update_fabrication_order,
 )
+from app.services.scm_fabrication_contextual_recipe_service import (
+    create_contextual_fabrication_recipe,
+)
 from app.services.scm_assembly_order_service import (
     create_exceptional_assembly_order,
     get_assembly_order,
@@ -1144,6 +1147,20 @@ def orden_fabricacion_actualizar(order_id):
         actor_id=_actor_id(),
         operation_id=_idempotency_key(),
         operation_order_id=order_id,
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post(
+    "/ordenes-fabricacion/<uuid:order_id>/corridas/<uuid:run_id>/formulacion-contextual"
+)
+def orden_fabricacion_formulacion_contextual(order_id, run_id):
+    return jsonify(create_contextual_fabrication_recipe(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        operation_order_id=order_id,
+        run_id=run_id,
         data=_json_body(),
     ))
 

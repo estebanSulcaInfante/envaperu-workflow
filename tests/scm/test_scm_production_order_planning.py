@@ -362,6 +362,7 @@ def test_create_and_release_exceptional_fabrication_order(
     client,
     scm_config,
 ):
+    from app.models.maquina import Maquina, TipoMaquina
     from app.models.molde import Molde
     from app.models.producto import (
         ColorBase,
@@ -451,7 +452,51 @@ def test_create_and_release_exceptional_fabrication_order(
         approved_recipe_id = approved_recipe.id
         draft_recipe_id = draft_recipe.id
         other_product_recipe_id = other_product_recipe.id
+        bad_type = TipoMaquina(
+            codigo="SOPLADO-OF-API",
+            nombre="Sopladora OF API",
+            proceso="SOPLADO",
+        )
+        bad_machine = Maquina(
+            codigo="MQ-SOPLADO-OF-API",
+            nombre="Maquina soplado OF API",
+            tipo_maquina=bad_type,
+            estado="OPERATIVA",
+            activo=True,
+        )
+        db.session.add(bad_machine)
         db.session.commit()
+        bad_machine_id = bad_machine.id
+
+    incompatible_machine = client.post(
+        "/api/scm/v1/ordenes-fabricacion/excepcionales",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={
+            "motivo": "No debe aceptar sugerencia SOPLADO para molde de inyeccion",
+            "molde_id": "ML-OF-API",
+            "maquina_prevista_id": bad_machine_id,
+            "snapshot_tiempo_ciclo_seg": 30,
+            "snapshot_horas_turno": 24,
+            "snapshot_peso_colada_gr": 10,
+            "corridas": [{
+                "color_produccion_id": color_id,
+                "receta_revision_id": approved_recipe_id,
+                "ciclos_objetivo": 50,
+                "salidas": [{
+                    "articulo_scm_id": article_id,
+                    "cantidad_por_ciclo": 2,
+                    "peso_unitario_g": 45,
+                }],
+            }],
+        },
+    )
+    assert incompatible_machine.status_code == 422
+    assert incompatible_machine.get_json()["error"]["code"] == (
+        "MACHINE_PROCESS_INCOMPATIBLE"
+    )
 
     rejected_draft = client.post(
         "/api/scm/v1/ordenes-fabricacion/excepcionales",
@@ -462,7 +507,6 @@ def test_create_and_release_exceptional_fabrication_order(
         json={
             "motivo": "No debe aceptar receta sin aprobar",
             "molde_id": "ML-OF-API",
-            "maquina_prevista_id": 1,
             "snapshot_tiempo_ciclo_seg": 30,
             "snapshot_horas_turno": 24,
             "snapshot_peso_colada_gr": 10,
@@ -493,7 +537,6 @@ def test_create_and_release_exceptional_fabrication_order(
         json={
             "motivo": "No debe aceptar receta de otro producto",
             "molde_id": "ML-OF-API",
-            "maquina_prevista_id": 1,
             "snapshot_tiempo_ciclo_seg": 30,
             "snapshot_horas_turno": 24,
             "snapshot_peso_colada_gr": 10,
@@ -515,6 +558,35 @@ def test_create_and_release_exceptional_fabrication_order(
         == "RECIPE_SCOPE_MISMATCH"
     )
 
+    insufficient_target = client.post(
+        "/api/scm/v1/ordenes-fabricacion/excepcionales",
+        headers={
+            "X-Actor-Id": str(actor_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={
+            "motivo": "Objetivo sin peso unitario",
+            "molde_id": "ML-OF-API",
+            "snapshot_tiempo_ciclo_seg": 30,
+            "snapshot_horas_turno": 24,
+            "snapshot_peso_colada_gr": 10,
+            "corridas": [{
+                "color_produccion_id": color_id,
+                "receta_revision_id": approved_recipe_id,
+                "objetivo_neto_kg": 5,
+                "salidas": [{
+                    "articulo_scm_id": article_id,
+                    "cantidad_por_ciclo": 2,
+                }],
+            }],
+        },
+    )
+    assert insufficient_target.status_code == 422
+    assert (
+        insufficient_target.get_json()["error"]["code"]
+        == "OF_NET_TARGET_DATA_REQUIRED"
+    )
+
     headers = {
         "X-Actor-Id": str(actor_id),
         "Idempotency-Key": str(uuid4()),
@@ -525,7 +597,6 @@ def test_create_and_release_exceptional_fabrication_order(
         json={
             "motivo": "Prueba controlada UAT",
             "molde_id": "ML-OF-API",
-            "maquina_prevista_id": 1,
             "snapshot_tiempo_ciclo_seg": 30,
             "snapshot_horas_turno": 24,
             "snapshot_peso_colada_gr": 10,
@@ -533,16 +604,19 @@ def test_create_and_release_exceptional_fabrication_order(
                 "color_produccion_id": color_id,
                 "receta_revision_id": approved_recipe_id,
                 "ciclos_objetivo": 50,
+                "objetivo_neto_kg": 5,
                 "salidas": [{
                     "articulo_scm_id": article_id,
                     "cantidad_por_ciclo": 2,
                     "peso_unitario_g": 45,
+                    "cantidad_objetivo": 100,
                 }],
             }],
         },
     )
     assert created.status_code == 201
     body = created.get_json()
+    assert body["proceso_requerido"] == "INYECCION"
     assert body["codigo"] == "OF-000001"
     assert body["fecha_necesidad"] is None
     assert body["fecha_necesidad_fuente"] is None
@@ -563,11 +637,19 @@ def test_create_and_release_exceptional_fabrication_order(
     }
     assert body["started_at"] is None
     assert body["closed_at"] is None
+    assert body["corridas"][0]["ciclos_objetivo"] == 56
+    assert body["corridas"][0]["objetivo_neto_kg"] == "5.000000"
+    assert body["corridas"][0]["kg_neto_por_ciclo"] == "0.090000"
+    assert body["corridas"][0]["kg_neto_alcanzable"] == "5.040000"
+    assert body["corridas"][0]["redondeo_kg"] == "0.040000"
     assert body["corridas"][0]["salidas"][0]["cantidad_objetivo"] == (
-        "100.000"
+        "112.000"
+    )
+    assert body["corridas"][0]["salidas"][0]["excedente_objetivo"] == (
+        "12.000"
     )
     assert body["corridas"][0]["salidas"][0]["kg_estandar_objetivo"] == (
-        "4.500000"
+        "5.040000"
     )
     assert body["corridas"][0]["receta"]["nombre"] == "Natural estándar"
     assert body["corridas"][0]["receta"]["base_virgen_kg"] == 25.0
@@ -1022,16 +1104,17 @@ def test_calcular_y_confirmar_plan_crea_of_y_oa_en_borrador(app, scm_config):
             data={
                 "version": fabrication_order.version,
                 "molde_id": "ML-PLAN-FLOW",
-                "maquina_prevista_id": 1,
                 "snapshot_horas_turno": 8,
                 "corridas": [{
                     "id": str(run.id),
+                    "objetivo_neto_kg": 0.5,
                     "salidas": [{"id": str(output.id)}],
                 }],
             },
         )
         configured_run = configured["corridas"][0]
         configured_output = configured_run["salidas"][0]
+        assert configured["maquina_prevista_id"] is None
         assert Decimal(configured["snapshot_tiempo_ciclo_seg"]) == Decimal("30")
         assert Decimal(configured["snapshot_peso_colada_gr"]) == Decimal("20")
         assert configured_run["ciclos_objetivo"] == 8

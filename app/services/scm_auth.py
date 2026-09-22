@@ -148,6 +148,25 @@ def _authorize_request(actor):
                 403,
             )
 
+        if path.startswith("/api/catalogo/recetas-color") and method in {"POST", "PUT", "PATCH"}:
+            payload = request.get_json(silent=True) or {}
+            target_state = str(payload.get("estado") or "").strip().upper()
+            if not target_state and method in {"PUT", "PATCH"}:
+                try:
+                    recipe_id = int(path.rstrip("/").rsplit("/", 1)[-1])
+                except ValueError:
+                    recipe_id = None
+                if recipe_id is not None:
+                    from app.models.receta_color import RecetaColorMaestra
+                    recipe = db.session.get(RecetaColorMaestra, recipe_id)
+                    target_state = recipe.estado if recipe is not None else ""
+            if target_state == "APROBADA" and not actor.tiene_capacidad("FORMULACION_PUBLICAR_DIRECTO"):
+                return _error(
+                    "CAPABILITY_REQUIRED",
+                    "Aprobar una formulación requiere autorización de publicación directa.",
+                    403,
+                )
+
         is_master_steward = actor.tiene_rol("GESTOR_MAESTROS")
         if is_master_steward:
             allowed = (

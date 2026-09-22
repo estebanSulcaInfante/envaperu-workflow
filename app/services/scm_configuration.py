@@ -205,6 +205,7 @@ CAPACIDADES_SCM_INICIALES = (
     ("ABASTECIMIENTO_EMERGENCIA_APROBAR", "Aprobar abastecimiento no planificado"),
     ("OF_VER", "Consultar ordenes de fabricacion"),
     ("OF_EDITAR_BORRADOR", "Editar borradores de fabricacion"),
+    ("FORMULACION_PUBLICAR_DIRECTO", "Aprobar y publicar formulaciones de material"),
     ("OF_EXCEPCIONAL_CREAR", "Crear fabricacion excepcional"),
     ("OF_LIBERAR", "Liberar ordenes de fabricacion"),
     ("OF_CERRAR", "Cerrar ordenes de fabricacion y acreditar demanda"),

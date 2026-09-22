@@ -84,6 +84,63 @@ def _positive_decimal(value, field, *, integral=False, allow_zero=False):
     return parsed
 
 
+def _run_cycles(
+    *,
+    minimum_cycles,
+    explicit_cycles,
+    objective_neto_kg,
+    kg_neto_por_ciclo,
+):
+    candidates = [int(minimum_cycles)]
+    if explicit_cycles is not None:
+        candidates.append(int(_positive_decimal(
+            explicit_cycles,
+            "ciclos_objetivo",
+            integral=True,
+        )))
+    if objective_neto_kg is not None:
+        if kg_neto_por_ciclo is None or kg_neto_por_ciclo <= 0:
+            raise ScmServiceError(
+                "OF_NET_TARGET_DATA_REQUIRED",
+                "El objetivo neto requiere cantidad por ciclo y peso unitario.",
+                status_code=422,
+            )
+        candidates.append(int((
+            objective_neto_kg / kg_neto_por_ciclo
+        ).to_integral_value(rounding=ROUND_CEILING)))
+    return max(candidates)
+
+
+def _run_net_projection(run):
+    snapshots = [
+        output for output in run.salidas
+        if output.cantidad_por_ciclo_snapshot is not None
+        and output.peso_unitario_snapshot_g is not None
+    ]
+    if not snapshots:
+        return None, None, None
+    kg_neto_por_ciclo = sum(
+        (
+            Decimal(output.cantidad_por_ciclo_snapshot)
+            * Decimal(output.peso_unitario_snapshot_g)
+            / Decimal("1000")
+            for output in snapshots
+        ),
+        Decimal("0"),
+    )
+    alcanzable = (
+        kg_neto_por_ciclo * Decimal(run.ciclos_objetivo)
+        if run.ciclos_objetivo is not None and kg_neto_por_ciclo > 0
+        else None
+    )
+    redondeo = (
+        alcanzable - Decimal(run.objetivo_neto_kg)
+        if alcanzable is not None and run.objetivo_neto_kg is not None
+        else None
+    )
+    return kg_neto_por_ciclo, alcanzable, redondeo
+
+
 def _decimal_text(value, scale):
     if value is None:
         return None
@@ -314,6 +371,7 @@ def _serialize_run(session, run):
         color_id=run.color_produccion_id,
     )
     color_name = color_identity["nombre"] if color_identity else None
+    kg_neto_por_ciclo, kg_neto_alcanzable, redondeo_kg = _run_net_projection(run)
     return {
         "id": str(run.id),
         "codigo": run.codigo,
@@ -335,6 +393,10 @@ def _serialize_run(session, run):
             if run.receta_revision is not None else None
         ),
         "ciclos_objetivo": run.ciclos_objetivo,
+        "objetivo_neto_kg": _decimal_text(run.objetivo_neto_kg, 6),
+        "kg_neto_por_ciclo": _decimal_text(kg_neto_por_ciclo, 6),
+        "kg_neto_alcanzable": _decimal_text(kg_neto_alcanzable, 6),
+        "redondeo_kg": _decimal_text(redondeo_kg, 6),
         "estado": run.estado,
         "lote_color_legacy_id": run.lote_color_legacy_id,
         "meta_kg_legacy": (
@@ -392,9 +454,7 @@ def _serialize(session, operation, *, schedule_projection=None):
             if operation.plan_produccion_id else None
         ),
         "propuesta_clave": operation.propuesta_clave,
-        "proceso_requerido": (
-            route_operation.tipo if route_operation is not None else None
-        ),
+        "proceso_requerido": _required_process_for_operation(operation),
         "created_by_id": operation.created_by_id,
         "released_by_id": operation.released_by_id,
         "released_at": _iso(operation.released_at),
@@ -435,16 +495,74 @@ def _normalized_process(value):
 
 def _machine_processes(machine):
     machine_type = machine.tipo_maquina
+    canonical = _normalized_process(
+        machine_type.proceso if machine_type else None
+    )
+    if canonical:
+        return {canonical}
     return {
         _normalized_process(value)
         for value in (
-            machine_type.proceso if machine_type else None,
             machine_type.codigo if machine_type else None,
             machine_type.nombre if machine_type else None,
             machine.tipo,
         )
         if _normalized_process(value)
     }
+
+
+def _resolve_machine_process(machine):
+    processes = _machine_processes(machine)
+    if len(processes) > 1:
+        raise ScmServiceError(
+            "MACHINE_PROCESS_AMBIGUOUS",
+            "La maquina tiene aliases legacy de proceso incompatibles; "
+            "corrija TipoMaquina.proceso.",
+            status_code=422,
+            details={
+                "maquina_id": machine.id,
+                "procesos_maquina": sorted(processes),
+            },
+        )
+    return next(iter(processes), None)
+
+
+def _required_process_for_operation(operation):
+    route_operation = operation.operacion_ruta_revision
+    required_process = _normalized_process(
+        route_operation.tipo if route_operation is not None else None
+    )
+    if (
+        not required_process
+        and operation.origen_demanda == "EXCEPCIONAL"
+        and operation.fabricacion is not None
+        and operation.fabricacion.molde_id
+    ):
+        return "INYECCION"
+    return required_process or None
+
+
+def _validate_machine_process(machine, required_process):
+    actual_process = _resolve_machine_process(machine)
+    if actual_process is None:
+        raise ScmServiceError(
+            "MACHINE_PROCESS_REQUIRED",
+            "La maquina no tiene un proceso canonico o legacy univoco.",
+            status_code=422,
+            details={"maquina_id": machine.id},
+        )
+    if actual_process != required_process:
+        raise ScmServiceError(
+            "MACHINE_PROCESS_INCOMPATIBLE",
+            "La maquina prevista no corresponde al proceso de la OF.",
+            status_code=422,
+            details={
+                "maquina_id": machine.id,
+                "proceso_requerido": required_process,
+                "proceso_maquina": actual_process,
+                "procesos_maquina": sorted(_machine_processes(machine)),
+            },
+        )
 
 
 def _validate_machine_for_operation(machine, operation):
@@ -458,21 +576,9 @@ def _validate_machine_for_operation(machine, operation):
                 "estado": machine.estado,
             },
         )
-    route_operation = operation.operacion_ruta_revision
-    required_process = _normalized_process(
-        route_operation.tipo if route_operation is not None else None
-    )
-    if required_process and required_process not in _machine_processes(machine):
-        raise ScmServiceError(
-            "MACHINE_PROCESS_INCOMPATIBLE",
-            "La maquina prevista no corresponde al proceso de la OF.",
-            status_code=422,
-            details={
-                "maquina_id": machine.id,
-                "proceso_requerido": required_process,
-                "procesos_maquina": sorted(_machine_processes(machine)),
-            },
-        )
+    required_process = _required_process_for_operation(operation)
+    if required_process:
+        _validate_machine_process(machine, required_process)
 
 
 def _load_fabrication(session, operation_id, *, lock=False):
@@ -756,6 +862,7 @@ def replace_fabrication_order(
                 receta_revision_id=None,
                 receta_hash=None,
                 ciclos_objetivo=run.ciclos_objetivo,
+                objetivo_neto_kg=run.objetivo_neto_kg,
                 estado="BORRADOR",
                 meta_kg_legacy=run.meta_kg_legacy,
             )
@@ -873,12 +980,15 @@ def create_exceptional_fabrication_order(
                 status_code=422,
             )
         machine_id = data.get("maquina_prevista_id")
-        if machine_id is not None and session.get(Maquina, machine_id) is None:
-            raise ScmServiceError(
-                "MACHINE_NOT_FOUND",
-                "La maquina prevista no existe.",
-                status_code=422,
-            )
+        machine = session.get(Maquina, machine_id) if machine_id is not None else None
+        if machine_id is not None:
+            if machine is None:
+                raise ScmServiceError(
+                    "MACHINE_NOT_FOUND",
+                    "La maquina prevista no existe.",
+                    status_code=422,
+                )
+            _validate_machine_process(machine, "INYECCION")
         raw_runs = data.get("corridas")
         if not isinstance(raw_runs, list) or not raw_runs:
             raise ScmServiceError(
@@ -928,6 +1038,7 @@ def create_exceptional_fabrication_order(
                     "color_produccion_id",
                     "receta_revision_id",
                     "ciclos_objetivo",
+                    "objetivo_neto_kg",
                     "salidas",
                 },
             )
@@ -942,11 +1053,20 @@ def create_exceptional_fabrication_order(
             recipe = None
             if recipe_id is not None:
                 recipe = _validated_approved_recipe(session, recipe_id, color_id)
-            cycles = int(_positive_decimal(
-                raw_run.get("ciclos_objetivo"),
-                "ciclos_objetivo",
-                integral=True,
-            ))
+            objective = (
+                _positive_decimal(raw_run["objetivo_neto_kg"], "objetivo_neto_kg")
+                if raw_run.get("objetivo_neto_kg") is not None
+                else None
+            )
+            explicit_cycles = (
+                _positive_decimal(
+                    raw_run["ciclos_objetivo"],
+                    "ciclos_objetivo",
+                    integral=True,
+                )
+                if raw_run.get("ciclos_objetivo") is not None
+                else None
+            )
             raw_outputs = raw_run.get("salidas")
             if not isinstance(raw_outputs, list) or not raw_outputs:
                 raise ScmServiceError(
@@ -954,18 +1074,10 @@ def create_exceptional_fabrication_order(
                     "Cada corrida requiere al menos una salida.",
                     status_code=422,
                 )
-            run = ScmCorridaFabricacion(
-                codigo=f"{code}-C{sequence:02d}",
-                secuencia=sequence,
-                color_produccion_id=color_id,
-                receta_revision_id=recipe_id,
-                # The immutable content fingerprint is calculated at release.
-                receta_hash=None,
-                ciclos_objetivo=cycles,
-            )
-            fabrication.corridas.append(run)
             seen_articles = set()
             output_articles = []
+            output_specs = []
+            minimum_cycles = 1
             for raw_output in raw_outputs:
                 if not isinstance(raw_output, dict):
                     raise ScmServiceError(
@@ -996,6 +1108,15 @@ def create_exceptional_fabrication_order(
                         "Una corrida no puede repetir el mismo articulo.",
                         status_code=422,
                     )
+                if objective is not None and (
+                    raw_output.get("cantidad_por_ciclo") is None
+                    or raw_output.get("peso_unitario_g") is None
+                ):
+                    raise ScmServiceError(
+                        "OF_NET_TARGET_DATA_REQUIRED",
+                        "El objetivo neto requiere cantidad por ciclo y peso unitario.",
+                        status_code=422,
+                    )
                 per_cycle = _positive_decimal(
                     raw_output.get("cantidad_por_ciclo"),
                     "cantidad_por_ciclo",
@@ -1004,28 +1125,73 @@ def create_exceptional_fabrication_order(
                     raw_output.get("peso_unitario_g"),
                     "peso_unitario_g",
                 )
-                calculated_quantity = Decimal(cycles) * per_cycle
-                quantity = (
+                requested_quantity = (
                     _positive_decimal(
                         raw_output["cantidad_objetivo"],
                         "cantidad_objetivo",
                     )
                     if raw_output.get("cantidad_objetivo") is not None
-                    else calculated_quantity
+                    else None
                 )
-                output = ScmOrdenOperacionSalida(
+                if requested_quantity is not None:
+                    minimum_cycles = max(
+                        minimum_cycles,
+                        int((requested_quantity / per_cycle).to_integral_value(
+                            rounding=ROUND_CEILING
+                        )),
+                    )
+                output_specs.append((
+                    article_id,
+                    article,
+                    per_cycle,
+                    unit_weight,
+                    requested_quantity,
+                ))
+                seen_articles.add(article_id)
+                output_articles.append(article)
+            kg_neto_por_ciclo = sum(
+                per_cycle * unit_weight / Decimal("1000")
+                for _, _, per_cycle, unit_weight, _ in output_specs
+            )
+            cycles = _run_cycles(
+                minimum_cycles=minimum_cycles,
+                explicit_cycles=explicit_cycles,
+                objective_neto_kg=objective,
+                kg_neto_por_ciclo=kg_neto_por_ciclo,
+            )
+            run = ScmCorridaFabricacion(
+                codigo=f"{code}-C{sequence:02d}",
+                secuencia=sequence,
+                color_produccion_id=color_id,
+                receta_revision_id=recipe_id,
+                # The immutable content fingerprint is calculated at release.
+                receta_hash=None,
+                ciclos_objetivo=cycles,
+                objetivo_neto_kg=objective,
+            )
+            fabrication.corridas.append(run)
+            for article_id, _, per_cycle, unit_weight, requested_quantity in output_specs:
+                projected_quantity = Decimal(cycles) * per_cycle
+                objective_excess = (
+                    projected_quantity - requested_quantity
+                    if objective is not None and requested_quantity is not None
+                    else Decimal("0")
+                )
+                quantity = (
+                    projected_quantity
+                    if objective is not None and requested_quantity is not None
+                    else requested_quantity or projected_quantity
+                )
+                ScmOrdenOperacionSalida(
                     orden_operacion=order,
                     corrida_fabricacion=run,
                     articulo_scm_id=article_id,
                     cantidad_por_ciclo_snapshot=per_cycle,
                     peso_unitario_snapshot_g=unit_weight,
                     cantidad_objetivo=quantity,
-                    kg_estandar_objetivo=(
-                        quantity * unit_weight / Decimal("1000")
-                    ),
+                    kg_estandar_objetivo=quantity * unit_weight / Decimal("1000"),
+                    excedente_objetivo=objective_excess,
                 )
-                seen_articles.add(article_id)
-                output_articles.append(article)
             if recipe is not None:
                 _validated_approved_recipe(
                     session,
@@ -1184,17 +1350,22 @@ def update_fabrication_order(
                 status_code=422,
             )
         machine_id = data.get("maquina_prevista_id")
-        machine = session.get(Maquina, machine_id)
-        if machine is None or not machine.activo:
+        machine = session.get(Maquina, machine_id) if machine_id is not None else None
+        if machine_id is not None and (machine is None or not machine.activo):
             raise ScmServiceError(
                 "MACHINE_NOT_FOUND",
                 "La máquina prevista no existe o está inactiva.",
                 status_code=422,
             )
-        _validate_machine_for_operation(machine, order)
         fabrication = order.fabricacion
         fabrication.molde_id = mold.codigo
-        fabrication.maquina_prevista_id = machine.id
+        if machine is not None:
+            required_process = _required_process_for_operation(order)
+            if required_process:
+                _validate_machine_process(machine, required_process)
+            else:
+                _validate_machine_for_operation(machine, order)
+        fabrication.maquina_prevista_id = machine.id if machine is not None else None
         fabrication.snapshot_tiempo_ciclo_seg = _positive_decimal(
             data.get(
                 "snapshot_tiempo_ciclo_seg",
@@ -1236,6 +1407,7 @@ def update_fabrication_order(
                     "color_produccion_id",
                     "receta_revision_id",
                     "ciclos_objetivo",
+                    "objetivo_neto_kg",
                     "salidas",
                 },
             )
@@ -1272,6 +1444,15 @@ def update_fabrication_order(
                     if piece_color.color_produccion_id is not None:
                         derived_colors.add(piece_color.color_produccion_id)
                 else:
+                    if raw_run.get("objetivo_neto_kg") is not None and (
+                        raw_output.get("cantidad_por_ciclo") is None
+                        or raw_output.get("peso_unitario_g") is None
+                    ):
+                        raise ScmServiceError(
+                            "OF_NET_TARGET_DATA_REQUIRED",
+                            "El objetivo neto requiere cantidad por ciclo y peso unitario.",
+                            status_code=422,
+                        )
                     per_cycle = _positive_decimal(
                         raw_output.get("cantidad_por_ciclo"),
                         "cantidad_por_ciclo",
@@ -1291,18 +1472,30 @@ def update_fabrication_order(
                 )
                 minimum_cycles = max(minimum_cycles, cycles_for_output)
                 prepared.append((output, per_cycle, unit_weight, required))
-            cycles = int(_positive_decimal(
-                raw_run.get("ciclos_objetivo", minimum_cycles),
-                "ciclos_objetivo",
-                integral=True,
-            ))
-            if cycles < minimum_cycles:
-                raise ScmServiceError(
-                    "OF_CYCLES_INSUFFICIENT",
-                    "Los ciclos no cubren la cantidad requerida.",
-                    status_code=422,
-                    details={"minimum_cycles": minimum_cycles},
+            objective = (
+                _positive_decimal(raw_run["objetivo_neto_kg"], "objetivo_neto_kg")
+                if raw_run.get("objetivo_neto_kg") is not None
+                else None
+            )
+            explicit_cycles = (
+                _positive_decimal(
+                    raw_run["ciclos_objetivo"],
+                    "ciclos_objetivo",
+                    integral=True,
                 )
+                if raw_run.get("ciclos_objetivo") is not None
+                else None
+            )
+            kg_neto_por_ciclo = sum(
+                per_cycle * unit_weight / Decimal("1000")
+                for _, per_cycle, unit_weight, _ in prepared
+            )
+            cycles = _run_cycles(
+                minimum_cycles=minimum_cycles,
+                explicit_cycles=explicit_cycles,
+                objective_neto_kg=objective,
+                kg_neto_por_ciclo=kg_neto_por_ciclo,
+            )
             requested_color = raw_run.get("color_produccion_id")
             if derived_colors:
                 if len(derived_colors) != 1:
@@ -1345,6 +1538,7 @@ def update_fabrication_order(
                 )
             run.receta_revision_id = recipe_id
             run.ciclos_objetivo = cycles
+            run.objetivo_neto_kg = objective
             for output, per_cycle, unit_weight, required in prepared:
                 actual = Decimal(cycles) * per_cycle
                 output.cantidad_por_ciclo_snapshot = per_cycle
@@ -1414,7 +1608,6 @@ def release_fabrication_order(
         fabrication = order.fabricacion
         incomplete = (
             not fabrication.molde_id
-            or not fabrication.maquina_prevista_id
             or not fabrication.snapshot_tiempo_ciclo_seg
             or not fabrication.snapshot_horas_turno
             or not fabrication.corridas

@@ -482,7 +482,7 @@ def get_material(session, *, actor_id, material_id):
     return serialize_material(material)
 
 
-def create_material(session, *, actor_id, data):
+def create_material(session, *, actor_id, data, commit=True):
     try:
         actor = load_actor_any(
             session,
@@ -547,7 +547,8 @@ def create_material(session, *, actor_id, data):
         material.activo = active
         session.flush()
         session.add(_material_event(material, actor, "MATERIAL_CREADO"))
-        session.commit()
+        if commit:
+            session.commit()
         return serialize_material(material)
     except ScmServiceError:
         session.rollback()

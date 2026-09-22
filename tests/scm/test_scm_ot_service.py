@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from app.extensions import db
 from app.models.lote import LoteColor, LoteSalidaPiezaColor
 from app.models.molde import Molde, MoldePieza, Pieza
-from app.models.maquina import Maquina
+from app.models.maquina import Maquina, TipoMaquina
 from app.models.orden import OrdenProduccion, SnapshotComposicionMolde
 from app.models.producto import (
     ColorBase,
@@ -63,6 +63,7 @@ from app.services.scm_ot_service import (
     _continuity_target_is_later,
     _operation_hash,
     _reserve_operation,
+    _resolve_machine_process,
     add_color_work,
     add_work_mangas,
     acknowledge_station_print_job,
@@ -295,6 +296,25 @@ def test_fabrication_run_lock_targets_only_run_on_postgresql():
 
     assert "LEFT OUTER JOIN color_produccion" in sql
     assert "FOR UPDATE OF scm_corrida_fabricacion" in sql
+
+
+def test_machine_process_legacy_ambiguo_rechaza_con_detalle_accionable():
+    machine = SimpleNamespace(
+        id=901,
+        tipo_maquina=SimpleNamespace(
+            proceso=None,
+            codigo="INYECCION",
+            nombre="Soplado",
+        ),
+        tipo=None,
+    )
+    with pytest.raises(ScmServiceError) as ambiguous:
+        _resolve_machine_process(machine)
+    assert ambiguous.value.code == "MACHINE_PROCESS_AMBIGUOUS"
+    assert ambiguous.value.details["procesos_maquina"] == [
+        "INYECCION",
+        "SOPLADO",
+    ]
 from app.services.scm_assembly_execution_service import (
     approve_assembly_quantity_correction,
     assign_assembly_output_mangas,
@@ -350,6 +370,10 @@ from app.services.scm_warehouse_service import (
 
 def _seed_normalized_order():
     ensure_initial_scm_configuration()
+    # This helper builds injection OFs; keep its shared machine explicit now
+    # that TipoMaquina.proceso is the canonical source.
+    default_machine = db.session.get(Maquina, 1)
+    default_machine.tipo_maquina.proceso = "INYECCION"
     creator = Trabajador.query.filter_by(codigo="TRB-01").one()
     creator.roles.extend([
         RolOperativo.query.filter_by(codigo="INGENIERIA_SCM").one(),
@@ -3771,10 +3795,66 @@ def test_uat_m01_m11_fachada_legacy_filtros_y_extras_por_trabajo(app):
                 "maquinista_predeterminado_id": creator.id,
             },
         )["ot"]
-        with pytest.raises(ScmServiceError) as incompatible:
+        accepted_on_different_machine = add_color_work(
+            db.session, actor_id=creator.id,
+            ot_id=UUID(wrong_header["public_id"]), operation_id=uuid4(),
+            data={
+                "corrida_fabricacion_id": str(first_run.id),
+                "maquinista_id": creator.id,
+                "asignaciones": [{
+                    "plan_linea_id": lines[str(first_run.id)]["id"],
+                    "cantidad_un": 50,
+                }],
+            },
+        )
+        assert accepted_on_different_machine["ot"]["maquina_id"] == wrong_machine.id
+
+        wrong_machine.estado = "MANTENIMIENTO"
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as unavailable:
             add_color_work(
                 db.session, actor_id=creator.id,
                 ot_id=UUID(wrong_header["public_id"]), operation_id=uuid4(),
+                data={
+                    "corrida_fabricacion_id": str(second_run.id),
+                    "maquinista_id": creator.id,
+                    "asignaciones": [{
+                        "plan_linea_id": lines[str(second_run.id)]["id"],
+                        "cantidad_un": 50,
+                    }],
+                },
+            )
+        assert unavailable.value.code == "MACHINE_NOT_AVAILABLE"
+        wrong_machine.estado = "OPERATIVA"
+        db.session.commit()
+
+        blowing_type = TipoMaquina(
+            codigo="SOPLADO-UAT-MACHINE",
+            nombre="Sopladora UAT",
+            proceso="SOPLADO",
+        )
+        incompatible_machine = Maquina(
+            codigo="MAQ-UAT-M-PROCESS",
+            nombre="Maquina UAT proceso incompatible",
+            tipo_maquina=blowing_type,
+            estado="OPERATIVA",
+            activo=True,
+        )
+        db.session.add(incompatible_machine)
+        db.session.commit()
+        incompatible_header = create_fabrication_ot_header(
+            db.session, actor_id=creator.id, operation_id=uuid4(),
+            data={
+                "maquina_id": incompatible_machine.id,
+                "fecha_operativa": "2026-08-14",
+                "turno": "DIA",
+                "maquinista_predeterminado_id": creator.id,
+            },
+        )["ot"]
+        with pytest.raises(ScmServiceError) as incompatible:
+            add_color_work(
+                db.session, actor_id=creator.id,
+                ot_id=UUID(incompatible_header["public_id"]), operation_id=uuid4(),
                 data={
                     "corrida_fabricacion_id": str(first_run.id),
                     "maquinista_id": creator.id,
@@ -3784,7 +3864,7 @@ def test_uat_m01_m11_fachada_legacy_filtros_y_extras_por_trabajo(app):
                     }],
                 },
             )
-        assert incompatible.value.code == "COLOR_WORK_MACHINE_MISMATCH"
+        assert incompatible.value.code == "MACHINE_PROCESS_INCOMPATIBLE"
 
         ineligible = Trabajador(
             codigo="TRB-UAT-M-NO",
@@ -3806,6 +3886,137 @@ def test_uat_m01_m11_fachada_legacy_filtros_y_extras_por_trabajo(app):
                 },
             )
         assert eligibility.value.code == "WORKER_NOT_ELIGIBLE"
+
+
+def test_of_excepcional_con_molde_exige_inyeccion_y_proceso_canonico(app):
+    with app.app_context():
+        creator, _approver, order, run, _output = _seed_fabrication_order()
+        order.fabricacion.maquina_prevista_id = None
+        db.session.commit()
+        plan = recalculate_fabrication_manga_plan(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={},
+        )["plan"]
+        line = plan["lineas"][0]
+
+        deceptive_type = TipoMaquina(
+            codigo="INYECCION-ENGANOSA",
+            nombre="Inyectora de prueba",
+            proceso="SOPLADO",
+        )
+        blowing_machine = Maquina(
+            codigo="MAQ-UAT-EXC-SOPLADO",
+            nombre="Maquina excepcional soplado",
+            tipo_maquina=deceptive_type,
+            estado="OPERATIVA",
+            activo=True,
+        )
+        db.session.add(blowing_machine)
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as incompatible:
+            create_fabrication_ot(
+                db.session,
+                actor_id=creator.id,
+                order_id=order.id,
+                operation_id=uuid4(),
+                data={
+                    "corrida_fabricacion_id": str(run.id),
+                    "maquina_id": blowing_machine.id,
+                    "fecha_operativa": "2026-08-20",
+                    "turno": "DIA",
+                    "maquinista_id": creator.id,
+                    "asignaciones": [{
+                        "plan_linea_id": line["id"],
+                        "cantidad_un": 100,
+                    }],
+                },
+            )
+        assert incompatible.value.code == "MACHINE_PROCESS_INCOMPATIBLE"
+        assert incompatible.value.details["proceso_requerido"] == "INYECCION"
+
+        injection_type = TipoMaquina(
+            codigo="SOPLADO-ENGANOSO-2",
+            nombre="Sopladora de prueba",
+            proceso="INYECCION",
+        )
+        injection_machine = Maquina(
+            codigo="MAQ-UAT-EXC-INYECCION",
+            nombre="Maquina excepcional inyeccion",
+            tipo_maquina=injection_type,
+            estado="OPERATIVA",
+            activo=True,
+        )
+        db.session.add(injection_machine)
+        db.session.commit()
+        created = create_fabrication_ot(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={
+                "corrida_fabricacion_id": str(run.id),
+                "maquina_id": injection_machine.id,
+                "fecha_operativa": "2026-08-20",
+                "turno": "NOCHE",
+                "maquinista_id": creator.id,
+                "asignaciones": [{
+                    "plan_linea_id": line["id"],
+                    "cantidad_un": 100,
+                }],
+            },
+        )
+        assert created["ot"]["maquina_id"] == injection_machine.id
+
+
+def test_of_excepcional_sin_molde_ni_ruta_rechaza_proceso_no_inferible(app):
+    with app.app_context():
+        creator, _approver, order, run, _output = _seed_fabrication_order()
+        order.fabricacion.maquina_prevista_id = None
+        order.fabricacion.molde_id = None
+        db.session.commit()
+        plan = recalculate_fabrication_manga_plan(
+            db.session,
+            actor_id=creator.id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={},
+        )["plan"]
+        machine_type = TipoMaquina(
+            codigo="TIPO-SIN-FUENTE",
+            nombre="Tipo sin fuente de OF",
+            proceso="INYECCION",
+        )
+        machine = Maquina(
+            codigo="MAQ-UAT-SIN-FUENTE",
+            nombre="Maquina sin fuente",
+            tipo_maquina=machine_type,
+            estado="OPERATIVA",
+            activo=True,
+        )
+        db.session.add(machine)
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as missing_source:
+            create_fabrication_ot(
+                db.session,
+                actor_id=creator.id,
+                order_id=order.id,
+                operation_id=uuid4(),
+                data={
+                    "corrida_fabricacion_id": str(run.id),
+                    "maquina_id": machine.id,
+                    "fecha_operativa": "2026-08-21",
+                    "turno": "DIA",
+                    "maquinista_id": creator.id,
+                    "asignaciones": [{
+                        "plan_linea_id": plan["lineas"][0]["id"],
+                        "cantidad_un": 100,
+                    }],
+                },
+            )
+        assert missing_source.value.code == "MACHINE_PROCESS_REQUIRED"
 
 
 def test_uat_m09_anular_pesaje_reabre_trabajo_y_permite_reemplazo(app):

@@ -1773,6 +1773,92 @@ def _validate_color_worker(worker):
     return worker
 
 
+def _normalized_process(value):
+    return str(value or "").strip().upper()
+
+
+def _machine_processes(machine):
+    machine_type = machine.tipo_maquina
+    canonical = _normalized_process(
+        machine_type.proceso if machine_type else None
+    )
+    if canonical:
+        return {canonical}
+    return {
+        _normalized_process(value)
+        for value in (
+            machine_type.codigo if machine_type else None,
+            machine_type.nombre if machine_type else None,
+            machine.tipo,
+        )
+        if _normalized_process(value)
+    }
+
+
+def _resolve_machine_process(machine):
+    processes = _machine_processes(machine)
+    if len(processes) > 1:
+        raise ScmServiceError(
+            "MACHINE_PROCESS_AMBIGUOUS",
+            "La maquina tiene aliases legacy de proceso incompatibles; "
+            "corrija TipoMaquina.proceso.",
+            status_code=422,
+            details={
+                "maquina_id": machine.id,
+                "procesos_maquina": sorted(processes),
+            },
+        )
+    return next(iter(processes), None)
+
+
+def _validate_machine_for_operation(session, machine, order):
+    if machine is None or not machine.activo or machine.estado != "OPERATIVA":
+        raise ScmServiceError(
+            "MACHINE_NOT_AVAILABLE",
+            "La maquina de la OT no se encuentra OPERATIVA.",
+            status_code=422,
+            details={
+                "maquina_id": machine.id if machine is not None else None,
+                "estado": machine.estado if machine is not None else None,
+            },
+        )
+    route_operation = order.operacion_ruta_revision
+    required_process = _normalized_process(
+        route_operation.tipo if route_operation is not None else None
+    )
+    if (
+        not required_process
+        and order.origen_demanda == "EXCEPCIONAL"
+        and order.fabricacion.molde_id
+    ):
+        required_process = "INYECCION"
+    if not required_process and order.fabricacion.maquina_prevista_id:
+        suggested_machine = session.get(
+            Maquina, order.fabricacion.maquina_prevista_id
+        )
+        if suggested_machine is not None:
+            required_process = _resolve_machine_process(suggested_machine)
+    if not required_process:
+        raise ScmServiceError(
+            "MACHINE_PROCESS_REQUIRED",
+            "No se puede inferir el proceso de la OF para validar la maquina.",
+            status_code=422,
+        )
+    actual_process = _resolve_machine_process(machine)
+    if actual_process != required_process:
+        raise ScmServiceError(
+            "MACHINE_PROCESS_INCOMPATIBLE",
+            "La maquina de la OT no corresponde al proceso de la OF.",
+            status_code=422,
+            details={
+                "maquina_id": machine.id,
+                "proceso_requerido": required_process,
+                "proceso_maquina": actual_process,
+                "procesos_maquina": sorted(_machine_processes(machine)),
+            },
+        )
+
+
 def _resolve_color_work_for_ot(ot, raw_work_id=None, *, required=False):
     works = [item for item in ot.trabajos_ot if item.tipo == "COLOR"]
     if raw_work_id is not None:
@@ -1831,6 +1917,13 @@ def create_fabrication_ot_header(
                 "INVALID_MACHINE",
                 "La maquina no esta activa.",
                 status_code=422,
+            )
+        if machine.estado != "OPERATIVA":
+            raise ScmServiceError(
+                "MACHINE_NOT_AVAILABLE",
+                "La maquina no se encuentra OPERATIVA.",
+                status_code=422,
+                details={"maquina_id": machine.id, "estado": machine.estado},
             )
         operational_date = _parse_date(data.get("fecha_operativa"))
         shift = required_text(
@@ -2499,12 +2592,12 @@ def add_color_work(
         order = _load_fabrication_order(
             session, run.orden_fabricacion_id, lock=True
         )
-        if order.fabricacion.maquina_prevista_id != ot.maquina_id:
-            raise ScmServiceError(
-                "COLOR_WORK_MACHINE_MISMATCH",
-                "La maquina de la OT no coincide con la maquina prevista por la OF.",
-                status_code=409,
-            )
+        machine = session.scalar(
+            select(Maquina)
+            .where(Maquina.id == ot.maquina_id)
+            .with_for_update()
+        )
+        _validate_machine_for_operation(session, machine, order)
         if continues_from is not None:
             previous_color = continues_from.trabajo_color
             unchanged = (
@@ -4085,12 +4178,7 @@ def create_fabrication_ot(
                 "La maquina no esta activa.",
                 status_code=422,
             )
-        if order.fabricacion.maquina_prevista_id != machine.id:
-            raise ScmServiceError(
-                "COLOR_WORK_MACHINE_MISMATCH",
-                "La maquina indicada no coincide con la maquina prevista por la OF.",
-                status_code=409,
-            )
+        _validate_machine_for_operation(session, machine, order)
         _validate_color_worker(worker)
         allocations = data.get("asignaciones")
         if not isinstance(allocations, list) or not allocations:
