@@ -505,6 +505,7 @@ def _history_rows(runs, groups, filters=None):
     rows = []
     seen_segments = set()
     theoretical_emitted = set()
+    theoretical_subtotal_emitted = set()
     for run in runs:
         for manga in run["mangas"].values():
             net = _d(manga._report_final_kg)
@@ -552,7 +553,10 @@ def _history_rows(runs, groups, filters=None):
                 theoretical_key = (manga.id, tuple(values.get(group) for group in groups))
                 emit_theoretical = theoretical_key not in theoretical_emitted
                 theoretical_emitted.add(theoretical_key)
-                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(kg), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if emit_theoretical and unit is not None and quantity is not None and quantity > 0 else None, "P_UNITARIO_QTY": _n(quantity) if emit_theoretical and quantity is not None and quantity > 0 else None, "P_TEORICO_KG": _n(theoretical), "SUBTOTAL_TEORICO_KG": None if theoretical is not None else _n(unit * _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) / Decimal("1000")) if unit is not None and _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) is not None else None, "_known": True, "_manga_id": manga.id})
+                theoretical_total = _n(unit * _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) / Decimal("1000")) if theoretical is None and manga.id not in theoretical_subtotal_emitted and unit is not None and _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) is not None else None
+                if theoretical_total is not None:
+                    theoretical_subtotal_emitted.add(manga.id)
+                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(kg), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if emit_theoretical and unit is not None and quantity is not None and quantity > 0 else None, "P_UNITARIO_QTY": _n(quantity) if emit_theoretical and quantity is not None and quantity > 0 else None, "P_TEORICO_KG": _n(theoretical), "SUBTOTAL_TEORICO_KG": theoretical_total, "_known": True, "_manga_id": manga.id})
     return rows
 
 
