@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 from app.services.scm_production_reports_service import (
     _filters,
+    _group_history_rows,
+    MEASURE_OPTIONS,
     _run_manga_values,
     _segment_conciliates,
     _valid_kg_segments,
@@ -52,6 +54,23 @@ def test_objective_without_mangas_does_not_claim_complete_weight_coverage():
     run = {"corrida": corrida, "mangas": {}}
     _final, _open, measured, total, known, _objective = _run_manga_values(run)
     assert (measured, total, known) == (None, 0, 0)
+
+
+def test_history_subtotal_deduplicates_manga_across_kg_segments_and_groups():
+    rows = []
+    for day, ot, kg in (("2026-09-01", "OT-1", 4), ("2026-09-01", "OT-1", 5)):
+        rows.append({
+            "DIA": day, "MES": "2026-09", "OF": "OF-1", "CORRIDA": "C-1",
+            "COLOR": "Rojo", "OT": ot, "RECURSO": "M1", "RESPONSABLE": "R",
+            "ARTICULO": "A", "PESO_KG": kg, "SUBTOTAL_CONOCIDO_KG": 9,
+            "SUBTOTAL_TEORICO_KG": None, "MANGAS": 1, "P_UNITARIO_G": 100,
+            "P_UNITARIO_WEIGHT": 100, "P_UNITARIO_QTY": 1, "P_TEORICO_KG": 1,
+            "_known": True, "_manga_id": 77,
+        })
+    for groups in (("OF",), ("DIA",), ("DIA", "OT")):
+        items = _group_history_rows(rows, {"groups": list(groups), "measures": list(MEASURE_OPTIONS)})
+        assert len(items) == 1
+        assert items[0]["SUBTOTAL_CONOCIDO_KG"] == 9
 
 
 def test_report_filters_reject_unknown_group_and_measure_without_fallback():

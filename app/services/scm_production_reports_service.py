@@ -300,11 +300,16 @@ def _load_rows(session, filters=None):
             )
             if direct_close_segment is not None and last_reopen is not None and direct_close_segment.cerrada_at is not None and direct_close_segment.cerrada_at <= last_reopen:
                 direct_close_segment = None
-            # A final from the last control is valid only with the append-only
-            # closure event (or the explicit segment evidence written by that
-            # operation). Manga state alone is never closure evidence.
-            if manga.estado != "ANULADA" and final is None and latest_control is not None and (closure_event is not None or direct_close_segment is not None):
-                final = _d((direct_close_segment or latest_control).cantidad_fin_kg if direct_close_segment is not None else latest_control.peso_neto_kg)
+            # The direct segment marker corroborates the append-only event;
+            # it can never create a final by itself.  The event payload keeps
+            # the source control identity when the closure operation supplied
+            # it, so reject a mismatched control rather than guessing.
+            event_control = ((closure_event.after_json or {}).get("control_fuente") if closure_event else None) or {}
+            event_control_id = str(event_control.get("id") or event_control.get("public_id") or "")
+            latest_control_id = str(getattr(latest_control, "public_id", "") or getattr(latest_control, "id", ""))
+            control_matches_event = not event_control_id or event_control_id in {latest_control_id, str(getattr(latest_control, "id", ""))}
+            if manga.estado != "ANULADA" and final is None and closure_event is not None and latest_control is not None and control_matches_event:
+                final = _d(direct_close_segment.cantidad_fin_kg if direct_close_segment is not None else latest_control.peso_neto_kg)
             open_kg = _d(latest_control.peso_neto_kg) if final is None and latest_control is not None and manga.estado != "ANULADA" else None
             manga._report_final_kg = final
             manga._report_open_kg = open_kg
@@ -360,11 +365,23 @@ def _matches(run, filters):
             return False
     if filters["estado_of"] and filters["estado_of"] != order.estado:
         return False
-    if filters["estado_ot"] and (ot is None or filters["estado_ot"] != ot.estado):
+    if filters["estado_ot"] and not any(filters["estado_ot"] == item["ot"].estado for item in contexts):
         return False
     if filters["articulo"] and not any(filters["articulo"].lower() in str(m.articulo_codigo_snapshot or "").lower() for m in run["mangas"].values()):
         return False
-    if filters["q"] and not any(filters["q"].lower() in value for value in values):
+    context_values = [
+        str(value or "").lower()
+        for item in contexts
+        for value in (
+            item["ot"].codigo_ot,
+            item["ot"].estado,
+            item["ot"].maquina_nombre_snapshot,
+            item["ot"].maquina_codigo_snapshot,
+            item["ot"].responsable.nombre_completo if item["ot"].responsable else None,
+            item["work"].codigo if item.get("work") else None,
+        )
+    ]
+    if filters["q"] and not any(filters["q"].lower() in value for value in (*values, *context_values)):
         return False
     return True
 
@@ -502,7 +519,7 @@ def _history_rows(runs, groups, filters=None):
                     context = _context_for_work(run, owner)
                     if context is not None and _context_matches(run, context, manga, filters):
                         seen_segments.add(segment.id)
-                        segment_values.append((run, context, _d(segment.cantidad_atribuida_kg)))
+                        segment_values.append((run, context, _d(segment.cantidad_atribuida_kg), segment))
             else:
                 # Without KG-evidence segments, a single unambiguous run can
                 # receive the complete NET. Existing but broken segments are
@@ -510,34 +527,37 @@ def _history_rows(runs, groups, filters=None):
                 # hidden by a fallback to the run total.
                 owner = effective_work(manga) if not segments else None
                 context = _context_for_work(run, owner)
-                segment_values = [(run, context, net)] if context is not None and not segments and _context_matches(run, context, manga, filters) else []
+                segment_values = [(run, context, net, None)] if context is not None and not segments and _context_matches(run, context, manga, filters) else []
             if not segment_values:
                 values = {group: _run_group_value(run, group) for group in GROUP_OPTIONS}
-                rows.append({**values, "PESO_KG": None, "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 0, "P_UNITARIO_G": None, "P_TEORICO_KG": None, "_known": False, "_manga_id": manga.id})
-            for segment_run, context, kg in segment_values:
+                unit = _d(manga.peso_unitario_snapshot_g)
+                quantity = _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un)
+                rows.append({**values, "PESO_KG": None, "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 0, "P_UNITARIO_G": None, "P_TEORICO_KG": None, "SUBTOTAL_TEORICO_KG": _n(unit * quantity / Decimal("1000")) if unit is not None and quantity is not None else None, "_known": False, "_manga_id": manga.id})
+            for segment_run, context, kg, segment in segment_values:
                 values = {group: _context_group_value(segment_run, context, group) for group in GROUP_OPTIONS}
                 values["ARTICULO"] = manga.articulo_codigo_snapshot
                 unit = _d(context["color_work"].peso_neto_snapshot_g) if context and context["color_work"] else _d(manga.peso_unitario_snapshot_g)
-                quantity = _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un)
-                theoretical = (unit * quantity / Decimal("1000")) if unit is not None and quantity is not None else None
+                quantity = _d(getattr(segment, "cantidad_atribuida_un", None)) if valid and segment is not None else None
+                theoretical = (unit * quantity / Decimal("1000")) if unit is not None and quantity is not None and quantity > 0 else None
                 theoretical_key = (manga.id, tuple(values.get(group) for group in groups))
                 emit_theoretical = theoretical_key not in theoretical_emitted
                 theoretical_emitted.add(theoretical_key)
-                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if emit_theoretical and unit is not None and quantity is not None else None, "P_UNITARIO_QTY": _n(quantity) if emit_theoretical and quantity is not None else None, "P_TEORICO_KG": _n(theoretical) if emit_theoretical else None, "_known": True, "_manga_id": manga.id})
+                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if emit_theoretical and unit is not None and quantity is not None and quantity > 0 else None, "P_UNITARIO_QTY": _n(quantity) if emit_theoretical and quantity is not None and quantity > 0 else None, "P_TEORICO_KG": _n(theoretical), "SUBTOTAL_TEORICO_KG": None if theoretical is not None else _n(unit * _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) / Decimal("1000")) if unit is not None and _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) is not None else None, "_known": True, "_manga_id": manga.id})
     return rows
 
 
-def list_production_history(session, *, actor_id, filters=None):
-    actor = load_actor(session, actor_id, capability="OT_VER")
-    normalized = _filters(filters, require_dates=True)
-    visible = actor.tiene_capacidad("MANGA_PESAJE_VER")
-    runs = _load_rows(session, normalized)
-    rows = _history_rows(runs, normalized["groups"], normalized) if visible else []
+def _group_history_rows(rows, normalized):
     grouped = {}
     for row in rows:
         key = tuple(row[group] for group in normalized["groups"])
-        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False})
-        item["SUBTOTAL_CONOCIDO_KG"] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
+        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "SUBTOTAL_TEORICO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False, "_subtotal_mangas": set(), "_theoretical_subtotal_mangas": set()})
+        manga_id = row.get("_manga_id")
+        if manga_id not in item["_subtotal_mangas"]:
+            item["SUBTOTAL_CONOCIDO_KG"] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
+            item["_subtotal_mangas"].add(manga_id)
+        if manga_id not in item["_theoretical_subtotal_mangas"]:
+            item["SUBTOTAL_TEORICO_KG"] += _d(row.get("SUBTOTAL_TEORICO_KG")) or Decimal("0")
+            item["_theoretical_subtotal_mangas"].add(manga_id)
         if row["PESO_KG"] is not None:
             item["PESO_KG"] += _d(row["PESO_KG"]) or Decimal("0")
         item["MANGAS"] += row["MANGAS"]
@@ -555,9 +575,31 @@ def list_production_history(session, *, actor_id, filters=None):
         item["P_UNITARIO_G"] = _n(weighted / qty) if qty else None
         item["PESO_KG"] = None if item.pop("_has_unknown") else _n(item["PESO_KG"])
         item["SUBTOTAL_CONOCIDO_KG"] = _n(item["SUBTOTAL_CONOCIDO_KG"])
+        item["SUBTOTAL_TEORICO_KG"] = _n(item["SUBTOTAL_TEORICO_KG"])
         item["P_TEORICO_KG"] = _n(item["P_TEORICO_KG"])
+        item.pop("_subtotal_mangas", None)
+        item.pop("_theoretical_subtotal_mangas", None)
         items.append(item)
-    return {"items": items, "grouping_options": list(GROUP_OPTIONS), "grouped_by": normalized["groups"], "filters": {key: value.isoformat() if isinstance(value, date) else value for key, value in normalized.items() if key != "groups"}, "visibilidad": {"pesaje": visible}}
+    return items
+
+
+def list_production_history(session, *, actor_id, filters=None):
+    actor = load_actor(session, actor_id, capability="OT_VER")
+    normalized = _filters(filters, require_dates=True)
+    visible = actor.tiene_capacidad("MANGA_PESAJE_VER")
+    runs = _load_rows(session, normalized)
+    rows = _history_rows(runs, normalized["groups"], normalized) if visible else []
+    items = _group_history_rows(rows, normalized)
+    selected = set(normalized["measures"])
+    for item in items:
+        for measure in MEASURE_OPTIONS:
+            if measure not in selected:
+                item.pop(measure, None)
+    dedup_known = {}
+    for row in rows:
+        dedup_known.setdefault(row.get("_manga_id"), _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0"))
+    subtotal_known = sum(dedup_known.values(), Decimal("0"))
+    return {"items": items, "grouping_options": list(GROUP_OPTIONS), "measure_options": list(MEASURE_OPTIONS), "measures": normalized["measures"], "grouped_by": normalized["groups"], "subtotal_conocido_kg": _n(subtotal_known), "filters": {key: value.isoformat() if isinstance(value, date) else value for key, value in normalized.items() if key not in {"groups", "measures"}}, "visibilidad": {"pesaje": visible}}
 
 
 def generate_production_history_xlsx(session, *, actor_id, filters=None):
@@ -576,7 +618,7 @@ def generate_production_history_xlsx(session, *, actor_id, filters=None):
     summary.append(["Peso efectivo (kg)", sum((row.get("PESO_KG") or 0 for row in payload["items"]), 0)])
     summary.append(["Filas", len(payload["items"])])
     data = workbook.create_sheet("Datos")
-    headers = list(payload["grouped_by"]) + ["PESO_KG", "SUBTOTAL_CONOCIDO_KG", "MANGAS", "P_UNITARIO_G", "P_TEORICO_KG", "coverage"]
+    headers = list(payload["grouped_by"]) + list(payload["measures"]) + ["SUBTOTAL_CONOCIDO_KG", "SUBTOTAL_TEORICO_KG", "coverage"]
     data.append(headers)
     for row in payload["items"]:
         data.append([row.get(header) for header in headers])
