@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 
 from app.extensions import db
 from app.models.scm_empaque import ScmTipoContenedor
@@ -259,6 +259,11 @@ from app.services.scm_production_observability_service import (
     list_production_manga_observability,
     list_production_ot_observability,
     summarize_production_ot_observability,
+)
+from app.services.scm_production_reports_service import (
+    generate_production_history_xlsx,
+    list_production_history,
+    list_production_progress,
 )
 from app.services.scm_product_onboarding_service import (
     apply_onboarding_image,
@@ -1728,6 +1733,39 @@ def observabilidad_resumen():
         filters=filters,
         granularity=granularity,
     ))
+
+
+@scm_bp.get("/observabilidad/avance-of")
+def observabilidad_avance_of():
+    return jsonify(list_production_progress(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+
+@scm_bp.get("/observabilidad/produccion-historica")
+def observabilidad_produccion_historica():
+    return jsonify(list_production_history(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+
+@scm_bp.get("/observabilidad/produccion-historica/export.xlsx")
+def observabilidad_produccion_historica_exportar():
+    workbook = generate_production_history_xlsx(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    )
+    return send_file(
+        workbook,
+        as_attachment=True,
+        download_name="produccion-historica.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @scm_bp.post("/ots/<uuid:public_id>/iniciar")
