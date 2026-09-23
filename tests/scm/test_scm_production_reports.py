@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from app.services.scm_production_reports_service import (
     _filters,
+    _run_manga_values,
     _segment_conciliates,
     _valid_kg_segments,
 )
@@ -44,6 +45,13 @@ def test_un_and_default_kg_segments_are_not_evidence():
 def test_explicit_control_close_is_kg_evidence():
     manga = SimpleNamespace(tramos_trabajo=[_segment(1, "0", "9", "9", quality="MEDIDA_DIRECTA_CIERRE_CONTROL")])
     assert [segment.secuencia for segment in _valid_kg_segments(manga, {})] == [1]
+
+
+def test_objective_without_mangas_does_not_claim_complete_weight_coverage():
+    corrida = SimpleNamespace(objetivo_neto_kg=Decimal("10"))
+    run = {"corrida": corrida, "mangas": {}}
+    _final, _open, measured, total, known, _objective = _run_manga_values(run)
+    assert (measured, total, known) == (None, 0, 0)
 
 
 def test_report_filters_reject_unknown_group_and_measure_without_fallback():
