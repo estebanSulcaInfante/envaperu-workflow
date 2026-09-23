@@ -486,6 +486,8 @@ def _context_matches(run, context, manga, filters):
     ]
     if not filters["fecha_desde"] <= ot.fecha <= filters["fecha_hasta"]:
         return False
+    if filters["estado_ot"] and filters["estado_ot"] != ot.estado:
+        return False
     checks = (
         ("of", run["orden"].codigo), ("corrida", run["corrida"].codigo),
         ("color", run["color_name"]), ("ot", ot.codigo_ot),
@@ -528,7 +530,15 @@ def _history_rows(runs, groups, filters=None):
                 owner = effective_work(manga) if not segments else None
                 context = _context_for_work(run, owner)
                 segment_values = [(run, context, net, None)] if context is not None and not segments and _context_matches(run, context, manga, filters) else []
-            if not segment_values:
+            if not segment_values and segments:
+                # A filtered-out ledger is still an attribution structure; it
+                # must not be turned into an unattributed NET fallback.
+                if valid:
+                    continue
+                owner = effective_work(manga)
+                context = _context_for_work(run, owner)
+                if context is None or not _context_matches(run, context, manga, filters):
+                    continue
                 values = {group: _run_group_value(run, group) for group in GROUP_OPTIONS}
                 unit = _d(manga.peso_unitario_snapshot_g)
                 quantity = _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un)
@@ -542,7 +552,7 @@ def _history_rows(runs, groups, filters=None):
                 theoretical_key = (manga.id, tuple(values.get(group) for group in groups))
                 emit_theoretical = theoretical_key not in theoretical_emitted
                 theoretical_emitted.add(theoretical_key)
-                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if emit_theoretical and unit is not None and quantity is not None and quantity > 0 else None, "P_UNITARIO_QTY": _n(quantity) if emit_theoretical and quantity is not None and quantity > 0 else None, "P_TEORICO_KG": _n(theoretical), "SUBTOTAL_TEORICO_KG": None if theoretical is not None else _n(unit * _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) / Decimal("1000")) if unit is not None and _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) is not None else None, "_known": True, "_manga_id": manga.id})
+                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(kg), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if emit_theoretical and unit is not None and quantity is not None and quantity > 0 else None, "P_UNITARIO_QTY": _n(quantity) if emit_theoretical and quantity is not None and quantity > 0 else None, "P_TEORICO_KG": _n(theoretical), "SUBTOTAL_TEORICO_KG": None if theoretical is not None else _n(unit * _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) / Decimal("1000")) if unit is not None and _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) is not None else None, "_known": True, "_manga_id": manga.id})
     return rows
 
 
@@ -550,14 +560,14 @@ def _group_history_rows(rows, normalized):
     grouped = {}
     for row in rows:
         key = tuple(row[group] for group in normalized["groups"])
-        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "SUBTOTAL_TEORICO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False, "_subtotal_mangas": set(), "_theoretical_subtotal_mangas": set()})
+        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "SUBTOTAL_TEORICO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False, "_has_theoretical_evidence": False, "_has_theoretical_subtotal": False})
         manga_id = row.get("_manga_id")
-        if manga_id not in item["_subtotal_mangas"]:
-            item["SUBTOTAL_CONOCIDO_KG"] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
-            item["_subtotal_mangas"].add(manga_id)
-        if manga_id not in item["_theoretical_subtotal_mangas"]:
+        item["SUBTOTAL_CONOCIDO_KG"] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
+        if row.get("P_TEORICO_KG") is not None:
+            item["_has_theoretical_evidence"] = True
+        if row.get("SUBTOTAL_TEORICO_KG") is not None:
+            item["_has_theoretical_subtotal"] = True
             item["SUBTOTAL_TEORICO_KG"] += _d(row.get("SUBTOTAL_TEORICO_KG")) or Decimal("0")
-            item["_theoretical_subtotal_mangas"].add(manga_id)
         if row["PESO_KG"] is not None:
             item["PESO_KG"] += _d(row["PESO_KG"]) or Decimal("0")
         item["MANGAS"] += row["MANGAS"]
@@ -575,10 +585,8 @@ def _group_history_rows(rows, normalized):
         item["P_UNITARIO_G"] = _n(weighted / qty) if qty else None
         item["PESO_KG"] = None if item.pop("_has_unknown") else _n(item["PESO_KG"])
         item["SUBTOTAL_CONOCIDO_KG"] = _n(item["SUBTOTAL_CONOCIDO_KG"])
-        item["SUBTOTAL_TEORICO_KG"] = _n(item["SUBTOTAL_TEORICO_KG"])
-        item["P_TEORICO_KG"] = _n(item["P_TEORICO_KG"])
-        item.pop("_subtotal_mangas", None)
-        item.pop("_theoretical_subtotal_mangas", None)
+        item["SUBTOTAL_TEORICO_KG"] = _n(item["SUBTOTAL_TEORICO_KG"]) if item.pop("_has_theoretical_subtotal") else None
+        item["P_TEORICO_KG"] = _n(item["P_TEORICO_KG"]) if item.pop("_has_theoretical_evidence") else None
         items.append(item)
     return items
 
@@ -595,9 +603,9 @@ def list_production_history(session, *, actor_id, filters=None):
         for measure in MEASURE_OPTIONS:
             if measure not in selected:
                 item.pop(measure, None)
-    dedup_known = {}
+    dedup_known = defaultdict(Decimal)
     for row in rows:
-        dedup_known.setdefault(row.get("_manga_id"), _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0"))
+        dedup_known[row.get("_manga_id")] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
     subtotal_known = sum(dedup_known.values(), Decimal("0"))
     return {"items": items, "grouping_options": list(GROUP_OPTIONS), "measure_options": list(MEASURE_OPTIONS), "measures": normalized["measures"], "grouped_by": normalized["groups"], "subtotal_conocido_kg": _n(subtotal_known), "filters": {key: value.isoformat() if isinstance(value, date) else value for key, value in normalized.items() if key not in {"groups", "measures"}}, "visibilidad": {"pesaje": visible}}
 
