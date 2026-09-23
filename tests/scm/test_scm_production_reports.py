@@ -98,3 +98,24 @@ def test_history_requires_operational_date_range(app, client, scm_config):
         )
         assert response.status_code == 400
         assert "fecha_desde" in response.get_json()["error"]["message"]
+
+
+def test_history_export_requires_weighing_capability_and_returns_workbook(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        params = {"fecha_desde": "2026-08-01", "fecha_hasta": "2026-08-31"}
+        denied = client.get(
+            "/api/scm/v1/observabilidad/produccion-historica/export.xlsx",
+            query_string=params,
+            headers={"X-Actor-Id": str(seeded["base"].id)},
+        )
+        assert denied.status_code == 403
+        exported = client.get(
+            "/api/scm/v1/observabilidad/produccion-historica/export.xlsx",
+            query_string=params,
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+        assert exported.status_code == 200
+        assert exported.mimetype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
