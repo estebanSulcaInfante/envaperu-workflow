@@ -287,6 +287,7 @@ def _load_rows(session, filters=None):
             segments = _valid_kg_segments(manga, {})
             latest_control = controls_by_manga.get(manga.id, [])[-1] if controls_by_manga.get(manga.id) else None
             closure_event = None
+            last_reopen = None
             if manga.estado != "ANULADA":
                 closure_event = closure_events.get(str(manga.id))
                 last_reopen = max((item.reabierta_at for item in manga.reaperturas if item.reabierta_at), default=None)
@@ -297,10 +298,12 @@ def _load_rows(session, filters=None):
                  if str(segment.calidad_evidencia_kg or "").upper() == "MEDIDA_DIRECTA_CIERRE_CONTROL"),
                 None,
             )
+            if direct_close_segment is not None and last_reopen is not None and direct_close_segment.cerrada_at is not None and direct_close_segment.cerrada_at <= last_reopen:
+                direct_close_segment = None
             # A final from the last control is valid only with the append-only
             # closure event (or the explicit segment evidence written by that
             # operation). Manga state alone is never closure evidence.
-            if final is None and latest_control is not None and (closure_event is not None or direct_close_segment is not None):
+            if manga.estado != "ANULADA" and final is None and latest_control is not None and (closure_event is not None or direct_close_segment is not None):
                 final = _d((direct_close_segment or latest_control).cantidad_fin_kg if direct_close_segment is not None else latest_control.peso_neto_kg)
             open_kg = _d(latest_control.peso_neto_kg) if final is None and latest_control is not None and manga.estado != "ANULADA" else None
             manga._report_final_kg = final
