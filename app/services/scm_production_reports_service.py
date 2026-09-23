@@ -314,11 +314,9 @@ def _load_rows(session, filters=None):
         ot = sorted((item["ot"] for item in contexts), key=lambda item: item.fecha)[0] if contexts else None
         work = contexts[0]["work"] if contexts else None
         color_work = contexts[0]["color_work"] if contexts else None
-        if ot is None:
-            continue
         color_name = run["corrida"].color_produccion.nombre if run["corrida"].color_produccion else (color_work.color_nombre_snapshot if color_work else None)
-        resource = ot.maquina_nombre_snapshot or ot.maquina_codigo_snapshot if ot.maquina_nombre_snapshot or ot.maquina_codigo_snapshot else None
-        responsible = ot.responsable.nombre_completo if ot.responsable else None
+        resource = (ot.maquina_nombre_snapshot or ot.maquina_codigo_snapshot) if ot is not None else None
+        responsible = ot.responsable.nombre_completo if ot is not None and ot.responsable else None
         record = {
             **run,
             "ot": ot,
@@ -340,9 +338,9 @@ def _matches(run, filters):
     ot = run["ot"]
     corrida = run["corrida"]
     order = run["orden"]
-    values = [str(item or "").lower() for item in (run["color_name"], run["resource"], run["responsible"], corrida.codigo, order.codigo, ot.codigo_ot, run["work"].codigo if run["work"] else None)]
-    contexts = run.get("contexts") or [{"work": run.get("work"), "color_work": run.get("color_work"), "ot": ot}]
-    if not any(filters["fecha_desde"] <= item["ot"].fecha <= filters["fecha_hasta"] for item in contexts):
+    values = [str(item or "").lower() for item in (run["color_name"], run["resource"], run["responsible"], corrida.codigo, order.codigo, ot.codigo_ot if ot else None, run["work"].codigo if run["work"] else None)]
+    contexts = run.get("contexts") or ([{"work": run.get("work"), "color_work": run.get("color_work"), "ot": ot}] if ot else [])
+    if contexts and not any(filters["fecha_desde"] <= item["ot"].fecha <= filters["fecha_hasta"] for item in contexts):
         return False
     if filters["of"] and not any(filters["of"].lower() in str(item["ot"].orden_operacion.codigo if item["ot"].orden_operacion else order.codigo).lower() for item in contexts):
         return False
@@ -359,7 +357,7 @@ def _matches(run, filters):
             return False
     if filters["estado_of"] and filters["estado_of"] != order.estado:
         return False
-    if filters["estado_ot"] and filters["estado_ot"] != ot.estado:
+    if filters["estado_ot"] and (ot is None or filters["estado_ot"] != ot.estado):
         return False
     if filters["articulo"] and not any(filters["articulo"].lower() in str(m.articulo_codigo_snapshot or "").lower() for m in run["mangas"].values()):
         return False
@@ -373,7 +371,7 @@ def _run_manga_values(run):
     opened = sum((_d(item._report_open_kg) or Decimal("0") for item in run["mangas"].values()), Decimal("0"))
     known = sum(item._report_final_kg is not None or item._report_open_kg is not None for item in run["mangas"].values())
     total = len(run["mangas"])
-    complete = total == known
+    complete = total > 0 and total == known
     objective = _d(run["corrida"].objetivo_neto_kg)
     measured = final + opened if complete else None
     return final, opened, measured, total, known, objective
@@ -397,7 +395,7 @@ def list_production_progress(session, *, actor_id, filters=None):
             "corrida_id": str(run["corrida"].id),
             "corrida": run["corrida"].codigo,
             "of": run["orden"].codigo,
-            "ot": run["ot"].codigo_ot,
+            "ot": run["ot"].codigo_ot if run["ot"] is not None else None,
             "color": run["color_name"],
             "objetivo_neto_kg": _n(objective),
             "kg_finalizados_efectivos": _n(final),
@@ -417,12 +415,12 @@ def _run_group_value(run, name):
     ot = run["ot"]
     corrida = run["corrida"]
     return {
-        "DIA": _iso(ot.fecha),
-        "MES": ot.fecha.strftime("%Y-%m"),
+        "DIA": _iso(ot.fecha) if ot else None,
+        "MES": ot.fecha.strftime("%Y-%m") if ot else None,
         "OF": run["orden"].codigo,
         "CORRIDA": corrida.codigo,
         "COLOR": run["color_name"],
-        "OT": ot.codigo_ot,
+        "OT": ot.codigo_ot if ot else None,
         "RECURSO": run["resource"],
         "RESPONSABLE": run["responsible"],
         "ARTICULO": next((m.articulo_codigo_snapshot for m in run["mangas"].values()), None),
