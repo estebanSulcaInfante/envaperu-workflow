@@ -68,7 +68,7 @@ def test_history_subtotal_deduplicates_manga_across_kg_segments_and_groups():
         rows.append({
             "DIA": day, "MES": "2026-09", "OF": "OF-1", "CORRIDA": "C-1",
             "COLOR": "Rojo", "OT": ot, "RECURSO": "M1", "RESPONSABLE": "R",
-            "ARTICULO": "A", "PESO_KG": kg, "SUBTOTAL_CONOCIDO_KG": kg,
+            "ARTICULO": "A", "ARTICULO_NOMBRE": "Artículo legible", "PESO_KG": kg, "SUBTOTAL_CONOCIDO_KG": kg,
             "SUBTOTAL_TEORICO_KG": None, "MANGAS": 1, "P_UNITARIO_G": 100,
             "P_UNITARIO_WEIGHT": 100, "P_UNITARIO_QTY": 1, "P_TEORICO_KG": 1,
             "_known": True, "_manga_id": 77,
@@ -78,6 +78,11 @@ def test_history_subtotal_deduplicates_manga_across_kg_segments_and_groups():
         assert len(items) == (1 if groups == ("OF",) else 2)
         assert sum(item["PESO_KG"] for item in items) == 9
         assert sorted(item["PESO_KG"] for item in items) == ([9] if groups == ("OF",) else [4, 5])
+
+    article = _group_history_rows(rows, {"groups": ["ARTICULO"], "measures": list(MEASURE_OPTIONS)})[0]
+    assert article["ARTICULO"] == "A"
+    assert article["ARTICULO_CODIGO"] == "A"
+    assert article["ARTICULO_NOMBRE"] == "Artículo legible"
 
 
 def test_theoretical_measure_stays_null_without_un_evidence():
@@ -109,6 +114,7 @@ def test_context_filter_does_not_turn_excluded_conciliated_segments_into_fallbac
             _segment(2, "4", "9", "5", attributed_un=50),
         ], peso_unitario_snapshot_g=100, cantidad_confirmada_un=90,
         cantidad_asignada_un=90, articulo_codigo_snapshot="A",
+        articulo_nombre_snapshot="Artículo buscable",
         correccion_asignacion=None,
     )
     manga._report_segments[0].trabajo = work
@@ -125,6 +131,10 @@ def test_context_filter_does_not_turn_excluded_conciliated_segments_into_fallbac
     for raw in ({"q": "OT-2"}, {"estado_ot": "ANULADA"}):
         filters = _filters({"fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-01", **raw})
         assert _history_rows([run], ["DIA"], filters) == []
+
+    for raw in ({"q": "buscable"}, {"articulo": "Artículo buscable"}, {"articulo": "A"}):
+        filters = _filters({"fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-01", **raw})
+        assert len(_history_rows([run], ["ARTICULO"], filters)) == 2
 
 
 def test_report_filters_reject_unknown_group_and_measure_without_fallback():
@@ -159,7 +169,7 @@ def test_history_export_requires_weighing_capability_and_returns_workbook(app, c
 
     with app.app_context():
         seeded = _seed_observability_graph()
-        params = {"fecha_desde": "2026-08-01", "fecha_hasta": "2026-08-31"}
+        params = {"fecha_desde": "2026-08-01", "fecha_hasta": "2026-08-31", "agrupaciones": "ARTICULO"}
         denied = client.get(
             "/api/scm/v1/observabilidad/produccion-historica/export.xlsx",
             query_string=params,
@@ -176,5 +186,6 @@ def test_history_export_requires_weighing_capability_and_returns_workbook(app, c
         workbook = load_workbook(BytesIO(exported.data), read_only=True, data_only=True)
         assert workbook.sheetnames == ["Resumen", "Datos"]
         headers = next(workbook["Datos"].iter_rows(values_only=True))
+        assert headers[:2] == ("ARTICULO_NOMBRE", "ARTICULO_CODIGO")
         assert "SUBTOTAL_CONOCIDO_KG" in headers
         assert "PESO_KG" in headers

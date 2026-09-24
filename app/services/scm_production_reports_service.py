@@ -347,6 +347,11 @@ def _matches(run, filters):
     corrida = run["corrida"]
     order = run["orden"]
     values = [str(item or "").lower() for item in (run["color_name"], run["resource"], run["responsible"], corrida.codigo, order.codigo, ot.codigo_ot if ot else None, run["work"].codigo if run["work"] else None)]
+    article_values = [
+        str(value or "").lower()
+        for manga in run["mangas"].values()
+        for value in (getattr(manga, "articulo_nombre_snapshot", None), manga.articulo_codigo_snapshot)
+    ]
     contexts = run.get("contexts") or ([{"work": run.get("work"), "color_work": run.get("color_work"), "ot": ot}] if ot else [])
     if contexts and not any(filters["fecha_desde"] <= item["ot"].fecha <= filters["fecha_hasta"] for item in contexts):
         return False
@@ -367,7 +372,7 @@ def _matches(run, filters):
         return False
     if filters["estado_ot"] and not any(filters["estado_ot"] == item["ot"].estado for item in contexts):
         return False
-    if filters["articulo"] and not any(filters["articulo"].lower() in str(m.articulo_codigo_snapshot or "").lower() for m in run["mangas"].values()):
+    if filters["articulo"] and not any(filters["articulo"].lower() in value for value in article_values):
         return False
     context_values = [
         str(value or "").lower()
@@ -381,7 +386,7 @@ def _matches(run, filters):
             item["work"].codigo if item.get("work") else None,
         )
     ]
-    if filters["q"] and not any(filters["q"].lower() in value for value in (*values, *context_values)):
+    if filters["q"] and not any(filters["q"].lower() in value for value in (*values, *context_values, *article_values)):
         return False
     return True
 
@@ -481,7 +486,7 @@ def _context_matches(run, context, manga, filters):
             run["color_name"], ot.codigo_ot, ot.maquina_nombre_snapshot,
             ot.maquina_codigo_snapshot, ot.responsable.nombre_completo if ot.responsable else None,
             run["corrida"].codigo, run["orden"].codigo, work.codigo if work else None,
-            manga.articulo_codigo_snapshot,
+            getattr(manga, "articulo_nombre_snapshot", None), manga.articulo_codigo_snapshot,
         )
     ]
     if not filters["fecha_desde"] <= ot.fecha <= filters["fecha_hasta"]:
@@ -493,11 +498,15 @@ def _context_matches(run, context, manga, filters):
         ("color", run["color_name"]), ("ot", ot.codigo_ot),
         ("recurso", ot.maquina_nombre_snapshot or ot.maquina_codigo_snapshot),
         ("responsable", ot.responsable.nombre_completo if ot.responsable else None),
-        ("articulo", manga.articulo_codigo_snapshot),
     )
     for key, value in checks:
         if filters[key] and filters[key].lower() not in str(value or "").lower():
             return False
+    if filters["articulo"] and not any(
+        filters["articulo"].lower() in str(value or "").lower()
+        for value in (getattr(manga, "articulo_nombre_snapshot", None), manga.articulo_codigo_snapshot)
+    ):
+        return False
     return not filters["q"] or any(filters["q"].lower() in value for value in values)
 
 
@@ -543,10 +552,11 @@ def _history_rows(runs, groups, filters=None):
                 values = {group: _run_group_value(run, group) for group in GROUP_OPTIONS}
                 unit = _d(manga.peso_unitario_snapshot_g)
                 quantity = _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un)
-                rows.append({**values, "PESO_KG": None, "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 0, "P_UNITARIO_G": None, "P_TEORICO_KG": None, "SUBTOTAL_TEORICO_KG": _n(unit * quantity / Decimal("1000")) if unit is not None and quantity is not None else None, "_known": False, "_manga_id": manga.id})
+                rows.append({**values, "ARTICULO_NOMBRE": getattr(manga, "articulo_nombre_snapshot", None), "PESO_KG": None, "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 0, "P_UNITARIO_G": None, "P_TEORICO_KG": None, "SUBTOTAL_TEORICO_KG": _n(unit * quantity / Decimal("1000")) if unit is not None and quantity is not None else None, "_known": False, "_manga_id": manga.id})
             for segment_run, context, kg, segment in segment_values:
                 values = {group: _context_group_value(segment_run, context, group) for group in GROUP_OPTIONS}
                 values["ARTICULO"] = manga.articulo_codigo_snapshot
+                values["ARTICULO_NOMBRE"] = getattr(manga, "articulo_nombre_snapshot", None)
                 unit = _d(context["color_work"].peso_neto_snapshot_g) if context and context["color_work"] else _d(manga.peso_unitario_snapshot_g)
                 quantity = _d(getattr(segment, "cantidad_atribuida_un", None)) if valid and segment is not None else None
                 theoretical = (unit * quantity / Decimal("1000")) if unit is not None and quantity is not None and quantity > 0 else None
@@ -564,7 +574,13 @@ def _group_history_rows(rows, normalized):
     grouped = {}
     for row in rows:
         key = tuple(row[group] for group in normalized["groups"])
-        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "SUBTOTAL_TEORICO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False, "_has_theoretical_evidence": False, "_has_theoretical_subtotal": False})
+        article_descriptor = ({
+            "ARTICULO_NOMBRE": row.get("ARTICULO_NOMBRE"),
+            "ARTICULO_CODIGO": row.get("ARTICULO"),
+        } if "ARTICULO" in normalized["groups"] else {})
+        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | article_descriptor | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "SUBTOTAL_TEORICO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False, "_has_theoretical_evidence": False, "_has_theoretical_subtotal": False})
+        if "ARTICULO" in normalized["groups"] and not item.get("ARTICULO_NOMBRE"):
+            item["ARTICULO_NOMBRE"] = row.get("ARTICULO_NOMBRE")
         manga_id = row.get("_manga_id")
         item["SUBTOTAL_CONOCIDO_KG"] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
         if row.get("P_TEORICO_KG") is not None:
@@ -630,7 +646,13 @@ def generate_production_history_xlsx(session, *, actor_id, filters=None):
     summary.append(["Peso efectivo (kg)", sum((row.get("PESO_KG") or 0 for row in payload["items"]), 0)])
     summary.append(["Filas", len(payload["items"])])
     data = workbook.create_sheet("Datos")
-    headers = list(payload["grouped_by"]) + list(payload["measures"]) + ["SUBTOTAL_CONOCIDO_KG", "SUBTOTAL_TEORICO_KG", "coverage"]
+    headers = []
+    for group in payload["grouped_by"]:
+        if group == "ARTICULO":
+            headers.extend(["ARTICULO_NOMBRE", "ARTICULO_CODIGO"])
+        else:
+            headers.append(group)
+    headers += list(payload["measures"]) + ["SUBTOTAL_CONOCIDO_KG", "SUBTOTAL_TEORICO_KG", "coverage"]
     data.append(headers)
     for row in payload["items"]:
         data.append([row.get(header) for header in headers])
