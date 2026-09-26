@@ -1762,6 +1762,16 @@ def confirm_production_plan(
             if item["tipo"] == "FABRICACION":
                 fabrication = ScmOrdenFabricacion(
                     orden_operacion=operation_order,
+                    snapshot_proceso=(
+                        item.get("tipo_operacion")
+                        if item.get("tipo_operacion") in {"INYECCION", "SOPLADO"}
+                        else None
+                    ),
+                    fuente_proceso=(
+                        "RUTA_CABECERA"
+                        if item.get("tipo_operacion") in {"INYECCION", "SOPLADO"}
+                        else None
+                    ),
                 )
                 color_id, unit_weight = _proposal_color_and_weight(article)
                 run = ScmCorridaFabricacion(

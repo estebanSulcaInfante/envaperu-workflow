@@ -762,6 +762,68 @@ def test_create_and_approve_route_with_wip_target(app, client):
     assert listed.get_json()["items"][0]["articulo_objetivo_id"] == target_id
 
 
+@pytest.mark.parametrize("operation_type", ["INYECCION", "SOPLADO"])
+def test_create_and_approve_route_with_piece_color_target(
+    app,
+    client,
+    operation_type,
+):
+    with app.app_context():
+        creator, approver = _actors()
+        target = ScmArticulo(
+            codigo=f"PC-RUTA-{operation_type}",
+            nombre=f"PiezaColor {operation_type}",
+            clase="PIEZA_COLOR",
+            unidad_base="UN",
+            unidad_inventario="UN",
+        )
+        db.session.add(target)
+        db.session.flush()
+        center = _center(
+            creator,
+            f"PC-{operation_type}",
+            operation_type=operation_type,
+        )
+        creator_id = creator.id
+        approver_id = approver.id
+        target_id = target.id
+        center_id = center["id"]
+
+    operation = _operation(
+        f"FABRICAR_{operation_type}",
+        10,
+        center_id,
+        target_id,
+        operation_type=operation_type,
+    )
+    created = client.post(
+        f"/api/scm/v1/articulos/{target_id}/rutas",
+        headers={"X-Actor-Id": str(creator_id)},
+        json={"operaciones": [operation], "precedencias": []},
+    )
+
+    assert created.status_code == 201
+    route = created.get_json()
+    assert route["articulo_objetivo"]["clase"] == "PIEZA_COLOR"
+    assert route["operaciones"][0]["articulo_salida_id"] == target_id
+    assert route["operaciones"][0]["tipo"] == operation_type
+
+    approved = client.post(
+        f"/api/scm/v1/rutas/{route['id']}/aprobar",
+        headers={
+            "X-Actor-Id": str(approver_id),
+            "Idempotency-Key": str(uuid4()),
+        },
+        json={"version": route["version"]},
+    )
+
+    assert approved.status_code == 200
+    payload = approved.get_json()
+    assert payload["estado"] == "APROBADA"
+    assert payload["articulo_objetivo"]["clase"] == "PIEZA_COLOR"
+    assert payload["content_hash"]
+
+
 def test_api_crea_oa_excepcional_wip_idempotente_y_gobernada(app, client):
     with app.app_context():
         creator, approver = _actors()

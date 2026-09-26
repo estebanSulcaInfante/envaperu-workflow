@@ -6,6 +6,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.models.scm_articulos import (
+    CLASE_PIEZA_COLOR,
     CLASE_PRODUCTO_TERMINADO,
     CLASE_SUBENSAMBLE_WIP,
     ScmArticulo,
@@ -197,6 +198,7 @@ def _event(route, actor, event_type, *, operation=None, before=None):
 
 
 ROUTE_TARGET_CLASSES = frozenset({
+    CLASE_PIEZA_COLOR,
     CLASE_SUBENSAMBLE_WIP,
     CLASE_PRODUCTO_TERMINADO,
 })
@@ -210,8 +212,8 @@ def _validate_route_target(
     if target.clase not in ROUTE_TARGET_CLASSES:
         raise ScmServiceError(
             unsupported_code,
-            "La ruta requiere un articulo SUBENSAMBLE_WIP o "
-            "PRODUCTO_TERMINADO.",
+            "La ruta requiere un articulo PIEZA_COLOR, "
+            "SUBENSAMBLE_WIP o PRODUCTO_TERMINADO.",
             status_code=422,
             details={"article_id": target.id, "class": target.clase},
         )
@@ -573,6 +575,16 @@ def _assert_route_approvable(session, route):
         )
 
     terminal_id = terminal[0].id
+    if route.articulo_objetivo.clase == CLASE_PIEZA_COLOR and (
+        terminal[0].executor_kind != EXECUTOR_OP_OT
+        or terminal[0].tipo not in {"INYECCION", "SOPLADO"}
+    ):
+        raise ScmServiceError(
+            "PIEZA_COLOR_TERMINAL_PROCESS_INVALID",
+            "La terminal de una PiezaColor debe ser OP_OT de INYECCION o SOPLADO.",
+            status_code=422,
+            details={"operation_id": terminal[0].id, "tipo": terminal[0].tipo},
+        )
     for operation in route.operaciones:
         if not operation.centro_trabajo.activo:
             raise ScmServiceError(

@@ -476,6 +476,7 @@ def test_create_and_release_exceptional_fabrication_order(
         },
         json={
             "motivo": "No debe aceptar sugerencia SOPLADO para molde de inyeccion",
+            "proceso": "INYECCION",
             "molde_id": "ML-OF-API",
             "maquina_prevista_id": bad_machine_id,
             "snapshot_tiempo_ciclo_seg": 30,
@@ -506,6 +507,7 @@ def test_create_and_release_exceptional_fabrication_order(
         },
         json={
             "motivo": "No debe aceptar receta sin aprobar",
+            "proceso": "INYECCION",
             "molde_id": "ML-OF-API",
             "snapshot_tiempo_ciclo_seg": 30,
             "snapshot_horas_turno": 24,
@@ -536,6 +538,7 @@ def test_create_and_release_exceptional_fabrication_order(
         },
         json={
             "motivo": "No debe aceptar receta de otro producto",
+            "proceso": "INYECCION",
             "molde_id": "ML-OF-API",
             "snapshot_tiempo_ciclo_seg": 30,
             "snapshot_horas_turno": 24,
@@ -566,6 +569,7 @@ def test_create_and_release_exceptional_fabrication_order(
         },
         json={
             "motivo": "Objetivo sin peso unitario",
+            "proceso": "INYECCION",
             "molde_id": "ML-OF-API",
             "snapshot_tiempo_ciclo_seg": 30,
             "snapshot_horas_turno": 24,
@@ -596,6 +600,7 @@ def test_create_and_release_exceptional_fabrication_order(
         headers=headers,
         json={
             "motivo": "Prueba controlada UAT",
+            "proceso": "INYECCION",
             "molde_id": "ML-OF-API",
             "snapshot_tiempo_ciclo_seg": 30,
             "snapshot_horas_turno": 24,

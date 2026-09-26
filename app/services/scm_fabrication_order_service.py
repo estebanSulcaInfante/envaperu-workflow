@@ -57,6 +57,14 @@ from app.services.scm_service_support import (
     reject_unknown_fields,
     required_text,
 )
+from app.services.scm_process_resolution import (
+    normalize_process,
+    resolve_order_process,
+    resolve_route_operation,
+    route_operation_dto,
+    route_snapshot,
+)
+from app.services.scm_route_service import _content_hash as _route_content_hash
 
 
 def _positive_decimal(value, field, *, integral=False, allow_zero=False):
@@ -209,6 +217,79 @@ def _mold_output_spec(session, output, mold):
         "per_cycle": Decimal(composition.cavidades),
         "unit_weight": Decimal(str(composition.peso_unitario_gr)),
     }
+
+
+def _validate_physical_output_set(
+    session,
+    mold,
+    color_id,
+    entries,
+    *,
+    require_complete=True,
+):
+    """Validate the immutable physical set whenever a run targets PC data.
+
+    Legacy PT/WIP runs retain their existing path. Once one PieceColor output
+    is present, every active mold piece must appear exactly once with the
+    canonical cavity and unit-weight snapshots.
+    """
+    mold_pieces = {
+        item.pieza_id: item
+        for item in session.scalars(
+            select(MoldePieza).where(
+                MoldePieza.molde_id == mold.codigo,
+                MoldePieza.activo.is_(True),
+            )
+        ).all()
+    }
+    pc_entries = []
+    non_pc_entries = []
+    for entry in entries:
+        article = entry[0]
+        if article.pieza_color is None or article.pieza_color.pieza_color is None:
+            non_pc_entries.append(entry)
+            continue
+        pc_entries.append(entry)
+    if not pc_entries:
+        return
+    if non_pc_entries:
+        raise ScmServiceError(
+            "MOLD_OUTPUT_SET_MISMATCH",
+            "Una corrida PiezaColor no puede mezclar salidas WIP/PT.",
+            status_code=422,
+        )
+    by_piece = {}
+    for article, per_cycle, unit_weight in pc_entries:
+        piece_color = article.pieza_color.pieza_color
+        if piece_color.color_produccion_id != color_id:
+            raise ScmServiceError(
+                "OF_RUN_COLOR_MISMATCH",
+                "La salida PiezaColor no corresponde al color de la corrida.",
+                status_code=422,
+            )
+        if piece_color.pieza_id in by_piece:
+            raise ScmServiceError(
+                "DUPLICATE_OF_PIECE",
+                "Una corrida no puede repetir una pieza fisica del molde.",
+                status_code=422,
+            )
+        by_piece[piece_color.pieza_id] = (per_cycle, unit_weight)
+    if require_complete and (set(by_piece) != set(mold_pieces) or any(
+        Decimal(str(by_piece[piece_id][0]))
+        != Decimal(str(mold_pieces[piece_id].cavidades))
+        or Decimal(str(by_piece[piece_id][1]))
+        != Decimal(str(mold_pieces[piece_id].peso_unitario_gr))
+        for piece_id in mold_pieces
+    )):
+        raise ScmServiceError(
+            "MOLD_OUTPUT_SET_MISMATCH",
+            "Las salidas deben cubrir exactamente las piezas activas, cavidades y pesos del molde.",
+            status_code=422,
+            details={
+                "piezas_requeridas": sorted(mold_pieces),
+                "piezas_recibidas": sorted(by_piece),
+            },
+        )
 
 
 def _default_recipe_for_run(session, run, outputs):
@@ -392,6 +473,9 @@ def _serialize_run(session, run):
             }
             if run.receta_revision is not None else None
         ),
+        "operacion_ruta_revision_id": run.operacion_ruta_revision_id,
+        "operacion_ruta_hash": run.operacion_ruta_hash,
+        "operacion_ruta": route_operation_dto(run.operacion_ruta),
         "ciclos_objetivo": run.ciclos_objetivo,
         "objetivo_neto_kg": _decimal_text(run.objetivo_neto_kg, 6),
         "kg_neto_por_ciclo": _decimal_text(kg_neto_por_ciclo, 6),
@@ -410,7 +494,24 @@ def _serialize_run(session, run):
 
 def _serialize(session, operation, *, schedule_projection=None):
     fabrication = operation.fabricacion
+    resolved_process, _, compatibility = resolve_order_process(operation)
     route_operation = operation.operacion_ruta_revision
+    if not fabrication.snapshot_proceso and route_operation is not None:
+        header_output_ids = {item.articulo_scm_id for item in operation.salidas}
+        header_valid = (
+            route_operation.ruta is not None
+            and route_operation.ruta.estado in {"APROBADA", "RETIRADA"}
+            and route_operation.executor_kind == "OP_OT"
+            and route_operation.tipo in {"INYECCION", "SOPLADO"}
+            and bool(operation.operacion_ruta_hash)
+            and operation.operacion_ruta_hash == _route_content_hash(
+                route_operation.ruta
+            )
+            and route_operation.articulo_salida_id in header_output_ids
+        )
+        if not header_valid:
+            resolved_process = None
+            compatibility = "RUTA_CABECERA_NO_VERIFICABLE"
     replacement = replacement_summary(session, operation)
     origin_op = operation.plan_produccion.orden_produccion if operation.plan_produccion else None
     kg_closure = session.scalar(
@@ -454,7 +555,10 @@ def _serialize(session, operation, *, schedule_projection=None):
             if operation.plan_produccion_id else None
         ),
         "propuesta_clave": operation.propuesta_clave,
-        "proceso_requerido": _required_process_for_operation(operation),
+        "proceso_requerido": resolved_process,
+        "snapshot_proceso": fabrication.snapshot_proceso,
+        "fuente_proceso": fabrication.fuente_proceso,
+        "compatibilidad_proceso": compatibility,
         "created_by_id": operation.created_by_id,
         "released_by_id": operation.released_by_id,
         "released_at": _iso(operation.released_at),
@@ -528,18 +632,8 @@ def _resolve_machine_process(machine):
 
 
 def _required_process_for_operation(operation):
-    route_operation = operation.operacion_ruta_revision
-    required_process = _normalized_process(
-        route_operation.tipo if route_operation is not None else None
-    )
-    if (
-        not required_process
-        and operation.origen_demanda == "EXCEPCIONAL"
-        and operation.fabricacion is not None
-        and operation.fabricacion.molde_id
-    ):
-        return "INYECCION"
-    return required_process or None
+    process, _, _ = resolve_order_process(operation)
+    return process
 
 
 def _validate_machine_process(machine, required_process):
@@ -851,6 +945,8 @@ def replace_fabrication_order(
             snapshot_tiempo_ciclo_seg=order.fabricacion.snapshot_tiempo_ciclo_seg,
             snapshot_horas_turno=order.fabricacion.snapshot_horas_turno,
             snapshot_peso_colada_gr=order.fabricacion.snapshot_peso_colada_gr,
+            snapshot_proceso=order.fabricacion.snapshot_proceso,
+            fuente_proceso=order.fabricacion.fuente_proceso,
             # codigo_legacy_op is intentionally not cloned: it is unique legacy identity.
         )
         for run in order.fabricacion.corridas:
@@ -863,6 +959,8 @@ def replace_fabrication_order(
                 receta_hash=None,
                 ciclos_objetivo=run.ciclos_objetivo,
                 objetivo_neto_kg=run.objetivo_neto_kg,
+                operacion_ruta_revision_id=run.operacion_ruta_revision_id,
+                operacion_ruta_hash=run.operacion_ruta_hash,
                 estado="BORRADOR",
                 meta_kg_legacy=run.meta_kg_legacy,
             )
@@ -951,6 +1049,7 @@ def create_exceptional_fabrication_order(
                 "snapshot_tiempo_ciclo_seg",
                 "snapshot_horas_turno",
                 "snapshot_peso_colada_gr",
+                "proceso",
                 "corridas",
             },
         )
@@ -973,22 +1072,13 @@ def create_exceptional_fabrication_order(
             field="molde_id",
             max_length=50,
         )
-        if session.get(Molde, mold_id) is None:
+        mold = session.get(Molde, mold_id)
+        if mold is None:
             raise ScmServiceError(
                 "MOLD_NOT_FOUND",
                 "El molde indicado no existe.",
                 status_code=422,
             )
-        machine_id = data.get("maquina_prevista_id")
-        machine = session.get(Maquina, machine_id) if machine_id is not None else None
-        if machine_id is not None:
-            if machine is None:
-                raise ScmServiceError(
-                    "MACHINE_NOT_FOUND",
-                    "La maquina prevista no existe.",
-                    status_code=422,
-                )
-            _validate_machine_process(machine, "INYECCION")
         raw_runs = data.get("corridas")
         if not isinstance(raw_runs, list) or not raw_runs:
             raise ScmServiceError(
@@ -996,6 +1086,68 @@ def create_exceptional_fabrication_order(
                 "La OF requiere al menos una corrida.",
                 status_code=422,
             )
+        explicit_process = normalize_process(data.get("proceso"))
+        if explicit_process is not None and explicit_process not in {"INYECCION", "SOPLADO"}:
+            raise ScmServiceError(
+                "PROCESS_INVALID",
+                "El proceso debe ser INYECCION o SOPLADO.",
+                status_code=422,
+            )
+        linked_operations = []
+        seen_route_ids = set()
+        all_runs_linked = True
+        for raw_run in raw_runs:
+            if not isinstance(raw_run, dict):
+                all_runs_linked = False
+                continue
+            route_id = raw_run.get("operacion_ruta_revision_id")
+            if route_id is None:
+                all_runs_linked = False
+                continue
+            if route_id in seen_route_ids:
+                raise ScmServiceError(
+                    "DUPLICATE_ROUTE_OPERATION",
+                    "Una OF no puede repetir la misma operacion de ruta.",
+                    status_code=422,
+                )
+            seen_route_ids.add(route_id)
+            linked_operations.append(resolve_route_operation(session, route_id, lock=True))
+        linked_processes = {item.tipo for item in linked_operations}
+        machine_id = data.get("maquina_prevista_id")
+        machine = session.get(Maquina, machine_id) if machine_id is not None else None
+        if machine_id is not None and machine is None:
+            raise ScmServiceError(
+                "MACHINE_NOT_FOUND",
+                "La maquina prevista no existe.",
+                status_code=422,
+            )
+        if len(linked_processes) > 1:
+            raise ScmServiceError(
+                "PROCESS_MISMATCH",
+                "Las operaciones de ruta de las corridas requieren procesos distintos.",
+                status_code=422,
+            )
+        if explicit_process is not None and linked_processes and explicit_process not in linked_processes:
+            raise ScmServiceError(
+                "PROCESS_MISMATCH",
+                "El proceso explicito no coincide con las operaciones de ruta.",
+                status_code=422,
+            )
+        if explicit_process is None and linked_processes and not all_runs_linked:
+            raise ScmServiceError(
+                "PROCESS_REQUIRED",
+                "Las corridas parcialmente enlazadas requieren proceso explicito.",
+                status_code=422,
+            )
+        resolved_process = explicit_process or (
+            next(iter(linked_processes)) if linked_processes else None
+        )
+        process_source = (
+            "EXPLICITO" if explicit_process is not None
+            else "RUTA_OBJETIVOS" if linked_processes else None
+        )
+        if machine_id is not None and resolved_process is not None:
+            _validate_machine_process(machine, resolved_process)
         code = generar_codigo_catalogo(
             "ORDEN_FABRICACION",
             session=session,
@@ -1024,7 +1176,10 @@ def create_exceptional_fabrication_order(
                 "snapshot_peso_colada_gr",
                 allow_zero=True,
             ),
+            snapshot_proceso=resolved_process,
+            fuente_proceso=process_source,
         )
+        seen_colors = set()
         for sequence, raw_run in enumerate(raw_runs, start=1):
             if not isinstance(raw_run, dict):
                 raise ScmServiceError(
@@ -1039,6 +1194,7 @@ def create_exceptional_fabrication_order(
                     "receta_revision_id",
                     "ciclos_objetivo",
                     "objetivo_neto_kg",
+                    "operacion_ruta_revision_id",
                     "salidas",
                 },
             )
@@ -1049,6 +1205,13 @@ def create_exceptional_fabrication_order(
                     "El color de una corrida no existe.",
                     status_code=422,
                 )
+            if color_id in seen_colors:
+                raise ScmServiceError(
+                    "DUPLICATE_OF_COLOR",
+                    "Una OF no puede repetir el mismo color en varias corridas.",
+                    status_code=422,
+                )
+            seen_colors.add(color_id)
             recipe_id = raw_run.get("receta_revision_id")
             recipe = None
             if recipe_id is not None:
@@ -1149,6 +1312,51 @@ def create_exceptional_fabrication_order(
                 ))
                 seen_articles.add(article_id)
                 output_articles.append(article)
+            route_id = raw_run.get("operacion_ruta_revision_id")
+            if route_id is not None:
+                route_operation = resolve_route_operation(session, route_id, lock=True)
+                route_article = route_operation.articulo_salida
+                route_piece_color = (
+                    route_article is not None
+                    and route_article.pieza_color is not None
+                    and route_article.pieza_color.pieza_color is not None
+                )
+                if not route_piece_color:
+                    raise ScmServiceError(
+                        "ROUTE_TARGET_OUT_OF_SCOPE",
+                        "La referencia de ruta por corrida solo aplica a articulos PiezaColor.",
+                        status_code=422,
+                    )
+                if route_operation.articulo_salida_id not in seen_articles:
+                    raise ScmServiceError(
+                        "ROUTE_OUTPUT_MISMATCH",
+                        "La salida objetivo de la operacion de ruta no pertenece a la corrida.",
+                        status_code=422,
+                    )
+                route_article = route_operation.articulo_salida
+                route_color = (
+                    route_article.pieza_color.pieza_color.color_produccion_id
+                    if route_article is not None
+                    and route_article.pieza_color is not None
+                    and route_article.pieza_color.pieza_color is not None
+                    else None
+                )
+                if route_color is not None and route_color != color_id:
+                    raise ScmServiceError(
+                        "ROUTE_COLOR_MISMATCH",
+                        "La operacion de ruta no corresponde al color de la corrida.",
+                        status_code=422,
+                    )
+            _validate_physical_output_set(
+                session,
+                mold,
+                color_id,
+                [
+                    (article, per_cycle, unit_weight)
+                    for _, article, per_cycle, unit_weight, _ in output_specs
+                ],
+                require_complete=True,
+            )
             kg_neto_por_ciclo = sum(
                 per_cycle * unit_weight / Decimal("1000")
                 for _, _, per_cycle, unit_weight, _ in output_specs
@@ -1168,6 +1376,20 @@ def create_exceptional_fabrication_order(
                 receta_hash=None,
                 ciclos_objetivo=cycles,
                 objetivo_neto_kg=objective,
+                operacion_ruta_revision_id=(
+                    raw_run.get("operacion_ruta_revision_id")
+                ),
+                operacion_ruta_hash=(
+                    route_snapshot(
+                        resolve_route_operation(
+                            session,
+                            raw_run.get("operacion_ruta_revision_id"),
+                            lock=True,
+                        )
+                    )[1]
+                    if raw_run.get("operacion_ruta_revision_id") is not None
+                    else None
+                ),
             )
             fabrication.corridas.append(run)
             for article_id, _, per_cycle, unit_weight, requested_quantity in output_specs:
@@ -1199,6 +1421,12 @@ def create_exceptional_fabrication_order(
                     color_id,
                     outputs=output_articles,
                 )
+        if resolved_process is None:
+            raise ScmServiceError(
+                "PROCESS_REQUIRED",
+                "La OF excepcional requiere proceso explicito o rutas por corrida.",
+                status_code=422,
+            )
         session.add(order)
         session.flush()
         response = _serialize(session, order)
@@ -1244,6 +1472,7 @@ def update_fabrication_order(
                 "snapshot_tiempo_ciclo_seg",
                 "snapshot_horas_turno",
                 "snapshot_peso_colada_gr",
+                "proceso",
                 "corridas",
             },
         )
@@ -1284,6 +1513,7 @@ def update_fabrication_order(
                 "Solo una OF en borrador admite configuración.",
                 status_code=409,
             )
+        before_response = _serialize(session, order)
         # A replacement carries immutable technical snapshots. Its only
         # editable decision in this increment is the approved recipe; using
         # the normal configuration path here would recalculate from current
@@ -1292,7 +1522,7 @@ def update_fabrication_order(
             reject_unknown_fields(data, allowed={"version", "corridas"})
             raw_runs = data.get("corridas")
             runs_by_id = {str(item.id): item for item in order.fabricacion.corridas}
-            if not isinstance(raw_runs, list) or {
+            if not isinstance(raw_runs, list) or len(raw_runs) != len(runs_by_id) or {
                 str(item.get("id")) for item in raw_runs
             } != set(runs_by_id):
                 raise ScmServiceError(
@@ -1332,6 +1562,7 @@ def update_fabrication_order(
                 tipo="OF_REPLACEMENT_RECIPE_SELECTED",
                 actor_id=actor.id,
                 actor_snapshot=actor_snapshot(actor),
+                before_json=before_response,
                 after_json=response,
                 operation_id=audit.operation_id,
             ))
@@ -1358,13 +1589,165 @@ def update_fabrication_order(
                 status_code=422,
             )
         fabrication = order.fabricacion
+        process_input_present = "proceso" in data
+        if order.origen_demanda != "EXCEPCIONAL" and process_input_present:
+            raise ScmServiceError(
+                "PROCESS_NOT_ALLOWED",
+                "El proceso solo puede editarse en OF excepcionales.",
+                status_code=422,
+            )
+        explicit_process = normalize_process(data.get("proceso")) if process_input_present else None
+        if process_input_present and explicit_process is not None and explicit_process not in {"INYECCION", "SOPLADO"}:
+            raise ScmServiceError(
+                "PROCESS_INVALID",
+                "El proceso debe ser INYECCION o SOPLADO.",
+                status_code=422,
+            )
+        raw_runs = data.get("corridas")
+        if not isinstance(raw_runs, list) or not raw_runs:
+            raise ScmServiceError(
+                "OF_CORRIDA_REQUIRED",
+                "La configuración requiere las corridas de la OF.",
+                status_code=422,
+            )
+        runs_by_id = {str(item.id): item for item in fabrication.corridas}
+        if (
+            len(raw_runs) != len(runs_by_id)
+            or {str(item.get("id")) for item in raw_runs} != set(runs_by_id)
+        ):
+            raise ScmServiceError(
+                "OF_CORRIDA_MISMATCH",
+                "Deben configurarse exactamente las corridas existentes.",
+                status_code=422,
+            )
+        requested_routes = []
+        seen_route_ids = set()
+        route_fields_changed = False
+        for raw_run in raw_runs:
+            if not isinstance(raw_run, dict):
+                raise ScmServiceError(
+                    "INVALID_OF_RUN",
+                    "Cada corrida debe ser un objeto JSON.",
+                    status_code=400,
+                )
+            reject_unknown_fields(
+                raw_run,
+                allowed={
+                    "id", "color_produccion_id", "receta_revision_id",
+                    "ciclos_objetivo", "objetivo_neto_kg",
+                    "operacion_ruta_revision_id", "salidas",
+                },
+            )
+            run = runs_by_id[str(raw_run["id"])]
+            if "operacion_ruta_revision_id" in raw_run:
+                if order.origen_demanda != "EXCEPCIONAL":
+                    raise ScmServiceError(
+                        "ROUTE_TARGET_OUT_OF_SCOPE",
+                        "Las referencias de ruta por corrida solo aplican a OF excepcionales.",
+                        status_code=422,
+                    )
+                route_fields_changed = True
+                route_id = raw_run.get("operacion_ruta_revision_id")
+                route_operation = (
+                    resolve_route_operation(
+                        session,
+                        route_id,
+                        lock=True,
+                        allow_retired=True,
+                    )
+                    if route_id is not None else None
+                )
+            else:
+                route_operation = None
+                if run.operacion_ruta_revision_id is not None:
+                    route_operation = resolve_route_operation(
+                        session,
+                        run.operacion_ruta_revision_id,
+                        lock=True,
+                        allow_retired=True,
+                    )
+                    if run.operacion_ruta_hash != _route_content_hash(
+                        route_operation.ruta
+                    ):
+                        raise ScmServiceError(
+                            "ROUTE_SNAPSHOT_MISMATCH",
+                            "La referencia de ruta de la corrida no coincide con su hash congelado.",
+                            status_code=409,
+                        )
+            if route_operation is not None:
+                route_article = route_operation.articulo_salida
+                route_piece_color = (
+                    route_article is not None
+                    and route_article.pieza_color is not None
+                    and route_article.pieza_color.pieza_color is not None
+                )
+                if not route_piece_color:
+                    raise ScmServiceError(
+                        "ROUTE_TARGET_OUT_OF_SCOPE",
+                        "La referencia de ruta por corrida solo aplica a articulos PiezaColor.",
+                        status_code=422,
+                    )
+                if route_operation.id in seen_route_ids:
+                    raise ScmServiceError(
+                        "DUPLICATE_ROUTE_OPERATION",
+                        "Una OF no puede repetir la misma operacion de ruta.",
+                        status_code=422,
+                    )
+                seen_route_ids.add(route_operation.id)
+            requested_routes.append(route_operation)
+        linked_processes = {
+            item.tipo for item in requested_routes if item is not None
+        }
+        if len(linked_processes) > 1:
+            raise ScmServiceError(
+                "PROCESS_MISMATCH",
+                "Las operaciones de ruta de las corridas requieren procesos distintos.",
+                status_code=422,
+            )
+        all_runs_linked = bool(requested_routes) and all(
+            item is not None for item in requested_routes
+        )
+        current_process = normalize_process(fabrication.snapshot_proceso)
+        current_source = fabrication.fuente_proceso
+        if process_input_present:
+            if explicit_process is not None:
+                desired_process = explicit_process
+                desired_source = "EXPLICITO"
+            elif all_runs_linked:
+                desired_process = next(iter(linked_processes))
+                desired_source = "RUTA_OBJETIVOS"
+            else:
+                raise ScmServiceError(
+                    "PROCESS_REQUIRED",
+                    "proceso:null sólo puede derivarse con todas las corridas enlazadas.",
+                    status_code=422,
+                )
+        elif current_source == "EXPLICITO" and current_process:
+            desired_process = current_process
+            desired_source = current_source
+        elif all_runs_linked:
+            desired_process = next(iter(linked_processes))
+            desired_source = "RUTA_OBJETIVOS"
+        elif current_process and not route_fields_changed:
+            desired_process = current_process
+            desired_source = current_source
+        else:
+            raise ScmServiceError(
+                "PROCESS_REQUIRED",
+                "Las corridas parcialmente enlazadas requieren proceso explicito.",
+                status_code=422,
+            )
+        if linked_processes and desired_process not in linked_processes:
+            raise ScmServiceError(
+                "PROCESS_MISMATCH",
+                "El proceso de la OF no coincide con una operacion de ruta.",
+                status_code=422,
+            )
+        if machine is not None:
+            _validate_machine_process(machine, desired_process)
         fabrication.molde_id = mold.codigo
         if machine is not None:
-            required_process = _required_process_for_operation(order)
-            if required_process:
-                _validate_machine_process(machine, required_process)
-            else:
-                _validate_machine_for_operation(machine, order)
+            _validate_machine_process(machine, desired_process)
         fabrication.maquina_prevista_id = machine.id if machine is not None else None
         fabrication.snapshot_tiempo_ciclo_seg = _positive_decimal(
             data.get(
@@ -1385,20 +1768,6 @@ def update_fabrication_order(
             "snapshot_peso_colada_gr",
             allow_zero=True,
         )
-        raw_runs = data.get("corridas")
-        if not isinstance(raw_runs, list) or not raw_runs:
-            raise ScmServiceError(
-                "OF_CORRIDA_REQUIRED",
-                "La configuración requiere las corridas de la OF.",
-                status_code=422,
-            )
-        runs_by_id = {str(item.id): item for item in fabrication.corridas}
-        if {str(item.get("id")) for item in raw_runs} != set(runs_by_id):
-            raise ScmServiceError(
-                "OF_CORRIDA_MISMATCH",
-                "Deben configurarse exactamente las corridas existentes.",
-                status_code=422,
-            )
         for raw_run in raw_runs:
             reject_unknown_fields(
                 raw_run,
@@ -1408,10 +1777,20 @@ def update_fabrication_order(
                     "receta_revision_id",
                     "ciclos_objetivo",
                     "objetivo_neto_kg",
+                    "operacion_ruta_revision_id",
                     "salidas",
                 },
             )
             run = runs_by_id[str(raw_run["id"])]
+            if "operacion_ruta_revision_id" in raw_run:
+                route_id = raw_run.get("operacion_ruta_revision_id")
+                if route_id is None:
+                    run.operacion_ruta_revision_id = None
+                    run.operacion_ruta_hash = None
+                else:
+                    route_operation = resolve_route_operation(session, route_id, lock=True)
+                    run.operacion_ruta_revision_id = route_id
+                    run.operacion_ruta_hash = route_operation.ruta.content_hash
             raw_outputs = raw_run.get("salidas")
             outputs_by_id = {str(item.id): item for item in run.salidas}
             if (
@@ -1472,6 +1851,36 @@ def update_fabrication_order(
                 )
                 minimum_cycles = max(minimum_cycles, cycles_for_output)
                 prepared.append((output, per_cycle, unit_weight, required))
+            _validate_physical_output_set(
+                session,
+                mold,
+                raw_run.get("color_produccion_id") or run.color_produccion_id,
+                [(item[0].articulo, item[1], item[2]) for item in prepared],
+                require_complete=order.origen_demanda == "EXCEPCIONAL",
+            )
+            if run.operacion_ruta is not None:
+                if run.operacion_ruta.articulo_salida_id not in {
+                    output.articulo_scm_id for output in outputs_by_id.values()
+                }:
+                    raise ScmServiceError(
+                        "ROUTE_OUTPUT_MISMATCH",
+                        "La salida objetivo de la operacion de ruta no pertenece a la corrida.",
+                        status_code=422,
+                    )
+                route_article = run.operacion_ruta.articulo_salida
+                route_color = (
+                    route_article.pieza_color.pieza_color.color_produccion_id
+                    if route_article is not None
+                    and route_article.pieza_color is not None
+                    and route_article.pieza_color.pieza_color is not None
+                    else None
+                )
+                if route_color is not None and route_color != run.color_produccion_id:
+                    raise ScmServiceError(
+                        "ROUTE_COLOR_MISMATCH",
+                        "La operacion de ruta no corresponde al color de la corrida.",
+                        status_code=422,
+                    )
             objective = (
                 _positive_decimal(raw_run["objetivo_neto_kg"], "objetivo_neto_kg")
                 if raw_run.get("objetivo_neto_kg") is not None
@@ -1548,6 +1957,8 @@ def update_fabrication_order(
                 output.kg_estandar_objetivo = (
                     actual * unit_weight / Decimal("1000")
                 )
+        fabrication.snapshot_proceso = desired_process
+        fabrication.fuente_proceso = desired_source
         order.version += 1
         session.flush()
         response = _serialize(session, order)
@@ -1559,6 +1970,7 @@ def update_fabrication_order(
             tipo="OF_DRAFT_CONFIGURED",
             actor_id=actor.id,
             actor_snapshot=actor_snapshot(actor),
+            before_json=before_response,
             after_json=response,
             operation_id=audit.operation_id,
         ))
@@ -1605,7 +2017,95 @@ def release_fabrication_order(
                 "Solo una OF en BORRADOR puede liberarse.",
                 status_code=409,
             )
+        before_response = _serialize(session, order)
         fabrication = order.fabricacion
+        if bool(fabrication.snapshot_proceso) != bool(fabrication.fuente_proceso):
+            raise ScmServiceError(
+                "PROCESS_SNAPSHOT_INCOMPLETE",
+                "La OF conserva un snapshot de proceso incompleto.",
+                status_code=409,
+            )
+        if not fabrication.snapshot_proceso:
+            if order.operacion_ruta_revision_id is None:
+                raise ScmServiceError(
+                    "PROCESS_REQUIRED",
+                    "La OF planificada requiere una operación de ruta de cabecera verificable.",
+                    status_code=422,
+                )
+            header_route = resolve_route_operation(
+                session,
+                order.operacion_ruta_revision_id,
+                lock=True,
+                allow_retired=True,
+            )
+            if (
+                not order.operacion_ruta_hash
+                or order.operacion_ruta_hash != _route_content_hash(header_route.ruta)
+            ):
+                raise ScmServiceError(
+                    "ROUTE_SNAPSHOT_MISMATCH",
+                    "La ruta de cabecera no coincide con su hash congelado.",
+                    status_code=409,
+                )
+            output_ids = {item.articulo_scm_id for item in order.salidas}
+            if header_route.articulo_salida_id not in output_ids:
+                raise ScmServiceError(
+                    "ROUTE_OUTPUT_MISMATCH",
+                    "La salida de la operación de cabecera no pertenece a la OF.",
+                    status_code=409,
+                )
+            fabrication.snapshot_proceso = header_route.tipo
+            fabrication.fuente_proceso = "RUTA_CABECERA"
+        for run in fabrication.corridas:
+            if run.operacion_ruta_revision_id is None:
+                continue
+            route_operation = resolve_route_operation(
+                session,
+                run.operacion_ruta_revision_id,
+                lock=True,
+                allow_retired=True,
+            )
+            if run.operacion_ruta_hash != _route_content_hash(route_operation.ruta):
+                raise ScmServiceError(
+                    "ROUTE_SNAPSHOT_MISMATCH",
+                    "La corrida conserva un hash de ruta que no coincide con la revision.",
+                    status_code=409,
+                )
+            if route_operation.tipo != fabrication.snapshot_proceso:
+                raise ScmServiceError(
+                    "PROCESS_MISMATCH",
+                    "La operación de ruta congelada no coincide con el proceso de la OF.",
+                    status_code=409,
+                )
+        if fabrication.maquina_prevista_id is not None:
+            release_machine = session.get(Maquina, fabrication.maquina_prevista_id)
+            if release_machine is None or not release_machine.activo:
+                raise ScmServiceError(
+                    "MACHINE_NOT_FOUND",
+                    "La máquina prevista no existe o está inactiva.",
+                    status_code=422,
+                )
+            _validate_machine_process(
+                release_machine,
+                normalize_process(fabrication.snapshot_proceso),
+            )
+        release_mold = session.get(Molde, fabrication.molde_id) if fabrication.molde_id else None
+        if release_mold is not None:
+            for run in fabrication.corridas:
+                _validate_physical_output_set(
+                    session,
+                    release_mold,
+                    run.color_produccion_id,
+                    [
+                        (
+                            output.articulo,
+                            output.cantidad_por_ciclo_snapshot,
+                            output.peso_unitario_snapshot_g,
+                        )
+                        for output in run.salidas
+                    ],
+                    require_complete=order.origen_demanda == "EXCEPCIONAL",
+                )
         incomplete = (
             not fabrication.molde_id
             or not fabrication.snapshot_tiempo_ciclo_seg
@@ -1665,6 +2165,7 @@ def release_fabrication_order(
             tipo="OF_RELEASED",
             actor_id=actor.id,
             actor_snapshot=actor_snapshot(actor),
+            before_json=before_response,
             after_json=response,
             operation_id=operation.operation_id,
         ))

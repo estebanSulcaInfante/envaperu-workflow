@@ -42,6 +42,9 @@ RUN_STATES = (
     "COMPLETADA",
     "ANULADA",
 )
+FABRICATION_PROCESSES = ("INYECCION", "SOPLADO")
+PROCESS_SOURCES = ("EXPLICITO", "RUTA_OBJETIVOS", "RUTA_CABECERA")
+PROCESS_COMPATIBILITY = ("LEGACY_ASUMIDO_INYECCION", "LEGACY_PENDIENTE")
 SUPPLY_SOURCE_TYPES = ("STOCK", "SALIDA_ORDEN")
 ALLOCATION_STATES = (
     "PLANIFICADA",
@@ -463,6 +466,19 @@ class ScmOrdenFabricacion(db.Model):
             "codigo_legacy_op",
             name="uq_scm_of_codigo_legacy",
         ),
+        db.CheckConstraint(
+            "snapshot_proceso IS NULL OR snapshot_proceso IN ('INYECCION', 'SOPLADO')",
+            name="ck_scm_of_snapshot_proceso",
+        ),
+        db.CheckConstraint(
+            "fuente_proceso IS NULL OR fuente_proceso IN ('EXPLICITO', 'RUTA_OBJETIVOS', 'RUTA_CABECERA')",
+            name="ck_scm_of_fuente_proceso",
+        ),
+        db.CheckConstraint(
+            "(snapshot_proceso IS NULL AND fuente_proceso IS NULL) OR "
+            "(snapshot_proceso IS NOT NULL AND fuente_proceso IS NOT NULL)",
+            name="ck_scm_of_process_snapshot_pair",
+        ),
     )
 
     orden_operacion_id = db.Column(
@@ -483,6 +499,8 @@ class ScmOrdenFabricacion(db.Model):
     snapshot_tiempo_ciclo_seg = db.Column(db.Numeric(12, 4), nullable=True)
     snapshot_horas_turno = db.Column(db.Numeric(8, 3), nullable=True)
     snapshot_peso_colada_gr = db.Column(db.Numeric(12, 4), nullable=True)
+    snapshot_proceso = db.Column(db.String(20), nullable=True)
+    fuente_proceso = db.Column(db.String(24), nullable=True)
     codigo_legacy_op = db.Column(
         db.String(20),
         db.ForeignKey("orden_produccion.numero_op", ondelete="RESTRICT"),
@@ -539,6 +557,12 @@ class ScmCorridaFabricacion(db.Model):
             "lote_color_legacy_id",
             name="uq_scm_corrida_lote_legacy",
         ),
+        db.CheckConstraint(
+            "(operacion_ruta_revision_id IS NULL AND operacion_ruta_hash IS NULL) OR "
+            "(operacion_ruta_revision_id IS NOT NULL AND operacion_ruta_hash IS NOT NULL "
+            "AND length(operacion_ruta_hash) = 64)",
+            name="ck_scm_corrida_route_reference_pair",
+        ),
     )
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -565,6 +589,12 @@ class ScmCorridaFabricacion(db.Model):
     receta_hash = db.Column(db.String(64), nullable=True)
     ciclos_objetivo = db.Column(db.Integer, nullable=True)
     objetivo_neto_kg = db.Column(db.Numeric(15, 6), nullable=True)
+    operacion_ruta_revision_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_operacion_ruta.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    operacion_ruta_hash = db.Column(db.String(64), nullable=True)
     estado = db.Column(
         db.String(24),
         nullable=False,
@@ -584,6 +614,10 @@ class ScmCorridaFabricacion(db.Model):
     )
     color_produccion = db.relationship("ColorProduccion", lazy="joined")
     receta_revision = db.relationship("RecetaColorMaestra")
+    operacion_ruta = db.relationship(
+        "ScmOperacionRuta",
+        foreign_keys=[operacion_ruta_revision_id],
+    )
     corrida_premezclas = db.relationship(
         "ScmLotePremezcla", back_populates="corrida", lazy="selectin",
         order_by="ScmLotePremezcla.secuencia",

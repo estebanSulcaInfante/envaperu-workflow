@@ -86,6 +86,7 @@ from app.services.scm_manga_assignment_projection import (
     effective_segment,
     effective_work,
 )
+from app.services.scm_process_resolution import resolve_order_process
 
 
 def _json_hash(value):
@@ -1822,22 +1823,9 @@ def _validate_machine_for_operation(session, machine, order):
                 "estado": machine.estado if machine is not None else None,
             },
         )
-    route_operation = order.operacion_ruta_revision
-    required_process = _normalized_process(
-        route_operation.tipo if route_operation is not None else None
-    )
-    if (
-        not required_process
-        and order.origen_demanda == "EXCEPCIONAL"
-        and order.fabricacion.molde_id
-    ):
-        required_process = "INYECCION"
-    if not required_process and order.fabricacion.maquina_prevista_id:
-        suggested_machine = session.get(
-            Maquina, order.fabricacion.maquina_prevista_id
-        )
-        if suggested_machine is not None:
-            required_process = _resolve_machine_process(suggested_machine)
+    required_process, _, compatibility = resolve_order_process(order)
+    if compatibility == "LEGACY_PENDIENTE":
+        required_process = None
     if not required_process:
         raise ScmServiceError(
             "MACHINE_PROCESS_REQUIRED",
