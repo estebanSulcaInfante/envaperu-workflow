@@ -413,7 +413,7 @@ def list_production_progress(session, *, actor_id, filters=None):
         if not visible:
             final = opened = measured = None
             known = 0
-        coverage = "COMPLETA" if total == known and visible else "INCOMPLETA"
+        coverage = "COMPLETA" if total > 0 and total == known and visible else "INCOMPLETA"
         percent = ((final / objective) * 100) if objective and coverage == "COMPLETA" else None
         remaining = (objective - final) if objective is not None and coverage == "COMPLETA" else None
         items.append({

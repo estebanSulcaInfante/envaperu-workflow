@@ -4,6 +4,20 @@ from types import SimpleNamespace
 
 from openpyxl import load_workbook
 
+from app.extensions import db
+from app.models.scm_ot import (
+    ScmAnulacionPesajeManga,
+    ScmManga,
+    ScmPesajeManga,
+    ScmTrabajoColor,
+    ScmTrabajoOt,
+)
+from app.models.scm_production_orders import (
+    ScmCorridaFabricacion,
+    ScmOrdenFabricacion,
+    ScmOrdenOperacion,
+)
+from app.models.trabajador import Trabajador
 from app.services.scm_production_reports_service import (
     _filters,
     _group_history_rows,
@@ -189,3 +203,146 @@ def test_history_export_requires_weighing_capability_and_returns_workbook(app, c
         assert headers[:2] == ("ARTICULO_NOMBRE", "ARTICULO_CODIGO")
         assert "SUBTOTAL_CONOCIDO_KG" in headers
         assert "PESO_KG" in headers
+
+
+def test_progress_http_keeps_positive_objective_without_mangas_incomplete(
+    app, client, scm_config
+):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabricacion = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabricacion)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=fabricacion.orden_operacion_id,
+            codigo="C-OBS-SIN-MANGAS",
+            secuencia=3,
+            objetivo_neto_kg=Decimal("10"),
+            estado="EN_EJECUCION",
+        )
+        db.session.add(corrida)
+        db.session.commit()
+
+        response = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+
+        assert response.status_code == 200
+        item = next(
+            item for item in response.get_json()["items"]
+            if item["corrida_id"] == str(corrida.id)
+        )
+        assert item["objetivo_neto_kg"] == 10.0
+        assert item["mangas"] == {"total": 0, "conocidas": 0}
+        assert item["kg_medidos_efectivos"] is None
+        assert item["coverage"]["estado"] == "INCOMPLETA"
+        assert item["porcentaje"] is None
+
+
+def test_progress_http_requires_ot_visibility_capability(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        response = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["denied"].id)},
+        )
+
+        assert response.status_code == 403
+        assert response.get_json()["error"]["details"] == {"capability": "OT_VER"}
+
+
+def test_progress_http_hides_weights_without_manga_visibility(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabricacion = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabricacion)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=fabricacion.orden_operacion_id,
+            codigo="C-OBS-RESTRINGIDA",
+            secuencia=3,
+            objetivo_neto_kg=Decimal("10"),
+            estado="EN_EJECUCION",
+        )
+        db.session.add(corrida)
+        db.session.commit()
+
+        response = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["base"].id)},
+        )
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        item = next(item for item in payload["items"] if item["corrida_id"] == str(corrida.id))
+        assert payload["visibilidad"] == {
+            "pesaje": False,
+            "restriccion": "MANGA_PESAJE_VER requerido para ver pesos",
+        }
+        assert item["kg_finalizados_efectivos"] is None
+        assert item["kg_medidos_en_abiertas"] is None
+        assert item["kg_medidos_efectivos"] is None
+        assert item["porcentaje"] is None
+        assert item["coverage"]["estado"] == "INCOMPLETA"
+        assert item["coverage"]["motivos"] == ["MANGA_PESAJE_VER_REQUERIDO"]
+
+
+def test_progress_http_reports_complete_known_weights(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabricacion = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabricacion)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=fabricacion.orden_operacion_id,
+            codigo="C-OBS-COMPLETA",
+            secuencia=3,
+            objetivo_neto_kg=Decimal("30"),
+            estado="EN_EJECUCION",
+        )
+        db.session.add(corrida)
+        db.session.flush()
+        blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
+        color_work = ScmTrabajoColor.query.filter_by(trabajo_ot_id=blue.id).one()
+        color_work.corrida_fabricacion_id = corrida.id
+        pending = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-01").one()
+        from test_scm_production_observability import NOW, _weighing
+
+        _weighing(
+            manga=pending,
+            worker=Trabajador.query.filter_by(codigo="TRB-01").one(),
+            net="0.500",
+            standard="0.500",
+            weighed_at=NOW,
+        )
+        annulled = next(
+            manga for manga in blue.mangas if manga.codigo.endswith("-04")
+        )
+        annulled.estado = "RECIBIDA"
+        pesaje = ScmPesajeManga.query.filter_by(manga_id=annulled.id).one()
+        db.session.delete(ScmAnulacionPesajeManga.query.filter_by(pesaje_id=pesaje.id).one())
+        db.session.commit()
+
+        response = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+
+        assert response.status_code == 200
+        item = next(item for item in response.get_json()["items"] if item["corrida_id"] == str(corrida.id))
+        assert item["mangas"] == {"total": 4, "conocidas": 4}
+        assert item["kg_medidos_efectivos"] == 30.0
+        assert item["coverage"]["estado"] == "COMPLETA"
+        assert item["porcentaje"] == 100.0
