@@ -28,6 +28,7 @@ from app.services.scm_kg_production_service import (
     preview_kg_attribution,
     record_kg_production_evidence,
 )
+from app.services.scm_kg_service import activate_article_for_kg
 from app.services.scm_ot_service import (
     acknowledge_station_print_job,
     add_color_work,
@@ -49,7 +50,7 @@ from app.services.scm_weighing_service import (
 )
 from app.services.scm_fabrication_order_service import close_fabrication_order
 from app.services.scm_service_support import ScmServiceError
-from app.services.scm_warehouse_service import resolve_receiving_label
+from app.services.scm_warehouse_service import receive_manga, resolve_receiving_label
 from tests.scm.test_scm_kg_receipt import _print_color_manga, _seed_aggregate_color_work
 from tests.scm.test_scm_kg_custody import _grant_capabilities
 from tests.scm.test_scm_inline_assembly import (
@@ -136,6 +137,162 @@ def _auto_final_kg_fixture(app, *, station_code):
         },
     )
     return creator, approver, manga, station, prelabel, weighed
+
+
+def _auto_final_kg_receiving_fixture(app, *, station_code):
+    creator, approver, manga, station, _prelabel, weighed = _auto_final_kg_fixture(
+        app, station_code=station_code,
+    )
+    acknowledge_station_print_job(
+        db.session,
+        station_id=station.station_id,
+        print_job_id=UUID(weighed["print_job_id"]),
+        data={
+            "results": [{
+                "label_id": weighed["post_label"]["public_id"],
+                "estado": "IMPRESA",
+                "printer_name": "TSC",
+            }],
+        },
+    )
+    warehouse_role = RolOperativo.query.filter_by(codigo="ALMACEN_RECEPCION").one()
+    receiver = Trabajador(
+        codigo=f"TRB-KG-AUTO-{uuid4().hex[:8]}",
+        nombres="Recepcion",
+        apellidos="KG",
+        activo=True,
+        roles=[warehouse_role],
+    )
+    db.session.add(receiver)
+    db.session.flush()
+    activate_article_for_kg(
+        db.session,
+        article_id=manga.lote_articulo.articulo.id,
+    )
+    db.session.commit()
+    app.config["KG_RECEIPT_WRITE_ENABLED"] = True
+    candidate = resolve_receiving_label(
+        db.session,
+        actor_id=receiver.id,
+        label_id=UUID(weighed["post_label"]["public_id"]),
+    )
+    return {
+        "creator": creator,
+        "approver": approver,
+        "receiver": receiver,
+        "manga": manga,
+        "station_id": station.station_id,
+        "weighed": weighed,
+        "label_id": UUID(weighed["post_label"]["public_id"]),
+        "candidate": candidate,
+        "location": "RECEPCION_PIEZAS_WIP",
+    }
+
+
+def _auto_final_receive_data(ctx, source):
+    return {
+        "label_id": str(ctx["label_id"]),
+        "ubicacion_codigo": ctx["location"],
+        "presencia_confirmada": True,
+        "bolsa_cerrada": True,
+        "coincidencia_etiquetas": True,
+        "expected_weighing_source": source,
+    }
+
+
+def test_kg_auto_final_receiving_uses_canonical_source_and_moves_stock_once(app):
+    with app.app_context():
+        ctx = _auto_final_kg_receiving_fixture(
+            app, station_code="PESAJE-KG-AUTO-RECEIVE",
+        )
+        received = receive_manga(
+            db.session,
+            actor_id=ctx["receiver"].id,
+            operation_id=uuid4(),
+            data=_auto_final_receive_data(
+                ctx, ctx["candidate"]["expected_weighing_source"],
+            ),
+        )
+        assert received["existencia"]["cantidad_fisica"] == "12.000"
+        assert received["existencia"]["estado_logistico"] == "RECIBIDA_ALMACEN"
+        assert received["existencia"]["estado_calidad"] == "SIN_CONTROL"
+        assert ScmMovimientoInventarioKg.query.count() == 3
+        assert sum(
+            Decimal(balance.cantidad_fisica_kg)
+            for balance in ScmSaldoInventarioKg.query.all()
+        ) == Decimal("12.000")
+
+
+def test_kg_auto_final_receiving_refreshes_source_after_correction_and_rejects_stale_token(app):
+    with app.app_context():
+        ctx = _auto_final_kg_receiving_fixture(
+            app, station_code="PESAJE-KG-AUTO-CORRECTION",
+        )
+        stale = dict(ctx["candidate"]["expected_weighing_source"])
+        _grant_capabilities(ctx["creator"], ("PESAJE_CORRECCION_SOLICITAR",))
+        _grant_capabilities(ctx["approver"], ("PESAJE_CORRECCION_APROBAR",))
+        db.session.commit()
+        correction = request_weighing_correction(
+            db.session,
+            actor_id=ctx["creator"].id,
+            weighing_id=UUID(ctx["weighed"]["weighing"]["public_id"]),
+            operation_id=uuid4(),
+            data={
+                "proposed": {"peso_bruto_kg": "11.600", "tara_kg": "0.100"},
+                "motivo": "Correccion de lectura KG",
+            },
+        )["correction"]
+        corrected = approve_weighing_correction(
+            db.session,
+            actor_id=ctx["approver"].id,
+            correction_id=UUID(correction["id"]),
+            operation_id=uuid4(),
+            data={"motivo_aprobacion": "Evidencia KG conciliada"},
+        )
+        assert corrected["correction"]["result_projection"]["kg_produccion_ot"] == "11.500"
+        acknowledge_station_print_job(
+            db.session,
+            station_id=ctx["station_id"],
+            print_job_id=UUID(corrected["print_job_id"]),
+            data={
+                "results": [{
+                    "label_id": corrected["post_label"]["public_id"],
+                    "estado": "IMPRESA",
+                    "printer_name": "TSC",
+                }],
+            },
+        )
+        ctx["label_id"] = UUID(corrected["post_label"]["public_id"])
+        with pytest.raises(ScmServiceError) as conflict:
+            receive_manga(
+                db.session,
+                actor_id=ctx["receiver"].id,
+                operation_id=uuid4(),
+                data=_auto_final_receive_data(ctx, stale),
+            )
+        assert conflict.value.code == "PESAJE_VERSION_CONFLICT"
+        assert ScmMovimientoInventarioKg.query.count() == 2
+        refreshed = resolve_receiving_label(
+            db.session,
+            actor_id=ctx["receiver"].id,
+            label_id=ctx["label_id"],
+        )
+        assert refreshed["expected_weighing_source"] != stale
+        received = receive_manga(
+            db.session,
+            actor_id=ctx["receiver"].id,
+            operation_id=uuid4(),
+            data=_auto_final_receive_data(
+                ctx, refreshed["expected_weighing_source"],
+            ),
+        )
+        assert received["existencia"]["cantidad_fisica"] == "11.500"
+        assert received["existencia"]["estado_calidad"] == "SIN_CONTROL"
+        assert ScmMovimientoInventarioKg.query.count() == 4
+        assert sum(
+            Decimal(balance.cantidad_fisica_kg)
+            for balance in ScmSaldoInventarioKg.query.all()
+        ) == Decimal("11.500")
 
 
 def test_kg_wip_weighing_uses_net_without_confirming_un_units(app):

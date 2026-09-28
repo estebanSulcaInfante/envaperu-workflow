@@ -2,6 +2,8 @@ from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
 
+import pytest
+
 from openpyxl import load_workbook
 
 from app.extensions import db
@@ -20,11 +22,17 @@ from app.models.scm_production_orders import (
 from app.models.trabajador import Trabajador
 from app.services.scm_production_reports_service import (
     _filters,
+    generate_production_history_xlsx,
     _group_history_rows,
+    _history_hierarchy,
+    _history_rows,
+    list_production_history,
     MEASURE_OPTIONS,
+    _project_corrected_kg_segments,
     _run_manga_values,
     _segment_conciliates,
     _valid_kg_segments,
+    _history_weight_summary,
 )
 from app.services.scm_service_support import ScmServiceError
 
@@ -51,6 +59,111 @@ def test_kg_segments_require_zero_continuity_and_exact_net():
         [_segment(1, "0", "4", "3"), _segment(2, "4", "9", "5")],
         Decimal("9"),
     ) is False
+
+
+def test_history_projects_corrected_net_only_into_last_kg_segment():
+    from datetime import date
+
+    work = SimpleNamespace(id="work-1", codigo="TR-1")
+    ot = SimpleNamespace(
+        fecha=date(2026, 9, 1), codigo_ot="OT-1", estado="CERRADA",
+        maquina_nombre_snapshot="M1", maquina_codigo_snapshot=None,
+        responsable=None, orden_operacion=None,
+    )
+    color_work = SimpleNamespace(peso_neto_snapshot_g=100)
+    segments = [
+        _segment(1, "0", "5", "5", attributed_un=50),
+        _segment(2, "5", "12", "7", attributed_un=70),
+    ]
+    for segment in segments:
+        segment.trabajo = work
+    manga = SimpleNamespace(
+        id=77, _report_final_kg=Decimal("11.900"), _report_segments=segments,
+        _report_weight_corrected=True,
+        peso_unitario_snapshot_g=100, cantidad_confirmada_un=120,
+        cantidad_asignada_un=120, articulo_codigo_snapshot="A",
+        articulo_nombre_snapshot="Artículo", correccion_asignacion=None,
+        trabajo=work,
+    )
+    run = {
+        "corrida": SimpleNamespace(id="run-1", codigo="C-1", objetivo_neto_kg=12),
+        "orden": SimpleNamespace(codigo="OF-1", estado="CERRADA"),
+        "ot": ot, "work": work, "color_work": color_work,
+        "color_name": "Rojo", "resource": "M1", "responsible": None,
+        "contexts": [{"work": work, "color_work": color_work, "ot": ot}],
+        "mangas": {77: manga},
+    }
+
+    rows = _history_rows([run], ["DIA"], None)
+
+    assert [row["PESO_KG"] for row in rows] == [5, 6.9]
+    assert sum(row["SUBTOTAL_CONOCIDO_KG"] for row in rows) == 11.9
+    assert [row["_manga_id"] for row in rows] == [77, 77]
+    assert {row["DIA"] for row in rows} == {"2026-09-01"}
+    assert [segment.cantidad_fin_kg for segment in segments] == [Decimal("5"), Decimal("12")]
+
+
+@pytest.mark.parametrize("net, expected", [("12.500", [5, 7.5]), ("5.000", [None])])
+def test_history_correction_projection_handles_positive_delta_and_crossed_frontier(net, expected):
+    from datetime import date
+
+    work = SimpleNamespace(id="work-1", codigo="TR-1")
+    ot = SimpleNamespace(
+        fecha=date(2026, 9, 1), codigo_ot="OT-1", estado="CERRADA",
+        maquina_nombre_snapshot="M1", maquina_codigo_snapshot=None,
+        responsable=None, orden_operacion=None,
+    )
+    segments = [_segment(1, "0", "5", "5"), _segment(2, "5", "12", "7")]
+    for segment in segments:
+        segment.trabajo = work
+    manga = SimpleNamespace(
+        id=77, _report_final_kg=Decimal(net), _report_segments=segments,
+        _report_weight_corrected=True,
+        peso_unitario_snapshot_g=100, cantidad_confirmada_un=120,
+        cantidad_asignada_un=120, articulo_codigo_snapshot="A",
+        articulo_nombre_snapshot="Artículo", correccion_asignacion=None,
+        trabajo=work,
+    )
+    run = {
+        "corrida": SimpleNamespace(id="run-1", codigo="C-1", objetivo_neto_kg=12),
+        "orden": SimpleNamespace(codigo="OF-1", estado="CERRADA"),
+        "ot": ot, "work": work, "color_work": SimpleNamespace(peso_neto_snapshot_g=100),
+        "color_name": "Rojo", "resource": "M1", "responsible": None,
+        "contexts": [{"work": work, "color_work": SimpleNamespace(peso_neto_snapshot_g=100), "ot": ot}],
+        "mangas": {77: manga},
+    }
+
+    rows = _history_rows([run], ["DIA"], None)
+
+    assert [row["PESO_KG"] for row in rows] == expected
+
+
+@pytest.mark.parametrize("net, expected", [("11.900", "11.900"), ("12.500", "12.500")])
+def test_corrected_net_projection_supports_one_segment_without_mutating_history(net, expected):
+    segments = [_segment(1, "0", "12", "12")]
+
+    projected = _project_corrected_kg_segments(segments, Decimal(net))
+
+    assert len(projected) == 1
+    assert projected[0].cantidad_fin_kg == Decimal(expected)
+    assert projected[0].cantidad_atribuida_kg == Decimal(expected)
+    assert projected[0].calidad_evidencia_kg == "CONCILIADA"
+    assert segments[0].cantidad_fin_kg == Decimal("12")
+    assert segments[0].cantidad_atribuida_kg == Decimal("12")
+
+
+def test_corrected_net_projection_is_idempotent_and_keeps_un_axis_separate():
+    segments = [_segment(1, "0", "12", "12")]
+    first = _project_corrected_kg_segments(segments, Decimal("11.900"))
+    second = _project_corrected_kg_segments(first, Decimal("11.900"))
+    un_segment = SimpleNamespace(
+        secuencia=1, cantidad_inicio_kg=None, cantidad_fin_kg=None,
+        cantidad_atribuida_kg=None, calidad_evidencia_kg=None,
+    )
+
+    assert [item.cantidad_fin_kg for item in second] == [Decimal("11.900")]
+    assert [item.cantidad_atribuida_kg for item in second] == [Decimal("11.900")]
+    assert _project_corrected_kg_segments([un_segment], Decimal("11.900")) == [un_segment]
 
 
 def test_un_and_default_kg_segments_are_not_evidence():
@@ -165,6 +278,232 @@ def test_report_filters_reject_unknown_group_and_measure_without_fallback():
             raise AssertionError("el filtro inválido no debe usar fallback")
 
 
+def test_report_filters_distinguish_omitted_from_explicit_empty_values():
+    omitted = _filters({"fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-02"})
+    total = _filters({"fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-02", "agrupaciones": ""})
+    assert omitted["groups"] == ["DIA"]
+    assert total["groups"] == []
+    try:
+        _filters({"fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-02", "medidas": ""})
+    except ScmServiceError as error:
+        assert error.code == "INVALID_OBSERVABILITY_MEASURE"
+        assert error.status_code == 400
+    else:
+        raise AssertionError("medidas vacías deben ser inválidas explícitamente")
+
+
+def test_report_filters_reject_empty_tokens_inside_nonempty_lists():
+    for key, value, code in (
+        ("agrupaciones", "DIA,", "INVALID_OBSERVABILITY_GROUP"),
+        ("agrupaciones", "DIA,,OT", "INVALID_OBSERVABILITY_GROUP"),
+        ("medidas", "PESO_KG,", "INVALID_OBSERVABILITY_MEASURE"),
+    ):
+        try:
+            _filters({"fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-02", key: value})
+        except ScmServiceError as error:
+            assert error.code == code
+            assert error.status_code == 400
+        else:
+            raise AssertionError("los tokens vacíos no deben desaparecer silenciosamente")
+
+
+def test_xlsx_weight_summary_keeps_partial_known_subtotal_without_false_zero():
+    total, coverage = _history_weight_summary(
+        [{"PESO_KG": Decimal("4.5")}, {"PESO_KG": None}], ["PESO_KG"]
+    )
+    assert total == Decimal("4.5")
+    assert coverage == "Parcial: 1 fila(s) sin peso"
+    assert _history_weight_summary([{"PESO_KG": None}], ["MANGAS"]) == ("No solicitado", None)
+
+
+def test_history_hierarchy_counts_a_manga_once_and_weights_unit_average_from_evidence():
+    rows = [
+        {
+            "DIA": "2026-09-01", "OT": "OT-1", "OF": "OF-1", "CORRIDA": "C-1",
+            "COLOR": "Rojo", "RECURSO": "M1", "RESPONSABLE": "R", "ARTICULO": "A",
+            "ARTICULO_NOMBRE": "Artículo", "PESO_KG": 4, "SUBTOTAL_CONOCIDO_KG": 4,
+            "SUBTOTAL_TEORICO_KG": None, "MANGAS": 1, "P_UNITARIO_WEIGHT": 1000,
+            "P_UNITARIO_QTY": 10, "P_UNITARIO_G": 100, "P_TEORICO_KG": None,
+            "_known": True, "_manga_id": 77,
+        },
+        {
+            "DIA": "2026-09-02", "OT": "OT-2", "OF": "OF-1", "CORRIDA": "C-1",
+            "COLOR": "Rojo", "RECURSO": "M1", "RESPONSABLE": "R", "ARTICULO": "A",
+            "ARTICULO_NOMBRE": "Artículo", "PESO_KG": 5, "SUBTOTAL_CONOCIDO_KG": 5,
+            "SUBTOTAL_TEORICO_KG": None, "MANGAS": 1, "P_UNITARIO_WEIGHT": 18000,
+            "P_UNITARIO_QTY": 90, "P_UNITARIO_G": 200, "P_TEORICO_KG": None,
+            "_known": True, "_manga_id": 77,
+        },
+    ]
+
+    hierarchy, summary = _history_hierarchy(rows, ["DIA", "OT"], list(MEASURE_OPTIONS))
+
+    assert len(hierarchy) == 2
+    assert sum(node["item"]["MANGAS"] for node in hierarchy) == 2
+    assert summary["MANGAS"] == 1
+    assert summary["PESO_KG"] == 9.0
+    assert summary["P_UNITARIO_G"] == 190.0
+    assert all(node["children"] for node in hierarchy)
+    assert hierarchy[0]["id"] != hierarchy[1]["id"]
+
+
+def test_history_real_rows_keep_weighted_unit_average_independent_of_grain(monkeypatch):
+    from datetime import date
+    from app.services import scm_production_reports_service as reports
+
+    def context(work, day, ot_code, unit):
+        ot = SimpleNamespace(
+            fecha=date.fromisoformat(day), codigo_ot=ot_code, estado="CERRADA",
+            maquina_nombre_snapshot="M1", maquina_codigo_snapshot=None,
+            responsable=None,
+        )
+        return {"work": work, "color_work": SimpleNamespace(peso_neto_snapshot_g=Decimal(unit)), "ot": ot}
+
+    work_a1 = SimpleNamespace(id="work-a1", codigo="TR-A1")
+    work_a2 = SimpleNamespace(id="work-a2", codigo="TR-A2")
+    work_b = SimpleNamespace(id="work-b", codigo="TR-B")
+    contexts = [
+        context(work_a1, "2026-09-01", "OT-1", "100"),
+        context(work_a2, "2026-09-02", "OT-2", "100"),
+        context(work_b, "2026-09-01", "OT-3", "200"),
+    ]
+
+    segments_a = [
+        _segment(1, "0", "4", "4", attributed_un=40),
+        _segment(2, "4", "9", "5", attributed_un=50),
+    ]
+    segments_a[0].trabajo = work_a1
+    segments_a[1].trabajo = work_a2
+    segment_b = _segment(3, "0", "2", "2", attributed_un=10)
+    segment_b.trabajo = work_b
+    manga_a = SimpleNamespace(
+        id=77, _report_final_kg=Decimal("9"), _report_segments=segments_a,
+        peso_unitario_snapshot_g=Decimal("100"), cantidad_confirmada_un=90,
+        cantidad_asignada_un=90, articulo_codigo_snapshot="A",
+        articulo_nombre_snapshot="Artículo A", correccion_asignacion=None,
+    )
+    manga_b = SimpleNamespace(
+        id=88, _report_final_kg=Decimal("2"), _report_segments=[segment_b],
+        peso_unitario_snapshot_g=Decimal("200"), cantidad_confirmada_un=10,
+        cantidad_asignada_un=10, articulo_codigo_snapshot="B",
+        articulo_nombre_snapshot="Artículo B", correccion_asignacion=None,
+    )
+    run = {
+        "corrida": SimpleNamespace(id="run-1", codigo="C-1", objetivo_neto_kg=11),
+        "orden": SimpleNamespace(codigo="OF-1", estado="CERRADA"),
+        "ot": contexts[0]["ot"], "work": work_a1, "color_work": contexts[0]["color_work"],
+        "color_name": "Rojo", "resource": "M1", "responsible": None,
+        "contexts": contexts, "mangas": {77: manga_a, 88: manga_b},
+    }
+
+    measures = list(MEASURE_OPTIONS)
+    for groups, raw_groups in (([], ""), (["DIA", "OT"], "DIA,OT")):
+        rows = _history_rows([run], groups, None)
+        flat = _group_history_rows(rows, {"groups": groups, "measures": measures})[0]
+        _hierarchy, summary = _history_hierarchy(rows, groups, measures)
+        if not groups:
+            assert flat["P_UNITARIO_G"] == 110.0
+        assert summary["P_UNITARIO_G"] == 110.0
+
+        monkeypatch.setattr(reports, "load_actor", lambda *_args, **_kwargs: SimpleNamespace(tiene_capacidad=lambda _capability: True))
+        monkeypatch.setattr(reports, "_load_rows", lambda _session, _filters: [run])
+        payload = list_production_history(
+            object(), actor_id=1,
+            filters={
+                "fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-02",
+                "agrupaciones": raw_groups, "medidas": "P_UNITARIO_G",
+                "incluir_jerarquia": "1",
+            },
+        )
+        if not groups:
+            assert payload["items"][0]["P_UNITARIO_G"] == 110.0
+            workbook = load_workbook(
+                BytesIO(generate_production_history_xlsx(
+                    object(), actor_id=1,
+                    filters={
+                        "fecha_desde": "2026-09-01", "fecha_hasta": "2026-09-02",
+                        "agrupaciones": "", "medidas": "P_UNITARIO_G",
+                    },
+                ).getvalue()),
+                read_only=True,
+                data_only=True,
+            )
+            headers = next(workbook["Datos"].iter_rows(values_only=True))
+            values = next(workbook["Datos"].iter_rows(min_row=2, values_only=True))
+            assert headers[0] == "P_UNITARIO_G"
+            assert values[0] == 110.0
+        assert payload["resumen"]["P_UNITARIO_G"] == 110.0
+
+
+def test_history_hierarchy_empty_is_null_summary_and_no_nodes():
+    assert _history_hierarchy([], ["DIA"], list(MEASURE_OPTIONS)) == ([], None)
+
+
+def test_history_hierarchy_keeps_unattributed_manga_out_of_count_and_weight():
+    rows = [{
+        "DIA": "2026-09-01", "PESO_KG": None, "SUBTOTAL_CONOCIDO_KG": 4,
+        "SUBTOTAL_TEORICO_KG": None, "MANGAS": 0, "P_UNITARIO_WEIGHT": None,
+        "P_UNITARIO_QTY": None, "P_TEORICO_KG": None, "_known": False,
+        "_manga_id": 77,
+    }]
+
+    hierarchy, summary = _history_hierarchy(rows, ["DIA"], list(MEASURE_OPTIONS))
+
+    assert hierarchy[0]["item"]["MANGAS"] == 0
+    assert hierarchy[0]["item"]["PESO_KG"] is None
+    assert summary["MANGAS"] == 0
+    assert summary["PESO_KG"] is None
+
+
+def test_history_xlsx_uses_flat_items_without_hierarchy_parents(monkeypatch):
+    from app.services import scm_production_reports_service as reports
+
+    def flat_payload(_session, *, actor_id, filters=None):
+        return {
+            "grouped_by": ["OF"],
+            "measures": ["PESO_KG"],
+            "items": [
+                {"OF": "OF-1", "PESO_KG": 4.0, "SUBTOTAL_CONOCIDO_KG": 4.0, "SUBTOTAL_TEORICO_KG": None, "coverage": "COMPLETA"},
+                {"OF": "OF-2", "PESO_KG": 5.0, "SUBTOTAL_CONOCIDO_KG": 5.0, "SUBTOTAL_TEORICO_KG": None, "coverage": "COMPLETA"},
+            ],
+        }
+
+    monkeypatch.setattr(reports, "load_actor", lambda *_args, **_kwargs: SimpleNamespace(tiene_capacidad=lambda _capability: True))
+    monkeypatch.setattr(reports, "list_production_history", flat_payload)
+    workbook = load_workbook(
+        BytesIO(generate_production_history_xlsx(object(), actor_id=1, filters={"incluir_jerarquia": "1"}).getvalue()),
+        read_only=True,
+        data_only=True,
+    )
+
+    assert workbook["Datos"].max_row == 3
+    assert [row[0].value for row in workbook["Datos"].iter_rows(min_row=2)] == ["OF-1", "OF-2"]
+
+
+def test_history_hierarchy_is_opt_in_and_legacy_payload_stays_flat(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        params = {"fecha_desde": "2026-01-01", "fecha_hasta": "2026-12-31", "agrupaciones": "DIA"}
+        legacy = client.get(
+            "/api/scm/v1/observabilidad/produccion-historica",
+            query_string=params,
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+        hierarchical = client.get(
+            "/api/scm/v1/observabilidad/produccion-historica",
+            query_string={**params, "incluir_jerarquia": "1"},
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+
+        assert legacy.status_code == hierarchical.status_code == 200
+        assert "jerarquia" not in legacy.get_json()
+        assert "resumen" not in legacy.get_json()
+        assert isinstance(hierarchical.get_json()["jerarquia"], list)
+        assert hierarchical.get_json()["resumen"] is None
+
+
 def test_history_requires_operational_date_range(app, client, scm_config):
     from test_scm_production_observability import _seed_observability_graph
 
@@ -176,6 +515,30 @@ def test_history_requires_operational_date_range(app, client, scm_config):
         )
         assert response.status_code == 400
         assert "fecha_desde" in response.get_json()["error"]["message"]
+
+
+def test_history_hierarchy_restricted_actor_returns_neutral_empty_payload(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        response = client.get(
+            "/api/scm/v1/observabilidad/produccion-historica",
+            query_string={
+                "desde": "2026-09-01",
+                "hasta": "2026-09-28",
+                "incluir_jerarquia": "1",
+            },
+            headers={"X-Actor-Id": str(seeded["base"].id)},
+        )
+
+        payload = response.get_json()
+        assert response.status_code == 200
+        assert payload["visibilidad"]["pesaje"] is False
+        assert payload["items"] == []
+        assert payload["jerarquia"] == []
+        assert payload["resumen"] is None
+        assert payload["subtotal_conocido_kg"] == 0
 
 
 def test_history_export_requires_weighing_capability_and_returns_workbook(app, client, scm_config):
@@ -203,6 +566,30 @@ def test_history_export_requires_weighing_capability_and_returns_workbook(app, c
         assert headers[:2] == ("ARTICULO_NOMBRE", "ARTICULO_CODIGO")
         assert "SUBTOTAL_CONOCIDO_KG" in headers
         assert "PESO_KG" in headers
+        mangas_only = client.get(
+            "/api/scm/v1/observabilidad/produccion-historica/export.xlsx",
+            query_string={**params, "medidas": "MANGAS"},
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+        mangas_book = load_workbook(BytesIO(mangas_only.data), read_only=True, data_only=True)
+        assert mangas_only.status_code == 200
+        assert mangas_book["Resumen"]["B2"].value == "No solicitado"
+        mangas_headers = next(mangas_book["Datos"].iter_rows(values_only=True))
+        assert mangas_headers == ("ARTICULO_NOMBRE", "ARTICULO_CODIGO", "MANGAS", "coverage")
+        mangas_json = client.get(
+            "/api/scm/v1/observabilidad/produccion-historica",
+            query_string={**params, "medidas": "MANGAS", "incluir_jerarquia": "1"},
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        assert "subtotal_conocido_kg" not in mangas_json
+        def assert_no_unrequested_weight(item):
+            assert not {"PESO_KG", "P_UNITARIO_G", "P_TEORICO_KG", "SUBTOTAL_CONOCIDO_KG", "SUBTOTAL_TEORICO_KG"}.intersection(item)
+        for item in mangas_json["items"]:
+            assert_no_unrequested_weight(item)
+        if mangas_json["resumen"]:
+            assert_no_unrequested_weight(mangas_json["resumen"])
+        for group in mangas_json["jerarquia"]:
+            assert_no_unrequested_weight(group["item"])
 
 
 def test_progress_http_keeps_positive_objective_without_mangas_incomplete(

@@ -9,9 +9,11 @@ manga abierta se exponen aparte y nunca se suman al cierre.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import copy
 from datetime import date
 from decimal import Decimal
 from io import BytesIO
+import json
 
 from openpyxl import Workbook
 from sqlalchemy import or_, select
@@ -45,6 +47,15 @@ GROUP_OPTIONS = (
     "RESPONSABLE", "ARTICULO",
 )
 MEASURE_OPTIONS = ("PESO_KG", "MANGAS", "P_UNITARIO_G", "P_TEORICO_KG")
+
+
+def _history_weight_summary(items, measures):
+    if "PESO_KG" not in measures:
+        return "No solicitado", None
+    known_weights = [row.get("PESO_KG") for row in items if row.get("PESO_KG") is not None]
+    unknown_count = len(items) - len(known_weights)
+    coverage = "Completa" if unknown_count == 0 else f"Parcial: {unknown_count} fila(s) sin peso"
+    return (sum(known_weights, 0) if known_weights else None), coverage
 
 
 def _d(value):
@@ -97,11 +108,15 @@ def _filters(raw, *, require_dates=True):
             "fecha_desde no puede ser posterior a fecha_hasta.",
             status_code=400,
         )
-    groups = data.get("agrupaciones") or data.get("agrupar") or data.get("group_by")
-    groups = [str(item).strip().upper() for item in str(groups).split(",")] if groups else ["DIA"]
+    group_key = next((key for key in ("agrupaciones", "agrupar", "group_by") if key in data), None)
+    groups = data.get(group_key) if group_key else None
+    groups = [str(item).strip().upper() for item in str(groups).split(",")] if groups else (["DIA"] if group_key is None else [])
     if any(item not in GROUP_OPTIONS for item in groups) or len(set(groups)) != len(groups):
         raise ScmServiceError("INVALID_OBSERVABILITY_GROUP", "Agrupación inválida.", status_code=400)
-    measures = data.get("medidas") or data.get("measures") or data.get("measure")
+    measure_key = next((key for key in ("medidas", "measures", "measure") if key in data), None)
+    measures = data.get(measure_key) if measure_key else None
+    if measure_key and not measures:
+        raise ScmServiceError("INVALID_OBSERVABILITY_MEASURE", "Debe seleccionar al menos una medida.", status_code=400)
     measures = [str(item).strip().upper() for item in str(measures).split(",")] if measures else list(MEASURE_OPTIONS)
     if any(item not in MEASURE_OPTIONS for item in measures) or len(set(measures)) != len(measures):
         raise ScmServiceError("INVALID_OBSERVABILITY_MEASURE", "Medida inválida.", status_code=400)
@@ -172,6 +187,38 @@ def _segment_conciliates(segments, net):
         previous = end
         total += attributed
     return previous == net.quantize(KG) and total == net.quantize(KG)
+
+
+def _project_corrected_kg_segments(segments, net):
+    """Project a corrected final NET onto the final closed segment only."""
+    if not segments or net is None:
+        return segments
+    ordered = sorted(segments, key=lambda item: item.secuencia)
+    previous = Decimal("0")
+    for segment in ordered:
+        start = _d(segment.cantidad_inicio_kg)
+        end = _d(segment.cantidad_fin_kg)
+        attributed = _d(segment.cantidad_atribuida_kg)
+        if (
+            start != previous
+            or end is None
+            or end <= start
+            or attributed != (end - start).quantize(KG)
+        ):
+            return segments
+        previous = end
+    final_net = net.quantize(KG)
+    last = ordered[-1]
+    start = _d(last.cantidad_inicio_kg)
+    if final_net == _d(last.cantidad_fin_kg):
+        return segments
+    if start is None or final_net <= start:
+        return segments
+    projected = copy(last)
+    projected.cantidad_fin_kg = final_net
+    projected.cantidad_atribuida_kg = (final_net - start).quantize(KG)
+    projected.calidad_evidencia_kg = "CONCILIADA"
+    return [*ordered[:-1], projected]
 
 
 def _load_rows(session, filters=None):
@@ -283,6 +330,17 @@ def _load_rows(session, filters=None):
         if not run["mangas"]:
             continue
         for manga in run["mangas"].values():
+            current_weighing = next(
+                (
+                    item for item in sorted(
+                        (row for row in weighing_rows if row.manga_id == manga.id),
+                        key=lambda value: value.id,
+                        reverse=True,
+                    )
+                    if item.estado == "VIGENTE"
+                ),
+                None,
+            )
             final = None if manga.estado == "ANULADA" else _effective_weight(manga, weighing_rows, correction_by_weight, annulment_ids)
             segments = _valid_kg_segments(manga, {})
             latest_control = controls_by_manga.get(manga.id, [])[-1] if controls_by_manga.get(manga.id) else None
@@ -314,6 +372,10 @@ def _load_rows(session, filters=None):
             manga._report_final_kg = final
             manga._report_open_kg = open_kg
             manga._report_segments = segments
+            manga._report_weight_corrected = (
+                current_weighing is not None
+                and current_weighing.id in correction_by_weight
+            )
             manga._report_controls = controls_by_manga.get(manga.id, [])
             manga._report_closure_event = closure_event
     result = []
@@ -521,6 +583,8 @@ def _history_rows(runs, groups, filters=None):
             if net is None:
                 continue
             segments = manga._report_segments
+            if getattr(manga, "_report_weight_corrected", False):
+                segments = _project_corrected_kg_segments(segments, net)
             valid = _segment_conciliates(segments, net)
             segment_values = []
             if valid:
@@ -566,7 +630,7 @@ def _history_rows(runs, groups, filters=None):
                 theoretical_total = _n(unit * _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) / Decimal("1000")) if theoretical is None and manga.id not in theoretical_subtotal_emitted and unit is not None and _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un) is not None else None
                 if theoretical_total is not None:
                     theoretical_subtotal_emitted.add(manga.id)
-                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(kg), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if emit_theoretical and unit is not None and quantity is not None and quantity > 0 else None, "P_UNITARIO_QTY": _n(quantity) if emit_theoretical and quantity is not None and quantity > 0 else None, "P_TEORICO_KG": _n(theoretical), "SUBTOTAL_TEORICO_KG": theoretical_total, "_known": True, "_manga_id": manga.id})
+                rows.append({**values, "PESO_KG": _n(kg), "SUBTOTAL_CONOCIDO_KG": _n(kg), "MANGAS": 1 if emit_theoretical else 0, "P_UNITARIO_G": _n(unit) if emit_theoretical else None, "P_UNITARIO_WEIGHT": _n(unit * quantity) if unit is not None and quantity is not None and quantity > 0 else None, "P_UNITARIO_QTY": _n(quantity) if quantity is not None and quantity > 0 else None, "P_TEORICO_KG": _n(theoretical), "SUBTOTAL_TEORICO_KG": theoretical_total, "_known": True, "_manga_id": manga.id})
     return rows
 
 
@@ -611,6 +675,154 @@ def _group_history_rows(rows, normalized):
     return items
 
 
+def _history_aggregate(rows, groups, measures):
+    """Aggregate the authorized atomic rows for one hierarchy prefix.
+
+    ``rows`` are the same evidence rows used by the flat response.  A node is
+    rebuilt from those rows instead of summing already grouped children.  The
+    manga count is therefore distinct at every prefix, while unit averages
+    retain their evidence weights across a manga split between contexts.
+    """
+    if not rows:
+        return None
+
+    item = {group: rows[0].get(group) for group in groups}
+    if "ARTICULO" in groups:
+        item["ARTICULO_NOMBRE"] = next(
+            (row.get("ARTICULO_NOMBRE") for row in rows if row.get("ARTICULO_NOMBRE") is not None),
+            None,
+        )
+        item["ARTICULO_CODIGO"] = next(
+            (row.get("ARTICULO") for row in rows if row.get("ARTICULO") is not None),
+            None,
+        )
+
+    peso = Decimal("0")
+    subtotal_conocido = Decimal("0")
+    subtotal_teorico = Decimal("0")
+    unit_weight = Decimal("0")
+    unit_qty = Decimal("0")
+    theoretical = Decimal("0")
+    has_theoretical_subtotal = False
+    has_theoretical = False
+    complete = True
+    manga_keys = set()
+    fallback_manga_key = 0
+    for row in rows:
+        known = bool(row.get("_known", True)) and row.get("PESO_KG") is not None
+        complete = complete and known
+        if known:
+            manga_id = row.get("_manga_id")
+            if manga_id is None:
+                fallback_manga_key += 1
+                manga_key = ("row", fallback_manga_key)
+            else:
+                manga_key = ("manga", manga_id)
+            manga_keys.add(manga_key)
+        if row.get("PESO_KG") is not None:
+            peso += _d(row["PESO_KG"]) or Decimal("0")
+        if row.get("SUBTOTAL_CONOCIDO_KG") is not None:
+            subtotal_conocido += _d(row["SUBTOTAL_CONOCIDO_KG"]) or Decimal("0")
+        if row.get("SUBTOTAL_TEORICO_KG") is not None:
+            has_theoretical_subtotal = True
+            subtotal_teorico += _d(row["SUBTOTAL_TEORICO_KG"]) or Decimal("0")
+        if row.get("P_TEORICO_KG") is not None:
+            has_theoretical = True
+            theoretical += _d(row["P_TEORICO_KG"]) or Decimal("0")
+        if row.get("P_UNITARIO_WEIGHT") is not None and row.get("P_UNITARIO_QTY") is not None:
+            unit_weight += _d(row["P_UNITARIO_WEIGHT"]) or Decimal("0")
+            unit_qty += _d(row["P_UNITARIO_QTY"]) or Decimal("0")
+
+    item["MANGAS"] = len(manga_keys)
+    item["coverage"] = "COMPLETA" if complete else "INCOMPLETA"
+    item["PESO_KG"] = _n(peso) if complete else None
+    item["SUBTOTAL_CONOCIDO_KG"] = _n(subtotal_conocido)
+    item["SUBTOTAL_TEORICO_KG"] = _n(subtotal_teorico) if has_theoretical_subtotal else None
+    item["P_TEORICO_KG"] = _n(theoretical) if has_theoretical else None
+    item["P_UNITARIO_G"] = _n(unit_weight / unit_qty) if unit_qty else None
+
+    _select_history_measures(item, measures)
+    return item
+
+
+def _select_history_measures(item, measures):
+    selected = set(measures)
+    for measure in MEASURE_OPTIONS:
+        if measure not in selected:
+            item.pop(measure, None)
+    if "PESO_KG" not in selected:
+        item.pop("SUBTOTAL_CONOCIDO_KG", None)
+    if "P_TEORICO_KG" not in selected:
+        item.pop("SUBTOTAL_TEORICO_KG", None)
+
+
+def _history_path_id(path):
+    """Return a stable, position-independent id for a group/value path."""
+    return json.dumps(
+        [{"dimension": dimension, "value": value} for dimension, value in path],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _history_hierarchy(rows, groups, measures):
+    """Build the opt-in hierarchy and its independent all-row aggregate."""
+    if not rows:
+        return [], None
+
+    summary = _history_aggregate(rows, (), measures)
+    if not groups:
+        return [], summary
+
+    roots = []
+    nodes = {}
+    for row in rows:
+        parent = None
+        path = []
+        for depth, dimension in enumerate(groups):
+            path.append((dimension, row.get(dimension)))
+            path_key = tuple(path)
+            node = nodes.get(path_key)
+            if node is None:
+                node = {
+                    "id": _history_path_id(path),
+                    "dimension": dimension,
+                    "value": row.get(dimension),
+                    "_rows": [],
+                    "children": [],
+                }
+                nodes[path_key] = node
+                if parent is None:
+                    roots.append(node)
+                else:
+                    parent["children"].append(node)
+            node["_rows"].append(row)
+            parent = node
+
+    def finalize(node, depth):
+        children = [finalize(child, depth + 1) for child in node["children"]]
+        return {
+            "id": node["id"],
+            "dimension": node["dimension"],
+            "value": node["value"],
+            "item": _history_aggregate(node["_rows"], groups[: depth + 1], measures),
+            "children": children,
+        }
+
+    return [finalize(node, 0) for node in roots], summary
+
+
+def history_rows_for_manga_detail(session, filters):
+    """Return the exact atomic report rows used by the contextual manga list.
+
+    Keeping this projection beside the report builder prevents the detail list
+    from reconstructing identity or contribution from already aggregated rows.
+    """
+    normalized = _filters(filters, require_dates=True)
+    runs = _load_rows(session, normalized)
+    return normalized, _history_rows(runs, normalized["groups"], normalized), runs
+
+
 def list_production_history(session, *, actor_id, filters=None):
     actor = load_actor(session, actor_id, capability="OT_VER")
     normalized = _filters(filters, require_dates=True)
@@ -620,14 +832,20 @@ def list_production_history(session, *, actor_id, filters=None):
     items = _group_history_rows(rows, normalized)
     selected = set(normalized["measures"])
     for item in items:
-        for measure in MEASURE_OPTIONS:
-            if measure not in selected:
-                item.pop(measure, None)
+        _select_history_measures(item, selected)
     dedup_known = defaultdict(Decimal)
     for row in rows:
         dedup_known[row.get("_manga_id")] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
     subtotal_known = sum(dedup_known.values(), Decimal("0"))
-    return {"items": items, "grouping_options": list(GROUP_OPTIONS), "measure_options": list(MEASURE_OPTIONS), "measures": normalized["measures"], "grouped_by": normalized["groups"], "subtotal_conocido_kg": _n(subtotal_known), "filters": {key: value.isoformat() if isinstance(value, date) else value for key, value in normalized.items() if key not in {"groups", "measures"}}, "visibilidad": {"pesaje": visible}}
+    payload = {"items": items, "grouping_options": list(GROUP_OPTIONS), "measure_options": list(MEASURE_OPTIONS), "measures": normalized["measures"], "grouped_by": normalized["groups"], "subtotal_conocido_kg": _n(subtotal_known), "filters": {key: value.isoformat() if isinstance(value, date) else value for key, value in normalized.items() if key not in {"groups", "measures"}}, "visibilidad": {"pesaje": visible}}
+    if "PESO_KG" not in selected:
+        payload.pop("subtotal_conocido_kg", None)
+    include_hierarchy = str((filters or {}).get("incluir_jerarquia", "")).strip().lower() in {"1", "true", "yes", "si"}
+    if include_hierarchy:
+        hierarchy, summary = _history_hierarchy(rows, normalized["groups"], normalized["measures"])
+        payload["jerarquia"] = hierarchy
+        payload["resumen"] = summary
+    return payload
 
 
 def generate_production_history_xlsx(session, *, actor_id, filters=None):
@@ -643,7 +861,10 @@ def generate_production_history_xlsx(session, *, actor_id, filters=None):
     summary = workbook.active
     summary.title = "Resumen"
     summary.append(["Agrupado por", ", ".join(payload["grouped_by"])])
-    summary.append(["Peso efectivo (kg)", sum((row.get("PESO_KG") or 0 for row in payload["items"]), 0)])
+    weight_total, weight_coverage = _history_weight_summary(payload["items"], payload["measures"])
+    summary.append(["Peso efectivo (kg)", weight_total])
+    if weight_coverage is not None and "PESO_KG" in payload["measures"]:
+        summary.append(["Cobertura peso", weight_coverage])
     summary.append(["Filas", len(payload["items"])])
     data = workbook.create_sheet("Datos")
     headers = []
@@ -652,7 +873,12 @@ def generate_production_history_xlsx(session, *, actor_id, filters=None):
             headers.extend(["ARTICULO_NOMBRE", "ARTICULO_CODIGO"])
         else:
             headers.append(group)
-    headers += list(payload["measures"]) + ["SUBTOTAL_CONOCIDO_KG", "SUBTOTAL_TEORICO_KG", "coverage"]
+    headers += list(payload["measures"])
+    if "PESO_KG" in payload["measures"]:
+        headers.append("SUBTOTAL_CONOCIDO_KG")
+    if "P_TEORICO_KG" in payload["measures"]:
+        headers.append("SUBTOTAL_TEORICO_KG")
+    headers.append("coverage")
     data.append(headers)
     for row in payload["items"]:
         data.append([row.get(header) for header in headers])

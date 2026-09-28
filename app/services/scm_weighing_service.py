@@ -3024,7 +3024,9 @@ def approve_weighing_correction(
                 status_code=422,
             )
         production_kg = (
-            quantity * Decimal(manga.peso_unitario_snapshot_g) / 1000
+            net if is_kg else (
+                quantity * Decimal(manga.peso_unitario_snapshot_g) / 1000
+            )
         ).quantize(KG_QUANTUM)
         projection = {
             "peso_bruto_kg": format(gross, "f"),

@@ -265,6 +265,10 @@ from app.services.scm_production_reports_service import (
     list_production_history,
     list_production_progress,
 )
+from app.services.scm_manga_detail_service import (
+    get_manga_detail,
+    list_manga_history,
+)
 from app.services.scm_product_onboarding_service import (
     apply_onboarding_image,
     apply_onboarding_step,
@@ -1750,6 +1754,25 @@ def observabilidad_produccion_historica():
         db.session,
         actor_id=_actor_id(),
         filters=request.args.to_dict(flat=True),
+    ))
+
+
+@scm_bp.get("/observabilidad/produccion-historica/mangas")
+def observabilidad_produccion_historica_mangas():
+    return jsonify(list_manga_history(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+        group=request.args.get("grupo"),
+    ))
+
+
+@scm_bp.get("/observabilidad/mangas/<uuid:public_id>")
+def observabilidad_manga_detalle(public_id):
+    return jsonify(get_manga_detail(
+        db.session,
+        actor_id=_actor_id(),
+        public_id=public_id,
     ))
 
 

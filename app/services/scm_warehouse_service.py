@@ -243,6 +243,34 @@ def _candidate_payload(session, manga, label, resolution):
         # first. The caller has already reauthorized capability and scope.
         quantity = Decimal(manga.cantidad_confirmada_un or 0).quantize(QUANTUM)
         logistics_state = kg_existing.estado_logistico
+        expected_source = {
+            "pesaje_public_id": (
+                str(kg_existing.pesaje_public_id)
+                if kg_existing.pesaje_public_id else None
+            ),
+            "correccion_aplicada_public_id": (
+                str(kg_existing.correccion_aplicada_public_id)
+                if kg_existing.correccion_aplicada_public_id else None
+            ),
+            "projection_sha256": kg_existing.projection_sha256,
+        }
+        if (
+            logistics_state == "DISPONIBLE_PRODUCCION"
+            and kg_existing.pesaje_public_id is not None
+        ):
+            weighing = session.scalar(
+                select(ScmPesajeManga)
+                .where(
+                    ScmPesajeManga.manga_id == manga.id,
+                    ScmPesajeManga.estado == "VIGENTE",
+                )
+                .order_by(ScmPesajeManga.id.desc())
+                .limit(1)
+            )
+            if weighing is not None:
+                expected_source = expected_source_payload(
+                    session, weighing, _effective_projection(weighing)
+                )
         return {
             "manga_id": str(manga.public_id),
             "manga_codigo": manga.codigo,
@@ -256,11 +284,7 @@ def _candidate_payload(session, manga, label, resolution):
             "tara_kg": None,
             "peso_neto_kg": format(kg_existing.peso_neto_snapshot_kg, "f"),
             "pesada_at": kg_existing.pesada_at_snapshot.isoformat() if kg_existing.pesada_at_snapshot else None,
-            "expected_weighing_source": {
-                "pesaje_public_id": str(kg_existing.pesaje_public_id) if kg_existing.pesaje_public_id else None,
-                "correccion_aplicada_public_id": str(kg_existing.correccion_aplicada_public_id) if kg_existing.correccion_aplicada_public_id else None,
-                "projection_sha256": kg_existing.projection_sha256,
-            },
+            "expected_weighing_source": expected_source,
             "existencia": kg_existing.to_dict(),
             "ot": {
                 "id": str(manga.ot.public_id),
