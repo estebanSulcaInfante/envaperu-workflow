@@ -69,6 +69,20 @@ def _required_text(value, field, max_length):
     return normalized
 
 
+def _strict_optional_bool(data, field, *, default=False):
+    """Read an optional JSON boolean without coercing strings or numbers."""
+    if field not in data:
+        return default
+    value = data[field]
+    if not isinstance(value, bool):
+        raise ColorRecipeError(
+            f"{field} debe ser booleano.",
+            code="EXIGIR_VARIANTE_NUEVA_INVALIDO",
+            details={"field": field},
+        )
+    return value
+
+
 def _scope_product(session, producto_sku):
     normalized = str(producto_sku or "").strip() or None
     if normalized and session.get(ProductoTerminado, normalized) is None:
@@ -270,6 +284,10 @@ def _apply_lines(recipe, normalized_lines):
 
 def create_recipe(session, data, *, forced_revision=None, commit=True):
     data = data or {}
+    require_new_variant = _strict_optional_bool(
+        data,
+        "exigir_variante_nueva",
+    )
     try:
         color_id = int(data.get("color_produccion_id"))
     except (TypeError, ValueError):
@@ -300,7 +318,7 @@ def create_recipe(session, data, *, forced_revision=None, commit=True):
         default_base_kg=base_kg,
         approved=state == "APROBADA",
     )
-    revision = forced_revision or _next_revision(
+    revision = 1 if require_new_variant else forced_revision or _next_revision(
         session,
         color_id=color_id,
         product_scope=product_scope,

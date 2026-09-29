@@ -267,3 +267,78 @@ def test_only_one_approved_default_exists_per_color_and_product_scope(
     defaults = [item for item in rows if item["estado"] == "APROBADA" and item["es_default"]]
     assert [item["id"] for item in defaults] == [second["id"]]
     assert next(item for item in rows if item["id"] == first["id"])["es_default"] is False
+
+
+def _draft_payload(catalog, *, variant="COPIA INDEPENDIENTE"):
+    payload = _approved_payload(catalog, variant=variant)
+    payload["estado"] = "BORRADOR"
+    payload["es_default"] = False
+    return payload
+
+
+def test_duplicate_variant_flag_is_strict_and_forces_revision_one_without_extra_row(
+    client,
+    app,
+    scm_config,
+):
+    catalog = _catalog(app, scm_config)
+    payload = _draft_payload(catalog)
+
+    invalid = client.post(
+        "/api/catalogo/recetas-color",
+        json={**payload, "exigir_variante_nueva": "true"},
+    )
+    assert invalid.status_code == 400
+    assert invalid.get_json()["codigo"] == "EXIGIR_VARIANTE_NUEVA_INVALIDO"
+
+    first = client.post(
+        "/api/catalogo/recetas-color",
+        json={**payload, "exigir_variante_nueva": True},
+    )
+    assert first.status_code == 201, first.get_json()
+    assert first.get_json()["revision"] == 1
+
+    conflict = client.post(
+        "/api/catalogo/recetas-color",
+        json={**payload, "exigir_variante_nueva": True},
+    )
+    assert conflict.status_code == 409
+
+    with app.app_context():
+        rows = RecetaColorMaestra.query.filter_by(
+            color_produccion_id=catalog["color_id"],
+            nombre_variante="COPIA INDEPENDIENTE",
+        ).all()
+        assert len(rows) == 1
+        assert rows[0].revision == 1
+
+
+def test_duplicate_variant_flag_preserves_legacy_next_revision_when_absent(
+    client,
+    app,
+    scm_config,
+):
+    catalog = _catalog(app, scm_config)
+    payload = _draft_payload(catalog, variant="LEGACY COMPATIBLE")
+
+    first = client.post("/api/catalogo/recetas-color", json=payload)
+    assert first.status_code == 201
+    second = client.post("/api/catalogo/recetas-color", json=payload)
+    assert second.status_code == 201, second.get_json()
+    assert second.get_json()["revision"] == 2
+
+
+def test_duplicate_variant_flag_rejects_non_boolean_values(
+    client,
+    app,
+    scm_config,
+):
+    catalog = _catalog(app, scm_config)
+    payload = _draft_payload(catalog, variant="FLAG ESTRICTO")
+    for value in (1, 0, None, [], {}):
+        response = client.post(
+            "/api/catalogo/recetas-color",
+            json={**payload, "exigir_variante_nueva": value},
+        )
+        assert response.status_code == 400
+        assert response.get_json()["codigo"] == "EXIGIR_VARIANTE_NUEVA_INVALIDO"
