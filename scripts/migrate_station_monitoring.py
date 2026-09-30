@@ -1,3 +1,5 @@
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -46,6 +48,35 @@ STATION_MONITORING_TABLES = (
     "estacion_comando_piloto",
 )
 
+KG009_RECOVERY_SCRIPT = PROJECT_ROOT / "scripts" / "run_kg009_recovery_manifest.py"
+
+
+def run_kg009_recovery_on_startup(environ=None, runner=subprocess.run):
+    """Attempt the gated recovery and never block API startup on its result."""
+    environ = os.environ if environ is None else environ
+    if environ.get("KG009_RECOVERY_ON_STARTUP") != "1":
+        return False
+
+    command = [
+        sys.executable,
+        str(KG009_RECOVERY_SCRIPT.resolve()),
+        "--manifest-env",
+        "KG009_RECOVERY_MANIFEST",
+    ]
+    try:
+        completed = runner(command, check=False, timeout=60)
+    except subprocess.TimeoutExpired:
+        print("KG009_RECOVERY_LAUNCHER_TIMEOUT: API startup continues.")
+    except OSError:
+        print("KG009_RECOVERY_LAUNCHER_ERROR: API startup continues.")
+    else:
+        if completed.returncode:
+            print(
+                "KG009_RECOVERY_LAUNCHER_EXIT_"
+                f"{completed.returncode}: API startup continues."
+            )
+    return True
+
 
 def create_station_monitoring_tables(engine):
     """Create only the central tables owned by station monitoring."""
@@ -76,6 +107,8 @@ def main():
             print(f"- {table_name}")
     else:
         print("El esquema de monitoreo ya estaba actualizado.")
+
+    run_kg009_recovery_on_startup()
 
 
 if __name__ == "__main__":
