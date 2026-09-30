@@ -4,7 +4,11 @@ from sqlalchemy import select
 from app.models.scm_articulos import ScmArticulo
 from app.services.scm_kg_service import activate_article_for_kg
 from app.services.scm_ot_service import _complete_operation, _event, _reserve_operation
-from app.services.scm_service_support import ScmServiceError, load_actor
+from app.services.scm_service_support import (
+    ScmServiceError,
+    acquire_kg_productive_write_lock,
+    load_actor,
+)
 
 
 def prepare_kg_pilot(session, *, actor_id, article_ids, reason, operation_id, apply=False):
@@ -20,10 +24,23 @@ def prepare_kg_pilot(session, *, actor_id, article_ids, reason, operation_id, ap
         if apply:
             operation, replay = _reserve_operation(session, operation_id, "CLI /kg-pilot/opt-in", actor, data)
             if replay is not None:
+                # Reservation is intentionally first.  A replay therefore
+                # returns before taking the global lock and closes its
+                # transaction without entering the KG critical section.
+                session.rollback()
                 return replay
+        # All mutating paths reserve idempotency before taking the advisory
+        # lock.  The advisory lock still precedes every article row lock,
+        # matching weighing/recovery without a cross-endpoint lock cycle.
+        acquire_kg_productive_write_lock(session)
         items = []
         for article_id in ids:
-            article = session.scalar(select(ScmArticulo).where(ScmArticulo.id == article_id).with_for_update())
+            article = session.scalar(
+                select(ScmArticulo)
+                .where(ScmArticulo.id == article_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
             before = article.unidad_inventario if article is not None else None
             article = activate_article_for_kg(session, article_id=article_id)
             item = {"article_id": article.id, "codigo": article.codigo, "before": before,

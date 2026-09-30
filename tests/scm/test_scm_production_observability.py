@@ -35,6 +35,7 @@ from app.services.scm_production_observability_service import (
     get_production_ot_observability,
     list_production_ot_observability,
 )
+from legacy_helpers import mark_legacy_un
 
 
 HASH = "a" * 64
@@ -744,6 +745,7 @@ def test_observability_http_preserves_canonical_un_standard_weight(
         )
         db.session.add(article)
         db.session.flush()
+        mark_legacy_un(db.session, article)
         operation_id = ScmOrdenOperacion.query.filter_by(
             codigo="OF-OBS-001"
         ).one().id

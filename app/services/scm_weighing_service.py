@@ -777,10 +777,11 @@ def register_manga_weighing_control(
             raise ScmServiceError(
                 "LABEL_NOT_FOUND", "La etiqueta no existe.", status_code=404
             )
-        manga = session.scalar(
-            select(ScmManga)
-            .where(ScmManga.id == label.manga_id)
-            .with_for_update()
+        # Refresh the article decision after the global productive lock. A
+        # concurrent KG opt-in must not let this final capture use a stale UN
+        # classification; the helper locks article before manga.
+        article, manga = _lock_manga_inventory_authority(
+            session, manga_id=label.manga_id
         )
         if manga.estado == "ANULADA":
             raise ScmServiceError(
@@ -788,11 +789,7 @@ def register_manga_weighing_control(
                 "La manga fue anulada y no puede utilizarse.",
                 status_code=409,
             )
-        is_kg = (
-            manga.lote_articulo is not None
-            and manga.lote_articulo.articulo is not None
-            and manga.lote_articulo.articulo.unidad_inventario == "KG"
-        )
+        is_kg = article is not None and article.unidad_inventario == "KG"
         if (
             label.tipo != "PREPESAJE"
             or label.estado != "IMPRESA"
@@ -1346,10 +1343,11 @@ def confirm_manga_weighing(
             raise ScmServiceError(
                 "LABEL_NOT_FOUND", "La etiqueta no existe.", status_code=404
             )
-        manga = session.scalar(
-            select(ScmManga)
-            .where(ScmManga.id == label.manga_id)
-            .with_for_update()
+        # Refresh the article decision after the global productive lock. A
+        # concurrent KG opt-in must not let this final capture use a stale UN
+        # classification; the helper locks article before manga.
+        article, manga = _lock_manga_inventory_authority(
+            session, manga_id=label.manga_id
         )
         if manga.estado == "ANULADA":
             raise ScmServiceError(
@@ -1369,11 +1367,7 @@ def confirm_manga_weighing(
                 "Se requiere una etiqueta PREPESAJE impresa y vigente.",
                 status_code=409,
             )
-        is_kg = (
-            manga.lote_articulo is not None
-            and manga.lote_articulo.articulo is not None
-            and manga.lote_articulo.articulo.unidad_inventario == "KG"
-        )
+        is_kg = article is not None and article.unidad_inventario == "KG"
         is_assembly = manga.ot.tipo_ot == "ENSAMBLE"
         segments = session.scalars(
             select(ScmTramoMangaTrabajo)

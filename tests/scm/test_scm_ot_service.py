@@ -53,6 +53,7 @@ from app.models.scm_inventory import (
     ScmMovimientoInventario,
     ScmSaldoInventario,
 )
+from legacy_helpers import mark_legacy_un
 from app.models.scm_warehouse import ScmExistenciaManga
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_configuration import ensure_initial_scm_configuration
@@ -478,6 +479,10 @@ def _seed_normalized_order():
     article_link = ScmArticuloPiezaColor.query.filter_by(
         pieza_color_sku=piece_color.sku
     ).one()
+    # This fixture exercises the pre-KG weighing/warehouse workflow.  Keep
+    # the article as an explicit historical UN row while production defaults
+    # now create PIEZA_COLOR as KG.
+    mark_legacy_un(db.session, article_link.articulo)
     container = create_container_type(
         db.session,
         actor_id=creator.id,
@@ -545,6 +550,7 @@ def _seed_fabrication_order():
     article_link = ScmArticuloPiezaColor.query.filter_by(
         pieza_color_sku=legacy_output.pieza_color_sku
     ).one()
+    mark_legacy_un(db.session, article_link.articulo)
     legacy_lot = db.session.get(LoteColor, legacy_output.lote_color_id)
     operation = ScmOrdenOperacion(
         codigo="OF-000900",

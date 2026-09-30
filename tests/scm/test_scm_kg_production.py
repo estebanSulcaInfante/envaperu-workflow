@@ -48,6 +48,7 @@ from app.services.scm_weighing_service import (
     request_weighing_correction,
     reopen_manga_after_accidental_close,
 )
+from legacy_helpers import mark_legacy_un
 from app.services.scm_fabrication_order_service import close_fabrication_order
 from app.services.scm_service_support import ScmServiceError
 from app.services.scm_warehouse_service import receive_manga, resolve_receiving_label
@@ -1193,6 +1194,7 @@ def test_kg_document_rejects_mixed_kg_and_un_outputs_without_effects(app):
         )
         db.session.add(un_article)
         db.session.flush()
+        mark_legacy_un(db.session, un_article)
         un_output = ScmOrdenOperacionSalida(
             orden_operacion_id=order.id,
             corrida_fabricacion_id=output.corrida_fabricacion_id,

@@ -29,6 +29,7 @@ from app.services.scm_assembly_order_service import (
     transition_assembly_order,
 )
 from app.services.scm_service_support import ScmServiceError
+from legacy_helpers import mark_legacy_un
 
 
 def test_demand_order_can_be_covered_by_fabrication_output(app):
@@ -765,6 +766,7 @@ def test_calcular_y_confirmar_plan_crea_of_y_oa_en_borrador(app, scm_config):
         piece_article = ScmArticuloPiezaColor.query.filter_by(
             pieza_color_sku=piece_color.sku
         ).one().articulo
+        mark_legacy_un(db.session, piece_article)
         product_article = ScmArticuloProducto.query.filter_by(
             producto_terminado_id=product.cod_sku_pt
         ).one().articulo

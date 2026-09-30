@@ -2,6 +2,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from app import db
+from legacy_helpers import mark_legacy_un
 
 
 def _headers(actor_id, key=None):
@@ -45,6 +46,7 @@ def test_pickup_multi_qr_mueve_custodia_sin_consumir(app, client, scm_config):
         article = ScmArticulo(codigo="PC-QR-018", nombre="Pieza QR", clase="PIEZA_COLOR")
         db.session.add(article)
         db.session.flush()
+        mark_legacy_un(db.session, article)
         balance = ScmSaldoInventario(
             articulo_scm_id=article.id, ubicacion_id=origin["id"], cantidad_fisica=20,
             cantidad_reservada=20,

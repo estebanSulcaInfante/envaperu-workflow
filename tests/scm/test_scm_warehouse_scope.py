@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from app import db
+from legacy_helpers import mark_legacy_un
 
 
 def _headers(actor_id, *, operation=False):
@@ -53,6 +54,8 @@ def test_almacen_configurable_activa_scope_fail_closed(
             ).one().id,
         )
         db.session.add_all([scoped, article, kg_article, material])
+        db.session.flush()
+        mark_legacy_un(db.session, article)
         db.session.commit()
         admin_id = admin.id
         scoped_id = scoped.id

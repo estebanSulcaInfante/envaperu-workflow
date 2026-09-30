@@ -19,7 +19,10 @@ from app.models.scm_inventory_kg import (
     ScmSaldoInventarioKg,
 )
 from app.models.scm_ot import ScmCorreccionPesajeManga
-from app.services.scm_service_support import ScmServiceError
+from app.services.scm_service_support import (
+    ScmServiceError,
+    acquire_kg_productive_write_lock,
+)
 from app.services.scm_inventory_service import (
     INVENTORY_SORTS,
     INVENTORY_STOCK_FILTERS,
@@ -109,7 +112,13 @@ def validate_expected_source(session, weighing, projection, expected):
 
 def activate_article_for_kg(session, *, article_id):
     """Internal fixture-only opt-in. No API/admin route calls this helper."""
-    article = session.scalar(select(ScmArticulo).where(ScmArticulo.id == article_id).with_for_update())
+    acquire_kg_productive_write_lock(session)
+    article = session.scalar(
+        select(ScmArticulo)
+        .where(ScmArticulo.id == article_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if article is None:
         raise ScmServiceError("ARTICLE_NOT_FOUND", "El articulo no existe.", status_code=404)
     if article.unidad_inventario == "KG":
@@ -131,7 +140,15 @@ def activate_article_for_kg(session, *, article_id):
 
 
 def deactivate_article_from_kg(session, *, article_id):
-    article = session.scalar(select(ScmArticulo).where(ScmArticulo.id == article_id).with_for_update())
+    # Serialize downgrade with every productive KG writer before taking the
+    # article row lock, then force a fresh version for the governed decision.
+    acquire_kg_productive_write_lock(session)
+    article = session.scalar(
+        select(ScmArticulo)
+        .where(ScmArticulo.id == article_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if article is None:
         raise ScmServiceError("ARTICLE_NOT_FOUND", "El articulo no existe.", status_code=404)
     if article.unidad_inventario != "KG":
@@ -141,9 +158,18 @@ def deactivate_article_from_kg(session, *, article_id):
         raise ScmServiceError("KG_DOWNGRADE_NONZERO", "El sublibro KG conserva saldo.", status_code=409)
     if session.scalar(select(ScmExistenciaMangaKg.id).where(ScmExistenciaMangaKg.articulo_scm_id == article.id, ScmExistenciaMangaKg.estado_logistico != "REVERSADA")) is not None:
         raise ScmServiceError("KG_DOWNGRADE_ACTIVE_EXISTENCE", "El sublibro KG conserva una existencia activa.", status_code=409)
-    article.unidad_inventario = "UN"
-    article.version += 1
-    session.flush()
+    marker = object()
+    previous_bypass = getattr(article, "_allow_kg_downgrade", marker)
+    article._allow_kg_downgrade = True
+    try:
+        article.unidad_inventario = "UN"
+        article.version += 1
+        session.flush()
+    finally:
+        if previous_bypass is marker:
+            delattr(article, "_allow_kg_downgrade")
+        else:
+            article._allow_kg_downgrade = previous_bypass
     return article
 
 

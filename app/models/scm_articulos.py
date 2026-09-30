@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Uuid, event, select
+from sqlalchemy import Uuid, event, inspect, select
 
 from app.extensions import db
 
@@ -14,6 +14,22 @@ CLASES_ARTICULO = (
     CLASE_SUBENSAMBLE_WIP,
     CLASE_PRODUCTO_TERMINADO,
 )
+
+KG_ARTICLE_CLASSES = frozenset({
+    CLASE_PIEZA_COLOR,
+    CLASE_SUBENSAMBLE_WIP,
+})
+
+
+def inventory_unit_for_class(article_class):
+    """Return the physical inventory unit mandated by the article class.
+
+    Planning remains UN for every SCM article.  Only piece/color and WIP
+    physical inventory are measured in KG; finished products retain UN.
+    Keeping this policy in the model module prevents ORM, import and catalog
+    synchronization paths from drifting apart.
+    """
+    return "KG" if article_class in KG_ARTICLE_CLASSES else "UN"
 
 
 def utc_now():
@@ -291,6 +307,7 @@ def _dual_write_catalog_article(
                 nombre=_normalized_catalog_name(name, code),
                 clase=article_class,
                 unidad_base="UN",
+                unidad_inventario=inventory_unit_for_class(article_class),
                 activo=True,
                 version=1,
             )
@@ -357,3 +374,29 @@ event.listen(
     "after_insert",
     _product_article_after_insert,
 )
+
+
+@event.listens_for(ScmArticulo, "before_insert")
+def _apply_article_inventory_policy(_mapper, _connection, target):
+    """Protect normal ORM/import creation from the legacy UN default."""
+    expected = inventory_unit_for_class(target.clase)
+    # New catalog rows must follow the class policy even when an importer
+    # supplies the legacy/default value (or an invalid KG value for PT).
+    target.unidad_inventario = expected
+
+
+@event.listens_for(ScmArticulo, "before_update")
+def _preserve_kg_article_policy(_mapper, _connection, target):
+    """Never let ordinary edits or sync paths silently degrade KG to UN."""
+    history = inspect(target).attrs.unidad_inventario.history
+    if (
+        history.has_changes()
+        and history.deleted
+        and history.deleted[0] == "KG"
+        and target.unidad_inventario == "UN"
+        and not getattr(target, "_allow_kg_downgrade", False)
+    ):
+        raise ValueError(
+            "KG_ARTICLE_UNIT_IMMUTABLE: use the governed KG deactivation "
+            "flow after reconciling all KG facts"
+        )

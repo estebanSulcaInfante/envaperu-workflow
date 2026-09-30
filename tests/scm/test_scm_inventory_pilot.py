@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from app import db
+from legacy_helpers import mark_legacy_un
 
 
 def test_saldo_inicial_individual_exige_lote_controlado(
@@ -23,6 +24,7 @@ def test_saldo_inicial_individual_exige_lote_controlado(
         )
         db.session.add(article)
         db.session.flush()
+        mark_legacy_un(db.session, article)
         actor_id = actor.id
         article_id = article.id
         db.session.commit()
@@ -105,6 +107,8 @@ def test_lote_apertura_exige_cuatro_ojos_y_aplica_lineas_atomicamente(
             categoria_recepcion_id=category_id,
         )
         db.session.add_all([approver, released, pending])
+        db.session.flush()
+        mark_legacy_un(db.session, released)
         db.session.commit()
         preparer_id = preparer.id
         approver_id = approver.id

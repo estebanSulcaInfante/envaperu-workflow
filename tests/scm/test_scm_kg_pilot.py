@@ -8,11 +8,13 @@ from app.services.scm_kg_pilot_service import prepare_kg_pilot
 from app.services.scm_service_support import ScmServiceError
 from test_scm_kg_custody import _grant_capabilities
 from test_scm_ot_service import _seed_aggregate_color_work
+from legacy_helpers import mark_legacy_un
 
 
 def test_opt_in_dry_run_then_apply_is_audited_and_idempotent(app):
     with app.app_context():
         creator, _, _, _, output, *_ = _seed_aggregate_color_work(quantity=120)
+        mark_legacy_un(db.session, output.articulo)
         _grant_capabilities(creator, ["ALMACEN_CONFIG_ADMINISTRAR"])
         db.session.commit()
         article_id, actor_id = output.articulo.id, creator.id
@@ -32,6 +34,7 @@ def test_opt_in_dry_run_then_apply_is_audited_and_idempotent(app):
 def test_opt_in_requires_existing_administration_capability(app):
     with app.app_context():
         actor, _, _, _, output, *_ = _seed_aggregate_color_work(quantity=120)
+        mark_legacy_un(db.session, output.articulo)
         actor.roles.clear()
         db.session.commit()
         with pytest.raises(ScmServiceError):

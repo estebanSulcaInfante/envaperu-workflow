@@ -8,6 +8,7 @@ from app.models.scm_articulos import (
     CLASE_PIEZA_COLOR,
     CLASE_PRODUCTO_TERMINADO,
     CLASE_SUBENSAMBLE_WIP,
+    inventory_unit_for_class,
     ScmArticulo,
     ScmArticuloPiezaColor,
     ScmArticuloProducto,
@@ -47,6 +48,7 @@ def _ensure_article(session, *, code, name, article_class):
             nombre=_article_name(name, code),
             clase=article_class,
             unidad_base="UN",
+            unidad_inventario=inventory_unit_for_class(article_class),
         )
         session.add(article)
         session.flush()
@@ -222,6 +224,7 @@ def create_wip_article(session, *, actor_id, data, commit=True):
             nombre=name,
             clase=CLASE_SUBENSAMBLE_WIP,
             unidad_base="UN",
+            unidad_inventario=inventory_unit_for_class(CLASE_SUBENSAMBLE_WIP),
         )
         article.definicion_wip = ScmDefinicionWip(
             descripcion=description,

@@ -107,6 +107,7 @@ def sync_kg_production_inventory(
     source_at=None,
     correction_id=None,
     final=False,
+    force=False,
 ):
     """Project one cumulative measured net into the KG ledger.
 
@@ -114,7 +115,7 @@ def sync_kg_production_inventory(
     movement is only the delta, so replaying a station command cannot duplicate
     mass.  Receipt later changes the location of this same existence.
     """
-    if not automatic_kg_intake_enabled():
+    if not force and not automatic_kg_intake_enabled():
         return None
     from hashlib import sha256
     from app.models.scm_articulos import ScmArticulo

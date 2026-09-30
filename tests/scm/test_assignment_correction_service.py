@@ -50,6 +50,7 @@ from app.services.scm_manga_assignment_projection import (
     effective_work,
     effective_work_for_segment,
 )
+from legacy_helpers import mark_legacy_un
 from tests.scm.test_scm_kg_custody import _grant_capabilities
 from tests.scm.test_scm_kg_production import _auto_final_kg_fixture
 from tests.scm.test_scm_inline_assembly_postgres import postgres_inline_app
@@ -234,7 +235,7 @@ def test_preview_rechaza_manga_un_fuera_del_piloto_kg(app):
             _auto_final_kg_fixture(app, station_code="PESAJE-REATRIBUCION-UN")
         )
         _grant_assignment_correction(creator)
-        manga.lote_articulo.articulo.unidad_inventario = "UN"
+        mark_legacy_un(db.session, manga.lote_articulo.articulo)
         db.session.commit()
 
         with pytest.raises(ScmServiceError) as error:

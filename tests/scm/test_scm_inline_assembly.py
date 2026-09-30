@@ -47,6 +47,7 @@ from app.models.scm_rutas import (
     ScmOperacionRuta,
     ScmRutaRevision,
 )
+from legacy_helpers import mark_legacy_un
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_assembly_execution_service import (
     approve_assembly_quantity_correction,
@@ -106,6 +107,8 @@ def _seed_concurrent_wip_flow():
     db.session.flush()
     tapa = ScmArticulo.query.filter_by(codigo="PC-F3-TAPA").one()
     pico = ScmArticulo.query.filter_by(codigo="PC-F3-PICO").one()
+    mark_legacy_un(db.session, tapa)
+    mark_legacy_un(db.session, pico)
     salida_wip = ScmArticulo(
         codigo="WIP-F3-TAPA-PICO",
         nombre="Tapa con pico F3",
@@ -153,6 +156,7 @@ def _seed_concurrent_wip_flow():
     )
     db.session.add_all([salida_wip, center, structure, route])
     db.session.flush()
+    mark_legacy_un(db.session, salida_wip)
     route_operation = ScmOperacionRuta(
         ruta=route,
         clave="ARMAR_EN_LINEA",

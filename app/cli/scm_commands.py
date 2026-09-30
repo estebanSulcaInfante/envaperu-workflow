@@ -14,6 +14,9 @@ from app.services.scm_demo_seed_service import (
 
 
 def register_scm_commands(app):
+    from app.cli.kg_recovery_commands import register_kg_recovery_commands
+    register_kg_recovery_commands(app)
+
     from app.cli.kg_pilot_commands import register_kg_pilot_commands
     register_kg_pilot_commands(app)
     @app.cli.command("seed-scm-config")
