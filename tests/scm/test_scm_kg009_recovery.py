@@ -1,9 +1,11 @@
 import pytest
+from sqlalchemy import text
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from app import db
+from app.models.scm_auditoria import ScmOperacion
 from app.models.scm_articulos import ScmArticulo
 from app.models.scm_inventory import ScmUbicacionInventario
 from app.models.scm_inventory_kg import ScmExistenciaMangaKg, ScmMovimientoInventarioKg
@@ -21,9 +23,13 @@ from app.services.scm_kg_recovery_service import (
 )
 from app.services.scm_kg_service import deactivate_article_from_kg
 import app.services.scm_kg_pilot_service as kg_pilot_service
+import app.services.scm_kg_recovery_service as recovery_service
 from app.services.scm_kg_pilot_service import prepare_kg_pilot
 from app.services.scm_ot_service import transition_color_work
-from app.services.scm_weighing_service import confirm_manga_weighing
+from app.services.scm_weighing_service import (
+    confirm_manga_weighing,
+    reopen_manga_after_accidental_close,
+)
 from app.services.scm_service_support import ScmServiceError
 from test_scm_kg_custody import _grant_capabilities
 from test_scm_ot_service import _print_color_manga, _seed_aggregate_color_work
@@ -88,8 +94,11 @@ def _seed_recovery_service_fixture(app, *, station_code):
     ).one()
     return {
         "creator": creator,
+        "approver": _approver,
         "article": article,
         "manga": manga,
+        "station": station,
+        "prelabel": label,
         "weighing": weighing,
         "weighed": weighed,
     }
@@ -332,6 +341,118 @@ def test_kg009_real_preview_rejects_manga_work_source_conflict(app):
         assert preview["apply_allowed"] is False
         assert "UN_SOURCE_MANGA_QUANTITY_MISMATCH" in conflicts
         assert ScmExistenciaMangaKg.query.count() == 0
+
+
+def test_kg009_preview_excludes_new_final_after_reopened_historical_weighing(app):
+    """A manga with a reopened historical final remains outside recovery."""
+    with app.app_context():
+        ctx = _seed_recovery_service_fixture(
+            app, station_code=f"PESAJE-KG009-REOPEN-{uuid4().hex[:8]}"
+        )
+        _grant_capabilities(ctx["approver"], ["MANGA_REABRIR"])
+        db.session.commit()
+        old_source_id = ctx["weighing"].public_id
+        manga = db.session.get(ScmManga, ctx["manga"].id)
+        reopened = reopen_manga_after_accidental_close(
+            db.session,
+            actor_id=ctx["approver"].id,
+            manga_id=manga.public_id,
+            operation_id=uuid4(),
+            data={
+                "version": manga.version,
+                "motivo": "Continuar llenado tras cierre histórico",
+                "evidencia": "KG009-REOPEN-TEST",
+            },
+        )
+        assert reopened["pesaje_invalidado"]["public_id"] == str(old_source_id)
+        manga = db.session.get(ScmManga, manga.id)
+        new_weighing = confirm_manga_weighing(
+            db.session,
+            station_id=ctx["station"].station_id,
+            operation_id=uuid4(),
+            actor_id=ctx["creator"].id,
+            data={
+                "label_id": ctx["prelabel"]["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "13.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-30T17:10:00-05:00",
+                "reading_stable": True,
+            },
+        )
+        new_source_id = UUID(new_weighing["weighing"]["public_id"])
+        assert new_source_id != old_source_id
+        assert ScmPesajeManga.query.filter_by(public_id=old_source_id).one().estado == "REABIERTO"
+        preview = preview_kg_recovery(
+            db.session,
+            actor_id=ctx["creator"].id,
+            article_ids=[ctx["article"].id],
+            reason="Recuperar solo el final vigente tras reapertura",
+            source_pesaje_ids=[new_source_id],
+        )
+        assert preview["apply_allowed"] is False
+        assert preview["sources"][0]["pesaje_public_id"] == str(new_source_id)
+        assert "REOPENING_PRESENT" in preview["sources"][0]["conflicts"]
+
+
+def test_kg009_late_deadline_rolls_back_final_unit_of_work(app, monkeypatch):
+    """A deadline reached after the final flush cannot commit recovery facts."""
+    with app.app_context():
+        ctx = _seed_recovery_service_fixture(
+            app, station_code=f"PESAJE-KG009-DEADLINE-{uuid4().hex[:8]}"
+        )
+        article_id = ctx["article"].id
+        source_id = ctx["weighing"].public_id
+        preview = preview_kg_recovery(
+            db.session,
+            actor_id=ctx["creator"].id,
+            article_ids=[ctx["article"].id],
+            reason="KG009 deadline rollback",
+            source_pesaje_ids=[source_id],
+        )
+        # SQLite's legacy transaction mode can release a SAVEPOINT without a
+        # surrounding BEGIN, making the idempotency reservation survive a
+        # rollback.  Start the real outer transaction used by PostgreSQL so
+        # this late-deadline contract is tested against the same boundary.
+        db.session.rollback()
+        db.session.execute(text("BEGIN"))
+        original_check = recovery_service._check_recovery_deadline
+        checks = {"count": 0}
+
+        def expire_after_mutation(deadline):
+            checks["count"] += 1
+            if checks["count"] >= 4:
+                raise ScmServiceError(
+                    "KG_RECOVERY_DEADLINE_EXCEEDED",
+                    "La recuperación excedió su ventana transaccional.",
+                    status_code=409,
+                )
+            return original_check(deadline)
+
+        monkeypatch.setattr(
+            recovery_service, "_check_recovery_deadline", expire_after_mutation
+        )
+        operation_id = uuid4()
+        with pytest.raises(ScmServiceError) as error:
+            apply_kg_recovery(
+                db.session,
+                actor_id=ctx["creator"].id,
+                article_ids=[ctx["article"].id],
+                reason="KG009 deadline rollback",
+                operation_id=operation_id,
+                source_pesaje_ids=[source_id],
+                source_snapshot_hashes={
+                    str(source_id): preview["sources"][0]["source_snapshot_hash"]
+                },
+            )
+        assert error.value.code == "KG_RECOVERY_DEADLINE_EXCEEDED"
+        assert checks["count"] >= 4
+        db.session.remove()
+        assert ScmOperacion.query.filter_by(operation_id=operation_id).count() == 0
+        assert ScmExistenciaMangaKg.query.count() == 0
+        assert ScmMovimientoInventarioKg.query.count() == 0
+        assert db.session.get(ScmArticulo, article_id).unidad_inventario == "UN"
 
 
 def test_kg009_governed_deactivation_bypasses_guard_only_after_checks(app):

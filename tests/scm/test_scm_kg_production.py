@@ -456,6 +456,7 @@ def test_kg_pilot_projects_cumulative_controls_as_deltas_and_replays_without_dup
             "reading_stable": True, "control_type": "AVANCE_KG",
         }
         operations = []
+        unit_id = None
         for index, net in enumerate(("5.000", "8.000", "12.000"), 1):
             operation = uuid4(); operations.append(operation)
             payload = {
@@ -466,6 +467,13 @@ def test_kg_pilot_projects_cumulative_controls_as_deltas_and_replays_without_dup
                 db.session, station_id=station.station_id, operation_id=operation,
                 actor_id=creator.id, data=payload,
             )
+            current_existence = ScmExistenciaMangaKg.query.one()
+            current_unit = current_existence.unidad_fisica_kg
+            assert current_unit is not None
+            if unit_id is None:
+                unit_id = current_unit.id
+            else:
+                assert current_unit.id == unit_id
             assert first["inventario_kg"]["delta_kg"] == ("5.000", "3.000", "4.000")[index - 1]
             if index == 2:
                 replay = register_manga_weighing_control(
@@ -484,6 +492,9 @@ def test_kg_pilot_projects_cumulative_controls_as_deltas_and_replays_without_dup
         assert Decimal(balance.cantidad_fisica_kg) == Decimal("12")
         assert existence.estado_logistico == "EN_PRODUCCION"
         assert existence.estado_calidad == "SIN_CONTROL"
+        assert existence.unidad_fisica_kg.id == unit_id
+        assert Decimal(existence.unidad_fisica_kg.kg_entregado) == Decimal("12")
+        assert Decimal(existence.unidad_fisica_kg.kg_verificados) == Decimal("12")
 
 
 def test_kg_close_from_last_control_http_requires_capability_and_is_idempotent(

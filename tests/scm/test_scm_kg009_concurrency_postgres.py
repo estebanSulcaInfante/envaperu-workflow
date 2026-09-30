@@ -9,7 +9,7 @@ lock with an in-memory assertion.
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from threading import Event
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 from sqlalchemy import create_engine, select, text
@@ -18,7 +18,12 @@ from sqlalchemy.exc import DBAPIError
 from app import create_app, db
 from app.config import Config
 from app.models.scm_articulos import ScmArticulo
-from app.models.scm_ot import ScmManga, ScmPesajeManga
+from app.models.scm_ot import ScmAtribucionProduccionKg, ScmManga, ScmPesajeManga
+from app.models.scm_auditoria import ScmOperacion
+from app.models.scm_inventory_kg import (
+    ScmExistenciaMangaKg,
+    ScmMovimientoInventarioKg,
+)
 from app.models.maquina import Maquina, TipoMaquina
 from app.models.producto import Familia, Linea
 from app.models.trabajador import RolOperativo, Trabajador
@@ -27,6 +32,11 @@ from app.services.scm_configuration import ensure_initial_scm_configuration
 from app.services.scm_kg_service import activate_article_for_kg
 from app.services.scm_weighing_service import confirm_manga_weighing
 from app.services.scm_kg_pilot_service import prepare_kg_pilot
+from app.services.scm_kg_recovery_service import (
+    RECOVERY_NAMESPACE,
+    apply_kg_recovery,
+    preview_kg_recovery,
+)
 from app.services.scm_service_support import ScmServiceError
 import app.services.scm_service_support as service_support
 import app.services.scm_kg_pilot_service as kg_pilot_service
@@ -38,6 +48,8 @@ from tests.scm.test_scm_kg_receipt import (
     _seed_aggregate_color_work,
 )
 from app.services.scm_ot_service import transition_color_work
+from test_scm_kg009_recovery import _seed_recovery_service_fixture
+import test_scm_kg009_recovery as recovery_tests
 
 
 pytestmark = pytest.mark.postgres
@@ -312,6 +324,80 @@ def _kg_weighing_row(app, scenario):
         return row, article
 
 
+def _prepare_recovery_source(app):
+    """Create one governed recovery source in the dedicated PostgreSQL DB."""
+    _reset_dedicated_data(app)
+    with app.app_context():
+        # The dedicated concurrency schema predates the current role-code
+        # width.  The recovery fixture's normal helper creates a role named
+        # after each capability (25 chars), which is valid in the application
+        # schema but cannot be inserted here.  Keep the production capability
+        # code unchanged and attach it to the existing MAQUINISTA role only
+        # for this isolated test fixture.
+        original_grant = recovery_tests._grant_capabilities
+
+        def grant_recovery_capability(actor, capabilities):
+            for code in capabilities:
+                capacity = ScmCapacidad.query.filter_by(codigo=code).first()
+                if capacity is None:
+                    capacity = ScmCapacidad(codigo=code, nombre=code)
+                    db.session.add(capacity)
+                    db.session.flush()
+                role = next(
+                    (candidate for candidate in actor.roles if candidate.codigo == "MAQUINISTA"),
+                    None,
+                )
+                assert role is not None
+                if capacity not in role.capacidades:
+                    role.capacidades.append(capacity)
+
+        recovery_tests._grant_capabilities = grant_recovery_capability
+        try:
+            ctx = _seed_recovery_service_fixture(
+                app, station_code=f"KG009-REC-{uuid4().hex[:8].upper()}"
+            )
+        finally:
+            recovery_tests._grant_capabilities = original_grant
+        source_id = ctx["weighing"].public_id
+        preview = preview_kg_recovery(
+            db.session,
+            actor_id=ctx["creator"].id,
+            article_ids=[ctx["article"].id],
+            reason="KG009 PostgreSQL recovery concurrency",
+            source_pesaje_ids=[source_id],
+        )
+        assert preview["apply_allowed"] is True
+        return {
+            "actor_id": ctx["creator"].id,
+            "article_id": ctx["article"].id,
+            "manga_id": ctx["manga"].id,
+            "weighing_id": ctx["weighing"].id,
+            "source_id": source_id,
+            "source_hash": preview["sources"][0]["source_snapshot_hash"],
+        }
+
+
+def _apply_recovery_in_thread(app, scenario, operation_id):
+    with app.app_context():
+        try:
+            return apply_kg_recovery(
+                db.session,
+                actor_id=scenario["actor_id"],
+                article_ids=[scenario["article_id"]],
+                reason="KG009 PostgreSQL recovery concurrency",
+                operation_id=operation_id,
+                source_pesaje_ids=[scenario["source_id"]],
+                source_snapshot_hashes={
+                    str(scenario["source_id"]): scenario["source_hash"]
+                },
+            )
+        except Exception:
+            db.session.rollback()
+            raise
+        finally:
+            db.session.remove()
+
+
 def test_kg009_postgres_advisory_lock_serializes_optin_before_pesaje(
     postgres_kg009_app, monkeypatch,
 ):
@@ -544,3 +630,119 @@ def test_kg009_postgres_same_uuid_cross_endpoint_is_idempotency_conflict(
         assert db.session.scalar(select(db.func.count(ScmPesajeManga.id)).where(
             ScmPesajeManga.manga_id == scenario["manga_id"]
         )) == 1
+
+
+def test_kg009_postgres_recovery_same_parent_two_sessions_is_one_apply(
+    postgres_kg009_app,
+):
+    """Two real recovery sessions share one parent idempotency operation."""
+    app = postgres_kg009_app
+    scenario = _prepare_recovery_source(app)
+    operation_id = uuid4()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(_apply_recovery_in_thread, app, scenario, operation_id)
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=60) for future in futures]
+    assert results[0] == results[1]
+    assert results[0]["mode"] == "APPLIED"
+    with app.app_context():
+        assert db.session.scalar(select(db.func.count(ScmExistenciaMangaKg.id)).where(
+            ScmExistenciaMangaKg.manga_id == scenario["manga_id"]
+        )) == 1
+        assert db.session.scalar(select(db.func.count(ScmMovimientoInventarioKg.id)).where(
+            ScmMovimientoInventarioKg.pesaje_public_id == scenario["source_id"]
+        )) == 1
+        assert db.session.scalar(select(db.func.count(ScmAtribucionProduccionKg.id)).where(
+            ScmAtribucionProduccionKg.pesaje_id == scenario["weighing_id"],
+            ScmAtribucionProduccionKg.tipo == "NETO_MEDIDO",
+        )) == 1
+        service_support.acquire_kg_productive_write_lock(db.session)
+        db.session.rollback()
+
+
+def test_kg009_postgres_recovery_stale_hash_refreshes_locked_source(
+    postgres_kg009_app,
+):
+    """A preloaded session rejects a changed locked manga before any write."""
+    app = postgres_kg009_app
+    scenario = _prepare_recovery_source(app)
+    operation_id = uuid4()
+    def mutate_manga():
+        with app.app_context():
+            try:
+                manga = db.session.get(ScmManga, scenario["manga_id"])
+                manga.version += 1
+                db.session.commit()
+            finally:
+                db.session.remove()
+
+    with app.app_context():
+        preloaded_manga = db.session.get(ScmManga, scenario["manga_id"])
+        preloaded_weighing = db.session.get(ScmPesajeManga, scenario["weighing_id"])
+        initial_manga_version = preloaded_manga.version
+        assert initial_manga_version >= 1
+        assert preloaded_weighing.public_id == scenario["source_id"]
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(mutate_manga).result(timeout=30)
+        with pytest.raises(ScmServiceError) as error:
+            apply_kg_recovery(
+                db.session,
+                actor_id=scenario["actor_id"],
+                article_ids=[scenario["article_id"]],
+                reason="KG009 stale hash",
+                operation_id=operation_id,
+                source_pesaje_ids=[scenario["source_id"]],
+                source_snapshot_hashes={
+                    str(scenario["source_id"]): scenario["source_hash"]
+                },
+            )
+        assert error.value.code == "KG_RECOVERY_CONFLICT"
+        assert any(
+            "SOURCE_SNAPSHOT_CHANGED" in conflict.get("conflicts", [])
+            for conflict in error.value.details["conflicts"]
+        )
+        assert db.session.scalar(select(db.func.count(ScmOperacion.operation_id)).where(
+            ScmOperacion.operation_id == operation_id
+        )) == 0
+        assert db.session.scalar(select(db.func.count(ScmMovimientoInventarioKg.id))) == 0
+        assert db.session.scalar(select(db.func.count(ScmExistenciaMangaKg.id))) == 0
+
+
+def test_kg009_postgres_recovery_child_uuid_conflict_has_no_effects(
+    postgres_kg009_app,
+):
+    """An occupied deterministic child UUID rejects without ledger writes."""
+    app = postgres_kg009_app
+    scenario = _prepare_recovery_source(app)
+    parent_id = uuid4()
+    child_id = uuid5(
+        RECOVERY_NAMESPACE, f"{parent_id}:{scenario['source_id']}"
+    )
+    with app.app_context():
+        db.session.add(ScmOperacion(
+            operation_id=child_id,
+            endpoint="/otro-endpoint",
+            actor_id=scenario["actor_id"],
+            request_sha256="x" * 64,
+            response_json={"occupied": True},
+            estado_http=200,
+        ))
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as error:
+            apply_kg_recovery(
+                db.session,
+                actor_id=scenario["actor_id"],
+                article_ids=[scenario["article_id"]],
+                reason="KG009 child conflict",
+                operation_id=parent_id,
+                source_pesaje_ids=[scenario["source_id"]],
+                source_snapshot_hashes={
+                    str(scenario["source_id"]): scenario["source_hash"]
+                },
+            )
+        assert error.value.code == "IDEMPOTENCY_CONFLICT"
+        assert db.session.scalar(select(db.func.count(ScmMovimientoInventarioKg.id))) == 0
+        assert db.session.scalar(select(db.func.count(ScmExistenciaMangaKg.id))) == 0
+        assert db.session.get(ScmArticulo, scenario["article_id"]).unidad_inventario == "UN"

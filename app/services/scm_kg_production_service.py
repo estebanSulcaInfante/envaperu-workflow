@@ -6,10 +6,11 @@ turn an estimate into a measured result.
 """
 
 from decimal import Decimal, InvalidOperation
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import noload, selectinload
 
 from app.models.registro import RegistroDiarioProduccion
 from app.models.scm_ot import (
@@ -108,6 +109,11 @@ def sync_kg_production_inventory(
     correction_id=None,
     final=False,
     force=False,
+    article=None,
+    location=None,
+    balance_cache=None,
+    existence_cache=None,
+    defer_flush=False,
 ):
     """Project one cumulative measured net into the KG ledger.
 
@@ -125,22 +131,27 @@ def sync_kg_production_inventory(
         ScmMovimientoInventarioKg,
         ScmSaldoInventarioKg,
     )
-    article = session.scalar(
-        select(ScmArticulo).where(ScmArticulo.id == manga.lote_articulo.articulo.id).with_for_update()
-    )
-    _kg_article(manga)
-    location = _production_location(session, article_class=article.clase)
+    if article is None:
+        article = session.scalar(
+            select(ScmArticulo).options(noload("*")).where(
+                ScmArticulo.id == manga.lote_articulo.articulo.id
+            ).with_for_update().execution_options(populate_existing=True)
+        )
+    _kg_article(manga, article=article)
+    if location is None:
+        location = _production_location(session, article_class=article.clase)
     total = _kg(net_kg, "net_kg")
     source_token = f"{source_type}:{source_id or manga.id}:{total}:{correction_id or ''}"
     projection_hash = sha256(source_token.encode()).hexdigest()
-    balance = session.scalar(
-        select(ScmSaldoInventarioKg)
-        .where(
-            ScmSaldoInventarioKg.articulo_scm_id == article.id,
-            ScmSaldoInventarioKg.ubicacion_id == location.id,
+    balance_key = (article.id, location.id)
+    balance = balance_cache.get(balance_key) if balance_cache is not None else None
+    if balance is None:
+        balance = session.scalar(
+            select(ScmSaldoInventarioKg).options(noload("*")).where(
+                ScmSaldoInventarioKg.articulo_scm_id == article.id,
+                ScmSaldoInventarioKg.ubicacion_id == location.id,
+            ).with_for_update().execution_options(populate_existing=True)
         )
-        .with_for_update()
-    )
     if balance is None:
         candidate_balance = ScmSaldoInventarioKg(
             articulo_scm_id=article.id,
@@ -155,27 +166,41 @@ def sync_kg_production_inventory(
                 session.add(candidate_balance)
                 session.flush()
             balance = candidate_balance
+            if balance_cache is not None:
+                balance_cache[balance_key] = balance
         except IntegrityError:
             # A concurrent first event may have won the article/location
             # unique key.  Re-read its locked row and continue the same
             # transaction instead of creating a second balance.
             balance = session.scalar(
-                select(ScmSaldoInventarioKg)
+                select(ScmSaldoInventarioKg).options(noload("*"))
                 .where(
                     ScmSaldoInventarioKg.articulo_scm_id == article.id,
                     ScmSaldoInventarioKg.ubicacion_id == location.id,
                 )
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if balance is None:
                 raise
-    existence = session.scalar(
-        select(ScmExistenciaMangaKg)
-        .where(
-            ScmExistenciaMangaKg.manga_id == manga.id,
-            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+            if balance_cache is not None:
+                balance_cache[balance_key] = balance
+    elif balance_cache is not None:
+        balance_cache[balance_key] = balance
+    existence = (
+        existence_cache.get(manga.id)
+        if existence_cache is not None
+        else session.scalar(
+            select(ScmExistenciaMangaKg).options(
+                noload("*"),
+                selectinload(ScmExistenciaMangaKg.unidad_fisica_kg),
+            )
+            .where(
+                ScmExistenciaMangaKg.manga_id == manga.id,
+                ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+            )
+            .with_for_update()
         )
-        .with_for_update()
     )
     previous = Decimal(existence.cantidad_fisica_kg) if existence is not None else Decimal("0")
     delta = (total - previous).quantize(KG_QUANTUM)
@@ -213,8 +238,8 @@ def sync_kg_production_inventory(
             fuente_tipo="KG_AUTO_PRODUCCION",
             atributo_proceso="TERMINADA" if final else "PROCESO",
         )
+        movement.id = uuid4()
         session.add(movement)
-        session.flush()
     else:
         movement = None
     if existence is None:
@@ -238,12 +263,14 @@ def sync_kg_production_inventory(
             recibida_por_id=actor_id,
             origen_tipo="PRODUCCION",
         )
+        existence.id = uuid4()
         session.add(existence)
-        session.flush()
+        if existence_cache is not None:
+            existence_cache[manga.id] = existence
         from app.services.scm_kg_receipt_service import _kg_identity_for_receipt
         unit, label = _kg_identity_for_receipt(
             session, existence=existence, article=article,
-            location=location, quantity=total,
+            location=location, quantity=total, manga=manga,
         )
         unit.estado_logistico = "DISPONIBLE_PRODUCCION" if final else "EN_PRODUCCION"
         unit.estado_calidad = "SIN_CONTROL"
@@ -276,7 +303,8 @@ def sync_kg_production_inventory(
         balance.atributo_proceso = "TERMINADA"
     elif balance.atributo_proceso == "TERMINADA":
         balance.atributo_proceso = "MIXTA"
-    session.flush()
+    if not defer_flush:
+        session.flush()
     return {
         "existencia": existence,
         "unidad": unit,
@@ -464,8 +492,8 @@ def _kg(value, field):
     return amount
 
 
-def _kg_article(manga):
-    article = (
+def _kg_article(manga, *, article=None):
+    article = article or (
         manga.lote_articulo.articulo
         if manga.lote_articulo is not None else None
     )

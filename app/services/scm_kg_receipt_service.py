@@ -65,15 +65,22 @@ def _locked_or_create_balance(session, *, article_id, location_id, atributo_proc
         return balance
 
 
-def _kg_identity_for_receipt(session, *, existence, article, location, quantity):
+def _kg_identity_for_receipt(session, *, existence, article, location, quantity, manga=None):
     """Create the canonical root without creating a second stock fact."""
     public_id = uuid4()
     label_public_id = uuid4()
     payload = {"v": 1, "label_id": str(label_public_id)}
     payload["qr_value"] = json.dumps(payload, separators=(",", ":"))
+    # ``ScmUnidadFisicaKg.recepcion_vigente_id`` points to the existence.  The
+    # recovery writer deliberately defers its normal phase flushes, so persist
+    # this parent before adding the physical unit.  The caller may also pass
+    # the locked manga explicitly because recovery suppresses relationship
+    # loading and ``existence.manga`` is then intentionally unavailable.
+    session.flush()
     unit = ScmUnidadFisicaKg(
+        id=uuid4(),
         public_id=public_id,
-        codigo=f"KG-{existence.manga.codigo if existence.manga else existence.id}",
+        codigo=f"KG-{manga.codigo if manga is not None else existence.manga.codigo if existence.manga else existence.id}",
         articulo_scm_id=article.id,
         existencia_manga_kg_id=existence.id,
         unidad_raiz_id=None,
@@ -95,9 +102,13 @@ def _kg_identity_for_receipt(session, *, existence, article, location, quantity)
         modo_lectura=None,
     )
     session.add(unit)
+    # The label FK has no ORM relationship on this legacy model.  Materialize
+    # the canonical unit before adding its label; the recovery caller still
+    # defers all subsequent balance/event flushes by phase.
     session.flush()
     unit.unidad_raiz_id = unit.id
     label = ScmEtiquetaUnidadKg(
+        id=uuid4(),
         public_id=label_public_id,
         unidad_id=unit.id,
         payload_json=payload,
@@ -107,7 +118,6 @@ def _kg_identity_for_receipt(session, *, existence, article, location, quantity)
     session.add(label)
     label.unidad_id = unit.id
     existence.unidad_fisica_kg_id = unit.id
-    session.flush()
     return unit, label
 
 
@@ -398,7 +408,7 @@ def receive_manga_kg(session, *, actor, operation_id, data, manga, label, resolu
         session.flush()
         unit, identity_label = _kg_identity_for_receipt(
             session, existence=existence, article=article, location=location,
-            quantity=quantity,
+            quantity=quantity, manga=manga,
         )
         response = {"existencia": existence.to_dict(), "unidad": unit.to_dict(), "etiqueta": {"id": str(identity_label.id), "public_id": str(identity_label.id), "qr_value": identity_label.payload_json.get("qr_value"), "payload_hash": identity_label.payload_hash, "estado": identity_label.estado}, "movimiento_id": str(movement.id), "operation_id": str(operation.operation_id), "idempotent_replay": False}
         _complete(operation, response, 201)
