@@ -6,7 +6,7 @@ import json
 from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import and_, false, func, or_, select
+from sqlalchemy import and_, false, func, literal, or_, select
 
 from app.models.scm_articulos import ScmArticulo
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
@@ -15,8 +15,9 @@ from app.models.scm_inventory import (
     ScmMovimientoInventario, ScmSaldoInventario, ScmSaldoMaterialInventario,
     ScmUbicacionInventario,
 )
+from app.models.scm_inventory_kg import ScmSaldoInventarioKg
 from app.models.scm_inventory_operations import (
-    ScmSesionOperacionAlmacen, ScmSesionOperacionItem,
+    ScmAlmacen, ScmSesionOperacionAlmacen, ScmSesionOperacionItem,
     ScmTransferenciaInventario, ScmTransferenciaItem,
 )
 from app.models.scm_ot import ScmManga
@@ -572,6 +573,142 @@ def inventory_summary(session, *, actor_id):
             or_(*material_scope) if material_scope else false()
         )
     material_rows = session.execute(material_query).all()
+    article_family_query = select(
+        ScmUbicacionInventario.almacen_id,
+        ScmAlmacen.codigo,
+        ScmAlmacen.nombre,
+        ScmArticulo.clase,
+        literal("UN").label("unidad"),
+        func.count(ScmSaldoInventario.id),
+        func.sum(ScmSaldoInventario.cantidad_fisica),
+        func.sum(ScmSaldoInventario.cantidad_reservada),
+        func.sum(ScmSaldoInventario.cantidad_no_disponible),
+    ).join(
+        ScmSaldoInventario,
+        ScmSaldoInventario.ubicacion_id == ScmUbicacionInventario.id,
+    ).join(
+        ScmArticulo,
+        ScmArticulo.id == ScmSaldoInventario.articulo_scm_id,
+    ).outerjoin(
+        ScmAlmacen,
+        ScmAlmacen.id == ScmUbicacionInventario.almacen_id,
+    ).group_by(
+        ScmUbicacionInventario.almacen_id,
+        ScmAlmacen.codigo,
+        ScmAlmacen.nombre,
+        ScmArticulo.clase,
+    )
+    material_family_query = select(
+        ScmUbicacionInventario.almacen_id,
+        ScmAlmacen.codigo,
+        ScmAlmacen.nombre,
+        ScmMaterial.clase,
+        func.count(ScmSaldoMaterialInventario.id),
+        func.sum(ScmSaldoMaterialInventario.cantidad_fisica_kg),
+        func.sum(ScmSaldoMaterialInventario.cantidad_reservada_kg),
+        func.sum(ScmSaldoMaterialInventario.cantidad_no_disponible_kg),
+    ).join(
+        ScmSaldoMaterialInventario,
+        ScmSaldoMaterialInventario.ubicacion_id == ScmUbicacionInventario.id,
+    ).join(
+        ScmMaterial,
+        ScmMaterial.id == ScmSaldoMaterialInventario.material_id,
+    ).outerjoin(
+        ScmAlmacen,
+        ScmAlmacen.id == ScmUbicacionInventario.almacen_id,
+    ).group_by(
+        ScmUbicacionInventario.almacen_id,
+        ScmAlmacen.codigo,
+        ScmAlmacen.nombre,
+        ScmMaterial.clase,
+    )
+    if scope["configured"] and not scope["transversal"]:
+        article_family_query = article_family_query.where(
+            or_(*article_scope) if article_scope else false()
+        )
+        material_family_query = material_family_query.where(
+            or_(*material_scope) if material_scope else false()
+        )
+    article_family_rows = session.execute(article_family_query).all()
+    material_family_rows = session.execute(material_family_query).all()
+
+    kg_family_query = select(
+        ScmUbicacionInventario.almacen_id,
+        ScmAlmacen.codigo,
+        ScmAlmacen.nombre,
+        ScmArticulo.clase,
+        func.count(ScmSaldoInventarioKg.id),
+        func.sum(ScmSaldoInventarioKg.cantidad_fisica_kg),
+        func.sum(ScmSaldoInventarioKg.cantidad_reservada_kg),
+        func.sum(ScmSaldoInventarioKg.cantidad_no_disponible_kg),
+    ).join(
+        ScmSaldoInventarioKg,
+        ScmSaldoInventarioKg.ubicacion_id == ScmUbicacionInventario.id,
+    ).join(
+        ScmArticulo,
+        ScmArticulo.id == ScmSaldoInventarioKg.articulo_scm_id,
+    ).outerjoin(
+        ScmAlmacen,
+        ScmAlmacen.id == ScmUbicacionInventario.almacen_id,
+    ).where(
+        ScmArticulo.unidad_inventario == "KG",
+    ).group_by(
+        ScmUbicacionInventario.almacen_id,
+        ScmAlmacen.codigo,
+        ScmAlmacen.nombre,
+        ScmArticulo.clase,
+    )
+    if scope["configured"] and not scope["transversal"]:
+        kg_family_query = kg_family_query.where(
+            or_(*article_scope) if article_scope else false()
+        )
+    kg_family_rows = session.execute(kg_family_query).all()
+
+    def summary_quantity(value):
+        return format(Decimal(value or 0).quantize(Decimal("0.001")), "f")
+
+    def family_payload(row, *, material=False):
+        physical = row[5] if material else row[6]
+        reserved = row[6] if material else row[7]
+        unavailable = row[7] if material else row[8]
+        return {
+            "almacen_id": str(row[0]) if row[0] else None,
+            "almacen_codigo": row[1],
+            "almacen_nombre": row[2],
+            "clase": row[3],
+            "unidad": "KG" if material else row[4],
+            "posiciones": row[4] if material else row[5],
+            "fisico": summary_quantity(physical),
+            "reservado": summary_quantity(reserved),
+            "no_disponible": summary_quantity(unavailable),
+            "libre": summary_quantity((physical or 0) - (reserved or 0) - (unavailable or 0)),
+        }
+
+    def kg_family_payload(row):
+        physical, reserved, unavailable = row[5], row[6], row[7]
+        return {
+            "almacen_id": str(row[0]) if row[0] else None,
+            "almacen_codigo": row[1],
+            "almacen_nombre": row[2],
+            "clase": row[3],
+            "unidad": "KG",
+            "posiciones": row[4],
+            "fisico": summary_quantity(physical),
+            "reservado": summary_quantity(reserved),
+            "no_disponible": summary_quantity(unavailable),
+            "libre": summary_quantity((physical or 0) - (reserved or 0) - (unavailable or 0)),
+        }
+
+    families = [
+        *[family_payload(row) for row in article_family_rows],
+        *[family_payload(row, material=True) for row in material_family_rows],
+        *[kg_family_payload(row) for row in kg_family_rows],
+    ]
+    families.sort(key=lambda item: (
+        item["almacen_codigo"] or "",
+        item["clase"] or "",
+        item["unidad"] or "",
+    ))
     return {
         "as_of": func.now(),
         "items": [{
@@ -588,4 +725,5 @@ def inventory_summary(session, *, actor_id):
             "reservado": format(row[3] or 0, "f"),
             "no_disponible": format(row[4] or 0, "f"),
         } for row in material_rows],
+        "familias": families,
     }

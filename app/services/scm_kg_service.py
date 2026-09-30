@@ -28,6 +28,7 @@ from app.services.scm_inventory_service import (
     _decode_inventory_cursor,
     _encode_inventory_cursor,
     _inventory_order,
+    _warehouse_condition,
     _page_limit,
     _search_pattern,
 )
@@ -192,7 +193,7 @@ def list_kg_movements(session, *, actor_id, limit=100):
     return {"items": [kg_movement_payload(item) for item in session.scalars(query).all()], "unidad": "KG", "unidad_inventario": "KG"}
 
 
-def explore_kg_balances(session, *, actor_id, query=None, location=None, stock_filter="TODOS", sort="CODIGO", limit=25, cursor=None):
+def explore_kg_balances(session, *, actor_id, query=None, location=None, warehouse_id=None, stock_filter="TODOS", sort="CODIGO", limit=25, cursor=None):
     from app.services.scm_service_support import load_actor
     from app.services.scm_warehouse_scope_service import warehouse_scope
     load_actor(session, actor_id, capability="INVENTARIO_VER")
@@ -218,6 +219,10 @@ def explore_kg_balances(session, *, actor_id, query=None, location=None, stock_f
             ScmUbicacionInventario.nombre.ilike(pattern, escape="\\"),
         ))
     if location: conditions.append(ScmUbicacionInventario.codigo == str(location).strip().upper())
+    if warehouse_id:
+        conditions.append(_warehouse_condition(
+            ScmUbicacionInventario.almacen_id, warehouse_id,
+        ))
     available = _availability_condition(
         stock_filter,
         ScmSaldoInventarioKg.cantidad_fisica_kg,
@@ -298,7 +303,7 @@ def explore_kg_balances(session, *, actor_id, query=None, location=None, stock_f
         next_cursor = _encode_inventory_cursor(
             ledger="PIEZAS_WIP_KG", sort=sort, value=value, row_id=last["id"],
         )
-    return {"items": items, "page": {"next_cursor": next_cursor, "limit": safe_limit, "has_more": next_cursor is not None, "total": int(total)}, "filters": {"kardex": "PIEZAS_WIP", "unidad": "KG", "q": str(query or "").strip(), "ubicacion": str(location or "").strip().upper() or None, "disponibilidad": stock_filter, "ordenar": sort}, "unidad": "KG", "unidad_inventario": "KG"}
+    return {"items": items, "page": {"next_cursor": next_cursor, "limit": safe_limit, "has_more": next_cursor is not None, "total": int(total)}, "filters": {"kardex": "PIEZAS_WIP", "unidad": "KG", "q": str(query or "").strip(), "ubicacion": str(location or "").strip().upper() or None, "almacen_id": str(warehouse_id).strip() if warehouse_id else None, "disponibilidad": stock_filter, "ordenar": sort}, "unidad": "KG", "unidad_inventario": "KG"}
 
 
 def kg_summary(session, *, actor_id):

@@ -26,6 +26,7 @@ from app.models.scm_ot import (
     ScmAsignacionPersonalTrabajoOt,
     ScmCorreccionPesajeManga,
     ScmEtiquetaManga,
+    ScmLoteArticulo,
     ScmManga,
     ScmPesajeManga,
     ScmTrabajoColor,
@@ -829,6 +830,10 @@ def _effective_weighing(weighing, correction, annulment):
             "peso_fisico_neto_kg": None,
             "neto_kg": None,
             "kg_produccion_estandar": None,
+            "kg_produccion_ot": None,
+            "kg_atribuido_ot": None,
+            "kg_fabricacion_estimado": None,
+            "kg_previo_estimado": None,
             "cantidad_confirmada_un": None,
             "pesada_at": _iso(weighing.pesada_at),
             "corregido": False,
@@ -841,24 +846,79 @@ def _effective_weighing(weighing, correction, annulment):
         else {
             "peso_fisico_neto_kg": weighing.peso_fisico_neto_kg,
             "kg_produccion_ot": weighing.kg_produccion_ot,
+            "kg_fabricacion_estimado": weighing.kg_fabricacion_estimado,
+            "kg_previo_estimado": weighing.kg_previo_estimado,
             "cantidad_confirmada": weighing.cantidad_confirmada,
             "pesada_at": _iso(weighing.pesada_at),
         }
     )
     physical = _number(projection.get("peso_fisico_neto_kg"))
-    standard = _number(projection.get("kg_produccion_ot"))
-    confirmed = _number(projection.get("cantidad_confirmada"))
+    production = (
+        _number(projection.get("kg_produccion_ot"))
+        if projection.get("kg_produccion_ot") is not None
+        else None
+    )
+    fabrication_estimated = (
+        _number(projection.get("kg_fabricacion_estimado"))
+        if projection.get("kg_fabricacion_estimado") is not None
+        else None
+    )
+    previous_estimated = (
+        _number(projection.get("kg_previo_estimado"))
+        if projection.get("kg_previo_estimado") is not None
+        else None
+    )
+    standard = _number(production) if production is not None else None
+    confirmed_value = projection.get("cantidad_confirmada")
+    confirmed = _number(confirmed_value) if confirmed_value is not None else None
     return {
         "public_id": str(weighing.public_id),
         "estado": "EFECTIVO",
         "peso_fisico_neto_kg": physical,
         "neto_kg": physical,
         "kg_produccion_estandar": standard,
+        "kg_produccion_ot": production,
+        "kg_atribuido_ot": None,
+        "kg_fabricacion_estimado": fabrication_estimated,
+        "kg_previo_estimado": previous_estimated,
         "cantidad_confirmada_un": confirmed,
         "pesada_at": projection.get("pesada_at") or _iso(weighing.pesada_at),
         "corregido": correction is not None,
         "corregida_at": _iso(correction.resolved_at) if correction else None,
         "anulada_at": None,
+    }
+
+
+def _metric_contract(*, article_unit, effective):
+    """Classify observable mass without turning an absent count into KG.
+
+    ``article_unit`` is resolved from the canonical ``ScmLoteArticulo`` /
+    ``ScmArticulo`` chain.  A snapshot or a zero UN quantity is deliberately
+    insufficient evidence.  Standard weight is meaningful only for a
+    canonical UN article; KG keeps physical, OT attribution and BOM estimates
+    on separate axes.
+    """
+    unit = str(article_unit or "").strip().upper() or None
+    if unit not in {"UN", "KG"}:
+        unit = None
+    physical = effective.get("peso_fisico_neto_kg")
+    fabrication_estimated = effective.get("kg_fabricacion_estimado")
+    previous_estimated = effective.get("kg_previo_estimado")
+    standard = effective.get("kg_produccion_estandar") if unit == "UN" else None
+    return {
+        "unidad_evidencia": unit,
+        "unidad_origen": "ARTICULO_SCM" if unit else None,
+        "peso_fisico_neto_kg": physical,
+        # Assignment corrections can move a manga overlay across OTs.  This
+        # read model is grouped by the manga's origin OT, so attribution is
+        # intentionally left unevaluated until the canonical overlay ledger
+        # is queried.  Physical and BOM axes remain available separately.
+        "kg_atribuido_ot": None,
+        "kg_fabricacion_estimado_bom": (
+            fabrication_estimated if unit == "KG" else None
+        ),
+        "kg_previo_estimado_bom": previous_estimated if unit == "KG" else None,
+        "kg_produccion_estandar": standard,
     }
 
 
@@ -888,6 +948,7 @@ def _build_item(
     existences,
     alerts,
     labels,
+    articles,
     visibility,
     as_of,
     detail,
@@ -895,6 +956,23 @@ def _build_item(
     ot, machine, center = row
     ot_works = sorted(works.get(ot.id, []), key=lambda value: value[0].secuencia)
     ot_mangas = sorted(mangas.get(ot.id, []), key=lambda value: value.secuencia_ot)
+    evidence_units = {
+        str(getattr(articles.get(manga.id), "unidad_inventario", "") or "")
+        .strip()
+        .upper()
+        for manga in ot_mangas
+        if articles.get(manga.id) is not None
+    }
+    evidence_units.discard("")
+    has_unknown_unit = any(
+        articles.get(manga.id) is None for manga in ot_mangas
+    )
+    evidence_unit = (
+        "MIXTO" if has_unknown_unit and evidence_units
+        else next(iter(evidence_units)) if len(evidence_units) == 1
+        else "MIXTO" if len(evidence_units) > 1
+        else "DESCONOCIDA" if has_unknown_unit else None
+    )
     work_states = Counter(work.estado for work, _color in ot_works)
     active_pair = next(
         (pair for pair in ot_works if pair[0].estado == "EN_EJECUCION"),
@@ -1046,6 +1124,7 @@ def _build_item(
     }
 
     effective_weighings = []
+    effective_metrics = []
     weighing_event_times = []
     if visibility["pesaje"]:
         for manga in ot_mangas:
@@ -1059,6 +1138,16 @@ def _build_item(
             )
             if effective["estado"] == "EFECTIVO":
                 effective_weighings.append(effective)
+                metric = _metric_contract(
+                    article_unit=getattr(
+                        articles.get(manga.id), "unidad_inventario", None
+                    ),
+                    effective=effective,
+                )
+                effective["kg_produccion_estandar"] = metric[
+                    "kg_produccion_estandar"
+                ]
+                effective_metrics.append((effective, metric))
             weighing_event_times.extend([
                 weighing.pesada_at,
                 corrections.get(weighing.id).resolved_at
@@ -1072,10 +1161,27 @@ def _build_item(
             (_decimal(item["peso_fisico_neto_kg"]) for item in effective_weighings),
             Decimal("0"),
         )
-        standard = sum(
-            (_decimal(item["kg_produccion_estandar"]) for item in effective_weighings),
-            Decimal("0"),
-        )
+        standard_values = [
+            metric["kg_produccion_estandar"]
+            for _effective, metric in effective_metrics
+            if metric["kg_produccion_estandar"] is not None
+        ]
+        standard = sum((_decimal(value) for value in standard_values), Decimal("0"))
+        attributed_values = [
+            metric["kg_atribuido_ot"]
+            for _effective, metric in effective_metrics
+            if metric["kg_atribuido_ot"] is not None
+        ]
+        fabrication_values = [
+            metric["kg_fabricacion_estimado_bom"]
+            for _effective, metric in effective_metrics
+            if metric["kg_fabricacion_estimado_bom"] is not None
+        ]
+        previous_values = [
+            metric["kg_previo_estimado_bom"]
+            for _effective, metric in effective_metrics
+            if metric["kg_previo_estimado_bom"] is not None
+        ]
         last_weighed = _latest([
             weighing.pesada_at
             for manga in ot_mangas
@@ -1086,7 +1192,26 @@ def _build_item(
             "cantidad": len(effective_weighings),
             "neto_kg": _number(physical),
             "peso_fisico_neto_kg": _number(physical),
-            "kg_produccion_estandar": _number(standard),
+            "kg_produccion_estandar": (
+                _number(standard)
+                if standard_values and evidence_unit != "MIXTO" else None
+            ),
+            "kg_atribuido_ot": (
+                _number(sum((_decimal(value) for value in attributed_values), Decimal("0")))
+                if attributed_values else None
+            ),
+            "kg_fabricacion_estimado_bom": (
+                _number(sum((_decimal(value) for value in fabrication_values), Decimal("0")))
+                if fabrication_values else None
+            ),
+            "kg_previo_estimado_bom": (
+                _number(sum((_decimal(value) for value in previous_values), Decimal("0")))
+                if previous_values else None
+            ),
+            "unidad_evidencia": evidence_unit,
+            "unidad_origen": (
+                "ARTICULO_SCM" if evidence_unit in {"KG", "UN"} else None
+            ),
             "ultimo_pesaje_at": _iso(last_weighed),
         }
     else:
@@ -1272,6 +1397,13 @@ def _build_item(
         objective = _decimal(ot.cantidad_objetivo)
         confirmed = _decimal(ot.cantidad_confirmada)
 
+    quantity_summary = {
+        "objetivo_un": _number(objective),
+        "confirmado_un": _number(confirmed),
+    }
+    if evidence_units and evidence_units != {"UN"}:
+        quantity_summary = {"objetivo_un": None, "confirmado_un": None}
+
     item = {
         "ot": {
             "public_id": str(ot.public_id),
@@ -1286,6 +1418,10 @@ def _build_item(
         "recurso": resource,
         "responsable": _worker_dict(responsible),
         "upstream": upstream,
+        "unidad_evidencia": evidence_unit,
+        "unidad_origen": (
+            "ARTICULO_SCM" if evidence_unit in {"KG", "UN"} else None
+        ),
         "trabajo_actual": work_dict(active_pair),
         "trabajo_siguiente": work_dict(next_pair, include_quantities=False),
         "trabajos_resumen": {
@@ -1293,8 +1429,8 @@ def _build_item(
             "por_estado": dict(sorted(work_states.items())),
         },
         "cantidades_resumen": {
-            "objetivo_un": _number(objective),
-            "confirmado_un": _number(confirmed),
+            **quantity_summary,
+            "unidad_evidencia": evidence_unit,
         },
         "mangas_resumen": manga_summary,
         "pesaje_resumen": weighing_summary,
@@ -1322,6 +1458,17 @@ def _build_item(
                     corrections.get(weighing.id),
                     annulments.get(weighing.id),
                 )
+                if weighing_payload["estado"] == "EFECTIVO":
+                    metric = _metric_contract(
+                        article_unit=getattr(
+                            articles.get(manga.id), "unidad_inventario", None
+                        ),
+                        effective=weighing_payload,
+                    )
+                    weighing_payload["kg_produccion_estandar"] = metric[
+                        "kg_produccion_estandar"
+                    ]
+                    weighing_payload["metricas"] = metric
             existence = existences.get(manga.id)
             warehouse_payload = None
             if (
@@ -1386,6 +1533,9 @@ def _build_item(
                     "codigo": manga.articulo_codigo_snapshot,
                     "nombre": manga.articulo_nombre_snapshot,
                     "sku_pieza_color": manga.pieza_color_sku_snapshot,
+                    "unidad_inventario": getattr(
+                        articles.get(manga.id), "unidad_inventario", None
+                    ),
                 },
                 "color": manga.color_snapshot,
                 "contenedor": {
@@ -1548,6 +1698,21 @@ def _hydrate(session, *, rows, actor, as_of, detail=False):
     for manga in manga_rows:
         mangas[manga.ot_id].append(manga)
     manga_ids = [manga.id for manga in manga_rows]
+    article_by_manga = {}
+    lot_ids = [manga.lote_articulo_id for manga in manga_rows]
+    if lot_ids:
+        lot_rows = session.execute(
+            select(ScmLoteArticulo, ScmArticulo)
+            .options(noload("*"))
+            .join(ScmArticulo, ScmArticulo.id == ScmLoteArticulo.articulo_id)
+            .where(ScmLoteArticulo.id.in_(lot_ids))
+        ).all()
+        article_by_lot = {lot.id: article for lot, article in lot_rows}
+        article_by_manga = {
+            manga.id: article_by_lot[manga.lote_articulo_id]
+            for manga in manga_rows
+            if manga.lote_articulo_id in article_by_lot
+        }
 
     weighing_by_manga = {}
     correction_by_weighing = {}
@@ -1734,6 +1899,7 @@ def _hydrate(session, *, rows, actor, as_of, detail=False):
             existences=existence_by_manga,
             alerts=alerts_by_ot,
             labels=label_by_manga,
+            articles=article_by_manga,
             visibility=visibility,
             as_of=as_of,
             detail=detail,
@@ -2309,26 +2475,41 @@ def _empty_metrics(*, weighing_visible, alerts_visible):
         "mangas_recibidas": 0,
         "peso_fisico_neto_kg": 0.0 if weighing_visible else None,
         "kg_produccion_estandar": 0.0 if weighing_visible else None,
+        "kg_atribuido_ot": 0.0 if weighing_visible else None,
+        "kg_fabricacion_estimado_bom": 0.0 if weighing_visible else None,
+        "kg_previo_estimado_bom": 0.0 if weighing_visible else None,
         "alertas_abiertas": 0 if alerts_visible else None,
     }
 
 
 def _add_item_metrics(target, item):
     target["ots"] += 1
-    target["objetivo_un"] += item["cantidades_resumen"]["objetivo_un"]
-    target["confirmado_un"] += item["cantidades_resumen"]["confirmado_un"]
+    quantities = item["cantidades_resumen"]
+    for key in ("objetivo_un", "confirmado_un"):
+        value = quantities.get(key)
+        if value is None:
+            target[f"_{key}_incompleto"] = True
+        else:
+            target[key] += value
     mangas = item["mangas_resumen"]
     target["mangas_total"] += mangas["total"]
     target["mangas_pendientes_pesaje"] += mangas["pendientes_pesaje"]
     target["mangas_pendientes_recepcion"] += mangas["pendientes_recepcion"]
     target["mangas_recibidas"] += mangas["recibidas"]
     if item["pesaje_resumen"] is not None:
-        target["peso_fisico_neto_kg"] += item["pesaje_resumen"][
-            "peso_fisico_neto_kg"
-        ]
-        target["kg_produccion_estandar"] += item["pesaje_resumen"][
-            "kg_produccion_estandar"
-        ]
+        weighing = item["pesaje_resumen"]
+        for key in (
+            "peso_fisico_neto_kg",
+            "kg_produccion_estandar",
+            "kg_atribuido_ot",
+            "kg_fabricacion_estimado_bom",
+            "kg_previo_estimado_bom",
+        ):
+            value = weighing.get(key)
+            if value is None:
+                target[f"_{key}_incompleto"] = True
+            else:
+                target[key] += value
     if item["alertas_resumen"] is not None:
         target["alertas_abiertas"] += item["alertas_resumen"]["abiertas"]
 
@@ -2406,6 +2587,17 @@ def summarize_production_ot_observability(
         page_filters["cursor"] = payload["page"]["next_cursor"]
     totals["por_estado_documental"] = dict(sorted(documental.items()))
     totals["por_estado_operativo"] = dict(sorted(operativo.items()))
+    for metrics in [totals, *series.values()]:
+        for key in (
+            "objetivo_un",
+            "confirmado_un",
+            "kg_produccion_estandar",
+            "kg_atribuido_ot",
+            "kg_fabricacion_estimado_bom",
+            "kg_previo_estimado_bom",
+        ):
+            if metrics.pop(f"_{key}_incompleto", False):
+                metrics[key] = None
     start = normalized["fecha_desde"] or observed_start
     end = normalized["fecha_hasta"] or observed_end
     return {

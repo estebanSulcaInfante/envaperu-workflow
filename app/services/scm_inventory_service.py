@@ -44,6 +44,17 @@ INVENTORY_STOCK_FILTERS = {
 }
 
 
+def _warehouse_condition(column, warehouse_id):
+    value = str(warehouse_id or "").strip()
+    if value.upper() in {"SIN_ALMACEN", "SIN_ALMACÉN"}:
+        return column.is_(None)
+    try:
+        warehouse_uuid = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return false()
+    return column == warehouse_uuid
+
+
 def _page_limit(value):
     try:
         parsed = int(value or 25)
@@ -159,7 +170,7 @@ def _row_quantity(value):
     return format(Decimal(value).quantize(Decimal("0.001")), "f")
 
 
-def _article_explorer(session, *, ledger, classes, scope, query, location, stock_filter, sort, limit, cursor):
+def _article_explorer(session, *, ledger, classes, scope, query, location, warehouse_id, stock_filter, sort, limit, cursor):
     free = (
         ScmSaldoInventario.cantidad_fisica
         - ScmSaldoInventario.cantidad_reservada
@@ -174,7 +185,7 @@ def _article_explorer(session, *, ledger, classes, scope, query, location, stock
         updated=ScmSaldoInventario.updated_at,
         row_id=ScmSaldoInventario.id,
     )
-    conditions = [ScmArticulo.clase.in_(classes), ScmArticulo.unidad_inventario == "UN"]
+    conditions = [ScmArticulo.clase.in_(classes)]
     scoped = _scope_condition(scope, ScmArticulo.clase)
     if scoped is not None:
         conditions.append(scoped)
@@ -188,6 +199,10 @@ def _article_explorer(session, *, ledger, classes, scope, query, location, stock
         ))
     if location:
         conditions.append(ScmUbicacionInventario.codigo == location)
+    if warehouse_id:
+        conditions.append(_warehouse_condition(
+            ScmUbicacionInventario.almacen_id, warehouse_id,
+        ))
     available = _availability_condition(
         stock_filter,
         ScmSaldoInventario.cantidad_fisica,
@@ -235,7 +250,11 @@ def _article_explorer(session, *, ledger, classes, scope, query, location, stock
         "articulo_scm_id": row["article_id"],
         "articulo": {
             "codigo": row["code"], "nombre": row["name"],
-            "clase": row["class_name"], "unidad": row["unit"],
+            # ScmSaldoInventario is the legacy piece-count subledger. Its
+            # unit remains UN even when the article has opted into the KG
+            # physical subledger, so do not relabel this row from the article
+            # master.
+            "clase": row["class_name"], "unidad": "UN",
         },
         "ubicacion": {
             "id": row["location_id"], "codigo": row["location_code"],
@@ -262,7 +281,7 @@ def _article_explorer(session, *, ledger, classes, scope, query, location, stock
     return items, int(total), next_cursor
 
 
-def _material_explorer(session, *, ledger, classes, scope, query, location, stock_filter, sort, limit, cursor):
+def _material_explorer(session, *, ledger, classes, scope, query, location, warehouse_id, stock_filter, sort, limit, cursor):
     free = (
         ScmSaldoMaterialInventario.cantidad_fisica_kg
         - ScmSaldoMaterialInventario.cantidad_reservada_kg
@@ -291,6 +310,10 @@ def _material_explorer(session, *, ledger, classes, scope, query, location, stoc
         ))
     if location:
         conditions.append(ScmUbicacionInventario.codigo == location)
+    if warehouse_id:
+        conditions.append(_warehouse_condition(
+            ScmUbicacionInventario.almacen_id, warehouse_id,
+        ))
     available = _availability_condition(
         stock_filter,
         ScmSaldoMaterialInventario.cantidad_fisica_kg,
@@ -364,7 +387,7 @@ def _material_explorer(session, *, ledger, classes, scope, query, location, stoc
 
 def explore_inventory_balances(
     session, *, actor_id, ledger, query=None, location=None,
-    stock_filter="TODOS", sort="CODIGO", limit=25, cursor=None,
+    warehouse_id=None, stock_filter="TODOS", sort="CODIGO", limit=25, cursor=None,
 ):
     load_actor(session, actor_id, capability="INVENTARIO_VER")
     ledger = str(ledger or "").strip().upper()
@@ -393,6 +416,7 @@ def explore_inventory_balances(
     items, total, next_cursor = explorer(
         session, ledger=ledger, classes=definition["classes"], scope=scope,
         query=query, location=str(location or "").strip().upper() or None,
+        warehouse_id=str(warehouse_id).strip() if warehouse_id else None,
         stock_filter=stock_filter, sort=sort, limit=limit,
         cursor=decoded_cursor,
     )
@@ -407,6 +431,7 @@ def explore_inventory_balances(
         "filters": {
             "kardex": ledger, "q": str(query or "").strip(),
             "ubicacion": str(location or "").strip().upper() or None,
+            "almacen_id": str(warehouse_id).strip() if warehouse_id else None,
             "disponibilidad": stock_filter, "ordenar": sort,
         },
     }

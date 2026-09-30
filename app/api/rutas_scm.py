@@ -530,6 +530,7 @@ def inventario_explorador():
         return jsonify(explore_kg_balances(
             db.session, actor_id=_actor_id(), query=request.args.get("q"),
             location=request.args.get("ubicacion"), stock_filter=request.args.get("disponibilidad", "TODOS"),
+            warehouse_id=request.args.get("almacen_id"),
             sort=request.args.get("ordenar", "CODIGO"), limit=request.args.get("limite", 25), cursor=request.args.get("cursor"),
         ))
     return jsonify(explore_inventory_balances(
@@ -538,6 +539,7 @@ def inventario_explorador():
         ledger=request.args.get("kardex"),
         query=request.args.get("q"),
         location=request.args.get("ubicacion"),
+        warehouse_id=request.args.get("almacen_id"),
         stock_filter=request.args.get("disponibilidad", "TODOS"),
         sort=request.args.get("ordenar", "CODIGO"),
         limit=request.args.get("limite", 25),

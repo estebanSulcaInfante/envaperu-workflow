@@ -36,6 +36,7 @@ from app.models.scm_production_orders import (
     ScmOrdenFabricacion,
     ScmOrdenOperacion,
 )
+from app.models.molde import Molde
 from app.services.scm_production_observability_service import _text
 from app.services.scm_service_support import ScmServiceError, load_actor
 from app.services.scm_manga_assignment_projection import effective_work, effective_work_for_segment
@@ -44,7 +45,7 @@ from app.services.scm_manga_assignment_projection import effective_work, effecti
 KG = Decimal("0.001")
 GROUP_OPTIONS = (
     "DIA", "MES", "OF", "CORRIDA", "COLOR", "OT", "RECURSO",
-    "RESPONSABLE", "ARTICULO",
+    "RESPONSABLE", "MOLDE", "PIEZA", "ARTICULO",
 )
 MEASURE_OPTIONS = ("PESO_KG", "MANGAS", "P_UNITARIO_G", "P_TEORICO_KG")
 
@@ -69,6 +70,25 @@ def _d(value):
 
 def _n(value):
     return float(value) if value is not None else None
+
+
+def _history_color_identity(row):
+    """Return the canonical color identity carried by one history row."""
+    return (
+        row.get("_COLOR_ID"),
+        row.get("COLOR_CODIGO"),
+        row.get("COLOR_HEX"),
+        row.get("COLOR"),
+    )
+
+
+def _history_color_metadata(rows):
+    """Expose a swatch only when every row has one unambiguous color identity."""
+    identities = {_history_color_identity(row) for row in rows}
+    if len(identities) != 1:
+        return None, None
+    identity = next(iter(identities))
+    return identity[1], identity[2]
 
 
 def _iso(value):
@@ -238,11 +258,18 @@ def _load_rows(session, filters=None):
             "contexts": [],
             "ots": [],
             "mangas": {},
+            "molde": None,
+            "moldes": {},
         }
         for corrida, orden_fabricacion, orden in rows
     }
     if not runs:
         return []
+    mold_ids = {run["of"].molde_id for run in runs.values() if run["of"].molde_id}
+    molds = session.scalars(select(Molde).where(Molde.codigo.in_(mold_ids))).all() if mold_ids else []
+    mold_by_code = {mold.codigo: mold for mold in molds}
+    for run in runs.values():
+        run["molde"] = mold_by_code.get(run["of"].molde_id)
     work_rows = session.execute(
         select(ScmTrabajoOt, ScmTrabajoColor, RegistroDiarioProduccion)
         .join(ScmTrabajoColor, ScmTrabajoColor.trabajo_ot_id == ScmTrabajoOt.id)
@@ -258,6 +285,16 @@ def _load_rows(session, filters=None):
         run["ots"].append(ot)
         work_ids.add(work.id)
         ot_ids.add(ot.id)
+    snapshot_mold_ids = {
+        getattr(color_work, "molde_codigo_snapshot", None)
+        for _work, color_work, _ot in work_rows
+        if getattr(color_work, "molde_codigo_snapshot", None)
+    }
+    all_mold_ids = mold_ids | snapshot_mold_ids
+    all_molds = session.scalars(select(Molde).where(Molde.codigo.in_(all_mold_ids))).all() if all_mold_ids else []
+    mold_by_code.update({mold.codigo: mold for mold in all_molds})
+    for run in runs.values():
+        run["moldes"] = mold_by_code
 
     mangas = session.scalars(
         select(ScmManga).where(
@@ -378,13 +415,16 @@ def _load_rows(session, filters=None):
             )
             manga._report_controls = controls_by_manga.get(manga.id, [])
             manga._report_closure_event = closure_event
+            article = getattr(getattr(manga, "lote_articulo", None), "articulo", None)
+            manga._report_identity = _canonical_article_identity(article)
     result = []
     for run in runs.values():
         contexts = run["contexts"]
         ot = sorted((item["ot"] for item in contexts), key=lambda item: item.fecha)[0] if contexts else None
         work = contexts[0]["work"] if contexts else None
         color_work = contexts[0]["color_work"] if contexts else None
-        color_name = run["corrida"].color_produccion.nombre if run["corrida"].color_produccion else (color_work.color_nombre_snapshot if color_work else None)
+        canonical_color = run["corrida"].color_produccion
+        color_name = canonical_color.nombre if canonical_color else (color_work.color_nombre_snapshot if color_work else None)
         resource = (ot.maquina_nombre_snapshot or ot.maquina_codigo_snapshot) if ot is not None else None
         responsible = ot.responsable.nombre_completo if ot is not None and ot.responsable else None
         record = {
@@ -393,6 +433,9 @@ def _load_rows(session, filters=None):
             "work": work,
             "color_work": color_work,
             "color_name": color_name,
+            "color_id": getattr(canonical_color, "id", None),
+            "color_code": getattr(canonical_color, "codigo", None),
+            "color_hex": getattr(canonical_color, "hex_referencia", None),
             "resource": resource,
             "responsible": responsible,
         }
@@ -454,14 +497,90 @@ def _matches(run, filters):
 
 
 def _run_manga_values(run):
-    final = sum((_d(item._report_final_kg) or Decimal("0") for item in run["mangas"].values()), Decimal("0"))
-    opened = sum((_d(item._report_open_kg) or Decimal("0") for item in run["mangas"].values()), Decimal("0"))
-    known = sum(item._report_final_kg is not None or item._report_open_kg is not None for item in run["mangas"].values())
-    total = len(run["mangas"])
+    work_ids = {str(item["work"].id) for item in run.get("contexts", ()) if item.get("work") is not None}
+    final = Decimal("0")
+    opened = Decimal("0")
+    known = 0
+    total = 0
+    for manga in run["mangas"].values():
+        segments = list(getattr(manga, "_report_segments", ()) or ())
+        net = _d(getattr(manga, "_report_final_kg", None))
+        assigned = False
+        open_net = _d(getattr(manga, "_report_open_kg", None))
+        observed = net if net is not None else open_net
+        attributed_evidence = False
+        if segments and observed is not None and _segment_conciliates(segments, observed):
+            if getattr(manga, "_report_weight_corrected", False):
+                segments = _project_corrected_kg_segments(segments, observed)
+            attributed = sum(
+                (
+                    _d(segment.cantidad_atribuida_kg) or Decimal("0")
+                    for segment in segments
+                    if (owner := effective_work_for_segment(manga, segment)) is not None
+                    and str(owner.id) in work_ids
+                ),
+                Decimal("0"),
+            )
+            assigned = attributed > 0
+            if assigned:
+                attributed_evidence = True
+                if net is not None:
+                    final += attributed
+                else:
+                    opened += attributed
+        if not assigned and segments:
+            # Keep ambiguous/open ledgers visible as incomplete under their
+            # effective owner without inventing or duplicating a kg amount.
+            owner = effective_work(manga)
+            assigned = owner is not None and str(owner.id) in work_ids
+        if not assigned and not segments:
+            owner = effective_work(manga)
+            assigned = owner is not None and str(owner.id) in work_ids
+            if assigned:
+                final += net or Decimal("0")
+                opened += _d(getattr(manga, "_report_open_kg", None)) or Decimal("0")
+                attributed_evidence = net is not None or open_net is not None
+        if assigned:
+            total += 1
+            if attributed_evidence:
+                known += 1
     complete = total > 0 and total == known
     objective = _d(run["corrida"].objetivo_neto_kg)
     measured = final + opened if complete else None
     return final, opened, measured, total, known, objective
+
+
+def _canonical_article_identity(article):
+    """Resolve only persisted SCM -> PiezaColor -> Pieza relationships."""
+    if article is None:
+        return {"pieza_nombre": None, "pieza_codigo": None}
+    variant_link = getattr(article, "pieza_color", None)
+    variant = getattr(variant_link, "pieza_color", None)
+    piece = getattr(variant, "pieza_rel", None)
+    return {
+        "pieza_nombre": getattr(piece, "nombre", None),
+        "pieza_codigo": getattr(piece, "codigo", None),
+    }
+
+
+def _manga_group_value(run, manga, name):
+    identity = getattr(manga, "_report_identity", None) or {"pieza_nombre": None, "pieza_codigo": None}
+    owner = effective_work(manga)
+    context = _context_for_work(run, owner)
+    mold_code, mold_name = _context_mold_identity(run, context)
+    return {
+        "MOLDE": mold_code,
+        "PIEZA": identity.get("pieza_codigo"),
+    }.get(name, _run_group_value(run, name))
+
+
+def _context_mold_identity(run, context):
+    snapshot_code = getattr(getattr(context, "color_work", None), "molde_codigo_snapshot", None) if context else None
+    if context and isinstance(context, dict):
+        snapshot_code = getattr(context.get("color_work"), "molde_codigo_snapshot", None)
+    code = snapshot_code or getattr(run.get("of"), "molde_id", None)
+    mold = (run.get("moldes") or {}).get(code)
+    return code, getattr(mold, "nombre", None)
 
 
 def list_production_progress(session, *, actor_id, filters=None):
@@ -478,12 +597,35 @@ def list_production_progress(session, *, actor_id, filters=None):
         coverage = "COMPLETA" if total > 0 and total == known and visible else "INCOMPLETA"
         percent = ((final / objective) * 100) if objective and coverage == "COMPLETA" else None
         remaining = (objective - final) if objective is not None and coverage == "COMPLETA" else None
+        outputs = []
+        for output in getattr(run["corrida"], "salidas", ()) or ():
+            article = getattr(output, "articulo", None)
+            variant_link = getattr(article, "pieza_color", None)
+            variant = getattr(variant_link, "pieza_color", None)
+            piece = getattr(variant, "pieza_rel", None)
+            outputs.append({
+                "nombre": getattr(article, "nombre", None),
+                "codigo": getattr(article, "codigo", None),
+                "clase": getattr(article, "clase", None),
+                "cantidad_objetivo": _n(getattr(output, "cantidad_objetivo", None)),
+                "kg_estandar_objetivo": _n(getattr(output, "kg_estandar_objetivo", None)),
+                "pieza": {
+                    "nombre": getattr(piece, "nombre", None),
+                    "codigo": getattr(piece, "codigo", None),
+                } if piece is not None else None,
+            })
         items.append({
             "corrida_id": str(run["corrida"].id),
             "corrida": run["corrida"].codigo,
             "of": run["orden"].codigo,
             "ot": run["ot"].codigo_ot if run["ot"] is not None else None,
             "color": run["color_name"],
+            "color_hex": getattr(getattr(run["corrida"], "color_produccion", None), "hex_referencia", None),
+            "molde": {
+                "nombre": getattr(run.get("molde"), "nombre", None),
+                "codigo": getattr(run.get("molde"), "codigo", None),
+            } if run.get("molde") is not None else None,
+            "salidas": outputs,
             "objetivo_neto_kg": _n(objective),
             "kg_finalizados_efectivos": _n(final),
             "kg_medidos_en_abiertas": _n(opened),
@@ -510,6 +652,8 @@ def _run_group_value(run, name):
         "OT": ot.codigo_ot if ot else None,
         "RECURSO": run["resource"],
         "RESPONSABLE": run["responsible"],
+        "MOLDE": getattr(run.get("molde"), "codigo", None),
+        "PIEZA": None,
         "ARTICULO": next((m.articulo_codigo_snapshot for m in run["mangas"].values()), None),
     }[name]
 
@@ -520,10 +664,11 @@ def _context_for_work(run, work):
     return next((item for item in run.get("contexts", ()) if item["work"].id == work.id), None)
 
 
-def _context_group_value(run, context, name):
+def _context_group_value(run, context, name, manga=None):
     context = context or {"ot": run["ot"], "work": run.get("work"), "color_work": run.get("color_work")}
     ot = context["ot"]
     corrida = run["corrida"]
+    mold_code, _mold_name = _context_mold_identity(run, context)
     return {
         "DIA": _iso(ot.fecha),
         "MES": ot.fecha.strftime("%Y-%m"),
@@ -533,6 +678,11 @@ def _context_group_value(run, context, name):
         "OT": ot.codigo_ot,
         "RECURSO": ot.maquina_nombre_snapshot or ot.maquina_codigo_snapshot,
         "RESPONSABLE": ot.responsable.nombre_completo if ot.responsable else None,
+        "MOLDE": mold_code,
+        "PIEZA": (
+            (getattr(manga, "_report_identity", None) or {}).get("pieza_codigo")
+            if manga is not None else None
+        ),
         "ARTICULO": None,
     }[name]
 
@@ -613,12 +763,28 @@ def _history_rows(runs, groups, filters=None):
                 context = _context_for_work(run, owner)
                 if context is None or not _context_matches(run, context, manga, filters):
                     continue
-                values = {group: _run_group_value(run, group) for group in GROUP_OPTIONS}
+                values = {group: _manga_group_value(run, manga, group) for group in GROUP_OPTIONS}
+                values["COLOR_CODIGO"] = run.get("color_code")
+                values["COLOR_HEX"] = run.get("color_hex")
+                values["_COLOR_ID"] = run.get("color_id")
+                values["PIEZA_CODIGO"] = (getattr(manga, "_report_identity", None) or {}).get("pieza_codigo")
+                values["PIEZA_NOMBRE"] = (getattr(manga, "_report_identity", None) or {}).get("pieza_nombre")
+                mold_code, mold_name = _context_mold_identity(run, context)
+                values["MOLDE_CODIGO"] = mold_code
+                values["MOLDE_NOMBRE"] = mold_name
                 unit = _d(manga.peso_unitario_snapshot_g)
                 quantity = _d(manga.cantidad_confirmada_un or manga.cantidad_asignada_un)
                 rows.append({**values, "ARTICULO_NOMBRE": getattr(manga, "articulo_nombre_snapshot", None), "PESO_KG": None, "SUBTOTAL_CONOCIDO_KG": _n(net), "MANGAS": 0, "P_UNITARIO_G": None, "P_TEORICO_KG": None, "SUBTOTAL_TEORICO_KG": _n(unit * quantity / Decimal("1000")) if unit is not None and quantity is not None else None, "_known": False, "_manga_id": manga.id})
             for segment_run, context, kg, segment in segment_values:
-                values = {group: _context_group_value(segment_run, context, group) for group in GROUP_OPTIONS}
+                values = {group: _context_group_value(segment_run, context, group, manga) for group in GROUP_OPTIONS}
+                values["COLOR_CODIGO"] = segment_run.get("color_code")
+                values["COLOR_HEX"] = segment_run.get("color_hex")
+                values["_COLOR_ID"] = segment_run.get("color_id")
+                values["PIEZA_CODIGO"] = (getattr(manga, "_report_identity", None) or {}).get("pieza_codigo")
+                values["PIEZA_NOMBRE"] = (getattr(manga, "_report_identity", None) or {}).get("pieza_nombre")
+                mold_code, mold_name = _context_mold_identity(segment_run, context)
+                values["MOLDE_CODIGO"] = mold_code
+                values["MOLDE_NOMBRE"] = mold_name
                 values["ARTICULO"] = manga.articulo_codigo_snapshot
                 values["ARTICULO_NOMBRE"] = getattr(manga, "articulo_nombre_snapshot", None)
                 unit = _d(context["color_work"].peso_neto_snapshot_g) if context and context["color_work"] else _d(manga.peso_unitario_snapshot_g)
@@ -642,9 +808,26 @@ def _group_history_rows(rows, normalized):
             "ARTICULO_NOMBRE": row.get("ARTICULO_NOMBRE"),
             "ARTICULO_CODIGO": row.get("ARTICULO"),
         } if "ARTICULO" in normalized["groups"] else {})
-        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | article_descriptor | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "SUBTOTAL_TEORICO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False, "_has_theoretical_evidence": False, "_has_theoretical_subtotal": False})
+        identity_descriptor = {}
+        if "MOLDE" in normalized["groups"]:
+            identity_descriptor = {
+                "MOLDE_NOMBRE": row.get("MOLDE_NOMBRE"),
+                "MOLDE_CODIGO": row.get("MOLDE_CODIGO"),
+            }
+        if "PIEZA" in normalized["groups"]:
+            identity_descriptor = {
+                **identity_descriptor,
+                "PIEZA_NOMBRE": row.get("PIEZA_NOMBRE"),
+                "PIEZA_CODIGO": row.get("PIEZA_CODIGO"),
+            }
+        item = grouped.setdefault(key, {group: row[group] for group in normalized["groups"]} | article_descriptor | identity_descriptor | {"PESO_KG": Decimal("0"), "SUBTOTAL_CONOCIDO_KG": Decimal("0"), "SUBTOTAL_TEORICO_KG": Decimal("0"), "MANGAS": 0, "P_UNITARIO_WEIGHT": Decimal("0"), "P_UNITARIO_QTY": Decimal("0"), "P_TEORICO_KG": Decimal("0"), "coverage": "COMPLETA", "_has_unknown": False, "_has_theoretical_evidence": False, "_has_theoretical_subtotal": False, "_color_identities": set()})
+        item["_color_identities"].add(_history_color_identity(row))
         if "ARTICULO" in normalized["groups"] and not item.get("ARTICULO_NOMBRE"):
             item["ARTICULO_NOMBRE"] = row.get("ARTICULO_NOMBRE")
+        if "MOLDE" in normalized["groups"] and not item.get("MOLDE_NOMBRE"):
+            item["MOLDE_NOMBRE"] = row.get("MOLDE_NOMBRE")
+        if "PIEZA" in normalized["groups"] and not item.get("PIEZA_NOMBRE"):
+            item["PIEZA_NOMBRE"] = row.get("PIEZA_NOMBRE")
         manga_id = row.get("_manga_id")
         item["SUBTOTAL_CONOCIDO_KG"] += _d(row.get("SUBTOTAL_CONOCIDO_KG")) or Decimal("0")
         if row.get("P_TEORICO_KG") is not None:
@@ -671,6 +854,14 @@ def _group_history_rows(rows, normalized):
         item["SUBTOTAL_CONOCIDO_KG"] = _n(item["SUBTOTAL_CONOCIDO_KG"])
         item["SUBTOTAL_TEORICO_KG"] = _n(item["SUBTOTAL_TEORICO_KG"]) if item.pop("_has_theoretical_subtotal") else None
         item["P_TEORICO_KG"] = _n(item["P_TEORICO_KG"]) if item.pop("_has_theoretical_evidence") else None
+        color_identities = item.pop("_color_identities")
+        if len(color_identities) == 1:
+            identity = next(iter(color_identities))
+            item["COLOR_CODIGO"] = identity[1]
+            item["COLOR_HEX"] = identity[2]
+        else:
+            item["COLOR_CODIGO"] = None
+            item["COLOR_HEX"] = None
         items.append(item)
     return items
 
@@ -696,6 +887,12 @@ def _history_aggregate(rows, groups, measures):
             (row.get("ARTICULO") for row in rows if row.get("ARTICULO") is not None),
             None,
         )
+    if "MOLDE" in groups:
+        item["MOLDE_NOMBRE"] = next((row.get("MOLDE_NOMBRE") for row in rows if row.get("MOLDE_NOMBRE") is not None), None)
+        item["MOLDE_CODIGO"] = next((row.get("MOLDE_CODIGO") for row in rows if row.get("MOLDE_CODIGO") is not None), None)
+    if "PIEZA" in groups:
+        item["PIEZA_NOMBRE"] = next((row.get("PIEZA_NOMBRE") for row in rows if row.get("PIEZA_NOMBRE") is not None), None)
+        item["PIEZA_CODIGO"] = next((row.get("PIEZA_CODIGO") for row in rows if row.get("PIEZA_CODIGO") is not None), None)
 
     peso = Decimal("0")
     subtotal_conocido = Decimal("0")
@@ -740,6 +937,9 @@ def _history_aggregate(rows, groups, measures):
     item["SUBTOTAL_TEORICO_KG"] = _n(subtotal_teorico) if has_theoretical_subtotal else None
     item["P_TEORICO_KG"] = _n(theoretical) if has_theoretical else None
     item["P_UNITARIO_G"] = _n(unit_weight / unit_qty) if unit_qty else None
+    color_code, color_hex = _history_color_metadata(rows)
+    item["COLOR_CODIGO"] = color_code
+    item["COLOR_HEX"] = color_hex
 
     _select_history_measures(item, measures)
     return item
@@ -871,6 +1071,10 @@ def generate_production_history_xlsx(session, *, actor_id, filters=None):
     for group in payload["grouped_by"]:
         if group == "ARTICULO":
             headers.extend(["ARTICULO_NOMBRE", "ARTICULO_CODIGO"])
+        elif group == "MOLDE":
+            headers.extend(["MOLDE_NOMBRE", "MOLDE_CODIGO"])
+        elif group == "PIEZA":
+            headers.extend(["PIEZA_NOMBRE", "PIEZA_CODIGO"])
         else:
             headers.append(group)
     headers += list(payload["measures"])

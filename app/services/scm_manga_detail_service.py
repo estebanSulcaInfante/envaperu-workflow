@@ -30,6 +30,7 @@ from app.models.scm_ot import (
     ScmTramoMangaTrabajo,
 )
 from app.models.scm_warehouse import ScmExistenciaManga, ScmReversionRecepcionManga
+from app.models.molde import Molde
 from app.services.scm_production_reports_service import (
     GROUP_OPTIONS,
     _context_group_value,
@@ -196,6 +197,8 @@ def list_manga_history(session, *, actor_id, filters=None, group=None):
             "id": str(getattr(next((m for run in runs for m in run["mangas"].values() if m.id == manga_id), None), "public_id", manga_id)),
             "codigo": row.get("MANGA") or None,
             "articulo": {"codigo": row.get("ARTICULO"), "nombre": row.get("ARTICULO_NOMBRE")},
+            "molde": {"codigo": row.get("MOLDE_CODIGO") or row.get("MOLDE"), "nombre": row.get("MOLDE_NOMBRE")},
+            "pieza": {"codigo": row.get("PIEZA_CODIGO") or row.get("PIEZA"), "nombre": row.get("PIEZA_NOMBRE")},
             "color": row.get("COLOR"),
             "estado": None,
             "aporte_consulta_kg": Decimal(str(row.get("PESO_KG") or 0)),
@@ -222,13 +225,26 @@ def list_manga_history(session, *, actor_id, filters=None, group=None):
     }
 
 
-def _identity(manga):
+def _identity(session, manga):
+    work = effective_work(manga)
+    operation = getattr(work, "orden_operacion", None)
+    fabrication = getattr(operation, "fabricacion", None)
+    work_color = getattr(work, "trabajo_color", None)
+    mold_code = getattr(work_color, "molde_codigo_snapshot", None) or (
+        fabrication.molde_id if fabrication is not None else None
+    )
+    mold = session.get(Molde, mold_code) if mold_code else None
+    article = getattr(getattr(manga, "lote_articulo", None), "articulo", None)
+    variant = getattr(getattr(article, "pieza_color", None), "pieza_color", None)
+    piece = getattr(variant, "pieza_rel", None)
     return {
         "id": str(manga.public_id),
         "codigo": manga.codigo,
         "articulo": {"codigo": manga.articulo_codigo_snapshot, "nombre": manga.articulo_nombre_snapshot},
         "pieza_color": manga.pieza_color_sku_snapshot,
         "color": manga.color_snapshot,
+        "molde": {"codigo": mold_code, "nombre": getattr(mold, "nombre", None)} if mold_code else None,
+        "pieza": {"codigo": getattr(piece, "codigo", None), "nombre": getattr(piece, "nombre", None)} if piece else None,
         "color_identidad": _weighing_color_identity(manga, effective_work(manga)),
         "tipo_manga": {"codigo": manga.tipo_contenedor_codigo_snapshot, "nombre": manga.tipo_contenedor_nombre_snapshot},
         "tipo": manga.tipo,
@@ -661,7 +677,7 @@ def get_manga_detail(session, *, actor_id, public_id):
         "id": str(manga.public_id),
         "as_of": _iso(datetime.now(timezone.utc)),
         "secciones": {
-            "identidad": _section("disponible", item=_identity(manga)),
+            "identidad": _section("disponible", item=_identity(session, manga)),
             "documentos": _section("disponible", item=_documents(manga)),
             "tramos": _tramos(manga, visible_weights),
             "pesajes_correcciones_reaperturas": _pesajes(session, manga, visible_weights),

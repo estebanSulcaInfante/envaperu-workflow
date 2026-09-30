@@ -11,15 +11,18 @@ from app.models.scm_ot import (
     ScmAnulacionPesajeManga,
     ScmCorreccionPesajeManga,
     ScmManga,
+    ScmLoteArticulo,
     ScmPesajeManga,
     ScmTrabajoColor,
     ScmTrabajoOt,
 )
 from app.models.scm_production_orders import (
     ScmOrdenOperacion,
+    ScmOrdenOperacionSalida,
     ScmOrdenProduccion,
     ScmPlanProduccion,
 )
+from app.models.scm_articulos import ScmArticulo
 from app.models.scm_reproceso import (
     ScmAlertaOperativa,
     ScmReglaAlertaRevision,
@@ -28,6 +31,7 @@ from app.models.scm_rutas import ScmCentroTrabajo
 from app.models.scm_warehouse import ScmExistenciaManga
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_production_observability_service import (
+    _metric_contract,
     get_production_ot_observability,
     list_production_ot_observability,
 )
@@ -35,6 +39,43 @@ from app.services.scm_production_observability_service import (
 
 HASH = "a" * 64
 NOW = datetime(2026, 8, 10, 6, 0, tzinfo=timezone.utc)
+
+
+def test_metric_contract_uses_canonical_unit_and_keeps_kg_bases_separate():
+    kg = _metric_contract(
+        article_unit="KG",
+        effective={
+            "peso_fisico_neto_kg": 12.0,
+            "kg_produccion_estandar": 12.0,
+            "kg_produccion_ot": 12.0,
+            "kg_atribuido_ot": 12.0,
+            "kg_fabricacion_estimado": 7.5,
+            "kg_previo_estimado": 4.5,
+        },
+    )
+    assert kg == {
+        "unidad_evidencia": "KG",
+        "unidad_origen": "ARTICULO_SCM",
+        "peso_fisico_neto_kg": 12.0,
+        "kg_atribuido_ot": None,
+        "kg_fabricacion_estimado_bom": 7.5,
+        "kg_previo_estimado_bom": 4.5,
+        "kg_produccion_estandar": None,
+    }
+
+    unknown = _metric_contract(
+        article_unit=None,
+        effective={
+            "peso_fisico_neto_kg": 0.0,
+            "kg_produccion_estandar": 0.0,
+            "kg_produccion_ot": 0.0,
+            "kg_atribuido_ot": None,
+            "kg_fabricacion_estimado": None,
+            "kg_previo_estimado": None,
+        },
+    )
+    assert unknown["unidad_evidencia"] is None
+    assert unknown["kg_produccion_estandar"] is None
 
 
 def _actor(code, capability_codes):
@@ -114,6 +155,27 @@ def _weighing(*, manga, worker, net, standard, weighed_at):
     db.session.add(weighing)
     db.session.flush()
     return weighing
+
+
+def _canonical_lot(*, article, operation_id, code):
+    output = ScmOrdenOperacionSalida(
+        orden_operacion_id=operation_id,
+        articulo_scm_id=article.id,
+        cantidad_objetivo=1,
+        excedente_objetivo=0,
+    )
+    db.session.add(output)
+    db.session.flush()
+    lot = ScmLoteArticulo(
+        codigo=code,
+        articulo_id=article.id,
+        clase="SALIDA_ORDEN_OPERACION",
+        orden_operacion_salida_id=output.id,
+        cantidad_acreditada=1,
+    )
+    db.session.add(lot)
+    db.session.flush()
+    return lot
 
 
 def _seed_observability_graph():
@@ -436,13 +498,11 @@ def test_list_observability_unifies_fabrication_multicolor_and_assembly(
         assert fabrication["mangas_resumen"]["pendientes_recepcion"] == 1
         assert fabrication["mangas_resumen"]["recibidas"] == 1
         assert fabrication["mangas_resumen"]["anuladas"] == 1
-        assert fabrication["pesaje_resumen"] == {
-            "cantidad": 2,
-            "neto_kg": 19.5,
-            "peso_fisico_neto_kg": 19.5,
-            "kg_produccion_estandar": 18.8,
-            "ultimo_pesaje_at": NOW.isoformat(),
-        }
+        assert fabrication["pesaje_resumen"]["cantidad"] == 2
+        assert fabrication["pesaje_resumen"]["neto_kg"] == 19.5
+        assert fabrication["pesaje_resumen"]["peso_fisico_neto_kg"] == 19.5
+        assert fabrication["pesaje_resumen"]["kg_produccion_estandar"] is None
+        assert fabrication["pesaje_resumen"]["unidad_evidencia"] == "DESCONOCIDA"
         assert fabrication["alertas_resumen"] == {
             "abiertas": 1,
             "criticas": 1,
@@ -550,7 +610,7 @@ def test_observability_detail_respects_permissions_and_effective_facts(
         corrected = mangas["M-OT-OBS-FAB-02"]
         annulled = mangas["M-OT-OBS-FAB-04"]
         assert corrected["pesaje"]["peso_fisico_neto_kg"] == 11.5
-        assert corrected["pesaje"]["kg_produccion_estandar"] == 10.8
+        assert corrected["pesaje"]["kg_produccion_estandar"] is None
         assert corrected["pesaje"]["corregido"] is True
         assert annulled["pesaje"]["estado"] == "ANULADO"
 
@@ -598,6 +658,118 @@ def test_observability_detail_respects_permissions_and_effective_facts(
             "estado_calidad": "LIBERADA",
             "calidad_at": NOW.isoformat(),
         }
+
+
+def test_observability_http_uses_canonical_kg_without_un_progress(
+    app, client, scm_config
+):
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        article = ScmArticulo(
+            codigo="WIP-OBS-KG",
+            nombre="WIP observabilidad KG",
+            clase="SUBENSAMBLE_WIP",
+            unidad_inventario="KG",
+        )
+        db.session.add(article)
+        db.session.flush()
+        operation_id = ScmOrdenOperacion.query.filter_by(
+            codigo="OF-OBS-001"
+        ).one().id
+        lot = _canonical_lot(
+            article=article,
+            operation_id=operation_id,
+            code="LOTE-OBS-KG",
+        )
+        article_un = ScmArticulo(
+            codigo="PC-OBS-UN",
+            nombre="Pieza observabilidad UN",
+            clase="PIEZA_COLOR",
+            unidad_inventario="UN",
+        )
+        db.session.add(article_un)
+        db.session.flush()
+        lot_un = _canonical_lot(
+            article=article_un,
+            operation_id=operation_id,
+            code="LOTE-OBS-UN",
+        )
+        corrected = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
+        received = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-03").one()
+        corrected.lote_articulo_id = lot.id
+        received.lote_articulo_id = lot_un.id
+        db.session.commit()
+
+        response = _get(
+            client,
+            f"/api/scm/v1/observabilidad/ots/{seeded['fab'].public_id}",
+            seeded["full"],
+        )
+        assert response.status_code == 200
+        item = response.get_json()["item"]
+        corrected_payload = next(
+            manga
+            for work in item["trabajos"]
+            for manga in work["mangas"]
+            if manga["codigo"] == "M-OT-OBS-FAB-02"
+        )
+        assert item["unidad_evidencia"] == "MIXTO"
+        assert item["cantidades_resumen"] == {
+            "objetivo_un": None,
+            "confirmado_un": None,
+            "unidad_evidencia": "MIXTO",
+        }
+        assert corrected_payload["articulo"]["unidad_inventario"] == "KG"
+        assert corrected_payload["pesaje"]["metricas"] == {
+            "unidad_evidencia": "KG",
+            "unidad_origen": "ARTICULO_SCM",
+            "peso_fisico_neto_kg": 11.5,
+            "kg_atribuido_ot": None,
+            "kg_fabricacion_estimado_bom": None,
+            "kg_previo_estimado_bom": None,
+            "kg_produccion_estandar": None,
+        }
+
+
+def test_observability_http_preserves_canonical_un_standard_weight(
+    app, client, scm_config
+):
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        article = ScmArticulo(
+            codigo="PC-OBS-UN-CANON",
+            nombre="Pieza UN canónica",
+            clase="PIEZA_COLOR",
+            unidad_inventario="UN",
+        )
+        db.session.add(article)
+        db.session.flush()
+        operation_id = ScmOrdenOperacion.query.filter_by(
+            codigo="OF-OBS-001"
+        ).one().id
+        lot = _canonical_lot(
+            article=article,
+            operation_id=operation_id,
+            code="LOTE-OBS-UN-CANON",
+        )
+        for code in (
+            "M-OT-OBS-FAB-01",
+            "M-OT-OBS-FAB-02",
+            "M-OT-OBS-FAB-03",
+            "M-OT-OBS-FAB-04",
+        ):
+            ScmManga.query.filter_by(codigo=code).one().lote_articulo_id = lot.id
+        db.session.commit()
+
+        response = _get(
+            client,
+            f"/api/scm/v1/observabilidad/ots/{seeded['fab'].public_id}",
+            seeded["full"],
+        )
+        item = response.get_json()["item"]
+        assert item["unidad_evidencia"] == "UN"
+        assert item["cantidades_resumen"]["objetivo_un"] == 500.0
+        assert item["pesaje_resumen"]["kg_produccion_estandar"] == 18.8
 
 
 def test_observability_filters_cursor_and_sensitive_alert_filter(
@@ -823,7 +995,7 @@ def test_observability_summary_groups_day_and_month_without_mixing_units_kg(
         assert payload["totales"]["objetivo_un"] == 700.0
         assert payload["totales"]["confirmado_un"] == 420.0
         assert payload["totales"]["peso_fisico_neto_kg"] == 19.5
-        assert payload["totales"]["kg_produccion_estandar"] == 18.8
+        assert payload["totales"]["kg_produccion_estandar"] is None
 
         monthly = _get(
             client,
@@ -874,7 +1046,7 @@ def test_observability_query_count_is_bounded_after_ot_page(app, scm_config):
             )
 
         assert len(payload["items"]) == 14
-        assert len(statements) <= 18
+        assert len(statements) <= 19
 
 
 def test_observability_summary_is_not_truncated_at_list_page_size(

@@ -1,5 +1,6 @@
 from decimal import Decimal
 from io import BytesIO
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -33,7 +34,10 @@ from app.services.scm_production_reports_service import (
     _segment_conciliates,
     _valid_kg_segments,
     _history_weight_summary,
+    _context_group_value,
+    list_production_progress,
 )
+import app.services.scm_production_reports_service as production_reports_service
 from app.services.scm_service_support import ScmServiceError
 
 
@@ -187,6 +191,184 @@ def test_objective_without_mangas_does_not_claim_complete_weight_coverage():
     run = {"corrida": corrida, "mangas": {}}
     _final, _open, measured, total, known, _objective = _run_manga_values(run)
     assert (measured, total, known) == (None, 0, 0)
+
+
+def test_progress_exposes_canonical_color_hex_or_null(monkeypatch):
+    actor = SimpleNamespace(tiene_capacidad=lambda _capability: True)
+    corrida = SimpleNamespace(
+        id=1,
+        codigo="C-HEX",
+        objetivo_neto_kg=Decimal("10"),
+        color_produccion=SimpleNamespace(nombre="Rojo", hex_referencia="#AABBCC"),
+        salidas=[],
+    )
+    no_hex_corrida = SimpleNamespace(
+        id=2,
+        codigo="C-NO-HEX",
+        objetivo_neto_kg=Decimal("10"),
+        color_produccion=SimpleNamespace(nombre="Sin referencia", hex_referencia=None),
+        salidas=[],
+    )
+    base = {
+        "orden": SimpleNamespace(codigo="OF-HEX", estado="ABIERTA"),
+        "ot": None,
+        "color_name": "Rojo",
+        "molde": None,
+        "mangas": {},
+        "contexts": [],
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_args, **_kwargs: actor)
+    monkeypatch.setattr(
+        production_reports_service,
+        "_load_rows",
+        lambda *_args, **_kwargs: [
+            {**base, "corrida": corrida},
+            {**base, "corrida": no_hex_corrida},
+        ],
+    )
+
+    payload = list_production_progress(object(), actor_id=1, filters={})
+
+    assert [item["color_hex"] for item in payload["items"]] == ["#AABBCC", None]
+
+
+def test_progress_attributes_one_manga_once_per_effective_work_segment():
+    work_a = SimpleNamespace(id="work-a")
+    work_b = SimpleNamespace(id="work-b")
+    first = _segment(1, "0", "4", "4")
+    second = _segment(2, "4", "9", "5")
+    first.trabajo = work_a
+    second.trabajo = work_b
+    manga = SimpleNamespace(
+        id=77,
+        _report_final_kg=Decimal("9"),
+        _report_open_kg=None,
+        _report_segments=[first, second],
+        _report_weight_corrected=False,
+    )
+    run_a = {"corrida": SimpleNamespace(objetivo_neto_kg=9), "mangas": {77: manga}, "contexts": [{"work": work_a}]}
+    run_b = {"corrida": SimpleNamespace(objetivo_neto_kg=9), "mangas": {77: manga}, "contexts": [{"work": work_b}]}
+
+    assert _run_manga_values(run_a)[:5] == (Decimal("4"), Decimal("0"), Decimal("4"), 1, 1)
+    assert _run_manga_values(run_b)[:5] == (Decimal("5"), Decimal("0"), Decimal("5"), 1, 1)
+
+
+def test_open_control_is_attributed_only_when_kg_segments_conciliate():
+    work_a = SimpleNamespace(id="work-a")
+    work_b = SimpleNamespace(id="work-b")
+    first = _segment(1, "0", "4", "4")
+    second = _segment(2, "4", "6", "2")
+    first.trabajo = work_a
+    second.trabajo = work_b
+    manga = SimpleNamespace(
+        id=78, _report_final_kg=None, _report_open_kg=Decimal("6"),
+        _report_segments=[first, second], _report_weight_corrected=False,
+        trabajo=work_b,
+    )
+    run_a = {"corrida": SimpleNamespace(objetivo_neto_kg=9), "mangas": {78: manga}, "contexts": [{"work": work_a}]}
+    run_b = {"corrida": SimpleNamespace(objetivo_neto_kg=9), "mangas": {78: manga}, "contexts": [{"work": work_b}]}
+
+    assert _run_manga_values(run_a)[:5] == (Decimal("0"), Decimal("4"), Decimal("4"), 1, 1)
+    assert _run_manga_values(run_b)[:5] == (Decimal("0"), Decimal("2"), Decimal("2"), 1, 1)
+
+    manga._report_open_kg = Decimal("5")
+    assert _run_manga_values(run_a)[:5] == (Decimal("0"), Decimal("0"), None, 0, 0)
+    assert _run_manga_values(run_b)[:5] == (Decimal("0"), Decimal("0"), None, 1, 0)
+
+
+def test_identity_dimensions_keep_canonical_key_and_readable_metadata():
+    row = {
+        "MOLDE": "ML-001", "MOLDE_NOMBRE": "Molde multipieza", "MOLDE_CODIGO": "ML-001",
+        "PIEZA": "PZ-BASE", "PIEZA_NOMBRE": "Pieza base", "PIEZA_CODIGO": "PZ-BASE",
+        "PESO_KG": 2, "SUBTOTAL_CONOCIDO_KG": 2, "SUBTOTAL_TEORICO_KG": None,
+        "MANGAS": 1, "P_UNITARIO_WEIGHT": None, "P_UNITARIO_QTY": None,
+        "P_TEORICO_KG": None, "_known": True, "_manga_id": 1,
+    }
+    items = _group_history_rows([row], {"groups": ["MOLDE", "PIEZA"], "measures": list(MEASURE_OPTIONS)})
+
+    assert items[0]["MOLDE"] == "ML-001"
+    assert items[0]["MOLDE_NOMBRE"] == "Molde multipieza"
+    assert items[0]["PIEZA"] == "PZ-BASE"
+    assert items[0]["PIEZA_NOMBRE"] == "Pieza base"
+
+
+def test_history_uses_effective_work_mold_snapshot_over_of_mold():
+    context = {
+        "work": SimpleNamespace(id="work-a"),
+        "color_work": SimpleNamespace(molde_codigo_snapshot="ML-SNAPSHOT"),
+        "ot": SimpleNamespace(
+            fecha=date(2026, 9, 1), codigo_ot="OT-1", estado="CERRADA",
+            maquina_nombre_snapshot="M1", maquina_codigo_snapshot=None, responsable=None,
+        ),
+    }
+    run = {
+        "of": SimpleNamespace(molde_id="ML-OF"),
+        "moldes": {
+            "ML-SNAPSHOT": SimpleNamespace(codigo="ML-SNAPSHOT", nombre="Molde snapshot"),
+            "ML-OF": SimpleNamespace(codigo="ML-OF", nombre="Molde OF"),
+        },
+        "corrida": SimpleNamespace(codigo="C-1"),
+        "orden": SimpleNamespace(codigo="OF-1"),
+        "color_name": "ROJO",
+    }
+    assert _context_group_value(run, context, "MOLDE") == "ML-SNAPSHOT"
+
+
+def test_history_color_hex_is_canonical_and_mixed_groups_are_neutral():
+    base = {
+        "OF": "OF-1", "COLOR": "Rojo", "COLOR_CODIGO": 10,
+        "COLOR_HEX": "#AABBCC", "_COLOR_ID": 1,
+        "PESO_KG": 2, "SUBTOTAL_CONOCIDO_KG": 2,
+        "SUBTOTAL_TEORICO_KG": None, "MANGAS": 1,
+        "P_UNITARIO_WEIGHT": None, "P_UNITARIO_QTY": None,
+        "P_TEORICO_KG": None, "_known": True, "_manga_id": 1,
+    }
+    normalized = {"groups": ["OF"], "measures": list(MEASURE_OPTIONS)}
+
+    single = _group_history_rows([base], normalized)[0]
+    assert single["COLOR_HEX"] == "#AABBCC"
+    assert single["COLOR_CODIGO"] == 10
+
+    mixed = _group_history_rows([
+        base,
+        {**base, "COLOR": "Azul", "COLOR_CODIGO": 20, "COLOR_HEX": "#112233", "_COLOR_ID": 2, "_manga_id": 2},
+    ], normalized)[0]
+    assert mixed["COLOR_HEX"] is None
+    assert mixed["COLOR_CODIGO"] is None
+
+    hierarchy, _summary = _history_hierarchy(
+        [base, {**base, "COLOR": "Azul", "COLOR_CODIGO": 20, "COLOR_HEX": "#112233", "_COLOR_ID": 2, "_manga_id": 2}],
+        ["OF"],
+        list(MEASURE_OPTIONS),
+    )
+    assert hierarchy[0]["item"]["COLOR_HEX"] is None
+
+    work = SimpleNamespace(id="work-hex", codigo="TR-HEX")
+    ot = SimpleNamespace(
+        fecha=date(2026, 9, 1), codigo_ot="OT-HEX", estado="CERRADA",
+        maquina_nombre_snapshot="M1", maquina_codigo_snapshot=None,
+        responsable=None,
+    )
+    segment = _segment(101, "0", "2", "2")
+    segment.trabajo = work
+    manga = SimpleNamespace(
+        id=101, _report_final_kg=Decimal("2"), _report_segments=[segment],
+        _report_weight_corrected=False, peso_unitario_snapshot_g=100,
+        cantidad_confirmada_un=20, cantidad_asignada_un=20,
+        articulo_codigo_snapshot="ART-HEX", articulo_nombre_snapshot="Artículo hex",
+        _report_identity={"pieza_codigo": "PZ-HEX", "pieza_nombre": "Pieza hex"},
+    )
+    run = {
+        "corrida": SimpleNamespace(id="run-hex", codigo="C-HEX", objetivo_neto_kg=2),
+        "orden": SimpleNamespace(codigo="OF-HEX", estado="CERRADA"),
+        "ot": ot, "work": work, "color_work": SimpleNamespace(peso_neto_snapshot_g=100),
+        "color_name": "Rojo", "color_id": 1, "color_code": 10,
+        "color_hex": "#AABBCC", "resource": "M1", "responsible": None,
+        "contexts": [{"work": work, "color_work": SimpleNamespace(peso_neto_snapshot_g=100), "ot": ot}],
+        "mangas": {101: manga},
+    }
+    rows = _history_rows([run], ["OF", "COLOR"], None)
+    assert rows[0]["COLOR_HEX"] == "#AABBCC"
 
 
 def test_history_subtotal_deduplicates_manga_across_kg_segments_and_groups():
@@ -729,7 +911,9 @@ def test_progress_http_reports_complete_known_weights(app, client, scm_config):
 
         assert response.status_code == 200
         item = next(item for item in response.get_json()["items"] if item["corrida_id"] == str(corrida.id))
-        assert item["mangas"] == {"total": 4, "conocidas": 4}
-        assert item["kg_medidos_efectivos"] == 30.0
+        # The OT also contains a red work; its manga must not be copied into
+        # the blue objective merely because both works share the OT.
+        assert item["mangas"] == {"total": 3, "conocidas": 3}
+        assert item["kg_medidos_efectivos"] == 29.5
         assert item["coverage"]["estado"] == "COMPLETA"
-        assert item["porcentaje"] == 100.0
+        assert item["porcentaje"] == pytest.approx(98.3333333333)
