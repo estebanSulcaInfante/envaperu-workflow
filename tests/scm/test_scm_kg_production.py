@@ -498,6 +498,85 @@ def test_kg_pilot_projects_cumulative_controls_as_deltas_and_replays_without_dup
         assert Decimal(existence.unidad_fisica_kg.kg_verificados) == Decimal("12")
 
 
+def test_kg_k11_accepts_control_and_final_above_snapshot_without_duplicate_ledger(app):
+    with app.app_context():
+        app.config["KG_AUTOMATIC_INTAKE_ENABLED"] = True
+        app.config["KG_PRODUCTION_LOCATION_CODE"] = "PILOT_K11_OVER_PLAN"
+        creator, _approver, _order, _run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=120)
+        )
+        manga = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+        manga.lote_articulo.articulo.unidad_inventario = "KG"
+        manga.peso_bruto_max_kg_snapshot = Decimal("11.045")
+        manga.tara_nominal_g_snapshot = Decimal("45")
+        db.session.add(ScmUbicacionInventario(
+            codigo="PILOT_K11_OVER_PLAN", nombre="Pilot K11 production",
+            clases_articulo_json=["PIEZA_COLOR"], tipo="PUNTO_PRODUCCION",
+            permite_saldo_libre=True, activo=True,
+        ))
+        db.session.flush()
+        transition_color_work(
+            db.session, actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]), operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]}, action="iniciar",
+        )
+        station, label = _print_color_manga(
+            actor=creator, manga_id=manga.public_id, station_code="PESAJE-K11-OVER-PLAN",
+        )
+        base = {
+            "label_id": label["public_id"], "tara_kg": "0.045",
+            "tara_fuente": "TIPO_MANGA", "pesada_at": "2026-09-18T16:55:00-05:00",
+            "reading_stable": True, "control_type": "AVANCE_KG",
+        }
+        first = register_manga_weighing_control(
+            db.session, station_id=station.station_id, operation_id=uuid4(),
+            actor_id=creator.id,
+            data={**base, "capture_id": str(uuid4()), "peso_bruto_kg": "6.045"},
+        )
+        second_operation = uuid4()
+        second_data = {
+            **base, "capture_id": str(uuid4()), "peso_bruto_kg": "12.045",
+        }
+        second = register_manga_weighing_control(
+            db.session, station_id=station.station_id, operation_id=second_operation,
+            actor_id=creator.id, data=second_data,
+        )
+        replay = register_manga_weighing_control(
+            db.session, station_id=station.station_id, operation_id=second_operation,
+            actor_id=creator.id, data=second_data,
+        )
+        final_operation = uuid4()
+        final_data = {
+            **base, "capture_id": str(uuid4()), "peso_bruto_kg": "13.500",
+            "control_type": None,
+        }
+        final = confirm_manga_weighing(
+            db.session, station_id=station.station_id, operation_id=final_operation,
+            actor_id=creator.id, data=final_data,
+        )
+        final_replay = confirm_manga_weighing(
+            db.session, station_id=station.station_id, operation_id=final_operation,
+            actor_id=creator.id, data=final_data,
+        )
+
+        assert first["control"]["peso_neto_kg"] == "6.000"
+        assert second["control"]["peso_neto_kg"] == "12.000"
+        assert second["control"]["aporte_desde_control_anterior_kg"] == "6.000"
+        assert replay["idempotent_replay"] is True
+        assert final_replay == final
+        assert final["weighing"]["peso_fisico_neto_kg"] == "13.455"
+        assert manga.peso_bruto_max_kg_snapshot == Decimal("11.045")
+        movements = ScmMovimientoInventarioKg.query.order_by(
+            ScmMovimientoInventarioKg.created_at, ScmMovimientoInventarioKg.id,
+        ).all()
+        assert sorted(Decimal(row.cantidad_delta_kg) for row in movements) == [
+            Decimal("1.455"), Decimal("6"), Decimal("6"),
+        ]
+        assert sum(Decimal(row.cantidad_delta_kg) for row in movements) == Decimal("13.455")
+
+
 def test_kg_close_from_last_control_http_requires_capability_and_is_idempotent(
     app, client,
 ):

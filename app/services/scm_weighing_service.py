@@ -939,12 +939,6 @@ def register_manga_weighing_control(
             raise ScmServiceError(
                 "INVALID_TARE", "La tara debe ser menor que el bruto.", status_code=422
             )
-        if gross > Decimal(manga.peso_bruto_max_kg_snapshot):
-            raise ScmServiceError(
-                "WEIGHT_EXCEEDS_CONTAINER_LIMIT",
-                "El bruto supera el limite congelado del tipo de manga.",
-                status_code=422,
-            )
         tare_source = str(data.get("tara_fuente") or "").upper()
         nominal_tare = (
             Decimal(manga.tara_nominal_g_snapshot) / 1000
@@ -1475,12 +1469,6 @@ def confirm_manga_weighing(
             raise ScmServiceError(
                 "INVALID_TARE",
                 "La tara debe ser menor que el peso bruto.",
-                status_code=422,
-            )
-        if gross > Decimal(manga.peso_bruto_max_kg_snapshot):
-            raise ScmServiceError(
-                "WEIGHT_EXCEEDS_CONTAINER_LIMIT",
-                "El bruto supera el limite congelado del tipo de manga.",
                 status_code=422,
             )
         tare_source = str(data.get("tara_fuente") or "").upper()
