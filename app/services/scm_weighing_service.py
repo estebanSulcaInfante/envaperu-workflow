@@ -208,6 +208,48 @@ def _exceeds_alert_threshold(session, code, value):
     return revision is not None and Decimal(str(value)) > Decimal(revision.umbral)
 
 
+def _late_annulment_alert(session, *, actor_id, manga, weighing, annulment):
+    """Create the configured late correction/annulment alert, if applicable."""
+    delay_hours = _elapsed_hours(annulment.anulada_at, weighing.pesada_at)
+    if not _exceeds_alert_threshold(
+        session, "CORRECCION_PESAJE_TARDIA", delay_hours
+    ):
+        return None
+    return upsert_operational_alert(
+        session,
+        rule_code="CORRECCION_PESAJE_TARDIA",
+        aggregate_type="ANULACION_PESAJE_MANGA",
+        aggregate_id=annulment.public_id,
+        condition_key=f"anulada:{weighing.public_id}",
+        summary=f"Anulacion tardia del pesaje de {manga.codigo}",
+        detail={
+            "manga": manga.codigo,
+            "pesaje_id": str(weighing.public_id),
+            "anulacion_id": str(annulment.public_id),
+            "motivo": annulment.motivo,
+            "evidencia": annulment.evidencia,
+            "actor_id": actor_id,
+            "trabajo_ot_id": str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None,
+            "orden_trabajo_id": (
+                str(manga.trabajo.orden_trabajo_id)
+                if manga.trabajo is not None and manga.trabajo.orden_trabajo_id
+                else None
+            ),
+            "orden_operacion_id": (
+                str(manga.trabajo.orden_operacion_id)
+                if manga.trabajo is not None and manga.trabajo.orden_operacion_id
+                else None
+            ),
+            "pesada_at": weighing.pesada_at.isoformat(),
+            "anulada_at": annulment.anulada_at.isoformat(),
+            "horas_transcurridas": format(
+                delay_hours.quantize(Decimal("0.001")), "f"
+            ),
+        },
+        actor_id=actor_id,
+    )
+
+
 def _kg(value, field, *, allow_zero=False):
     try:
         parsed = Decimal(str(value))
@@ -2031,6 +2073,7 @@ def annul_manga_weighing(
                 atributo_proceso=kg_existence.atributo_proceso,
             )
             session.add(movement_kg)
+            session.flush()
             kg_existence.estado_logistico = "REVERSADA"
             kg_existence.version += 1
             unit_kg = kg_existence.unidad_fisica_kg
@@ -2039,6 +2082,7 @@ def annul_manga_weighing(
                 unit_kg.estado_logistico = "REVERSADA"
                 unit_kg.saldo_id = None
                 unit_kg.ubicacion_id = None
+                unit_kg.recepcion_vigente_id = None
                 unit_kg.version += 1
                 kg_inventory_reversal = {
                     "movimiento_id": movement_kg.id,
@@ -2076,6 +2120,15 @@ def annul_manga_weighing(
                     correction.resolution_reason = (
                         "Rechazada automaticamente por anulacion del pesaje."
                     )
+                segments = session.scalars(
+                    select(ScmTramoMangaTrabajo)
+                    .where(ScmTramoMangaTrabajo.manga_id == manga.id)
+                    .with_for_update()
+                ).all()
+                for segment in segments:
+                    # Preserve measured boundaries and audit facts; ANULADO
+                    # removes the contribution from productive projections.
+                    segment.estado = "ANULADO"
                 annulment = ScmAnulacionPesajeManga(
                     pesaje_id=weighing.id,
                     motivo=reason,
@@ -2087,6 +2140,13 @@ def annul_manga_weighing(
                 )
                 session.add(annulment)
                 session.flush()
+                alert = _late_annulment_alert(
+                    session,
+                    actor_id=actor.id,
+                    manga=manga,
+                    weighing=weighing,
+                    annulment=annulment,
+                )
                 response = {
                     "anulacion": annulment.to_dict(),
                     "manga": _serialize_manga(manga),
@@ -2101,6 +2161,7 @@ def annul_manga_weighing(
                     "trabajo_color_id": (
                         str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
                     ),
+                    "alertas_generadas": [str(alert.id)] if alert else [],
                     "anulacion_inventario_kg": (
                         {
                             "movimiento_id": str(kg_inventory_reversal["movimiento_id"]),
@@ -2275,6 +2336,13 @@ def annul_manga_weighing(
         )
         session.add(annulment)
         session.flush()
+        alert = _late_annulment_alert(
+            session,
+            actor_id=actor.id,
+            manga=manga,
+            weighing=weighing,
+            annulment=annulment,
+        )
         response = {
             "anulacion": annulment.to_dict(),
             "manga": _serialize_manga(manga),
@@ -2289,6 +2357,7 @@ def annul_manga_weighing(
             "trabajo_color_id": (
                 str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None
             ),
+            "alertas_generadas": [str(alert.id)] if alert else [],
             "anulacion_inventario_kg": (
                 {
                     "movimiento_id": str(kg_inventory_reversal["movimiento_id"]),

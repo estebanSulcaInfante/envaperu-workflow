@@ -248,6 +248,7 @@ def test_detail_after_real_weighing_annulment_keeps_negative_typed_movement(app)
         payload = get_manga_detail(db.session, actor_id=creator.id, public_id=manga.public_id)
         history = payload["secciones"]["pesajes_correcciones_reaperturas"]
         assert history["vigente"] is None
+        assert payload["secciones"]["stock_movimientos"]["custodia_vigente"] == []
         movements = payload["secciones"]["stock_movimientos"]["movimientos"]
         annulments = [item for item in movements if item["referencia_tipo"] == "ANULACION_PESAJE_MANGA"]
         assert annulments

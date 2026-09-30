@@ -22,6 +22,7 @@ from app.models.trabajador import RolOperativo, Trabajador
 from app.models.registro import RegistroDiarioProduccion
 from app.models.scm_inventory import ScmMovimientoInventario, ScmSaldoInventario, ScmUbicacionInventario
 from app.models.scm_inventory_kg import ScmExistenciaMangaKg, ScmMovimientoInventarioKg, ScmSaldoInventarioKg
+from app.models.scm_reproceso import ScmAlertaOperativa
 from app.services.scm_kg_production_service import (
     close_kg_from_last_control,
     close_productive_document_kg,
@@ -754,6 +755,121 @@ def test_kg_auto_correction_reopen_reweigh_and_annul_keep_ledger_coherent(app):
         assert annulled["manga"]["estado"] == "ANULADA"
         assert Decimal(ScmSaldoInventarioKg.query.one().cantidad_fisica_kg) == Decimal("0")
         assert ScmExistenciaMangaKg.query.one().estado_logistico == "REVERSADA"
+
+
+def test_kg_annulment_neutralizes_segments_and_reports_late_alert(app):
+    """An annulled KG manga must not contribute its closed segment to OT totals."""
+    with app.app_context():
+        creator, approver, manga, _station, _prelabel, weighed = _auto_final_kg_fixture(
+            app, station_code="PESAJE-KG-ANNUL-SEGMENT"
+        )
+        _grant_capabilities(approver, ("PESAJE_ANULAR", "OT_VER", "MANGA_PESAJE_VER"))
+        db.session.commit()
+        segments = ScmTramoMangaTrabajo.query.filter_by(manga_id=manga.id).all()
+        if not segments:
+            segments = [ScmTramoMangaTrabajo(
+                manga_id=manga.id,
+                asignacion_plan_id=manga.asignacion_id,
+                trabajo_ot_id=manga.trabajo_ot_id,
+                asignacion_personal_trabajo_id=manga.asignacion_personal_trabajo_id,
+                secuencia=1,
+                estado="CERRADO",
+                cantidad_inicio_un=0,
+                cantidad_fin_un=manga.cantidad_asignada_un,
+                cantidad_atribuida_un=0,
+                cantidad_inicio_kg=0,
+                cantidad_fin_kg=weighed["weighing"]["peso_fisico_neto_kg"],
+                cantidad_atribuida_kg=weighed["weighing"]["peso_fisico_neto_kg"],
+                created_by_id=creator.id,
+            )]
+            db.session.add(segments[0])
+            db.session.flush()
+        assert any(item.estado == "CERRADO" for item in segments)
+
+        operation_id = uuid4()
+        result = annul_manga_weighing(
+            db.session,
+            actor_id=approver.id,
+            weighing_id=UUID(weighed["weighing"]["public_id"]),
+            operation_id=operation_id,
+            data={"motivo": "Anulación de prueba tardía"},
+        )
+
+        db.session.expire_all()
+        persisted_segments = ScmTramoMangaTrabajo.query.filter_by(manga_id=manga.id).all()
+        assert all(item.estado == "ANULADO" for item in persisted_segments)
+        assert all(item.cantidad_atribuida_kg is not None for item in persisted_segments)
+        assert ScmExistenciaMangaKg.query.one().unidad_fisica_kg.recepcion_vigente_id is None
+        assert result["anulacion_inventario_kg"]["movimiento_id"] != "None"
+        assert result["alertas_generadas"]
+        assert {item.tipo for item in ScmAlertaOperativa.query.all()} >= {
+            "CORRECCION_PESAJE_TARDIA"
+        }
+        alert = ScmAlertaOperativa.query.filter_by(
+            tipo="CORRECCION_PESAJE_TARDIA"
+        ).one()
+        assert alert.agregado_tipo == "ANULACION_PESAJE_MANGA"
+        assert alert.detalle["motivo"] == "Anulación de prueba tardía"
+        assert alert.detalle["pesaje_id"] == weighed["weighing"]["public_id"]
+        assert alert.detalle["actor_id"] == approver.id
+        replay = annul_manga_weighing(
+            db.session,
+            actor_id=approver.id,
+            weighing_id=UUID(weighed["weighing"]["public_id"]),
+            operation_id=operation_id,
+            data={"motivo": "Anulación de prueba tardía"},
+        )
+        assert replay == result
+        assert ScmAlertaOperativa.query.filter_by(
+            tipo="CORRECCION_PESAJE_TARDIA"
+        ).count() == 1
+
+
+def test_kg_ot_close_excludes_historical_annulled_manga_and_closed_segment(app):
+    """Historical annulled rows cannot contribute to a later OT KG close."""
+    with app.app_context():
+        creator, _approver, manga, _station, _prelabel, weighed = _auto_final_kg_fixture(
+            app, station_code="PESAJE-KG-CLOSE-ANNULLED-HISTORY"
+        )
+        work = db.session.get(ScmTrabajoOt, manga.trabajo_ot_id)
+        for ot_work in work.orden_trabajo.trabajos_ot:
+            ot_work.estado = "COMPLETADO"
+            for work_manga in work.mangas:
+                work_manga.estado = "ANULADA"
+        segments = ScmTramoMangaTrabajo.query.filter_by(manga_id=manga.id).all()
+        if not segments:
+            db.session.add(ScmTramoMangaTrabajo(
+                manga_id=manga.id,
+                asignacion_plan_id=manga.asignacion_id,
+                trabajo_ot_id=manga.trabajo_ot_id,
+                asignacion_personal_trabajo_id=manga.asignacion_personal_trabajo_id,
+                secuencia=1,
+                estado="CERRADO",
+                cantidad_inicio_un=0,
+                cantidad_fin_un=manga.cantidad_asignada_un,
+                cantidad_atribuida_un=0,
+                cantidad_inicio_kg=0,
+                cantidad_fin_kg="19.700",
+                cantidad_atribuida_kg="19.700",
+                created_by_id=creator.id,
+            ))
+        else:
+            for segment in segments:
+                segment.estado = "CERRADO"
+                segment.cantidad_atribuida_kg = "19.700"
+        db.session.flush()
+
+        result = close_productive_document_kg(
+            db.session,
+            actor_id=creator.id,
+            documento_tipo="OT",
+            documento_id=work.orden_trabajo.public_id,
+            operation_id=uuid4(),
+            data={"version": work.orden_trabajo.version},
+        )
+
+        assert result["kg_medido"] == "0.000"
+        assert result["un_confirmadas"] is False
 
 
 def test_kg_production_evidence_is_idempotent_and_keeps_bom_pending(app):

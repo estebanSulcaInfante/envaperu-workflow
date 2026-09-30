@@ -1201,6 +1201,10 @@ def close_productive_document_kg(
                 if segment.estado != "ANULADO":
                     ot_segments_by_manga.setdefault(segment.manga_id, []).append(segment)
         for manga in mangas:
+            if manga.estado == "ANULADA":
+                # Annulment preserves the weighing/segment facts but removes
+                # this manga from the productive KG projection entirely.
+                continue
             physical_segments = (
                 ot_segments_by_manga.get(manga.id, [])
                 if tipo == "OT" else [

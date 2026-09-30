@@ -488,6 +488,8 @@ def _stock(session, manga, actor_id, visible_weights):
     # An active unit without a receipt remains visible as an unknown quantity;
     # no difference against the original receipt is calculated here.
     for unit in kg_units:
+        if unit.estado != "ACTIVA":
+            continue
         article_class = getattr(getattr(unit, "articulo", None), "clase", None)
         receipt = (
             session.get(ScmExistenciaMangaKg, unit.recepcion_vigente_id)
@@ -501,7 +503,7 @@ def _stock(session, manga, actor_id, visible_weights):
                 "estado": "restringido", "unidad": "KG", "motivo": "warehouse_scope"
             })
             continue
-        if receipt is not None and receipt.unidad_fisica_kg_id == unit.id:
+        if receipt is not None and receipt.estado_logistico != "REVERSADA" and receipt.unidad_fisica_kg_id == unit.id:
             if visible_weights:
                 current_custody.append(kg_receipt_payload(receipt, unit))
             else:
