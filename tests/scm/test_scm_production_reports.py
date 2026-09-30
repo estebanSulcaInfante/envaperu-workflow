@@ -193,6 +193,91 @@ def test_objective_without_mangas_does_not_claim_complete_weight_coverage():
     assert (measured, total, known) == (None, 0, 0)
 
 
+def _progress_manga(manga_id, *, state="PENDIENTE_RECEPCION_ALMACEN", final=Decimal("6"), open_kg=None, work=None):
+    return SimpleNamespace(
+        id=manga_id, estado=state, trabajo=work,
+        _report_final_kg=final, _report_open_kg=open_kg,
+        _report_segments=[], _report_weight_corrected=False,
+    )
+
+
+def test_progress_excludes_cancelled_mangas_from_coverage_and_totals(monkeypatch):
+    work = SimpleNamespace(id="work-of78")
+    active = {
+        index: _progress_manga(index, final=(Decimal("55.7") if index == 68 else Decimal("6")), work=work)
+        for index in range(1, 69)
+    }
+    cancelled = {
+        100 + index: _progress_manga(100 + index, state="ANULADA", final=Decimal("10"), work=work)
+        for index in range(1, 10)
+    }
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("1000")),
+        "mangas": {**active, **cancelled},
+        "contexts": [{"work": work}],
+    }
+
+    final, opened, measured, total, known, objective = _run_manga_values(run)
+
+    assert (final, opened, measured, total, known, objective) == (
+        Decimal("457.7"), Decimal("0"), Decimal("457.7"), 68, 68, Decimal("1000")
+    )
+    run.update({
+        "corrida": SimpleNamespace(
+            id="run-of78", codigo="C-OF78", objetivo_neto_kg=Decimal("1000"),
+            color_produccion=None, salidas=[],
+        ),
+        "orden": SimpleNamespace(codigo="OF-000078", estado="ABIERTA"),
+        "ot": None, "color_name": "Rojo", "molde": None,
+    })
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_args, **_kwargs: SimpleNamespace(tiene_capacidad=lambda _capability: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_args, **_kwargs: [run])
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+    assert item["kg_finalizados_efectivos"] == 457.7
+    assert item["porcentaje"] == pytest.approx(45.77)
+    assert item["coverage"]["estado"] == "COMPLETA"
+    assert item["mangas"] == {"total": 68, "conocidas": 68}
+
+
+def test_progress_excludes_cancelled_manga_even_when_old_weight_is_present():
+    work = SimpleNamespace(id="work-cancelled")
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("100")),
+        "mangas": {1: _progress_manga(1, state="ANULADA", final=Decimal("90"), work=work)},
+        "contexts": [{"work": work}],
+    }
+
+    final, opened, measured, total, known, _objective = _run_manga_values(run)
+
+    assert (final, opened, measured, total, known) == (Decimal("0"), Decimal("0"), None, 0, 0)
+
+
+def test_progress_with_only_cancelled_mangas_has_no_fabricated_evidence():
+    work = SimpleNamespace(id="work-only-cancelled")
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("100")),
+        "mangas": {1: _progress_manga(1, state="ANULADA", final=None, open_kg=None, work=work)},
+        "contexts": [{"work": work}],
+    }
+
+    final, opened, measured, total, known, _objective = _run_manga_values(run)
+
+    assert (final, opened, measured, total, known) == (Decimal("0"), Decimal("0"), None, 0, 0)
+
+
+def test_progress_active_manga_without_evidence_remains_incomplete():
+    work = SimpleNamespace(id="work-unknown")
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("100")),
+        "mangas": {1: _progress_manga(1, final=None, open_kg=None, work=work)},
+        "contexts": [{"work": work}],
+    }
+
+    final, opened, measured, total, known, _objective = _run_manga_values(run)
+
+    assert (final, opened, measured, total, known) == (Decimal("0"), Decimal("0"), None, 1, 0)
+
+
 def test_progress_exposes_canonical_color_hex_or_null(monkeypatch):
     actor = SimpleNamespace(tiene_capacidad=lambda _capability: True)
     corrida = SimpleNamespace(

@@ -503,6 +503,8 @@ def _run_manga_values(run):
     known = 0
     total = 0
     for manga in run["mangas"].values():
+        if str(getattr(manga, "estado", "")).upper() == "ANULADA":
+            continue
         segments = list(getattr(manga, "_report_segments", ()) or ())
         net = _d(getattr(manga, "_report_final_kg", None))
         assigned = False
