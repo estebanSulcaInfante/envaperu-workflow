@@ -505,6 +505,8 @@ def _ensure_demand_and_orders(session, *, actor, machine, catalogs, operational_
                 orden_operacion=order,
                 molde_id=catalogs["mold"].codigo,
                 maquina_prevista_id=machine.id,
+                snapshot_proceso="SOPLADO",
+                fuente_proceso="EXPLICITO",
                 snapshot_tiempo_ciclo_seg=Decimal("30"),
                 snapshot_horas_turno=Decimal("8"),
                 snapshot_peso_colada_gr=Decimal("5"),

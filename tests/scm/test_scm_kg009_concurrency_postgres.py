@@ -1,7 +1,7 @@
 """KG009 PostgreSQL concurrency contracts.
 
-These tests use the real weighing and KG opt-in services against the dedicated
-``kg009_concurrency`` database.  Every worker owns its Flask/SQLAlchemy
+These tests use the real weighing and KG opt-in services against an isolated
+schema in ``TEST_DATABASE_URL``.  Every worker owns its Flask/SQLAlchemy
 session; the events only order the two sessions and never replace a database
 lock with an in-memory assertion.
 """
@@ -12,8 +12,12 @@ from threading import Event
 from uuid import UUID, uuid4, uuid5
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.schema import DropSchema
+from tests.scm.test_scm_prepared_material_postgres import (
+    _isolated_postgres_schema, _upgrade_schema,
+)
 
 from app import create_app, db
 from app.config import Config
@@ -54,41 +58,28 @@ import test_scm_kg009_recovery as recovery_tests
 
 pytestmark = pytest.mark.postgres
 
-KG009_DATABASE_URL = "postgresql://kg009_test@127.0.0.1:55441/kg009_concurrency"
+@pytest.fixture(scope="module")
+def kg009_schema_url():
+    """Own one migrated schema in the guarded local TEST_DATABASE_URL.
+
+    Like the other PostgreSQL service tests this requires a backend test role
+    (superuser or BYPASSRLS). It does not validate production RLS policies.
+    """
+    engine, schema, url = _isolated_postgres_schema()
+    try:
+        _upgrade_schema(url)
+        yield url.render_as_string(hide_password=False)
+    finally:
+        with engine.begin() as connection:
+            connection.execute(DropSchema(schema, cascade=True))
+        engine.dispose()
 
 
 @pytest.fixture(scope="module")
-def postgres_kg009_app():
-    """Bind a real app to the coordinator-owned, isolated KG009 database."""
-    engine = create_engine(KG009_DATABASE_URL, pool_pre_ping=True)
-    try:
-        with engine.connect() as connection:
-            database = connection.execute(text("SELECT current_database()" )).scalar_one()
-            if database != "kg009_concurrency":
-                pytest.fail(f"suite KG009 conectada a base no autorizada: {database}")
-            tables = set(connection.execute(text(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-            )).scalars())
-        if "scm_articulo" not in tables or "scm_manga" not in tables:
-            pytest.fail(
-                "kg009_concurrency no tiene el esquema migrado; ejecutar la "
-                "preparación PostgreSQL aprobada antes de esta suite"
-            )
-        # This database is created exclusively for this suite.  Reset only its
-        # data so repeated RED/GREEN runs cannot reuse actors or hard-coded
-        # legacy fixture codes; migration history remains intact.
-        data_tables = sorted(tables - {"alembic_version"})
-        if data_tables:
-            quoted = ", ".join(f'"{table}"' for table in data_tables)
-            with engine.begin() as connection:
-                connection.execute(text(
-                    f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"
-                ))
-    finally:
-        engine.dispose()
-
+def postgres_kg009_app(kg009_schema_url):
+    """Bind the app to this module's isolated, freshly migrated schema."""
     original_uri = Config.SQLALCHEMY_DATABASE_URI
-    Config.SQLALCHEMY_DATABASE_URI = KG009_DATABASE_URL
+    Config.SQLALCHEMY_DATABASE_URI = kg009_schema_url
     app = create_app()
     app.config.update(
         TESTING=True,
@@ -186,13 +177,13 @@ def _prepare_unweighed_manga(app):
 
 
 def _reset_dedicated_data(app):
-    """Reset only the explicitly dedicated database between scenarios."""
+    """Reset only this module-owned schema between scenarios."""
     with app.app_context():
         db.session.rollback()
         db.session.remove()
         with db.engine.begin() as connection:
             tables = set(connection.execute(text(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()"
             )).scalars())
             data_tables = sorted(tables - {"alembic_version"})
             if data_tables:

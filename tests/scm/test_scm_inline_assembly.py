@@ -199,6 +199,7 @@ def _seed_concurrent_wip_flow():
     )
 
     machine = Maquina.query.first()
+    machine.tipo_maquina.proceso = "INYECCION"
     fabrication_order = ScmOrdenOperacion(
         codigo="OF-F3-000001",
         tipo="FABRICACION",
@@ -210,6 +211,8 @@ def _seed_concurrent_wip_flow():
     fabrication = ScmOrdenFabricacion(
         orden_operacion=fabrication_order,
         maquina_prevista_id=machine.id,
+        snapshot_proceso="INYECCION",
+        fuente_proceso="EXPLICITO",
     )
     run = ScmCorridaFabricacion(
         orden_fabricacion=fabrication,
@@ -440,7 +443,7 @@ def test_api_real_flow_reserves_inline_quota_without_fake_fabrication_manga(
             "asignaciones": [],
         },
     )
-    assert work_response.status_code == 201
+    assert work_response.status_code == 201, work_response.get_json()
     work_payload = work_response.get_json()["trabajo_color"]
     work_id = UUID(work_payload["id"])
     started = client.post(

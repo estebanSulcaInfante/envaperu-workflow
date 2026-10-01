@@ -11,13 +11,12 @@ from test_station_monitoring_contract import provisioned_station, _auth_headers
 CONTRACT = Path(__file__).resolve().parents[1] / "contracts/scm-kg-return-weighing-v1"
 
 
-def test_contract_copies_and_examples():
-    workspace = Path(__file__).resolve().parents[2]
-    for filename in ("contract.schema.json", "examples.json"):
-        assert (CONTRACT / filename).read_bytes() == (workspace / "contracts/scm-kg-return-weighing-v1" / filename).read_bytes()
-        assert (CONTRACT / filename).read_bytes() == (workspace / "modulo-pesaje/backend/contracts/scm-kg-return-weighing-v1" / filename).read_bytes()
-    schema = json.loads((CONTRACT / "contract.schema.json").read_text())
-    for name, example in json.loads((CONTRACT / "examples.json").read_text()).items():
+def test_provider_contract_schema_and_examples():
+    # The pinned station has no KG return consumer; no parity claim is made.
+    schema = json.loads((CONTRACT / "contract.schema.json").read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(schema)
+    examples = json.loads((CONTRACT / "examples.json").read_text(encoding="utf-8"))
+    for name, example in examples.items():
         Draft202012Validator(schema["$defs"][name], format_checker=FormatChecker()).validate(example)
 
 

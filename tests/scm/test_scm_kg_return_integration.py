@@ -1,11 +1,8 @@
-"""Station-contract E2E for KG return custody.
+"""Provider HTTP integration for KG return custody.
 
-The HTTP adapter is deliberately tiny: CentralApiClient remains the real
-station consumer and Flask's test client is the real Central provider.
+Uses the real Flask provider through a minimal HTTP test fixture.
+Station-consumer integration remains pending until KG return is implemented.
 """
-from importlib.util import module_from_spec, spec_from_file_location
-from pathlib import Path
-import os
 from uuid import UUID, uuid4
 
 import pytest
@@ -25,66 +22,52 @@ from app.services.station_auth import provision_station
 from test_scm_kg_custody import _grant_capabilities, _received
 
 
-_CLIENT_PATH = (
-    Path(os.environ.get("ENVA_WORKSPACE_ROOT", Path(__file__).resolve().parents[3]))
-    / "modulo-pesaje"
-    / "backend"
-    / "app"
-    / "services"
-    / "central_api_client.py"
-)
-_CLIENT_SPEC = spec_from_file_location("kg_return_station_client", _CLIENT_PATH)
-assert _CLIENT_SPEC and _CLIENT_SPEC.loader
-_CLIENT_MODULE = module_from_spec(_CLIENT_SPEC)
-_CLIENT_SPEC.loader.exec_module(_CLIENT_MODULE)
-CentralApiClient = _CLIENT_MODULE.CentralApiClient
-CentralApiError = _CLIENT_MODULE.CentralApiError
-
-
-class _FlaskResponse:
+class _ProviderHttpError(Exception):
     def __init__(self, response):
-        self.status_code = response.status_code
-        self.headers = response.headers
-        self._response = response
-
-    def json(self):
-        return self._response.get_json()
+        self.http_status = response.status_code
+        self.payload = response.get_json()
+        super().__init__(str(self.payload))
 
 
-class _FlaskSession:
-    def __init__(self, client):
+class _ProviderHttpClient:
+    """Test-only HTTP transport; no station behavior or business logic."""
+
+    def __init__(self, client, token):
         self.client = client
+        self.token = token
 
-    def request(self, method, url, *, headers=None, json=None, timeout=None):
-        parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(url)
-        return _FlaskResponse(self.client.open(
-            parsed.path,
-            method=method,
+    def post(self, station_id, resource, payload, operation_id=None):
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "X-Station-Version": "provider-test-fixture",
+            "X-Correlation-Id": str(uuid4()),
+        }
+        if operation_id is not None:
+            headers["Idempotency-Key"] = operation_id
+        response = self.client.post(
+            f"/api/integration/v1/stations/{station_id}/{resource}",
             headers=headers,
-            json=json,
-        ))
+            json=payload,
+        )
+        if response.status_code >= 400:
+            raise _ProviderHttpError(response)
+        return response.get_json()
 
 
-def _station_client(app, actor, *, token=None):
+def _provider_client(app):
     station_id = str(uuid4())
     station, clear_token = provision_station(
         station_id,
         f"KG-RETURN-{station_id[:8]}",
         "Estación retorno KG de prueba",
         "Almacén QA",
-        token=token or f"station-token-{station_id}",
+        token=f"station-token-{station_id}",
     )
-    client = app.test_client()
-    central = CentralApiClient(
-        "http://127.0.0.1",
-        clear_token,
-        "station-test-v1",
-        session=_FlaskSession(client),
-    )
+    central = _ProviderHttpClient(app.test_client(), clear_token)
     return station, central
 
 
-def test_station_central_client_runs_kg_return_flow_without_stock_inflation(app):
+def test_provider_http_runs_kg_return_flow_without_stock_inflation(app):
     with app.app_context():
         ctx = _received(app)
         actor = ctx["actor"]
@@ -168,22 +151,22 @@ def test_station_central_client_runs_kg_return_flow_without_stock_inflation(app)
             },
         )
         db.session.refresh(return_unit)
-        station, central = _station_client(app, actor)
+        station, central = _provider_client(app)
         station_id = station.station_id
 
-        resolved = central.resolve_kg_return(station_id, {
+        resolved = central.post(station_id, "kg-return-units/resolve", {
             "actor_id": actor.id,
             "code": return_unit.codigo,
         })
         assert resolved["unit"]["id"] == str(return_unit.id)
-        label = central.get_kg_return_label(station_id, {
+        label = central.post(station_id, "kg-return-labels/resolve", {
             "actor_id": actor.id,
             "unit_id": str(return_unit.id),
         })
         assert label["label"]["public_id"] == resolved["label"]["public_id"]
-        acknowledged = central.acknowledge_kg_return_label(
+        acknowledged = central.post(
             station_id,
-            str(uuid4()),
+            "kg-return-labels/ack",
             {
                 "actor_id": actor.id,
                 "unit_id": str(return_unit.id),
@@ -192,6 +175,7 @@ def test_station_central_client_runs_kg_return_flow_without_stock_inflation(app)
                 "payload_hash": label["label"]["payload_hash"],
                 "job_id": "KG-RETURN-PRINT-1",
             },
+            operation_id=str(uuid4()),
         )
         assert acknowledged["label"]["payload_hash"] == label["label"]["payload_hash"]
         db.session.refresh(return_unit)
@@ -218,12 +202,13 @@ def test_station_central_client_runs_kg_return_flow_without_stock_inflation(app)
             **capture_payload["scale_snapshot"],
             "source": "MANUAL",
         }}
-        with pytest.raises(CentralApiError) as manual_reading:
-            central.capture_kg_return(station_id, str(uuid4()), invalid_capture)
-        assert manual_reading.value.state == "CONTRACT_CONFLICT"
+        with pytest.raises(_ProviderHttpError) as manual_reading:
+            central.post(station_id, "kg-return-measurements", invalid_capture, operation_id=str(uuid4()))
+        assert manual_reading.value.http_status == 409
+        assert manual_reading.value.payload["error"]["code"] == "SCALE_READING_SOURCE_INVALID"
         assert ScmMedicionUnidadKg.query.count() == 0
-        measured = central.capture_kg_return(station_id, capture_operation, capture_payload)
-        replay = central.capture_kg_return(station_id, capture_operation, capture_payload)
+        measured = central.post(station_id, "kg-return-measurements", capture_payload, operation_id=capture_operation)
+        replay = central.post(station_id, "kg-return-measurements", capture_payload, operation_id=capture_operation)
         assert replay == measured
         assert measured["measurement"]["neto_kg"] == "3.000"
         assert ScmMedicionUnidadKg.query.count() == 1
@@ -263,10 +248,11 @@ def test_station_central_client_runs_kg_return_flow_without_stock_inflation(app)
         )
         db.session.add(intruder)
         db.session.commit()
-        with pytest.raises(CentralApiError) as forbidden:
-            central.resolve_kg_return(station_id, {
+        with pytest.raises(_ProviderHttpError) as forbidden:
+            central.post(station_id, "kg-return-units/resolve", {
                 "actor_id": intruder.id,
                 "code": return_unit.codigo,
             })
-        assert forbidden.value.state == "AUTH_ERROR"
+        assert forbidden.value.payload["error"]["code"] == "CAPABILITY_REQUIRED"
+        assert forbidden.value.payload["error"]["details"]["capability"] == "ABASTECIMIENTO_VER"
         assert forbidden.value.http_status == 403

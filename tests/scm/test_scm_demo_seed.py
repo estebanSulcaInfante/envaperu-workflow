@@ -91,6 +91,9 @@ def test_seed_demo_alcancia_is_idempotent_and_uses_only_mangas(app):
         ).one()
         assert idle.estado == "LIBERADA"
         assert active.estado == "EN_EJECUCION"
+        for order in (idle, active):
+            assert order.fabricacion.snapshot_proceso == "SOPLADO"
+            assert order.fabricacion.fuente_proceso == "EXPLICITO"
         assert idle.plan_produccion_id == active.plan_produccion_id
         assert idle.plan_produccion.orden_produccion_id == demand.id
         allocations = ScmAsignacionDemandaSuministro.query.all()
@@ -156,7 +159,13 @@ def test_seed_demo_alcancia_is_idempotent_and_uses_only_mangas(app):
             "mangas": ScmManga.query.count(),
             "labels": ScmEtiquetaManga.query.count(),
         }
+        # A rerun must not silently rewrite a pre-existing legacy OF.
+        idle.fabricacion.snapshot_proceso = None
+        idle.fabricacion.fuente_proceso = None
+        db.session.commit()
         second = seed_alcancia_pablo_demo(db.session, **command)
+        assert idle.fabricacion.snapshot_proceso is None
+        assert idle.fabricacion.fuente_proceso is None
         counts_after = {
             "orders": ScmOrdenOperacion.query.count(),
             "ots": RegistroDiarioProduccion.query.count(),

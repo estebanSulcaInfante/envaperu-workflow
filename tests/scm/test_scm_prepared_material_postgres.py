@@ -22,6 +22,7 @@ from app.models.scm_prepared_material import (
     ScmSaldoMaterialPreparado,
 )
 from app.models.scm_material_execution import ScmLotePremezcla
+from app.models.scm_catalogos import ScmCapacidad
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_configuration import ensure_initial_scm_configuration
 from tests.scm.test_scm_prepared_material import (
@@ -75,6 +76,15 @@ def _upgrade_schema(schema_url):
 def _seed_postgres_baseline(app):
     with app.app_context():
         ensure_initial_scm_configuration()
+        # The weighing-only rollout deliberately disables OPM (f89d4e6a8c53).
+        # These OPM concurrency scenarios explicitly enable that module only in
+        # their UUID test schema; production guards remain unchanged.
+        assert not ScmCapacidad.query.filter_by(codigo="OPM_CREAR").one().activo
+        assert not RolOperativo.query.filter_by(codigo="PREPARADOR_MATERIAL").one().activo
+        for capability in ScmCapacidad.query.all():
+            if capability.codigo.startswith(("OPM_", "MATERIAL_PREPARADO_")):
+                capability.activo = True
+        RolOperativo.query.filter_by(codigo="PREPARADOR_MATERIAL").one().activo = True
         operator = Trabajador(
             codigo="TRB-01",
             nombres="Planificador",

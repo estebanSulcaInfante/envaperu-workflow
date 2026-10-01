@@ -8,6 +8,7 @@ from threading import Barrier
 from uuid import uuid4
 
 import pytest
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -34,7 +35,7 @@ PRODUCT_ONBOARDING_REVISION = "f81d0e6f2b53"
 UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
 PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
 OPM_PREPARED_MATERIAL_REVISION = "c3a91f6e2d47"
-HEAD_REVISION = "f99a1b2c3d09"
+HEAD_REVISION = ScriptDirectory(str(BACKEND_ROOT / "migrations")).get_current_head()
 
 
 def _isolated_postgres_url():
