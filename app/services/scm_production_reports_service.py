@@ -14,9 +14,11 @@ from datetime import date
 from decimal import Decimal
 from io import BytesIO
 import json
+from uuid import UUID
 
 from openpyxl import Workbook
 from sqlalchemy import or_, select
+from sqlalchemy.orm import noload, selectinload
 
 from app.models.registro import RegistroDiarioProduccion
 from app.models.scm_auditoria import ScmEvento
@@ -25,16 +27,20 @@ from app.models.scm_ot import (
     ScmControlPesoManga,
     ScmCorreccionAsignacionManga,
     ScmCorreccionPesajeManga,
+    ScmLoteArticulo,
     ScmManga,
     ScmPesajeManga,
     ScmTramoMangaTrabajo,
     ScmTrabajoColor,
     ScmTrabajoOt,
 )
+from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
+from app.models.producto import PiezaColor
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
     ScmOrdenFabricacion,
     ScmOrdenOperacion,
+    ScmOrdenOperacionSalida,
 )
 from app.models.molde import Molde
 from app.services.scm_production_observability_service import _text
@@ -140,6 +146,24 @@ def _filters(raw, *, require_dates=True):
     measures = [str(item).strip().upper() for item in str(measures).split(",")] if measures else list(MEASURE_OPTIONS)
     if any(item not in MEASURE_OPTIONS for item in measures) or len(set(measures)) != len(measures):
         raise ScmServiceError("INVALID_OBSERVABILITY_MEASURE", "Medida inválida.", status_code=400)
+    raw_of_ids = data.get("of_ids")
+    of_ids = None if "of_ids" not in data else set()
+    if raw_of_ids not in (None, "", []):
+        values = raw_of_ids if isinstance(raw_of_ids, (list, tuple, set)) else str(raw_of_ids).split(",")
+        values = [str(item).strip() for item in values if str(item).strip()]
+        try:
+            # Collapse repeated IDs before applying the page-sized limit.  A
+            # client may safely retry with duplicates without being rejected
+            # for exceeding the distinct scope bound.
+            of_ids = {UUID(value) for value in values}
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ScmServiceError(
+                "INVALID_OF_SCOPE", "of_ids debe contener UUID validos.", status_code=400,
+            ) from error
+        if len(of_ids) > 100:
+            raise ScmServiceError(
+                "INVALID_OF_SCOPE", "of_ids admite como maximo 100 OF.", status_code=400,
+            )
     return {
         "fecha_desde": start,
         "fecha_hasta": end,
@@ -153,6 +177,7 @@ def _filters(raw, *, require_dates=True):
         "articulo": _text(data.get("articulo")),
         "estado_of": _text(data.get("estado_of"), upper=True),
         "estado_ot": _text(data.get("estado_ot"), upper=True),
+        "of_ids": of_ids,
         "groups": groups,
         "measures": measures,
     }
@@ -244,11 +269,32 @@ def _project_corrected_kg_segments(segments, net):
 def _load_rows(session, filters=None):
     """Load runs and their physical mangas in one normalized in-memory graph."""
     run_filters = filters or {}
-    rows = session.execute(
+    statement = (
         select(ScmCorridaFabricacion, ScmOrdenFabricacion, ScmOrdenOperacion)
         .join(ScmOrdenFabricacion, ScmOrdenFabricacion.orden_operacion_id == ScmCorridaFabricacion.orden_fabricacion_id)
         .join(ScmOrdenOperacion, ScmOrdenOperacion.id == ScmOrdenFabricacion.orden_operacion_id)
-    ).all()
+        .options(
+            # The report serializes planned outputs, but not premezclas or
+            # colour-work collections.  Override the model selectin defaults
+            # for this read path only; the model contract remains unchanged.
+            noload(ScmOrdenFabricacion.corridas),
+            noload(ScmOrdenOperacion.salidas),
+            selectinload(ScmCorridaFabricacion.salidas).options(
+                selectinload(ScmOrdenOperacionSalida.articulo)
+                .options(
+                    selectinload(ScmArticulo.pieza_color)
+                    .selectinload(ScmArticuloPiezaColor.pieza_color)
+                    .selectinload(PiezaColor.pieza_rel),
+                ),
+                noload(ScmOrdenOperacionSalida.asignaciones),
+            ),
+            noload(ScmCorridaFabricacion.corrida_premezclas),
+            noload(ScmCorridaFabricacion.trabajos_color),
+        )
+    )
+    if run_filters.get("of_ids") is not None:
+        statement = statement.where(ScmOrdenOperacion.id.in_(run_filters["of_ids"]))
+    rows = session.execute(statement).all()
     runs = {
         corrida.id: {
             "corrida": corrida,
@@ -266,15 +312,19 @@ def _load_rows(session, filters=None):
     if not runs:
         return []
     mold_ids = {run["of"].molde_id for run in runs.values() if run["of"].molde_id}
-    molds = session.scalars(select(Molde).where(Molde.codigo.in_(mold_ids))).all() if mold_ids else []
-    mold_by_code = {mold.codigo: mold for mold in molds}
-    for run in runs.values():
-        run["molde"] = mold_by_code.get(run["of"].molde_id)
     work_rows = session.execute(
         select(ScmTrabajoOt, ScmTrabajoColor, RegistroDiarioProduccion)
         .join(ScmTrabajoColor, ScmTrabajoColor.trabajo_ot_id == ScmTrabajoOt.id)
         .join(RegistroDiarioProduccion, RegistroDiarioProduccion.id == ScmTrabajoOt.orden_trabajo_id)
         .where(ScmTrabajoColor.corrida_fabricacion_id.in_(list(runs)))
+        .options(
+            selectinload(RegistroDiarioProduccion.responsable),
+            noload(RegistroDiarioProduccion.trabajos_ot),
+            noload(ScmTrabajoOt.asignaciones_personal),
+            noload(ScmTrabajoOt.mangas),
+            noload(ScmTrabajoOt.tramos_manga),
+            noload(ScmTrabajoOt.saldos_wip_salida),
+        )
     ).all()
     work_ids = set()
     ot_ids = set()
@@ -292,33 +342,70 @@ def _load_rows(session, filters=None):
     }
     all_mold_ids = mold_ids | snapshot_mold_ids
     all_molds = session.scalars(select(Molde).where(Molde.codigo.in_(all_mold_ids))).all() if all_mold_ids else []
-    mold_by_code.update({mold.codigo: mold for mold in all_molds})
+    mold_by_code = {mold.codigo: mold for mold in all_molds}
     for run in runs.values():
+        run["molde"] = mold_by_code.get(run["of"].molde_id)
         run["moldes"] = mold_by_code
 
-    mangas = session.scalars(
-        select(ScmManga).where(
-            or_(
-                ScmManga.trabajo_ot_id.in_(work_ids) if work_ids else False,
-                ScmManga.ot_id.in_(ot_ids) if ot_ids else False,
-            )
-        )
-    ).all()
+    work_loader = selectinload(ScmTramoMangaTrabajo.trabajo).options(
+        noload(ScmTrabajoOt.mangas),
+        noload(ScmTrabajoOt.tramos_manga),
+        noload(ScmTrabajoOt.asignaciones_personal),
+        noload(ScmTrabajoOt.saldos_wip_salida),
+    )
+    correction_loader = selectinload(ScmManga.correccion_asignacion).options(
+        selectinload(ScmCorreccionAsignacionManga.destino_trabajo).options(
+            noload(ScmTrabajoOt.mangas),
+            noload(ScmTrabajoOt.tramos_manga),
+            noload(ScmTrabajoOt.asignaciones_personal),
+            noload(ScmTrabajoOt.saldos_wip_salida),
+        ),
+        selectinload(ScmCorreccionAsignacionManga.tramo_objetivo)
+        .options(
+            work_loader,
+            noload(ScmTramoMangaTrabajo.controles_peso),
+        ),
+    )
+    manga_statement = select(ScmManga).options(
+        selectinload(ScmManga.trabajo).options(
+            noload(ScmTrabajoOt.mangas),
+            noload(ScmTrabajoOt.tramos_manga),
+            noload(ScmTrabajoOt.asignaciones_personal),
+            noload(ScmTrabajoOt.saldos_wip_salida),
+        ),
+        selectinload(ScmManga.lote_articulo)
+        .selectinload(ScmLoteArticulo.articulo)
+        .options(
+            selectinload(ScmArticulo.pieza_color)
+            .selectinload(ScmArticuloPiezaColor.pieza_color)
+            .selectinload(PiezaColor.pieza_rel),
+        ),
+        selectinload(ScmManga.tramos_trabajo).options(
+            work_loader,
+            noload(ScmTramoMangaTrabajo.controles_peso),
+        ),
+        noload(ScmManga.etiquetas),
+        noload(ScmManga.controles_peso),
+        selectinload(ScmManga.reaperturas),
+        correction_loader,
+    )
+    candidate_predicates = []
     if work_ids:
-        mangas += session.scalars(
-            select(ScmManga)
-            .join(ScmTramoMangaTrabajo, ScmTramoMangaTrabajo.manga_id == ScmManga.id)
-            .where(ScmTramoMangaTrabajo.trabajo_ot_id.in_(work_ids))
-        ).all()
-    correction_assignments = session.scalars(
-        select(ScmCorreccionAsignacionManga).where(
-            or_(
-                ScmCorreccionAsignacionManga.destino_trabajo_ot_id.in_(work_ids) if work_ids else False,
-                ScmCorreccionAsignacionManga.origen_trabajo_ot_id.in_(work_ids) if work_ids else False,
-            )
-        )
-    ).all()
-    mangas += [item.manga for item in correction_assignments if item.manga is not None]
+        candidate_predicates.extend((
+            ScmManga.trabajo_ot_id.in_(work_ids),
+            ScmManga.tramos_trabajo.any(
+                ScmTramoMangaTrabajo.trabajo_ot_id.in_(work_ids),
+            ),
+            ScmManga.correccion_asignacion.has(or_(
+                ScmCorreccionAsignacionManga.destino_trabajo_ot_id.in_(work_ids),
+                ScmCorreccionAsignacionManga.origen_trabajo_ot_id.in_(work_ids),
+            )),
+        ))
+    if ot_ids:
+        candidate_predicates.append(ScmManga.ot_id.in_(ot_ids))
+    mangas = session.scalars(
+        manga_statement.where(or_(*candidate_predicates) if candidate_predicates else False)
+    ).unique().all()
     unique_mangas = {item.id: item for item in mangas}
     closure_events = {}
     if unique_mangas:
@@ -334,15 +421,32 @@ def _load_rows(session, filters=None):
                 .order_by(ScmEvento.occurred_at, ScmEvento.id)
             ).all()
         }
+    mangas_by_work = defaultdict(dict)
+    mangas_by_ot = defaultdict(dict)
+    for manga in unique_mangas.values():
+        if manga.trabajo_ot_id is not None:
+            mangas_by_work[manga.trabajo_ot_id][manga.id] = manga
+        if manga.ot_id is not None:
+            mangas_by_ot[manga.ot_id][manga.id] = manga
+        for segment in manga.tramos_trabajo:
+            if segment.trabajo_ot_id is not None:
+                mangas_by_work[segment.trabajo_ot_id][manga.id] = manga
     for run in runs.values():
         run_work_ids = {item[0].id for item in run["works"]}
+        run_ot_ids = {ot.id for ot in run["ots"]}
+        associated = {}
+        for work_id in run_work_ids:
+            associated.update(mangas_by_work.get(work_id, {}))
+        for ot_id in run_ot_ids:
+            associated.update(mangas_by_ot.get(ot_id, {}))
         for manga in unique_mangas.values():
-            if manga.trabajo_ot_id in run_work_ids or any(
-                segment.trabajo_ot_id in run_work_ids for segment in manga.tramos_trabajo
-            ) or any(
-                ot.id == manga.ot_id for ot in run["ots"]
+            correction = manga.correccion_asignacion
+            if correction is not None and (
+                correction.origen_trabajo_ot_id in run_work_ids
+                or correction.destino_trabajo_ot_id in run_work_ids
             ):
-                run["mangas"][manga.id] = manga
+                associated[manga.id] = manga
+        run["mangas"].update(associated)
 
     weighing_rows = session.scalars(select(ScmPesajeManga).where(ScmPesajeManga.manga_id.in_(list(unique_mangas)))).all() if unique_mangas else []
     weighing_ids = [item.id for item in weighing_rows]
@@ -363,22 +467,21 @@ def _load_rows(session, filters=None):
     controls_by_manga = defaultdict(list)
     for control in controls:
         controls_by_manga[control.manga_id].append(control)
+    weighings_by_manga = defaultdict(list)
+    for weighing in weighing_rows:
+        weighings_by_manga[weighing.manga_id].append(weighing)
+    for values in weighings_by_manga.values():
+        values.sort(key=lambda value: value.id, reverse=True)
+
     for run in runs.values():
         if not run["mangas"]:
             continue
         for manga in run["mangas"].values():
             current_weighing = next(
-                (
-                    item for item in sorted(
-                        (row for row in weighing_rows if row.manga_id == manga.id),
-                        key=lambda value: value.id,
-                        reverse=True,
-                    )
-                    if item.estado == "VIGENTE"
-                ),
+                (item for item in weighings_by_manga.get(manga.id, ()) if item.estado == "VIGENTE"),
                 None,
             )
-            final = None if manga.estado == "ANULADA" else _effective_weight(manga, weighing_rows, correction_by_weight, annulment_ids)
+            final = None if manga.estado == "ANULADA" else _effective_weight(manga, weighings_by_manga.get(manga.id, ()), correction_by_weight, annulment_ids)
             segments = _valid_kg_segments(manga, {})
             latest_control = controls_by_manga.get(manga.id, [])[-1] if controls_by_manga.get(manga.id) else None
             closure_event = None
@@ -617,6 +720,7 @@ def list_production_progress(session, *, actor_id, filters=None):
                 } if piece is not None else None,
             })
         items.append({
+            "of_id": str(getattr(run["orden"], "id", "")) if getattr(run["orden"], "id", None) is not None else None,
             "corrida_id": str(run["corrida"].id),
             "corrida": run["corrida"].codigo,
             "of": run["orden"].codigo,

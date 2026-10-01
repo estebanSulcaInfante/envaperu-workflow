@@ -1139,6 +1139,7 @@ def ordenes_fabricacion_listar():
     return jsonify(list_fabrication_orders(
         db.session,
         actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
     ))
 
 

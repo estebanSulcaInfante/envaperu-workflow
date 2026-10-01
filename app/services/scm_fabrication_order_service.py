@@ -8,16 +8,18 @@ from app.services.scm_draft_order_annulment import (
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
-from sqlalchemy import select
+from sqlalchemy import cast, exists, func, or_, select, String
+from sqlalchemy.orm import noload, selectinload
 from sqlalchemy.exc import IntegrityError
 
 from app.models.maquina import Maquina
 from app.models.molde import Molde, MoldePieza
-from app.models.producto import ColorProduccion
+from app.models.producto import ColorBase, ColorProduccion, FamiliaColor, PiezaColor
 from app.models.receta_color import RecetaColorMaestra
 from app.models.scm_articulos import (
     CLASE_PRODUCTO_TERMINADO,
     ScmArticulo,
+    ScmArticuloPiezaColor,
 )
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
 from app.models.scm_estructuras import ScmEstructuraComponente
@@ -29,6 +31,8 @@ from app.models.scm_ot import ScmCierreProductivoKg, ScmLoteArticulo, ScmManga, 
 from app.models.scm_production_orders import (
     ScmAsignacionDemandaSuministro,
     ScmCorridaFabricacion,
+    ScmPlanProduccion,
+    ScmOrdenProduccion,
     ScmOrdenFabricacion,
     ScmOrdenOperacion,
     ScmOrdenOperacionSalida,
@@ -492,7 +496,7 @@ def _serialize_run(session, run):
     }
 
 
-def _serialize(session, operation, *, schedule_projection=None):
+def _serialize(session, operation, *, schedule_projection=None, include_catalog_identity=False):
     fabrication = operation.fabricacion
     resolved_process, _, compatibility = resolve_order_process(operation)
     route_operation = operation.operacion_ruta_revision
@@ -522,7 +526,7 @@ def _serialize(session, operation, *, schedule_projection=None):
         )
         .order_by(ScmCierreProductivoKg.created_at.desc(), ScmCierreProductivoKg.id.desc())
     )
-    return {
+    payload = {
         **(
             schedule_projection
             if schedule_projection is not None
@@ -591,6 +595,31 @@ def _serialize(session, operation, *, schedule_projection=None):
             _serialize_run(session, run) for run in fabrication.corridas
         ],
     }
+    if include_catalog_identity:
+        mold = session.get(Molde, fabrication.molde_id) if fabrication.molde_id else None
+        machine = session.get(Maquina, fabrication.maquina_prevista_id) if fabrication.maquina_prevista_id else None
+        # Detail identity is intentionally narrower than the editable catalog
+        # DTO.  The readonly screen needs stable labels/codes only; returning
+        # composition, notes or serials here defeats the read-path boundary.
+        payload["molde"], payload["maquina_prevista"] = _detail_catalog_identity(
+            mold, machine,
+        )
+    return payload
+
+
+def _detail_catalog_identity(mold, machine):
+    """Return only stable catalog identity for the readonly detail DTO."""
+    return (
+        {
+            "codigo": mold.codigo,
+            "nombre": mold.nombre,
+        } if mold is not None else None,
+        {
+            "id": machine.id,
+            "codigo": machine.codigo,
+            "nombre": machine.nombre,
+        } if machine is not None else None,
+    )
 
 
 def _normalized_process(value):
@@ -696,8 +725,306 @@ def _load_fabrication(session, operation_id, *, lock=False):
     return operation
 
 
-def list_fabrication_orders(session, *, actor_id):
+_SUMMARY_PAGE_SIZES = (25, 50, 100)
+_SUMMARY_STATES = {"SIN_ANULADAS", "TODOS"}
+
+
+def _fold_sql(expression):
+    """Fold the Spanish accents used by SCM search on SQLite and PostgreSQL.
+
+    Both engines implement ``lower`` and ``replace`` without extensions.  A
+    small explicit mapping keeps search portable (rather than relying on
+    PostgreSQL's optional ``unaccent`` extension) and is also easy to exercise
+    in the isolated SQLite/PostgreSQL contract tests.
+    """
+    for accented, plain in (
+        ("Á", "á"), ("É", "é"), ("Í", "í"), ("Ó", "ó"), ("Ú", "ú"),
+        ("Ü", "ü"), ("Ñ", "ñ"),
+    ):
+        expression = func.replace(expression, accented, plain)
+    folded = func.lower(expression)
+    for accented, plain in (
+        ("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"),
+        ("ü", "u"), ("ñ", "n"),
+    ):
+        folded = func.replace(folded, accented, plain)
+    return folded
+
+
+def _summary_text_match(expression, query):
+    return _fold_sql(expression).contains(query, autoescape=True)
+
+
+def _summary_parse(filters):
+    values = dict(filters or {})
+    view = values.get("vista")
+    if view not in (None, "", "resumen"):
+        raise ScmServiceError(
+            "INVALID_OF_VIEW", "vista debe ser resumen.", status_code=400,
+            details={"field": "vista"},
+        )
+    if view != "resumen":
+        return None
+    state = str(values.get("estado") or "SIN_ANULADAS").strip().upper()
+    if state not in _SUMMARY_STATES:
+        # A concrete documented state is accepted; the DB constraint is the
+        # authority for the exact list and this avoids silently changing it.
+        state_values = {"BORRADOR", "LIBERADA", "PROGRAMADA", "EN_EJECUCION", "CERRADA", "ANULADA"}
+        if state not in state_values:
+            raise ScmServiceError(
+                "INVALID_OF_STATE", "estado no es un estado de OF valido.",
+                status_code=400, details={"field": "estado"},
+            )
+    order = str(values.get("orden") or "reciente").strip().lower()
+    if order not in {"reciente", "codigo"}:
+        raise ScmServiceError(
+            "INVALID_OF_ORDER", "orden debe ser reciente o codigo.",
+            status_code=400, details={"field": "orden"},
+        )
+    try:
+        page = int(values.get("pagina") or 1)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "INVALID_OF_PAGE", "pagina debe ser un entero positivo.",
+            status_code=400, details={"field": "pagina"},
+        ) from error
+    if page < 1:
+        raise ScmServiceError(
+            "INVALID_OF_PAGE", "pagina debe ser un entero positivo.",
+            status_code=400, details={"field": "pagina"},
+        )
+    try:
+        page_size = int(values.get("tamano") or 25)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "INVALID_OF_PAGE_SIZE", "tamano debe ser 25, 50 o 100.",
+            status_code=400, details={"field": "tamano"},
+        ) from error
+    if page_size not in _SUMMARY_PAGE_SIZES:
+        raise ScmServiceError(
+            "INVALID_OF_PAGE_SIZE", "tamano debe ser 25, 50 o 100.",
+            status_code=400, details={"field": "tamano"},
+        )
+    return {
+        "q": _fold_search_value(values.get("q")),
+        "estado": state,
+        "orden": order,
+        "pagina": page,
+        "tamano": page_size,
+    }
+
+
+def _fold_search_value(value):
+    import unicodedata
+
+    text = str(value or "").strip().lower()
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(char)
+    )
+
+
+def _summary_query(session, parsed):
+    statement = select(ScmOrdenOperacion.id).where(
+        ScmOrdenOperacion.tipo == "FABRICACION",
+    )
+    if parsed["estado"] == "SIN_ANULADAS":
+        statement = statement.where(ScmOrdenOperacion.estado != "ANULADA")
+    elif parsed["estado"] != "TODOS":
+        statement = statement.where(ScmOrdenOperacion.estado == parsed["estado"])
+    query = parsed["q"]
+    if query:
+        fabrication_match = exists(
+            select(1)
+            .select_from(ScmOrdenFabricacion)
+            .outerjoin(Molde, Molde.codigo == ScmOrdenFabricacion.molde_id)
+            .where(
+                ScmOrdenFabricacion.orden_operacion_id == ScmOrdenOperacion.id,
+                or_(
+                    _summary_text_match(ScmOrdenFabricacion.molde_id, query),
+                    _summary_text_match(Molde.nombre, query),
+                ),
+            )
+        )
+        run_match = exists(
+            select(1)
+            .select_from(ScmCorridaFabricacion)
+            .outerjoin(ColorProduccion, ColorProduccion.id == ScmCorridaFabricacion.color_produccion_id)
+            .outerjoin(ColorBase, ColorBase.id == ColorProduccion.color_base_id)
+            .outerjoin(FamiliaColor, FamiliaColor.id == ColorProduccion.familia_color_id)
+            .where(
+                ScmCorridaFabricacion.orden_fabricacion_id == ScmOrdenOperacion.id,
+                or_(
+                    _summary_text_match(ScmCorridaFabricacion.codigo, query),
+                    _summary_text_match(cast(ColorProduccion.codigo_legacy, String), query),
+                    _summary_text_match(ColorBase.nombre, query),
+                    _summary_text_match(FamiliaColor.nombre, query),
+                    _summary_text_match(ColorBase.nombre + " " + FamiliaColor.nombre, query),
+                ),
+            )
+        )
+        output_match = exists(
+            select(1)
+            .select_from(ScmOrdenOperacionSalida)
+            .join(ScmArticulo, ScmArticulo.id == ScmOrdenOperacionSalida.articulo_scm_id)
+            .where(
+                ScmOrdenOperacionSalida.orden_operacion_id == ScmOrdenOperacion.id,
+                or_(
+                    _summary_text_match(ScmArticulo.codigo, query),
+                    _summary_text_match(ScmArticulo.nombre, query),
+                ),
+            )
+        )
+        origin_match = exists(
+            select(1)
+            .select_from(ScmPlanProduccion)
+            .join(ScmOrdenProduccion, ScmOrdenProduccion.id == ScmPlanProduccion.orden_produccion_id)
+            .where(
+                ScmPlanProduccion.id == ScmOrdenOperacion.plan_produccion_id,
+                or_(
+                    _summary_text_match(ScmOrdenProduccion.codigo, query),
+                    _summary_text_match(ScmOrdenProduccion.origen, query),
+                    _summary_text_match(ScmOrdenProduccion.referencia_origen, query),
+                ),
+            )
+        )
+        statement = statement.where(or_(
+            _summary_text_match(ScmOrdenOperacion.codigo, query),
+            _summary_text_match(ScmOrdenOperacion.origen_demanda, query),
+            _summary_text_match(ScmOrdenOperacion.motivo, query),
+            _summary_text_match(ScmOrdenOperacion.propuesta_clave, query),
+            fabrication_match,
+            run_match,
+            output_match,
+            origin_match,
+        ))
+    if parsed["orden"] == "codigo":
+        statement = statement.order_by(ScmOrdenOperacion.codigo.asc(), ScmOrdenOperacion.id.asc())
+    else:
+        statement = statement.order_by(ScmOrdenOperacion.created_at.desc(), ScmOrdenOperacion.id.desc())
+    return statement
+
+
+def _summary_item(operation, mold_by_code):
+    fabrication = operation.fabricacion
+    origin_op = operation.plan_produccion.orden_produccion if operation.plan_produccion else None
+    return {
+        "id": str(operation.id),
+        "codigo": operation.codigo,
+        "estado": operation.estado,
+        "origen_demanda": operation.origen_demanda,
+        "motivo": operation.motivo,
+        "created_at": _iso(operation.created_at),
+        "procedencia": {
+            "op_id": str(origin_op.id) if origin_op else None,
+            "op_codigo": origin_op.codigo if origin_op else None,
+            "plan_id": str(operation.plan_produccion_id) if operation.plan_produccion_id else None,
+            "tipo": operation.origen_demanda,
+            "orden_anterior_id": None,
+        },
+        "molde": ({
+            "codigo": fabrication.molde_id,
+            "nombre": getattr(mold_by_code.get(fabrication.molde_id), "nombre", None),
+        } if fabrication is not None and fabrication.molde_id else None),
+        "corridas": [
+            {
+                "id": str(run.id),
+                "codigo": run.codigo,
+                "estado": run.estado,
+                "ciclos_objetivo": run.ciclos_objetivo,
+                "objetivo_neto_kg": _decimal_text(run.objetivo_neto_kg, 6),
+                "color_produccion": ({
+                    "id": run.color_produccion.id,
+                    "codigo": run.color_produccion.codigo_legacy,
+                    "nombre": run.color_produccion.nombre,
+                    "hex_referencia": run.color_produccion.hex_referencia,
+                } if run.color_produccion is not None else None),
+                "salidas": [
+                    {
+                        "articulo": ({
+                            "id": output.articulo.id,
+                            "codigo": output.articulo.codigo,
+                            "nombre": output.articulo.nombre,
+                            "pieza": ({
+                                "codigo": getattr(getattr(getattr(output.articulo.pieza_color, "pieza_color", None), "pieza_rel", None), "codigo", None),
+                                "nombre": getattr(getattr(getattr(output.articulo.pieza_color, "pieza_color", None), "pieza_rel", None), "nombre", None),
+                            } if output.articulo.pieza_color is not None else None),
+                        } if output.articulo is not None else None),
+                    }
+                    for output in (run.salidas or ())
+                ],
+            }
+            for run in (fabrication.corridas if fabrication is not None else ())
+        ],
+    }
+
+
+def _list_fabrication_summary(session, parsed):
+    count_query = _summary_query(session, parsed).order_by(None).subquery()
+    total = session.scalar(select(func.count()).select_from(count_query)) or 0
+    total_pages = max(1, (total + parsed["tamano"] - 1) // parsed["tamano"])
+    page = min(parsed["pagina"], total_pages)
+    offset = (page - 1) * parsed["tamano"]
+    ids = session.scalars(
+        _summary_query(session, parsed).offset(offset).limit(parsed["tamano"])
+    ).all()
+    if parsed["orden"] == "codigo":
+        order_by = (ScmOrdenOperacion.codigo.asc(), ScmOrdenOperacion.id.asc())
+    else:
+        order_by = (ScmOrdenOperacion.created_at.desc(), ScmOrdenOperacion.id.desc())
+    statement = (
+        select(ScmOrdenOperacion)
+        .where(ScmOrdenOperacion.id.in_(ids))
+        .options(
+            noload(ScmOrdenOperacion.salidas),
+            selectinload(ScmOrdenOperacion.fabricacion)
+            .selectinload(ScmOrdenFabricacion.corridas)
+            .options(
+                noload(ScmCorridaFabricacion.corrida_premezclas),
+                noload(ScmCorridaFabricacion.trabajos_color),
+                selectinload(ScmCorridaFabricacion.salidas).options(
+                    selectinload(ScmOrdenOperacionSalida.articulo)
+                    .selectinload(ScmArticulo.pieza_color)
+                    .selectinload(ScmArticuloPiezaColor.pieza_color)
+                    .selectinload(PiezaColor.pieza_rel),
+                    noload(ScmOrdenOperacionSalida.asignaciones),
+                ),
+            ),
+            selectinload(ScmOrdenOperacion.fabricacion)
+            .selectinload(ScmOrdenFabricacion.corridas)
+            .selectinload(ScmCorridaFabricacion.color_produccion)
+            .selectinload(ColorProduccion.color_base_rel),
+            selectinload(ScmOrdenOperacion.fabricacion)
+            .selectinload(ScmOrdenFabricacion.corridas)
+            .selectinload(ScmCorridaFabricacion.color_produccion)
+            .selectinload(ColorProduccion.familia_color_rel),
+            selectinload(ScmOrdenOperacion.plan_produccion)
+            .selectinload(ScmPlanProduccion.orden_produccion),
+        )
+        .order_by(*order_by)
+    )
+    operations = session.scalars(statement).unique().all()
+    mold_ids = {item.fabricacion.molde_id for item in operations if item.fabricacion and item.fabricacion.molde_id}
+    mold_by_code = {
+        item.codigo: item for item in session.scalars(select(Molde).where(Molde.codigo.in_(mold_ids))).all()
+    } if mold_ids else {}
+    return {
+        "items": [_summary_item(operation, mold_by_code) for operation in operations],
+        "pagination": {
+            "page": page,
+            "page_size": parsed["tamano"],
+            "total": total,
+            "total_pages": total_pages,
+        },
+        "filters": {key: parsed[key] for key in ("q", "estado", "orden")},
+    }
+
+
+def list_fabrication_orders(session, *, actor_id, filters=None):
     load_actor(session, actor_id, capability="OF_VER")
+    parsed = _summary_parse(filters)
+    if parsed is not None:
+        return _list_fabrication_summary(session, parsed)
     operations = session.scalars(
         select(ScmOrdenOperacion)
         .where(ScmOrdenOperacion.tipo == "FABRICACION")
@@ -719,7 +1046,7 @@ def list_fabrication_orders(session, *, actor_id):
 def get_fabrication_order(session, *, actor_id, operation_id):
     load_actor(session, actor_id, capability="OF_VER")
     order = _load_fabrication(session, operation_id)
-    payload = _serialize(session, order)
+    payload = _serialize(session, order, include_catalog_identity=True)
     if order.estado == "LIBERADA":
         try:
             _ensure_replacement_eligible(session, order)
