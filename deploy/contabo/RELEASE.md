@@ -18,11 +18,33 @@ Its local_archive_sha256 refers to the local docker-save archive, not the CI arc
 Image registry digest, source label, non-root user and platform were verified locally.
 The successful public job metadata also confirms the original build/publish gates.
 
-compose.release.yaml pins the published API and official PostgreSQL 16.15 Bookworm
-linux/amd64 manifest. PostgreSQL major 16 matches the reviewed postgres-smoke CI.
-The source database version, extensions, role/policy inventory and restore compatibility
-MUST still be checked before initializing/migrating the target; the pin is preparation,
-not a claim that a restore from the current source has been validated.
+compose.release.yaml pins the unchanged published API and official PostgreSQL 17.11
+Bookworm linux/amd64 manifest. Source current_setting(server_version) was confirmed
+as 17.6 via read-only catalogs; the previously reported Supabase build is 17.6.1.155.
+This corrects the prior PG16 preparation: legacy CI on PG16 was not sufficient to
+justify a downgrade. No source data has been dumped, restored or migrated.
+
+See postgres-compatibility.json for the bounded catalog inventory and local tests.
+Three existing PostgreSQL tests passed on the exact PG17.11 image in 29.08 seconds:
+connectivity, fresh-schema migrations without drift, and ACL/RLS/owner roundtrip.
+The test database lived only in local tmpfs with no external network or published
+ports; test containers were removed. No source restore was attempted.
+Source extensions: plpgsql 1.0, pgcrypto 1.3, uuid-ossp 1.1,
+pg_stat_statements 1.11 and supabase_vault 0.3.1. The first four are available in the
+selected PG17 image; Vault is managed Supabase infrastructure and is not present
+in the vanilla image. Do not copy auth/storage/vault or Supabase service roles:
+Auth, existing users/sessions and S3/object metadata remain in Supabase.
+
+The inspected public catalogs show 184 tables with RLS, 32 FORCE RLS and only one
+public-schema policy. All 31 noninternal public triggers call public functions.
+No FK to auth/storage, explicit auth/storage reference in public policies/functions/
+views, nonbuiltin public column type or extension-specific default was found.
+The checked direct public extension dependencies resolve only to plpgsql. These
+bounded catalog/text checks do not prove absence of indirect/dynamic SQL dependencies.
+Review the complete application migration scope and role/policy behavior before
+cutover. In particular, a non-owner scm_api role cannot be assumed to work with the
+source's policy configuration; define/test least-privilege policies rather than
+using superuser/BYPASSRLS. An actual isolated restore remains a separate gate.
 
 ## Shortest Dokploy step (save configuration only)
 

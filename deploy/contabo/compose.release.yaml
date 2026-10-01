@@ -46,7 +46,7 @@ services:
       driver: json-file
       options: {max-size: 10m, max-file: "3"}
   db:
-    image: postgres:16-bookworm@sha256:efdf07c2f9d4df592783dcc8ea5f6db02efbf5f6452b527225ff5e58364570e9
+    image: postgres:17-bookworm@sha256:91eb910c44c7ed13f7f1a4ccadaa9ca72ef14cddc04cacb6e070e48eb44731a3
     restart: unless-stopped
     cpus: 1.0
     mem_limit: 1536m
