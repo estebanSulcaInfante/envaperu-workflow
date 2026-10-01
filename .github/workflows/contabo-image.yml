@@ -1,0 +1,179 @@
+name: Prepare SCM Contabo image (manual)
+
+# No deploy, VPS access, repository writes or automatic push trigger.
+on:
+  workflow_dispatch:
+    inputs:
+      python_base:
+        description: Reviewed python:3.12-slim variant with immutable @sha256 digest
+        required: true
+        type: string
+      publish:
+        description: Publish the tested image after environment approval
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+concurrency:
+  group: scm-contabo-image
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 167154600b58f62e536fc1cf7b0764713ab0860d
+  RECIPE_SHA: f9e632e274879256a007c39827a2f34f2b264e2c
+  PYTHON_BASE: ${{ inputs.python_base }}
+  IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
+
+jobs:
+  build:
+    if: github.repository == 'estebanSulcaInfante/envaperu-workflow' && github.ref == 'refs/heads/codex/scm-contabo-image'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
+      image_id: ${{ steps.archive.outputs.image_id }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout immutable reviewed recipe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: f9e632e274879256a007c39827a2f34f2b264e2c
+          path: recipe
+          persist-credentials: false
+      - name: Verify recipe checkout and exact reviewed source CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git -C recipe rev-parse HEAD)" = "$RECIPE_SHA"
+          python3 recipe/deploy/contabo/check_ci.py
+      - name: Verify publication protection before requesting privileged job
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 recipe/deploy/contabo/check_publish_gate.py
+      - name: Checkout exact application source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 167154600b58f62e536fc1cf7b0764713ab0860d
+          path: source
+          persist-credentials: false
+      - name: Build from newly generated hashed context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 recipe/deploy/contabo/build_context.py source context
+          docker build --platform linux/amd64 --build-arg PYTHON_BASE="$PYTHON_BASE" \
+            --build-arg SOURCE_SHA="$SOURCE_SHA" -f context/Dockerfile \
+            -t "$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" context
+      - name: Smoke-check dependencies and required template without network
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --entrypoint python \
+            "$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -c "import gunicorn, flask, psycopg2, openpyxl; from pathlib import Path; assert Path('/app/run.py').is_file(); assert Path('/app/migrations').is_dir(); w=openpyxl.load_workbook('/app/app/templates/excel/OrdenProduccion/Book2.xlsx'); assert 'IMPRIMIR OP' in w.sheetnames; w.close()"
+      - name: Save and inspect every layer of the tested image
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker save --output image.tar "$tag"
+          python3 recipe/deploy/contabo/verify_image_layers.py image.tar
+          echo "archive_sha256=$(sha256sum image.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "image_id=$(docker image inspect "$tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+      - name: Preserve exact tested image for separate publication job
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scm-tested-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: image.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: inputs.publish && github.repository == 'estebanSulcaInfante/envaperu-workflow' && github.ref == 'refs/heads/codex/scm-contabo-image'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: scm-pilot-image-public
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    env:
+      EXPECTED_ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
+      EXPECTED_IMAGE_ID: ${{ needs.build.outputs.image_id }}
+    steps:
+      - name: Checkout immutable reviewed publication checks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: f9e632e274879256a007c39827a2f34f2b264e2c
+          path: recipe
+          persist-credentials: false
+      - name: Recheck recipe and actual environment policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git -C recipe rev-parse HEAD)" = "$RECIPE_SHA"
+          python3 recipe/deploy/contabo/check_publish_gate.py
+      - name: Download only the artifact from the successful build job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: tested
+          merge-multiple: true
+      - name: Verify archive, layers and loaded image identity without executing it
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "$EXPECTED_ARCHIVE_SHA256" tested/image.tar | sha256sum --check --strict
+          python3 recipe/deploy/contabo/verify_image_layers.py tested/image.tar
+          docker load --input tested/image.tar
+          tag="$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$(docker image inspect "$tag" --format '{{.Id}}')" = "$EXPECTED_IMAGE_ID"
+      - name: Login using ephemeral publication token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GH_ACTOR" --password-stdin
+      - name: Publish exact tested image and record immutable reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker push "$tag"
+          docker image inspect "$tag" --format '{{json .RepoDigests}}' > repo-digests.json
+          python3 - <<'PY'
+          import json, os, re
+          refs=json.load(open('repo-digests.json'))
+          refs=[r for r in refs if r.startswith(os.environ['IMAGE']+'@sha256:')]
+          assert len(refs)==1 and re.fullmatch(r'.+@sha256:[0-9a-f]{64}', refs[0])
+          result={'source_sha':os.environ['SOURCE_SHA'], 'recipe_sha':os.environ['RECIPE_SHA'],
+                  'workflow_sha':os.environ['GITHUB_SHA'], 'python_base':os.environ['PYTHON_BASE'],
+                  'api_image':refs[0], 'archive_sha256':os.environ['EXPECTED_ARCHIVE_SHA256'],
+                  'image_id':os.environ['EXPECTED_IMAGE_ID'], 'run_id':os.environ['GITHUB_RUN_ID'],
+                  'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'], 'deployed':False}
+          with open('release-image.json','w') as f: json.dump(result,f,indent=2)
+          print('Candidate image:',refs[0])
+          PY
+      - name: Preserve release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scm-release-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-image.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Logout
+        if: always()
+        run: docker logout ghcr.io
