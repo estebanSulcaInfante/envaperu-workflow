@@ -242,6 +242,16 @@ def _ack(receipt, next_heartbeat_seconds):
     }
 
 
+def _receipt_ack_query(heartbeat_id):
+    # Idempotency checks and ACKs never need the historical payload body.
+    return db.session.query(
+        EstacionHeartbeatRecepcion.station_id,
+        EstacionHeartbeatRecepcion.heartbeat_id,
+        EstacionHeartbeatRecepcion.payload_hash,
+        EstacionHeartbeatRecepcion.received_at_utc,
+    ).filter(EstacionHeartbeatRecepcion.heartbeat_id == heartbeat_id)
+
+
 def process_heartbeat(
     station,
     payload,
@@ -265,9 +275,7 @@ def process_heartbeat(
     payload_json = _canonical_json(normalized)
     digest = _payload_hash(payload_json)
 
-    existing = EstacionHeartbeatRecepcion.query.filter_by(
-        heartbeat_id=payload_id
-    ).one_or_none()
+    existing = _receipt_ack_query(payload_id).one_or_none()
     if existing is not None:
         if existing.station_id != station.station_id or existing.payload_hash != digest:
             raise HeartbeatIdempotencyConflict(payload_id)
@@ -303,13 +311,14 @@ def process_heartbeat(
             received_at,
         )
 
+    # Capture application-assigned values before commit expires the ORM object.
+    # The ACK is returned only after persistence succeeds.
+    ack = _ack(receipt, next_heartbeat_seconds)
     try:
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        concurrent = EstacionHeartbeatRecepcion.query.filter_by(
-            heartbeat_id=payload_id
-        ).one_or_none()
+        concurrent = _receipt_ack_query(payload_id).one_or_none()
         if (
             concurrent is None
             or concurrent.station_id != station.station_id
@@ -317,7 +326,7 @@ def process_heartbeat(
         ):
             raise HeartbeatIdempotencyConflict(payload_id)
         return _ack(concurrent, next_heartbeat_seconds)
-    return _ack(receipt, next_heartbeat_seconds)
+    return ack
 
 
 def station_monitor_dict(

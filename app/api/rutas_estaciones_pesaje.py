@@ -7,6 +7,7 @@ from flask import Blueprint, current_app, g, jsonify, request
 from app.extensions import db
 from app.models.estacion_pesaje import EstacionPesaje
 from app.services.station_auth import require_station_auth
+from app.services.station_monitoring_sync import monitoring_sync_check
 from app.services.station_monitoring import (
     HeartbeatIdempotencyConflict,
     HeartbeatValidationError,
@@ -191,6 +192,7 @@ def capabilities():
                     "station-production-progress-v1",
                     "station-legacy-history-v1",
                     "station-legacy-continuity-v1",
+                    "station-monitoring-sync-v1",
                 ],
                 "manga_prelabel": ["scm-manga-prelabel-v1"],
                 "manga_weighing": ["scm-manga-weighing-v1"],
@@ -885,5 +887,17 @@ def post_pilot_command():
         return jsonify(
             create_pilot_command(station_id, payload.get("action"), payload)
         ), 202
+    except LegacyContinuityError as exc:
+        return _continuity_error(exc)
+
+
+@integration_station_bp.post("/stations/<station_id>/monitoring/sync-check")
+@require_station_auth
+def station_snapshot_sync_check(station_id):
+    matches, error = _station_matches(station_id)
+    if not matches:
+        return error
+    try:
+        return jsonify(monitoring_sync_check(station_id, request.get_json(silent=True)))
     except LegacyContinuityError as exc:
         return _continuity_error(exc)

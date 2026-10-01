@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.envaperu.local/station/monitoring-sync/v1/contract.schema.json",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "window_start_date",
+        "window_end_date",
+        "include_legacy"
+      ],
+      "properties": {
+        "contract_version": {
+          "const": "station-monitoring-sync-v1"
+        },
+        "window_start_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "window_end_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "include_legacy": {
+          "type": "boolean"
+        },
+        "pending_report_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "pending_batch_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "station_id",
+        "window_start_date",
+        "window_end_date",
+        "checked_at_utc",
+        "progress_fingerprint",
+        "closures_fingerprint",
+        "legacy_state",
+        "pending_report_received",
+        "pending_batch_received"
+      ],
+      "properties": {
+        "contract_version": {
+          "const": "station-monitoring-sync-v1"
+        },
+        "station_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "window_start_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "window_end_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "checked_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "progress_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "closures_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "legacy_state": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "station_id",
+            "initial_import_id",
+            "high_watermark",
+            "contract_version"
+          ],
+          "properties": {
+            "station_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "initial_import_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "high_watermark": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "contract_version": {
+              "const": "station-legacy-continuity-v1"
+            }
+          }
+        },
+        "pending_report_received": {
+          "type": "boolean"
+        },
+        "pending_batch_received": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
