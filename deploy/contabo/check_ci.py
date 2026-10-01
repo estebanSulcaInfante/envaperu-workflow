@@ -1,37 +1,28 @@
-"""Read-only GitHub gate for exact source SHA; no deployment or credentials printed."""
+"""Validate the explicitly reviewed source CI run, not any green branch."""
 import json
 import os
 import re
-import urllib.parse
 import urllib.request
-
-
+SOURCE_SHA='167154600b58f62e536fc1cf7b0764713ab0860d'
+RUN_ID=36900452865
+BRANCH='codex/render-provisional-dashboard'
+REPOSITORY='estebanSulcaInfante/envaperu-workflow'
 def validate_inputs(source_sha, python_base):
-    if not re.fullmatch(r'[0-9a-f]{40}', source_sha):
-        raise ValueError('source_sha must be a full lowercase commit SHA')
-    if not re.fullmatch(r'python:3\.12[.\w-]*@sha256:[0-9a-f]{64}', python_base):
-        raise ValueError('python_base must be an approved Python 3.12 image pinned by digest')
-
-
-def select_success(payload, source_sha):
-    runs = [r for r in payload.get('workflow_runs', []) if r.get('head_sha') == source_sha]
-    if not runs:
-        raise ValueError('No backend CI run found for the exact source SHA')
-    latest = max(runs, key=lambda r: (r['run_number'], r.get('run_attempt', 1)))
-    if latest.get('status') != 'completed' or latest.get('conclusion') != 'success':
-        raise ValueError('Latest backend CI run for the source SHA is not successful')
-    if latest.get('head_branch') != 'main' or latest.get('event') not in ('push', 'workflow_dispatch'):
-        raise ValueError('Source must pass trusted main-branch CI, not a pull-request run')
-    return latest['html_url']
-
-
-if __name__ == '__main__':
-    sha = os.environ['SOURCE_SHA']
-    validate_inputs(sha, os.environ['PYTHON_BASE'])
-    repo = 'estebanSulcaInfante/envaperu-workflow'
-    url = f'https://api.github.com/repos/{repo}/actions/workflows/tests.yml/runs?' + urllib.parse.urlencode({'head_sha': sha, 'per_page': 100})
-    headers = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28',
-               'Authorization': 'Bearer ' + os.environ['GH_TOKEN']}
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
-        payload = json.load(response)
-    print('Verified source CI:', select_success(payload, sha))
+    if source_sha!=SOURCE_SHA: raise ValueError('Only reviewed source SHA is approved')
+    if not re.fullmatch(r'python:3\.12[.\w-]*@sha256:[0-9a-f]{64}',python_base):
+        raise ValueError('Approved Python 3.12 immutable base required')
+def select_success(run, source_sha):
+    if (source_sha!=SOURCE_SHA or run.get('id')!=RUN_ID or run.get('head_sha')!=SOURCE_SHA
+        or run.get('head_branch')!=BRANCH or run.get('event')!='push'
+        or run.get('path')!='.github/workflows/tests.yml'
+        or run.get('repository',{}).get('full_name')!=REPOSITORY
+        or run.get('status')!='completed' or run.get('conclusion')!='success'):
+        raise ValueError('Reviewed CI run identity or success does not match')
+    return run['html_url']
+if __name__=='__main__':
+    validate_inputs(os.environ['SOURCE_SHA'],os.environ['PYTHON_BASE'])
+    url=f'https://api.github.com/repos/{REPOSITORY}/actions/runs/{RUN_ID}'
+    headers={'Accept':'application/vnd.github+json','Authorization':'Bearer '+os.environ['GH_TOKEN']}
+    with urllib.request.urlopen(urllib.request.Request(url,headers=headers),timeout=30) as response:
+        run=json.load(response)
+    print('Verified reviewed CI:',select_success(run,os.environ['SOURCE_SHA']))

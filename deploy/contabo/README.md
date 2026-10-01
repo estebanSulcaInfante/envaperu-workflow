@@ -1,114 +1,114 @@
-# SCM en Contabo: Compose Git e imagen construida fuera del VPS
+# SCM Contabo: reviewed image preparation
 
-Preparación local NO publicada. Rama prep/contabo-final-ci, base exacta
-167154600b58f62e536fc1cf7b0764713ab0860d (optimización ya publicada).
-No modifica configuración Render, dashboard ni módulo físico de pesaje. Solo API y PostgreSQL aplicativos.
-No crea credenciales, proyectos, webhooks, permisos GitHub ni despliega servicios.
+Status: local preparation; independent review required before pushing or publishing.
+The user authorized a PUBLIC GHCR image containing code, dependencies and necessary
+runtime templates. No VPS deployment, credentials, Odoo changes or data migration
+are part of this package.
 
-## Configuración Dokploy propuesta, sin secretos
+## Source and trusted CI
 
-Servicio existente scm-pilot; composeId gUdHzz5cr5cYSsbq84hhu;
-appName envaperuscmpilot-scmpilot-cnxr9n; projectId uqV_MPCVwsGLJrRcWL_gH.
+Application source is fixed to 167154600b58f62e536fc1cf7b0764713ab0860d.
+check_ci.py accepts only GitHub Actions run 36900452865, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/render-provisional-dashboard,
+push event, .github/workflows/tests.yml, exact source SHA, completed and success.
+It does not accept a green run from an arbitrary branch or require main: main is
+older than this source. The existing source CI includes fast-suite/postgres-smoke.
 
-| Campo | Valor futuro |
-|---|---|
-| Tipo | Docker Compose, no Stack |
-| Provider | Git (genérico), no GitHub App ni Raw |
-| Repository URL | https://github.com/estebanSulcaInfante/envaperu-workflow.git |
-| Branch | release/scm-pilot (se creará/promoverá solo después de aprobar y publicar imagen) |
-| Compose Path | ./deploy/contabo/compose.release.yaml |
-| SSH Key | None |
-| Enable submodules | false |
-| AutoDeploy | OFF |
-| Domains | ninguno hasta autorizar proxy/corte |
+The workflow checks out the deployment recipe at a literal commit SHA, separately
+from the source. Recipe files are committed first; a following workflow-only commit
+pins that reviewed recipe. Both commits require review. Actions are pinned to SHAs.
 
-La rama release y compose.release.yaml NO existen todavía: no guardar esta configuración esperando que
-despliegue hoy. La rama local de preparación es otra cosa y no debe confundirse con release final.
-No publicar la rama ni activar workflow sin aprobación del bloque final. Primer deploy manual en UI después
-de los gates. Sin APIkey Dokploy, GitHubApp, webhook, runner en VPS, builds en VPS o panel expuesto a Internet.
+## Runtime files and templates
 
-Soporte exacto v0.30.7 verificado: SaveGitProviderCompose guarda sourceType=git, customGitUrl,
-customGitBranch, composePath y customGitSSHKeyId=null; proveedor git clona HTTPS sin key con --branch.
-Código: https://github.com/Dokploy/dokploy/blob/v0.30.7/apps/dokploy/components/dashboard/compose/general/generic/save-git-provider-compose.tsx
-y https://github.com/Dokploy/dokploy/blob/v0.30.7/packages/server/src/utils/providers/git.ts .
-Repositorio confirmado público por API anónima GitHub y página pública; main es rama predeterminada.
-No necesita conceder acceso a organización ni crear una instalación GitHub para clonar por HTTPS.
+runtime-allowlist.json enumerates 239 approved files with SHA-256 hashes.
+build_context.py creates a NEW context from these bytes; the source checkout is
+never sent to Docker. Unexpected files in the checkout do not enter the context.
+Every approved byte must match the fixed source; symlinks/escaping paths fail.
 
-## Construcción y evidencia
+Book2.xlsx is retained byte-for-byte: app/services/excel_service.py:TEMPLATE_PATH
+loads it when generating orders, using worksheet IMPRIMIR OP. The owner confirmed
+that necessary templates must remain. An offline scan of its XML/relationships
+found no private-key, GitHub-token, AWS-access-key or email markers; this bounded
+scan is not a general guarantee about all personal data.
 
-Workflow contabo-image.yml: solo workflow_dispatch; publish=false por defecto. Antes de construir valida
-SHA completo y comprueba que el último run tests.yml correspondiente a ese SHA en main terminó success.
-Eso reutiliza fast-suite y postgres-smoke existentes con sus contratos fijados; no reemplaza el gate del
-workspace. Evidencia inicial informada: backend run36900452865 y workspace run36903663774 exitosos.
-Confirmar vinculación workspace/backend final antes de promover cada nueva release.
+Eight other binary/CSV resources remain UNCHANGED in the source repository:
 
-Checkout separado de receta (GITHUB_SHA) y app (source_sha), sin credenciales Git persistidas. Dockerfile
-dedicado copia solo app/migrations/run.py/requirements.txt, usuario10001 y Python3.12-slim por digest aprobado.
-No usa Dockerfile existente ni modifica Render. .dockerignore específico reduce contexto a runtime permitido;
-revisar que no haya secretos versionados dentro de app antes de la primera publicación pública.
-Prueba de imagen sin red: imports Flask/Gunicorn/psycopg2 y archivos básicos. No demuestra conexión DB/Auth/S3.
-Se necesita ensayo real aislado antes del corte. Sin secreto de aplicación en build args/capas.
+- Book1.xlsx: input of scratch_update_template.py, which generates Book2.
+- OP1322-BALDE ROMANO.xlsm: offline analysis/debug scripts.
+- SKU PIEZAS 2025.xlsx and SKU PRODUCTOS TERMINADOS 2025.xlsx: import/analysis scripts.
+- image.png: OCR test fixture.
+- Book3.xlsx, REPORTE NOVIEMBRE25 CERRADO.xlsm and SKU PRODUCTOS PART 1.csv:
+  no Python runtime reference found in the reviewed source.
 
-Publicar requiere packages:write y GITHUB_TOKEN efímero; no PAT nuevo. El workflow tiene environment
-scm-pilot-image: configurar protección/revisor antes de ejecutarlo; el nombre por sí solo no garantiza gate.
-Su permiso packages:write se declara en el job incluso si publish=false: aprobación necesaria antes de
-activarlo. GHCR propuesto: ghcr.io/estebansulcainfante/envaperu-scm-api; tags únicos sha+run+attempt.
-Se publica LA MISMA imagen testeada y se registra digest, SHA fuente, SHA receta, base y run en release-image.json.
-No cambia visibilidad del package. Si se aprueba público, el administrador la establece y se verifica pull
-anónimo por digest antes de despliegue. Si privado, necesita handoff separado para lectura desde VPS.
-Repo público NO significa imagen pública; no exponer código/metadatos en imagen sin aprobar esa elección.
+These offline resources are explicitly listed as excluded from the API image,
+not deleted or sanitized. If a future runtime path needs one, review its content
+and amend the allowlist; do not broadly copy app/templates.
 
-Después de publicar, con digest PG inventariado y aprobado:
+verify_image_layers.py reads EVERY docker-save layer, including bytes hidden by
+later layers. All /app files must match the allowlist, and excluded resource
+basenames are rejected anywhere. Base OS/Python and installed dependencies outside
+/app are permitted by the reviewed Dockerfile and immutable Python base. This is
+not a dependency vulnerability scanner. No application secret is supplied to build.
 
-```sh
-python deploy/contabo/render_release.py --evidence release-image.json --postgres-image 'postgres:VERSION@sha256:DIGEST_REAL' --expected-source 167154600b58f62e536fc1cf7b0764713ab0860d --output deploy/contabo/compose.release.yaml
-```
+## Build and publication boundary
 
-El comando es plantilla: VERSION/DIGEST_REAL no son valores ejecutables. El renderer rechaza tags sueltos,
-PG18 (layout diferente) y SHA inconsistente, y no sobrescribe archivos. Después revisar/commitear el manifiesto
-resuelto y evidencia no secreta en release/scm-pilot mediante promoción explícita. Workflow no hace git push.
-El digest no existe aún: no inventarlo ni reemplazar por latest. Primer deploy necesita confirmar en Dokploy
-que el commit clonado contiene exactamente el release aprobado.
+The manual workflow runs only on codex/scm-contabo-image in the expected repository.
+Its build job has contents:read and actions:read, with no packages:write. It validates
+CI, builds linux/amd64 outside the VPS, imports dependencies and opens Book2 without
+network or credentials, then checks every saved image layer. It uploads the exact
+image archive and records its SHA-256 and image ID as job outputs.
 
-## Aislamiento y gates operativos
+Only the separate publish job has packages:write, and only runs when publish=true.
+It requires environment scm-pilot-image-public. check_publish_gate.py fails unless
+that environment has a required reviewer and exactly one allowed deployment branch,
+codex/scm-contabo-image. The build also checks this gate when publication is requested,
+before the privileged job. No script creates or weakens environment protections.
+The publish job downloads the artifact by its exact ID from this run, verifies the
+archive hash and all layers again, loads the tested image and checks its image ID.
+It never builds or executes application code. GHCR login uses the ephemeral workflow
+token. Tags include source SHA, run ID and attempt; release-image.json records the
+registry digest, source SHA, pinned recipe SHA, base and run. There is no deploy step.
 
-Compose base: API1CPU/1GiB, DB1CPU/1.5GiB, volumen PG propio, sin ports publicados, DB red internal; API egress
-para SupabaseAuth/S3. Config guard inline evita montar scripts desde el checkout que Dokploy reemplaza.
-API exige scm_api y SCM_AUTH_MODE=supabase; no superuser/BYPASSRLS. Credenciales todavía ausentes.
-Mantener el proveedor Auth y S3 existentes; no poner estación física/pesaje en VPS ni mover dashboardgratis.
+Execution prerequisites still needing coordinator resolution:
 
-Dokploy puede adjuntar redes/labels: revisar su Compose renderizado/preview antes del primer start y comprobar
-que DB NO pertenezca a dokploy-network, ingress ni red del proxy. No basta comprobar el YAML fuente.
-No conectar API al proxy hasta aprobación de dominio/TLS. Mantener idle durante preparación.
+1. Independent review of the new local recipe and workflow commits before any push.
+2. A protected scm-pilot-image-public environment with the reviewer/branch policy
+   above. It is not created by this preparation; unavailable API metadata fails closed.
+3. workflow_dispatch requires the workflow on the default branch. main is old:
+   do not merge the optimized application into main or change default branches just
+   to enable dispatch. Coordinate a reviewed workflow-only bootstrap before execution.
+4. Supply a reviewed immutable python:3.12-slim@sha256 digest. No fabricated digest.
+5. A supported authenticated GitHub execution path. No PAT or credentials are created.
+6. GHCR visibility is separate from repository visibility. The new image is authorized
+   public, but setting/verifying package visibility and an anonymous digest pull remain
+   necessary after publication; this workflow does not silently change visibility.
 
-PG version/extensiones, roles owner/API/backup, grants y policies FORCE RLS deben inventariarse y aprobarse.
-Backup DB externo cifrado y restauración comprobada son gates; propuesta7diarios+4semanales, RPO24h/RTO4h
-pendientes de aceptación/medición. BackupS3 aplazado según usuario, no implica borrar imágenes compartidas.
-Rollback de imagen requiere compatibilidad de schema; tras nuevas escrituras no apuntar a DBvieja sin
-reconciliación. Un único escritor durante el corte futuro.
+## Later deployment, outside current publication scope
 
-## Un único bloque pendiente de aprobación/necesidades
+The existing Dokploy scm-pilot service remains idle. Future generic Git configuration:
+https://github.com/estebanSulcaInfante/envaperu-workflow.git, release/scm-pilot,
+./deploy/contabo/compose.release.yaml, no SSH key/submodules, AutoDeploy OFF.
+That release branch/manifest must be created only after image digest review; no
+GitHub App, webhook or new Dokploy API key is required for public HTTPS Git cloning.
 
-1. Publicar estos archivos revisados en backend y activar workflow manual con packages:write limitado al
-   repo/paquete indicado, usando token efímero. Aprobar imagen GHCR pública para pull sin nuevas credenciales,
-   o elegir privada y handoff seguro de lectura. Confirmar protección del environment scm-pilot-image.
-2. Autorizar preparación Git genérica del servicio existente, promoción de release tras CI y primer deploy
-   manual cuando los gates pasen. No se solicita GitHubApp, webhook, APIkey, accesoorg ni abrir panelInternet.
-3. Aprobar roles/credenciales DB y uso persistente S3 existente mediante entrada directa segura; concretar
-   destino backup externo/retención/restauración. No enviar passwords/tokens por chat.
+render_release.py resolves the API digest plus an approved immutable PostgreSQL
+15-17 reference into a new compose.release.yaml; it rejects unpinned references,
+PG18's different layout, inconsistent source and overwrites. Secret-file placeholders
+remain mandatory; no credentials are included or generated.
 
-Dominio/corte se aprueban después: no son necesarios para publicar la imagen ni guardar Git/Compose.
-Las variables SCM_API_ENV_FILE y SCM_PG_PASSWORD_FILE siguen obligatorias: deben apuntar a archivos seguros
-gestionados por administrador dentro del layout persistente Dokploy; no generar secretos ni usar rutas
-de otro proyecto. El manifiesto resuelto fija imágenes y conserva únicamente placeholders de esos archivos.
+Compose budgets: API 1 CPU/1 GiB; DB 1 CPU/1.5 GiB, own volume, internal database
+network and no published DB port. Supabase Auth/S3 stay external; dashboard and
+physical weighing station stay where they are. Review Dokploy's rendered networks
+before a future start so PostgreSQL is not attached to proxy/ingress networks.
+DB roles/FORCE RLS, secure credential handoff, external backups and tested restoration
+are separate gates before migration or cutover. Odoo is untouched.
 
-Estado: spec_phase tech_spec; delivery_state review; functional_validation static_only;
-ux_validation not_applicable; physical_uat pending; release_constraint no_habilitar_en_planta.
-Revisión independiente/bitácora del workspace pendientes del coordinador para evitar editar sus archivos.
+## Local validation
 
-Validación local ejecutada: 3 pruebas unittest offline OK (múltiples casos de rechazo CI/SHA/digest);
-Docker Compose config --no-interpolate --no-env-resolution OK; YAML del workflow y Compose parseado con
-js-yaml ya instalado, todas las acciones fijadas a SHA, solo trigger manual y publish=false comprobados;
-bash -n de cada bloque run OK; git diff --check OK tras retirar espacios sobrantes. PyYAML no estaba
-instalado; no se instaló y se reutilizó js-yaml. No se ejecutó build Docker, workflow GitHub, push GHCR,
-pull VPS, carga funcional ni modificación Dokploy. Faltan esas verificaciones tras aprobación.
+Run: python deploy/contabo/test_preparation.py
+Tests cover exact CI identity, context hashes, excluded files/hidden layer content,
+publication environment policy, runtime template inclusion and digest rendering.
+Also validate the real source context, YAML, bash syntax, Compose configuration and
+git diff --check. Image build/smoke/layer verification are mandatory CI steps, not
+claimed as completed locally. No workflow, image push or VPS deployment is implied
+by these static tests.
