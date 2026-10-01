@@ -1,0 +1,14 @@
+**
+!requirements.txt
+!run.py
+!app/
+!app/**
+!migrations/
+!migrations/**
+**/.env
+**/.env.*
+**/__pycache__
+**/*.pyc
+**/*.pem
+**/*.key
+**/logs/**

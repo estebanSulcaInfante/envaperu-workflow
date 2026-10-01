@@ -1,0 +1,113 @@
+name: Prepare SCM Contabo image (manual)
+
+# DRAFT: publish only after approval of packages:write and image visibility.
+# No deployment, repository writes, VPS access or automatic push trigger.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact optimized backend commit that passed main CI
+        required: true
+        default: '167154600b58f62e536fc1cf7b0764713ab0860d'
+        type: string
+      python_base:
+        description: Approved python:3.12-slim variant with immutable @sha256 digest
+        required: true
+        type: string
+      publish:
+        description: Publish tested image to GHCR (requires approval)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: contabo-image-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: scm-pilot-image
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      PYTHON_BASE: ${{ inputs.python_base }}
+      IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
+    steps:
+      - name: Checkout reviewed deployment recipe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: recipe
+          persist-credentials: false
+      - name: Require successful CI for exact source SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 recipe/deploy/contabo/check_ci.py
+      - name: Checkout exact application source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - name: Build outside VPS with explicit runtime allowlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          cp recipe/deploy/contabo/Dockerfile source/Contabo.Dockerfile
+          cp recipe/deploy/contabo/Dockerfile.dockerignore source/Contabo.Dockerfile.dockerignore
+          docker build --platform linux/amd64 --build-arg PYTHON_BASE="$PYTHON_BASE" \
+            --build-arg SOURCE_SHA="$SOURCE_SHA" -f source/Contabo.Dockerfile \
+            -t "$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" source
+      - name: Smoke-check image without credentials or network
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --entrypoint python \
+            "$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -c "import gunicorn, flask, psycopg2; from pathlib import Path; assert Path('/app/run.py').is_file(); assert Path('/app/migrations').is_dir(); assert not Path('/app/.env').exists()"
+      - name: Login with ephemeral workflow token
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GH_ACTOR" --password-stdin
+      - name: Publish exact tested image and record immutable reference
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker push "$tag"
+          docker image inspect "$tag" --format '{{json .RepoDigests}}' > repo-digests.json
+          python3 - <<'PY'
+          import json, os, re
+          refs=json.load(open('repo-digests.json'))
+          refs=[r for r in refs if r.startswith(os.environ['IMAGE']+'@sha256:')]
+          assert len(refs)==1 and re.fullmatch(r'.+@sha256:[0-9a-f]{64}', refs[0])
+          result={'source_sha':os.environ['SOURCE_SHA'], 'recipe_sha':os.environ['GITHUB_SHA'],
+                  'python_base':os.environ['PYTHON_BASE'], 'api_image':refs[0],
+                  'run_id':os.environ['GITHUB_RUN_ID'], 'deployed':False}
+          with open('release-image.json','w') as f: json.dump(result,f,indent=2)
+          print('Candidate image:',refs[0])
+          PY
+      - name: Save release evidence (not a deployment)
+        if: ${{ inputs.publish }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scm-image-${{ inputs.source_sha }}
+          path: release-image.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Logout
+        if: ${{ always() && inputs.publish }}
+        run: docker logout ghcr.io

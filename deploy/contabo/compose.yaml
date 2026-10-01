@@ -1,0 +1,132 @@
+# PREPARATION ONLY: requires approved administrator handoff before any start.
+# Project name is controlled by Dokploy: envaperuscmpilot-scmpilot-cnxr9n
+services:
+  api:
+    image: ${SCM_API_IMAGE:?Set reviewed final API image with immutable sha256 digest}
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 1g
+    mem_reservation: 512m
+    pids_limit: 128
+    env_file:
+      - ${SCM_API_ENV_FILE:?Administrator must securely supply API environment file}
+    environment:
+      SCM_AUTH_MODE: supabase
+      CATALOG_IMAGE_STORAGE: supabase_s3
+      CATALOG_IMAGE_KEEP_DATABASE_COPY: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    entrypoint: [python, /prep/start_guard.py]
+    command: [gunicorn, run:app, --bind, "0.0.0.0:5000", --workers, "2", --timeout, "60", --graceful-timeout, "30", --max-requests, "1000", --max-requests-jitter, "100", --error-logfile, "-"]
+    configs:
+      - source: start_guard
+        target: /prep/start_guard.py
+    tmpfs:
+      - /tmp:size=67108864,mode=1777
+      - /app/logs:size=83886080,uid=10001,gid=10001,mode=0700
+      - /app/instance:size=16777216,uid=10001,gid=10001,mode=0700
+    networks: [database, egress]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+  db:
+    image: ${SCM_POSTGRES_IMAGE:?Set approved PostgreSQL 15-17 image with immutable digest after source inventory}
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 1536m
+    mem_reservation: 512m
+    shm_size: 256m
+    pids_limit: 128
+    environment:
+      POSTGRES_DB: scm_pilot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_bootstrap_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets: [pg_bootstrap_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [database]
+    command: [postgres, -c, shared_buffers=256MB, -c, work_mem=4MB, -c, maintenance_work_mem=64MB, -c, max_connections=50, -c, max_wal_size=1GB, -c, log_statement=none]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d scm_pilot"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+networks:
+  database:
+    internal: true
+  egress: {}
+volumes:
+  pgdata: {}
+configs:
+  start_guard:
+    content: |
+      """Fail closed without displaying configuration or importing the application."""
+      import os
+      import sys
+      from urllib.parse import urlsplit
+
+
+      def validate(env):
+          errors = []
+          if env.get("SCM_AUTH_MODE") != "supabase":
+              errors.append("SCM_AUTH_MODE")
+          db = urlsplit(env.get("DATABASE_URL", ""))
+          if (db.scheme not in ("postgresql", "postgresql+psycopg2")
+                  or db.username != "scm_api" or not db.password
+                  or db.hostname != "db" or db.path != "/scm_pilot"):
+              errors.append("DATABASE_URL")
+          for key in ("SUPABASE_URL", "SUPABASE_S3_ENDPOINT"):
+              value = urlsplit(env.get(key, ""))
+              if value.scheme != "https" or not value.hostname or value.username or value.password:
+                  errors.append(key)
+          base = env.get("SUPABASE_URL", "").rstrip("/")
+          if env.get("SUPABASE_JWT_ISSUER", "").rstrip("/") != base + "/auth/v1":
+              errors.append("SUPABASE_JWT_ISSUER")
+          for key in ("SUPABASE_JWT_AUDIENCE", "SUPABASE_S3_REGION",
+                      "SUPABASE_S3_ACCESS_KEY_ID", "SUPABASE_S3_SECRET_ACCESS_KEY",
+                      "SUPABASE_STORAGE_BUCKET"):
+              if not env.get(key, "").strip():
+                  errors.append(key)
+          origins = env.get("ALLOWED_ORIGINS", "").split(",")
+          if any(not x.strip().startswith("https://") or "*" in x for x in origins):
+              errors.append("ALLOWED_ORIGINS")
+          if env.get("SCM_DEMO_MODE", "").strip():
+              errors.append("SCM_DEMO_MODE")
+          return errors
+
+
+      if __name__ == "__main__":
+          try:
+              invalid = validate(os.environ)
+          except ValueError:
+              invalid = ["malformed URL configuration"]
+          if invalid:
+              sys.exit("Configuration rejected; check variable names: " + ", ".join(invalid))
+          if len(sys.argv) < 2:
+              sys.exit("Missing process command")
+          os.execvp(sys.argv[1], sys.argv[1:])
+secrets:
+  pg_bootstrap_password:
+    file: ${SCM_PG_PASSWORD_FILE:?Administrator must approve and supply bootstrap password file}
