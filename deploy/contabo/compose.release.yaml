@@ -31,7 +31,22 @@ services:
       - /tmp:size=67108864,mode=1777
       - /app/logs:size=83886080,uid=10001,gid=10001,mode=0700
       - /app/instance:size=16777216,uid=10001,gid=10001,mode=0700
-    networks: [database, egress]
+    networks: [database, egress, proxy]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: dokploy-network
+      traefik.http.routers.scm-pilot-api-http.rule: Host(`api-scm.envaperu.pe`)
+      traefik.http.routers.scm-pilot-api-http.entrypoints: web
+      traefik.http.routers.scm-pilot-api-http.middlewares: scm-pilot-api-https
+      traefik.http.routers.scm-pilot-api-http.service: scm-pilot-api
+      traefik.http.middlewares.scm-pilot-api-https.redirectscheme.scheme: https
+      traefik.http.middlewares.scm-pilot-api-https.redirectscheme.permanent: "true"
+      traefik.http.routers.scm-pilot-api.rule: Host(`api-scm.envaperu.pe`)
+      traefik.http.routers.scm-pilot-api.entrypoints: websecure
+      traefik.http.routers.scm-pilot-api.tls: "true"
+      traefik.http.routers.scm-pilot-api.tls.certresolver: letsencrypt
+      traefik.http.routers.scm-pilot-api.service: scm-pilot-api
+      traefik.http.services.scm-pilot-api.loadbalancer.server.port: "5000"
     depends_on:
       db:
         condition: service_healthy
@@ -78,6 +93,9 @@ networks:
   database:
     internal: true
   egress: {}
+  proxy:
+    external: true
+    name: dokploy-network
 volumes:
   pgdata: {}
 configs:
