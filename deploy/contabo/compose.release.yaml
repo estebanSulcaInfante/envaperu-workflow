@@ -27,6 +27,14 @@ services:
     configs:
       - source: start_guard
         target: /prep/start_guard.py
+      - source: station_heartbeat_v1
+        target: /app/contracts/station-heartbeat-v1/contract.schema.json
+      - source: station_production_progress_v1
+        target: /app/contracts/station-production-progress-v1/contract.schema.json
+      - source: station_legacy_history_v1
+        target: /app/contracts/station-legacy-history-v1/contract.schema.json
+      - source: station_monitoring_sync_v1
+        target: /app/contracts/station-monitoring-sync-v1/contract.schema.json
     tmpfs:
       - /tmp:size=67108864,mode=1777
       - /app/logs:size=83886080,uid=10001,gid=10001,mode=0700
@@ -101,6 +109,14 @@ volumes:
 configs:
   start_guard:
     file: ./start_guard.py
+  station_heartbeat_v1:
+    file: ../../contracts/station-heartbeat-v1/contract.schema.json
+  station_production_progress_v1:
+    file: ../../contracts/station-production-progress-v1/contract.schema.json
+  station_legacy_history_v1:
+    file: ../../contracts/station-legacy-history-v1/contract.schema.json
+  station_monitoring_sync_v1:
+    file: ../../contracts/station-monitoring-sync-v1/contract.schema.json
 
 secrets:
   pg_bootstrap_password:
