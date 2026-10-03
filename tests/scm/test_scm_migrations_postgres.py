@@ -8,6 +8,8 @@ from threading import Barrier
 from uuid import uuid4
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
@@ -35,6 +37,7 @@ PRODUCT_ONBOARDING_REVISION = "f81d0e6f2b53"
 UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
 PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
 OPM_PREPARED_MATERIAL_REVISION = "c3a91f6e2d47"
+ARTICLE_FUNCTION_GRANT_BASE_REVISION = "fa1b2c3d4e50"
 HEAD_REVISION = ScriptDirectory(str(BACKEND_ROOT / "migrations")).get_current_head()
 
 
@@ -106,11 +109,334 @@ def _run_flask_db_failure(schema_url, *args):
     return result
 
 
+def _repeat_article_subtype_grant_upgrade(connection):
+    revision = ScriptDirectory(str(BACKEND_ROOT / "migrations")).get_revision(
+        "fb2c3d4e5f60"
+    )
+    with Operations.context(MigrationContext.configure(connection)):
+        revision.module.upgrade()
+
+
 def _drop_isolated_schema(admin_engine, schema):
     try:
         with admin_engine.begin() as connection:
             connection.execute(DropSchema(schema, cascade=True))
     finally:
+        admin_engine.dispose()
+
+
+def _ensure_scm_api_role(admin_engine):
+    """Create the runtime role only in the isolated local test cluster."""
+    with admin_engine.begin() as connection:
+        role_exists = connection.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'scm_api')"
+        )).scalar_one()
+        created_role = not role_exists
+        if created_role:
+            connection.execute(text("CREATE ROLE scm_api NOLOGIN"))
+
+        membership_exists = connection.execute(text(
+            "SELECT pg_has_role(current_user, 'scm_api', 'MEMBER')"
+        )).scalar_one()
+        added_membership = not membership_exists
+        if added_membership:
+            connection.execute(text("GRANT scm_api TO CURRENT_USER"))
+    return created_role, added_membership
+
+
+def _cleanup_scm_api_role(admin_engine, *, created_role, added_membership):
+    with admin_engine.begin() as connection:
+        if added_membership:
+            connection.execute(text("REVOKE scm_api FROM CURRENT_USER"))
+        if created_role:
+            connection.execute(text("DROP ROLE scm_api"))
+
+
+def _article_subtype_function_acl(connection):
+    return {
+        tuple(row)
+        for row in connection.execute(text("""
+        SELECT privilege.grantee,
+               privilege.privilege_type,
+               privilege.is_grantable
+        FROM pg_proc AS function
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = function.pronamespace
+        CROSS JOIN LATERAL aclexplode(
+            COALESCE(
+                function.proacl,
+                acldefault('f', function.proowner)
+            )
+        ) AS privilege
+        WHERE namespace.nspname = current_schema()
+          AND function.proname = 'scm_assert_article_subtype'
+          AND pg_get_function_identity_arguments(function.oid) = 'target_id integer'
+        """)).all()
+    }
+
+
+def _insert_article_color_link(connection, *, article_id, sku):
+    connection.execute(text("""
+        INSERT INTO scm_articulo (
+            id, public_id, codigo, nombre, clase, unidad_base, activo, version
+        ) VALUES (
+            :id, :public_id, :codigo, 'Asa de prueba', 'PIEZA_COLOR',
+            'UN', true, 1
+        )
+    """), {
+        "id": article_id,
+        "public_id": uuid4(),
+        "codigo": sku,
+    })
+    connection.execute(text("""
+        INSERT INTO scm_articulo_pieza_color (articulo_id, pieza_color_sku)
+        VALUES (:article_id, :sku)
+    """), {"article_id": article_id, "sku": sku})
+
+
+def test_article_subtype_helper_is_granted_only_to_scm_api_and_guard_stays_active():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    created_role = False
+    added_membership = False
+    schema_engine = None
+    try:
+        created_role, added_membership = _ensure_scm_api_role(admin_engine)
+        _run_flask_db(schema_url, "upgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
+        schema_engine = create_engine(schema_url)
+
+        with schema_engine.begin() as connection:
+            preparer = connection.dialect.identifier_preparer
+            quoted_schema = preparer.quote_identifier(schema)
+            connection.execute(text(
+                "REVOKE EXECUTE ON FUNCTION "
+                f"{quoted_schema}.scm_assert_article_subtype(integer) "
+                "FROM PUBLIC, scm_api"
+            ))
+            connection.execute(text("""
+                INSERT INTO pieza_color (sku, activo, version)
+                VALUES ('PC-FUNCTION-GRANT-001', true, 1)
+            """))
+            connection.execute(text(
+                f"GRANT USAGE ON SCHEMA {quoted_schema} TO scm_api"
+            ))
+            connection.execute(text("""
+                GRANT SELECT ON scm_articulo, scm_articulo_pieza_color,
+                    scm_definicion_wip, scm_articulo_producto TO scm_api;
+                GRANT INSERT ON scm_articulo, scm_articulo_pieza_color TO scm_api
+            """))
+            function_privilege_before = connection.execute(text("""
+                SELECT has_function_privilege(
+                    'scm_api',
+                    'scm_assert_article_subtype(integer)',
+                    'EXECUTE'
+                )
+            """)).scalar_one()
+            assert function_privilege_before is False
+            acl_before = _article_subtype_function_acl(connection)
+
+        with pytest.raises(DBAPIError) as denied:
+            with schema_engine.begin() as connection:
+                connection.execute(text("SET LOCAL ROLE scm_api"))
+                _insert_article_color_link(
+                    connection,
+                    article_id=910001,
+                    sku="PC-FUNCTION-GRANT-001",
+                )
+                connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        assert "permission denied for function scm_assert_article_subtype" in str(
+            denied.value
+        ).lower()
+
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        # Re-executing this grant-only revision is explicitly idempotent.
+        with schema_engine.begin() as connection:
+            acl_before_repeat = _article_subtype_function_acl(connection)
+            _repeat_article_subtype_grant_upgrade(connection)
+            assert _article_subtype_function_acl(connection) == acl_before_repeat
+        with schema_engine.connect() as connection:
+            assert connection.execute(text("""
+                SELECT has_function_privilege(
+                    'scm_api',
+                    'scm_assert_article_subtype(integer)',
+                    'EXECUTE'
+                )
+            """)).scalar_one() is True
+            role_oid = connection.execute(text(
+                "SELECT oid FROM pg_roles WHERE rolname = 'scm_api'"
+            )).scalar_one()
+            acl_after = _article_subtype_function_acl(connection)
+            assert acl_after - acl_before == {(role_oid, "EXECUTE", False)}
+            assert (0, "EXECUTE", False) not in acl_after
+            assert connection.execute(text("""
+                SELECT prosecdef
+                FROM pg_proc
+                WHERE oid = 'scm_assert_article_subtype(integer)'::regprocedure
+            """)).scalar_one() is False
+
+        with schema_engine.begin() as connection:
+            connection.execute(text("SET LOCAL ROLE scm_api"))
+            _insert_article_color_link(
+                connection,
+                article_id=910002,
+                sku="PC-FUNCTION-GRANT-001",
+            )
+            connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+        with pytest.raises(DBAPIError, match="ARTICLE_SUBTYPE_MISMATCH"):
+            with schema_engine.begin() as connection:
+                connection.execute(text("SET LOCAL ROLE scm_api"))
+                connection.execute(text("""
+                    INSERT INTO scm_articulo (
+                        id, public_id, codigo, nombre, clase,
+                        unidad_base, activo, version
+                    ) VALUES (
+                        910003, :public_id, 'PC-SIN-SUBTIPO',
+                        'Pieza sin subtipo', 'PIEZA_COLOR', 'UN', true, 1
+                    )
+                """), {"public_id": uuid4()})
+                connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+        _run_flask_db(schema_url, "downgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
+        with schema_engine.connect() as connection:
+            assert connection.execute(text("""
+                SELECT has_function_privilege(
+                    'scm_api',
+                    'scm_assert_article_subtype(integer)',
+                    'EXECUTE'
+                )
+            """)).scalar_one() is True
+            assert connection.execute(text(
+                "SELECT to_regclass(:name) IS NULL"
+            ), {"name": f'"{schema}".scm_function_grant_state_fb2c3d4e5f60'}).scalar_one()
+    finally:
+        if schema_engine is not None:
+            schema_engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(DropSchema(schema, cascade=True))
+        _cleanup_scm_api_role(
+            admin_engine,
+            created_role=created_role,
+            added_membership=added_membership,
+        )
+        admin_engine.dispose()
+
+
+def test_article_subtype_helper_downgrade_preserves_preexisting_scm_api_grant():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    created_role = False
+    added_membership = False
+    schema_engine = None
+    try:
+        created_role, added_membership = _ensure_scm_api_role(admin_engine)
+        _run_flask_db(schema_url, "upgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
+        schema_engine = create_engine(schema_url)
+        with schema_engine.begin() as connection:
+            preparer = connection.dialect.identifier_preparer
+            quoted_schema = preparer.quote_identifier(schema)
+            connection.execute(text(
+                "REVOKE EXECUTE ON FUNCTION "
+                f"{quoted_schema}.scm_assert_article_subtype(integer) FROM PUBLIC"
+            ))
+            connection.execute(text(
+                "GRANT EXECUTE ON FUNCTION "
+                f"{quoted_schema}.scm_assert_article_subtype(integer) TO scm_api"
+            ))
+
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        _run_flask_db(schema_url, "downgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
+        with schema_engine.connect() as connection:
+            assert connection.execute(text("""
+                SELECT has_function_privilege(
+                    'scm_api',
+                    'scm_assert_article_subtype(integer)',
+                    'EXECUTE'
+                )
+            """)).scalar_one() is True
+    finally:
+        if schema_engine is not None:
+            schema_engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(DropSchema(schema, cascade=True))
+        _cleanup_scm_api_role(
+            admin_engine,
+            created_role=created_role,
+            added_membership=added_membership,
+        )
+        admin_engine.dispose()
+
+
+def test_article_subtype_helper_grant_upgrade_and_downgrade_with_missing_role():
+    admin_engine, schema, schema_url = _isolated_postgres_url()
+    schema_engine = None
+    try:
+        with admin_engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT to_regrole('scm_api') IS NULL"
+            )).scalar_one() is True
+
+        _run_flask_db(schema_url, "upgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
+        schema_engine = create_engine(schema_url)
+        with schema_engine.connect() as connection:
+            acl_before = _article_subtype_function_acl(connection)
+
+        # With no runtime role, both upgrade and downgrade remain harmless.
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        with schema_engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT to_regrole('scm_api') IS NULL"
+            )).scalar_one() is True
+            assert connection.execute(text(
+                "SELECT to_regclass(:name) IS NULL"
+            ), {"name": f'"{schema}".scm_function_grant_state_fb2c3d4e5f60'}).scalar_one()
+            assert _article_subtype_function_acl(connection) == acl_before
+
+        _run_flask_db(schema_url, "downgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
+        with schema_engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT to_regrole('scm_api') IS NULL"
+            )).scalar_one() is True
+            assert connection.execute(text(
+                "SELECT to_regclass(:name) IS NULL"
+            ), {"name": f'"{schema}".scm_function_grant_state_fb2c3d4e5f60'}).scalar_one()
+            assert _article_subtype_function_acl(connection) == acl_before
+
+        # Also cover removal of the optional role after this revision grants it.
+        with admin_engine.begin() as connection:
+            connection.execute(text("CREATE ROLE scm_api NOLOGIN"))
+        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        with schema_engine.begin() as connection:
+            preparer = connection.dialect.identifier_preparer
+            quoted_schema = preparer.quote_identifier(schema)
+            connection.execute(text(
+                "REVOKE EXECUTE ON FUNCTION "
+                f"{quoted_schema}.scm_assert_article_subtype(integer) FROM scm_api"
+            ))
+        with admin_engine.begin() as connection:
+            connection.execute(text("DROP ROLE scm_api"))
+
+        _run_flask_db(schema_url, "downgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
+        with schema_engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT to_regrole('scm_api') IS NULL"
+            )).scalar_one() is True
+            assert connection.execute(text(
+                "SELECT to_regclass(:name) IS NULL"
+            ), {"name": f'"{schema}".scm_function_grant_state_fb2c3d4e5f60'}).scalar_one()
+            assert _article_subtype_function_acl(connection) == acl_before
+    finally:
+        if schema_engine is not None:
+            schema_engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.execute(DropSchema(schema, cascade=True))
+            connection.execute(text("""
+                DO $body$
+                BEGIN
+                  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'scm_api') THEN
+                    DROP ROLE scm_api;
+                  END IF;
+                END
+                $body$;
+            """))
         admin_engine.dispose()
 
 
