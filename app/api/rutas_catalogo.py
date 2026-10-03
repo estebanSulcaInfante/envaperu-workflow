@@ -8,6 +8,12 @@ from flask import Blueprint, Response, jsonify, request
 from app.extensions import db
 from app.models.producto import ProductoTerminado, PiezaColor, ProductoPieza, ColorProduccion, ColorBase, Linea, Familia, FamiliaColor, LineaFamilia
 from app.models.scm_commercial import ScmPresentacionComercial
+from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
+from app.models.scm_articulos import CLASE_PIEZA_COLOR
+from app.services.catalog_name_service import (
+    MAX_LONGITUD_NOMBRE_CATALOGO,
+    nombre_pieza_color,
+)
 from app.services.catalog_classification_service import (
     ClassificationError,
     classification_usage,
@@ -46,7 +52,7 @@ from app.services.catalog_image_storage import (
     has_catalog_image,
     validate_catalog_image_content,
 )
-from sqlalchemy import or_
+from sqlalchemy import or_, select, update
 
 catalogo_bp = Blueprint('catalogo', __name__)
 
@@ -352,7 +358,15 @@ def obtener_pieza_maestra(pieza_id):
 
 @catalogo_bp.route('/piezas/<int:pieza_id>', methods=['PUT'])
 def actualizar_pieza_maestra(pieza_id):
-    pieza = db.session.get(Pieza, pieza_id)
+    # Bloqueo con orden estable: Pieza -> PiezaColor por SKU -> Artículo SCM
+    # por id. El CAS de versión conserva la protección también en SQLite,
+    # donde FOR UPDATE no adquiere bloqueos de fila.
+    pieza = db.session.execute(
+        select(Pieza)
+        .where(Pieza.id == pieza_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if not pieza:
         return jsonify({'error': 'Pieza no encontrada'}), 404
     data = request.get_json() or {}
@@ -384,6 +398,11 @@ def actualizar_pieza_maestra(pieza_id):
         return jsonify({'error': 'peso_nominal_gr debe ser numérico'}), 400
     if not nombre or peso_nominal <= 0:
         return jsonify({'error': 'Nombre y peso nominal positivo son obligatorios'}), 400
+    if len(nombre) > MAX_LONGITUD_NOMBRE_CATALOGO:
+        return jsonify({
+            'error': 'El nombre no puede exceder 200 caracteres',
+            'codigo': 'NOMBRE_DEMASIADO_LARGO',
+        }), 400
     try:
         linea, familia, _ = validate_linea_familia(
             linea_id=data.get('linea_id', pieza.linea_id),
@@ -398,14 +417,124 @@ def actualizar_pieza_maestra(pieza_id):
         return jsonify({
             'error': 'Desvincule la pieza de todos los moldes antes de inactivarla'
         }), 409
-    pieza.nombre = nombre
-    pieza.peso_nominal_gr = peso_nominal
-    pieza.linea_id = linea.id if linea else None
-    pieza.familia_id = familia.id if familia else None
-    pieza.activo = nuevo_activo
-    pieza.version += 1
     try:
+        nombre_anterior = pieza.nombre
+        variantes = db.session.execute(
+            select(PiezaColor)
+            .where(PiezaColor.pieza_id == pieza.id)
+            .order_by(PiezaColor.sku)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalars().all()
+
+        variantes_generadas = []
+        for variante in variantes if nombre != nombre_anterior else ():
+            color = variante.color_produccion_rel
+            if color is None:
+                continue
+            nombre_generado_anterior = nombre_pieza_color(
+                nombre_anterior,
+                color.nombre,
+            )
+            if variante.piezas != nombre_generado_anterior:
+                continue
+            nombre_generado_nuevo = nombre_pieza_color(nombre, color.nombre)
+            if len(nombre_generado_nuevo) > MAX_LONGITUD_NOMBRE_CATALOGO:
+                db.session.rollback()
+                return jsonify({
+                    'error': (
+                        'El nombre generado de PiezaColor no puede exceder '
+                        '200 caracteres'
+                    ),
+                    'codigo': 'NOMBRE_DERIVADO_DEMASIADO_LARGO',
+                    'sku': variante.sku,
+                }), 400
+            variantes_generadas.append((variante, nombre_generado_anterior,
+                                        nombre_generado_nuevo))
+
+        articulos_por_sku = {}
+        if variantes_generadas:
+            skus = [item[0].sku for item in variantes_generadas]
+            articulos = db.session.execute(
+                select(ScmArticulo, ScmArticuloPiezaColor.pieza_color_sku)
+                .join(
+                    ScmArticuloPiezaColor,
+                    ScmArticuloPiezaColor.articulo_id == ScmArticulo.id,
+                )
+                .where(ScmArticuloPiezaColor.pieza_color_sku.in_(skus))
+                .order_by(ScmArticulo.id)
+                .with_for_update(of=ScmArticulo)
+                .execution_options(populate_existing=True)
+            ).all()
+            articulos_por_sku = {sku: articulo for articulo, sku in articulos}
+
+        pieza_update = db.session.execute(
+            update(Pieza)
+            .where(Pieza.id == pieza.id, Pieza.version == expected_version)
+            .values(
+                nombre=nombre,
+                peso_nominal_gr=peso_nominal,
+                linea_id=linea.id if linea else None,
+                familia_id=familia.id if familia else None,
+                activo=nuevo_activo,
+                version=expected_version + 1,
+            )
+        )
+        if pieza_update.rowcount != 1:
+            db.session.rollback()
+            return jsonify({
+                'error': 'La pieza cambió desde que fue cargada',
+                'codigo': 'VERSION_CONFLICT',
+            }), 409
+
+        for variante, nombre_anterior_pc, nombre_nuevo_pc in variantes_generadas:
+            variante_update = db.session.execute(
+                update(PiezaColor)
+                .where(
+                    PiezaColor.sku == variante.sku,
+                    PiezaColor.piezas == nombre_anterior_pc,
+                    PiezaColor.version == variante.version,
+                )
+                .values(
+                    piezas=nombre_nuevo_pc,
+                    version=variante.version + 1,
+                )
+            )
+            if variante_update.rowcount != 1:
+                db.session.rollback()
+                return jsonify({
+                    'error': 'Una PiezaColor cambió durante el renombrado',
+                    'codigo': 'VERSION_CONFLICT',
+                    'sku': variante.sku,
+                }), 409
+            articulo = articulos_por_sku.get(variante.sku)
+            if (
+                articulo is not None
+                and articulo.clase == CLASE_PIEZA_COLOR
+                and articulo.nombre == nombre_anterior_pc
+            ):
+                articulo_update = db.session.execute(
+                    update(ScmArticulo)
+                    .where(
+                        ScmArticulo.id == articulo.id,
+                        ScmArticulo.version == articulo.version,
+                        ScmArticulo.nombre == nombre_anterior_pc,
+                    )
+                    .values(
+                        nombre=nombre_nuevo_pc,
+                        version=articulo.version + 1,
+                    )
+                )
+                if articulo_update.rowcount != 1:
+                    db.session.rollback()
+                    return jsonify({
+                        'error': 'Un Artículo SCM cambió durante el renombrado',
+                        'codigo': 'VERSION_CONFLICT',
+                        'sku': variante.sku,
+                    }), 409
+
         db.session.commit()
+        db.session.refresh(pieza)
         return jsonify(pieza.to_dict(include_moldes=True)), 200
     except Exception as exc:
         db.session.rollback()
@@ -1236,7 +1365,7 @@ def _ensure_mold_color_variants(molde, color):
             })
             variante = PiezaColor(
                 sku=generar_codigo_catalogo('PIEZA_COLOR'),
-                piezas=f"{pieza_maestra.nombre} {color.nombre}",
+                piezas=nombre_pieza_color(pieza_maestra.nombre, color.nombre),
                 peso=pieza_maestra.peso_nominal_gr,
                 cavidad=None,
                 linea_id=linea.id if linea else None,
@@ -1468,7 +1597,12 @@ def crear_pieza_color():
 @catalogo_bp.route('/piezas-color/<sku>', methods=['PUT'])
 def actualizar_pieza_color(sku):
     """Actualiza un SKU coloreado; las cavidades se editan en MoldePieza."""
-    pieza = db.session.get(PiezaColor, sku)
+    pieza = db.session.execute(
+        select(PiezaColor)
+        .where(PiezaColor.sku == sku)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if not pieza:
         return jsonify({'error': 'PiezaColor no encontrada'}), 404
     
@@ -1494,26 +1628,41 @@ def actualizar_pieza_color(sku):
             data,
             current=pieza,
         )
-        pieza.piezas = data.get('nombre', pieza.piezas)
-        pieza.peso = data.get('peso', pieza.peso)
-        pieza.color_produccion_id = data.get(
-            'color_produccion_id',
-            pieza.color_produccion_id,
+        current_version = pieza.version
+        result = db.session.execute(
+            update(PiezaColor)
+            .where(
+                PiezaColor.sku == pieza.sku,
+                PiezaColor.version == current_version,
+            )
+            .values(
+                piezas=data.get('nombre', pieza.piezas),
+                peso=data.get('peso', pieza.peso),
+                color_produccion_id=data.get(
+                    'color_produccion_id', pieza.color_produccion_id,
+                ),
+                cod_pieza=data.get('cod_pieza', pieza.cod_pieza),
+                linea_id=linea.id if linea else None,
+                familia_id=familia.id if familia else None,
+                pieza_id=pieza_maestra.id if pieza_maestra else None,
+                cod_extru=data.get('cod_extru', pieza.cod_extru),
+                tipo_extruccion=data.get(
+                    'tipo_extruccion', pieza.tipo_extruccion,
+                ),
+                cod_mp=data.get('cod_mp', pieza.cod_mp),
+                mp=data.get('mp', pieza.mp),
+                version=current_version + 1,
+            )
         )
-        pieza.cod_pieza = data.get('cod_pieza', pieza.cod_pieza)
-        pieza.linea_id = linea.id if linea else None
-        pieza.familia_id = familia.id if familia else None
-        pieza.pieza_id = pieza_maestra.id if pieza_maestra else None
-        pieza.cod_extru = data.get('cod_extru', pieza.cod_extru)
-        pieza.tipo_extruccion = data.get(
-            'tipo_extruccion',
-            pieza.tipo_extruccion,
-        )
-        pieza.cod_mp = data.get('cod_mp', pieza.cod_mp)
-        pieza.mp = data.get('mp', pieza.mp)
-
+        if result.rowcount != 1:
+            db.session.rollback()
+            return jsonify({
+                'error': 'La PiezaColor cambió durante la actualización',
+                'codigo': 'VERSION_CONFLICT',
+            }), 409
         db.session.commit()
-        return jsonify({'sku': pieza.sku, 'nombre': pieza.piezas}), 200
+        refreshed = db.session.get(PiezaColor, sku)
+        return jsonify({'sku': refreshed.sku, 'nombre': refreshed.piezas}), 200
     except ClassificationError as exc:
         db.session.rollback()
         return _classification_error_response(exc)
@@ -2218,7 +2367,9 @@ def configurar_producto_cascada():
         if colores:
             for color in colores:
                 for forma in formas_creadas:
-                    nombre_coloreado = f"{forma.nombre} {color.nombre}"
+                    nombre_coloreado = nombre_pieza_color(
+                        forma.nombre, color.nombre,
+                    )
 
                     pieza_existente = PiezaColor.query.filter_by(
                         pieza_id=forma.pieza_id,

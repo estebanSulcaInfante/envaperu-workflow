@@ -79,6 +79,7 @@ from app.services.catalog_classification_service import (
     validate_linea_familia,
 )
 from app.services.catalog_code_generator import generar_codigo_catalogo
+from app.services.catalog_name_service import nombre_pieza_color
 from app.services.scm_article_service import create_wip_article
 from app.services.catalog_image_storage import (
     CatalogImageStorageError,
@@ -3435,7 +3436,7 @@ def _apply_colors(
         if variant is None:
             variant = PiezaColor(
                 sku=generar_codigo_catalogo("PIEZA_COLOR", session=session),
-                piezas=f"{piece.nombre} {color.nombre}",
+                piezas=nombre_pieza_color(piece.nombre, color.nombre),
                 peso=piece.peso_nominal_gr,
                 cavidad=None,
                 linea_id=None,

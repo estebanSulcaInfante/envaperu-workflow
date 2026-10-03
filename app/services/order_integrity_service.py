@@ -21,6 +21,7 @@ from app.models.producto import (
     ProductoTerminado,
 )
 from app.services.catalog_code_generator import generar_codigo_catalogo
+from app.services.catalog_name_service import nombre_pieza_color
 from app.services.catalog_classification_service import (
     ClassificationError,
     validate_linea_familia,
@@ -307,7 +308,7 @@ def _resolve_variant(
                             "PIEZA_COLOR",
                             session=active_session,
                         ),
-                        piezas=f"{pieza.nombre} {color.nombre}",
+                        piezas=nombre_pieza_color(pieza.nombre, color.nombre),
                         pieza_id=pieza.id,
                         linea_id=None,
                         familia_id=None,
