@@ -141,6 +141,25 @@ def _complete(operation, payload, status=200):
     return complete(operation, payload, status)
 
 
+def _begin_batch_transaction(session):
+    """Start SQLite's real transaction before the idempotency savepoint.
+
+    SQLite's legacy driver does not start a DB transaction for a preceding
+    SELECT.  In that state ``begin_nested`` creates a top-level savepoint and
+    releasing it commits the root ``ScmOperacion`` before the batch work can
+    be validated.  A normal transaction is already active in SQLAlchemy, so
+    this only emits the driver-level BEGIN for that SQLite edge case.  Other
+    dialects retain the shared race-safe idempotency helper unchanged.
+    """
+    bind = session.get_bind()
+    if bind.dialect.name != "sqlite":
+        return
+    connection = session.connection()
+    raw_connection = getattr(connection.connection, "driver_connection", connection.connection)
+    if not getattr(raw_connection, "in_transaction", False):
+        connection.exec_driver_sql("BEGIN")
+
+
 def _scope_unit(session, actor, unit):
     if unit is None:
         raise ScmServiceError("KG_UNIT_NOT_FOUND", "La identidad KG no existe.", status_code=404)
@@ -182,6 +201,25 @@ def _unit_by_code(session, code, *, actor=None):
             return unit
         manga_label = session.scalar(select(ScmEtiquetaManga).where(ScmEtiquetaManga.public_id == label_public_id))
         if manga_label is not None:
+            manga = session.get(ScmManga, manga_label.manga_id)
+            existing = session.scalar(select(ScmExistenciaMangaKg).where(
+                ScmExistenciaMangaKg.manga_id == manga_label.manga_id,
+                ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+            ))
+            if actor is not None and existing is not None and existing.ubicacion is not None:
+                try:
+                    _assert_kg_location_scope(
+                        session,
+                        actor_id=actor.id,
+                        location=existing.ubicacion,
+                        article_class=existing.articulo.clase,
+                    )
+                except ScmServiceError as error:
+                    raise ScmServiceError(
+                        "KG_UNIT_NOT_FOUND",
+                        "La identidad KG no pertenece al alcance del actor.",
+                        status_code=404,
+                    ) from error
             if manga_label.tipo != "PREPESAJE":
                 raise ScmServiceError("KG_LABEL_SOURCE_INVALID", "El QR no es una etiqueta PREPESAJE vigente.", status_code=409)
             if manga_label.estado == "INVALIDADA":
@@ -194,13 +232,9 @@ def _unit_by_code(session, code, *, actor=None):
             ).order_by(ScmEtiquetaManga.version.desc()).limit(1))
             if current_label is None or current_label.id != manga_label.id:
                 raise ScmServiceError("ETIQUETA_VERSION_CONFLICT", "La etiqueta PREPESAJE ya no es la versión vigente.", status_code=409)
-            manga = session.get(ScmManga, manga_label.manga_id)
             if manga is None or manga.estado == "ANULADA":
                 raise ScmServiceError("MANGA_NO_VIGENTE", "La manga de la etiqueta PREPESAJE no está vigente.", status_code=409)
-            existence = session.scalar(select(ScmExistenciaMangaKg).where(
-                ScmExistenciaMangaKg.manga_id == manga.id,
-                ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
-            ))
+            existence = existing
             if existence is None or existence.unidad_fisica_kg_id is None:
                 raise ScmServiceError("KG_IDENTITY_MISSING", "La manga no tiene una identidad KG vigente; no se creará ni reconstruirá automáticamente.", status_code=409)
             unit = session.get(ScmUnidadFisicaKg, existence.unidad_fisica_kg_id)
@@ -386,20 +420,7 @@ def _delivery_payload(session, retiro):
 
 
 def resolve_kg_return(session, *, actor_id, code, operation_id=None):
-    # The outgoing picking flow already authorizes both preparation and
-    # dispatch.  Keep the legacy read capability valid, but do not broaden
-    # return resolution to either picking capability on its own.
-    actor = load_actor(session, actor_id)
-    if not actor.tiene_capacidad("ABASTECIMIENTO_VER") and not (
-        actor.tiene_capacidad("PICKING_PREPARAR")
-        and actor.tiene_capacidad("PICKING_DESPACHAR")
-    ):
-        raise ScmServiceError(
-            "CAPABILITY_REQUIRED",
-            "El actor requiere ABASTECIMIENTO_VER o las capacidades conjuntas de picking.",
-            status_code=403,
-            details={"capabilities_any": ["ABASTECIMIENTO_VER", "PICKING_PREPARAR+PICKING_DESPACHAR"]},
-        )
+    actor = load_actor(session, actor_id, capability="ABASTECIMIENTO_VER")
     unit = _unit_by_code(session, code, actor=actor)
     if unit is None:
         raise ScmServiceError("KG_UNIT_NOT_FOUND", "La identidad KG no existe.", status_code=404)
@@ -431,6 +452,35 @@ def resolve_kg_return(session, *, actor_id, code, operation_id=None):
             "measurement": {"id": str(measurement.id), "neto_kg": f"{Decimal(measurement.neto_kg):.3f}", "intencion": measurement.intencion} if measurement else None,
             "can_capture": bool(measurement_context["modo_lectura"]) and measurement is None,
             "return_locations": return_locations, "label": _labels_payload(session, unit)}
+
+
+def resolve_kg_outgoing(session, *, actor_id, code):
+    """Resolve a scan for the direct Armado flow without return details."""
+    actor = load_actor(session, actor_id)
+    if not (actor.tiene_capacidad("PICKING_PREPARAR") and actor.tiene_capacidad("PICKING_DESPACHAR")):
+        raise ScmServiceError(
+            "CAPABILITY_REQUIRED",
+            "El actor requiere PICKING_PREPARAR y PICKING_DESPACHAR.",
+            status_code=403,
+            details={"capabilities_all": ["PICKING_PREPARAR", "PICKING_DESPACHAR"]},
+        )
+    unit = _unit_by_code(session, code, actor=actor)
+    if unit is None:
+        raise ScmServiceError("KG_UNIT_NOT_FOUND", "La identidad KG no existe.", status_code=404)
+    _scope_unit(session, actor, unit)
+    if unit.estado == "HISTORICA":
+        raise ScmServiceError(
+            "KG_UNIT_HISTORICAL",
+            "La identidad es hist�rica; usa una hija vigente.",
+            status_code=409,
+        )
+    if unit.estado != "ACTIVA":
+        raise ScmServiceError(
+            "KG_UNIT_COMPETING_OPERATION",
+            "La identidad no est� vigente para retiro.",
+            status_code=409,
+        )
+    return {"unit": unit.to_dict()}
 
 
 def reserve_kg_unit(session, *, actor_id, unit_id, operation_id, data):
@@ -602,6 +652,7 @@ def withdraw_kg_batch(session, *, actor_id, operation_id, data):
     }
     endpoint = "POST /retiros-armado-kg/lotes"
     acquire_kg_productive_write_lock(session)
+    _begin_batch_transaction(session)
     operation, replay = _reserve_operation(session, operation_id, endpoint, actor, command)
     if replay is not None:
         _assert_batch_response_scope(session, actor, replay)
@@ -647,8 +698,19 @@ def withdraw_kg_batch(session, *, actor_id, operation_id, data):
             balance = session.scalar(select(ScmSaldoInventarioKg).where(
                 ScmSaldoInventarioKg.id == unit.saldo_id
             ).with_for_update().execution_options(populate_existing=True))
-            if balance is None or balance.articulo_scm_id != unit.articulo_scm_id:
+            if (
+                balance is None
+                or balance.articulo_scm_id != unit.articulo_scm_id
+                or balance.ubicacion_id != unit.ubicacion_id
+                or unit.almacen_responsable_id != getattr(balance.ubicacion, "almacen_id", None)
+            ):
                 raise ScmServiceError("INVENTORY_CONFLICT", "La identidad no tiene un saldo KG vigente.", status_code=409, details={"unit_id": str(unit.id)})
+            _assert_kg_location_scope(
+                session,
+                actor_id=actor.id,
+                location=balance.ubicacion,
+                article_class=unit.articulo.clase,
+            )
             free = Decimal(balance.cantidad_fisica_kg) - Decimal(balance.cantidad_reservada_kg) - Decimal(balance.cantidad_no_disponible_kg)
             if free < quantity:
                 raise ScmServiceError("INVENTORY_CONFLICT", "El saldo libre no cubre el retiro KG.", status_code=409, details={"unit_id": str(unit.id)})
@@ -760,18 +822,6 @@ def withdraw_kg_batch(session, *, actor_id, operation_id, data):
         return response
     except Exception:
         session.rollback()
-        # ``_reserve_operation`` uses a nested transaction to make the
-        # idempotency insert race safe.  Some SQLite request harnesses can
-        # release that savepoint before the surrounding transaction starts;
-        # explicitly remove this newly-created incomplete root so a rejected
-        # batch cannot strand an unusable key or masquerade as pending.
-        try:
-            incomplete = session.get(ScmOperacion, operation_id)
-            if incomplete is not None and incomplete.endpoint == endpoint and incomplete.response_json is None:
-                session.delete(incomplete)
-                session.commit()
-        except Exception:
-            session.rollback()
         raise
 
 

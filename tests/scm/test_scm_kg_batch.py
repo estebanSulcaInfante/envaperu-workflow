@@ -1,19 +1,27 @@
 """Focused regressions for direct KG batch withdrawal."""
+import json
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
 
 from app import db
 from app.models.scm_inventory_kg import (
+    ScmExistenciaMangaKg,
     ScmReservaUnidadKg,
     ScmRetiroArmadoKg,
+    ScmSaldoInventarioKg,
     ScmUnidadFisicaKg,
 )
 from app.models.scm_auditoria import ScmOperacion
+from app.models.scm_inventory import ScmUbicacionInventario
 from app.models.scm_inventory_operations import ScmAlmacen, ScmAlmacenTrabajador
+from app.models.scm_ot import ScmEtiquetaManga
+from app.models.trabajador import Trabajador
 from app.services.scm_kg_custody_service import (
     get_kg_withdrawal_batch,
+    resolve_kg_outgoing,
     resolve_kg_return,
     withdraw_kg_batch,
 )
@@ -164,7 +172,7 @@ def test_batch_get_is_actor_scoped_and_missing_is_404(app):
         assert missing.value.status_code == 404
 
 
-def test_resolver_accepts_joint_picking_capabilities_for_outgoing_identity(app):
+def test_outgoing_resolver_accepts_joint_picking_but_legacy_return_does_not(app):
     with app.app_context():
         actor, units = _batch_ready(app)
         from app.models.scm_catalogos import ScmCapacidad
@@ -173,5 +181,122 @@ def test_resolver_accepts_joint_picking_capabilities_for_outgoing_identity(app):
             if read_capability in role.capacidades:
                 role.capacidades.remove(read_capability)
         db.session.commit()
-        resolved = resolve_kg_return(db.session, actor_id=actor.id, code=units[0].codigo)
+        resolved = resolve_kg_outgoing(db.session, actor_id=actor.id, code=units[0].codigo)
         assert resolved["unit"]["id"] == str(units[0].id)
+        with pytest.raises(ScmServiceError) as error:
+            resolve_kg_return(db.session, actor_id=actor.id, code=units[0].codigo)
+        assert error.value.code == "CAPABILITY_REQUIRED"
+        assert error.value.details["capability"] == "ABASTECIMIENTO_VER"
+
+
+def _prepesaje_qr(label):
+    return json.dumps({"v": 1, "label_id": str(label.public_id)})
+
+
+def test_resolver_accepts_current_prepesaje_and_rejects_stale_label(app):
+    with app.app_context():
+        actor, units = _batch_ready(app)
+        label = db.session.query(ScmEtiquetaManga).filter_by(
+            manga_id=db.session.get(ScmExistenciaMangaKg, units[0].recepcion_vigente_id).manga_id,
+            tipo="PREPESAJE",
+        ).order_by(ScmEtiquetaManga.version.desc()).first()
+        assert label is not None
+        resolved = resolve_kg_return(db.session, actor_id=actor.id, code=_prepesaje_qr(label))
+        assert resolved["unit"]["id"] == str(units[0].id)
+
+        replacement = ScmEtiquetaManga(
+            public_id=uuid4(), manga_id=label.manga_id,
+            trabajo_impresion_id=label.trabajo_impresion_id,
+            tipo="PREPESAJE", version=label.version + 1,
+            estado="IMPRESA", plantilla_version=label.plantilla_version,
+            payload_hash="b" * 64, payload_json=dict(label.payload_json or {}),
+        )
+        db.session.add(replacement)
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as error:
+            resolve_kg_return(db.session, actor_id=actor.id, code=_prepesaje_qr(label))
+        assert error.value.code == "ETIQUETA_VERSION_CONFLICT"
+
+
+def test_resolver_rejects_prepesaje_without_existing_kg_identity(app):
+    with app.app_context():
+        actor, units = _batch_ready(app)
+        label = db.session.query(ScmEtiquetaManga).filter_by(
+            manga_id=db.session.get(ScmExistenciaMangaKg, units[0].recepcion_vigente_id).manga_id,
+            tipo="PREPESAJE",
+        ).order_by(ScmEtiquetaManga.version.desc()).first()
+        existence = db.session.scalar(select(ScmExistenciaMangaKg).where(
+            ScmExistenciaMangaKg.manga_id == label.manga_id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        ))
+        existence.unidad_fisica_kg_id = None
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as error:
+            resolve_kg_return(db.session, actor_id=actor.id, code=_prepesaje_qr(label))
+        assert error.value.code == "KG_IDENTITY_MISSING"
+
+
+def test_resolver_hides_prepesaje_state_outside_actor_scope(app):
+    with app.app_context():
+        actor, units = _batch_ready(app)
+        label = db.session.query(ScmEtiquetaManga).filter_by(
+            manga_id=db.session.get(ScmExistenciaMangaKg, units[0].recepcion_vigente_id).manga_id,
+            tipo="PREPESAJE",
+        ).order_by(ScmEtiquetaManga.version.desc()).first()
+        label.estado = "INVALIDADA"
+        outsider = Trabajador(
+            codigo=f"KG-OUTSIDER-{uuid4().hex[:8]}",
+            nombres="Sin", apellidos="Alcance", activo=True,
+        )
+        outsider.roles.append(actor.roles[0])
+        db.session.add(outsider)
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as error:
+            resolve_kg_return(db.session, actor_id=outsider.id, code=_prepesaje_qr(label))
+        assert error.value.code == "KG_UNIT_NOT_FOUND"
+        assert error.value.status_code == 404
+
+
+def test_resolver_rejects_historical_identity_from_current_prepesaje(app):
+    with app.app_context():
+        actor, units = _batch_ready(app)
+        label = db.session.query(ScmEtiquetaManga).filter_by(
+            manga_id=db.session.get(ScmExistenciaMangaKg, units[0].recepcion_vigente_id).manga_id,
+            tipo="PREPESAJE",
+        ).order_by(ScmEtiquetaManga.version.desc()).first()
+        units[0].estado = "HISTORICA"
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as error:
+            resolve_kg_return(db.session, actor_id=actor.id, code=_prepesaje_qr(label))
+        assert error.value.code == "KG_UNIT_HISTORICAL"
+
+
+def test_batch_rejects_balance_from_other_warehouse(app):
+    with app.app_context():
+        actor, units = _batch_ready(app)
+        other = ScmAlmacen(codigo="KG-OTHER", nombre="KG Other", tipo="PIEZAS_WIP")
+        db.session.add(other)
+        db.session.flush()
+        other_location = ScmUbicacionInventario(
+            codigo="KG-OTHER-POS", nombre="KG Other", tipo="POSICION",
+            almacen_id=other.id, activo=True, permite_saldo_libre=True,
+        )
+        db.session.add(other_location)
+        db.session.flush()
+        balance = ScmSaldoInventarioKg(
+            articulo_scm_id=units[1].articulo_scm_id,
+            ubicacion_id=other_location.id,
+            cantidad_fisica_kg=Decimal("24.000"),
+        )
+        db.session.add(balance)
+        db.session.flush()
+        units[1].saldo_id = balance.id
+        db.session.commit()
+        with pytest.raises(ScmServiceError) as error:
+            withdraw_kg_batch(
+                db.session, actor_id=actor.id, operation_id=uuid4(),
+                data=_request(units, holder_id=actor.id),
+            )
+        assert error.value.code == "INVENTORY_CONFLICT"
+        assert ScmRetiroArmadoKg.query.count() == 0
+        assert ScmReservaUnidadKg.query.count() == 0

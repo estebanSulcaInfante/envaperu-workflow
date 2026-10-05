@@ -51,6 +51,7 @@ from app.services.scm_kg_custody_service import (
     release_kg_reservation,
     reserve_kg_unit,
     resolve_kg_return,
+    resolve_kg_outgoing,
     withdraw_kg_unit,
     withdraw_kg_batch,
     get_kg_withdrawal_batch,
@@ -297,6 +298,11 @@ def receiving_reversal_resolve(reversal_id):
 @scm_warehouse_bp.get("/unidades-kg/resolver-identidad/<string:code>")
 def kg_identity_resolve(code):
     return jsonify(resolve_kg_return(db.session, actor_id=_actor_id(), code=code))
+
+
+@scm_warehouse_bp.get("/unidades-kg/resolver-salida/<path:code>")
+def kg_outgoing_identity_resolve(code):
+    return jsonify(resolve_kg_outgoing(db.session, actor_id=_actor_id(), code=code))
 
 
 @scm_warehouse_bp.post("/unidades-kg/<uuid:unit_id>/reservas")
