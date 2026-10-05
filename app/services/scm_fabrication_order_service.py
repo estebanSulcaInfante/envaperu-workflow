@@ -2523,8 +2523,14 @@ def close_fabrication_order(
     # ``cantidad_real`` units or credited to an OP.
     actor_probe = load_actor(session, actor_id, capability="OF_CERRAR")
     probe = _load_fabrication(session, operation_order_id, lock=False)
+    from app.services.scm_kg_production_service import (
+        _cancelled_output_has_no_activity,
+        close_productive_document_kg,
+    )
+
     has_kg_output = any(
         getattr(output.articulo, "unidad_inventario", None) == "KG"
+        and not _cancelled_output_has_no_activity(session, output)
         for output in probe.salidas
     )
     inline_works = session.scalars(
@@ -2542,8 +2548,6 @@ def close_fabrication_order(
         for reservation in getattr(saldo, "reservas", ())
     )
     if has_kg_output or has_kg_inline_context:
-        from app.services.scm_kg_production_service import close_productive_document_kg
-
         return close_productive_document_kg(
             session,
             actor_id=actor_probe.id,

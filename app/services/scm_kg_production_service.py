@@ -13,11 +13,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import noload, selectinload
 
 from app.models.registro import RegistroDiarioProduccion
+from app.models.scm_inline_wip import ScmSaldoWipSalida
+from app.models.scm_material_execution import ScmRequerimientoMaterial
+from app.models.scm_prepared_material import ScmRequerimientoMaterialPreparado
 from app.models.scm_ot import (
     ScmAtribucionProduccionKg,
     ScmCierreProductivoKg,
     ScmControlPesoManga,
     ScmCorreccionAsignacionManga,
+    ScmLoteArticulo,
     ScmManga,
     ScmPesajeManga,
     ScmTramoMangaTrabajo,
@@ -967,6 +971,49 @@ def _document_aggregate(session, *, documento_tipo, documento_id):
     return order, works
 
 
+def _cancelled_output_has_no_activity(session, output):
+    """Ignore only an unused cancelled run when selecting closure units."""
+    run = output.corrida_fabricacion
+    if run is None or run.estado != "ANULADA":
+        return False
+    # Legacy links may carry execution evidence outside the canonical graph.
+    if run.lote_color_legacy_id is not None or output.lote_salida_legacy_id is not None:
+        return False
+    if run.trabajos_color or run.corrida_premezclas or output.asignaciones:
+        return False
+    if output.cantidad_real is not None or output.cantidad_rechazada is not None:
+        return False
+    # These roots can own reservations, emissions and consumption without a work.
+    for model in (ScmRequerimientoMaterial, ScmRequerimientoMaterialPreparado):
+        if session.scalar(
+            select(model.id).where(model.corrida_fabricacion_id == run.id).limit(1)
+        ) is not None:
+            return False
+    if session.scalar(
+        select(ScmSaldoWipSalida.id).where(
+            ScmSaldoWipSalida.orden_operacion_salida_id == output.id
+        ).limit(1)
+    ) is not None:
+        return False
+    lot = session.scalar(
+        select(ScmLoteArticulo).where(
+            ScmLoteArticulo.orden_operacion_salida_id == output.id
+        )
+    )
+    if lot is None:
+        return True
+    if (
+        Decimal(lot.cantidad_acreditada or 0) != 0
+        or lot.event_time is not None
+        or lot.estado_calidad != "PLANIFICADO"
+    ):
+        return False
+    # Annulled mangas still count as historical evidence.
+    return session.scalar(
+        select(ScmManga.id).where(ScmManga.lote_articulo_id == lot.id).limit(1)
+    ) is None
+
+
 def close_productive_document_kg(
     session, *, actor_id, documento_tipo, documento_id, operation_id, data
 ):
@@ -1155,6 +1202,8 @@ def close_productive_document_kg(
                 units.add(str(article.unidad_inventario).upper())
         if tipo in {"OF", "OA"}:
             for output in getattr(aggregate, "salidas", ()):
+                if tipo == "OF" and _cancelled_output_has_no_activity(session, output):
+                    continue
                 article = getattr(output, "articulo", None)
                 if article is not None and article.unidad_inventario:
                     units.add(str(article.unidad_inventario).upper())

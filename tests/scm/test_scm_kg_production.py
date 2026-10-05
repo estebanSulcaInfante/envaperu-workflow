@@ -1,6 +1,7 @@
 """KG005-KG007 production evidence tests."""
 
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -17,13 +18,22 @@ from app.models.scm_ot import (
     ScmLoteArticulo,
 )
 from app.models.scm_articulos import ScmArticulo
-from app.models.scm_production_orders import ScmOrdenOperacion, ScmOrdenOperacionSalida
+from app.models.receta_color import RecetaColorMaestra
+from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial
+from app.models.scm_material_execution import ScmRequerimientoMaterial
+from app.models.scm_prepared_material import ScmRequerimientoMaterialPreparado
+from app.models.scm_production_orders import (
+    ScmCorridaFabricacion,
+    ScmOrdenOperacion,
+    ScmOrdenOperacionSalida,
+)
 from app.models.trabajador import RolOperativo, Trabajador
 from app.models.registro import RegistroDiarioProduccion
 from app.models.scm_inventory import ScmMovimientoInventario, ScmSaldoInventario, ScmUbicacionInventario
 from app.models.scm_inventory_kg import ScmExistenciaMangaKg, ScmMovimientoInventarioKg, ScmSaldoInventarioKg
 from app.models.scm_reproceso import ScmAlertaOperativa
 from app.services.scm_kg_production_service import (
+    _cancelled_output_has_no_activity,
     close_kg_from_last_control,
     close_productive_document_kg,
     preview_kg_attribution,
@@ -101,6 +111,343 @@ def _weigh_kg_fixture(*, quantity=120):
         data=weighing_data,
     )
     return creator, work, manga, weighed
+
+
+def _add_cancelled_un_output(order, *, color_produccion_id=None):
+    article = ScmArticulo(
+        codigo=f"UN-CANCELLED-{uuid4().hex[:8].upper()}",
+        nombre="Salida UN anulada sin actividad",
+        clase="PIEZA_COLOR",
+        unidad_inventario="UN",
+    )
+    db.session.add(article)
+    db.session.flush()
+    mark_legacy_un(db.session, article)
+    cancelled_run = ScmCorridaFabricacion(
+        orden_fabricacion_id=order.id,
+        codigo=f"CANCELLED-{uuid4().hex[:8].upper()}",
+        secuencia=max((run.secuencia for run in order.fabricacion.corridas), default=0) + 1,
+        color_produccion_id=color_produccion_id,
+        estado="ANULADA",
+    )
+    db.session.add(cancelled_run)
+    db.session.flush()
+    output = ScmOrdenOperacionSalida(
+        orden_operacion_id=order.id,
+        corrida_fabricacion_id=cancelled_run.id,
+        articulo_scm_id=article.id,
+        cantidad_objetivo=1,
+        excedente_objetivo=0,
+    )
+    order.salidas.append(output)
+    db.session.flush()
+    return article, cancelled_run, output
+
+
+def _complete_fixture_color_work(creator, work):
+    transition_color_work(
+        db.session,
+        actor_id=creator.id,
+        work_id=work.id,
+        operation_id=uuid4(),
+        data={"version": work.version},
+        action="completar",
+    )
+
+
+def test_of_close_ignores_cancelled_un_output_without_activity_and_preserves_kg(app):
+    with app.app_context():
+        creator, work_payload, manga, weighed = _weigh_kg_fixture(quantity=100)
+        _grant_capabilities(creator, ("OF_CERRAR",))
+        work = db.session.get(ScmTrabajoOt, UUID(work_payload["id"]))
+        order = work.orden_operacion
+        order.salidas[0].articulo.unidad_inventario = "KG"
+        kg_run = order.salidas[0].corrida_fabricacion
+        _, cancelled_run, cancelled_output = _add_cancelled_un_output(
+            order, color_produccion_id=kg_run.color_produccion_id
+        )
+        _complete_fixture_color_work(creator, work)
+        physical_weight = ScmPesajeManga.query.filter_by(
+            manga_id=manga.id, estado="VIGENTE"
+        ).one().peso_fisico_neto_kg
+        actor_id, order_id, version = creator.id, order.id, order.version
+        db.session.flush()
+        db.session.expire_all()
+
+        result = close_fabrication_order(
+            db.session,
+            actor_id=actor_id,
+            operation_id=uuid4(),
+            operation_order_id=order_id,
+            data={"version": version},
+        )
+
+        assert result["kg_medido"] == "12.000"
+        assert result["un_confirmadas"] is False
+        assert cancelled_run.estado == "ANULADA"
+        assert cancelled_output in order.salidas
+        db.session.refresh(manga)
+        persisted_weighing = ScmPesajeManga.query.filter_by(
+            manga_id=manga.id, estado="VIGENTE"
+        ).one()
+        assert persisted_weighing.peso_fisico_neto_kg == physical_weight
+        assert persisted_weighing.public_id == UUID(weighed["weighing"]["public_id"])
+
+
+def test_of_kg_close_still_rejects_active_un_output(app):
+    with app.app_context():
+        creator, work_payload, _manga, _weighed = _weigh_kg_fixture(quantity=100)
+        _grant_capabilities(creator, ("OF_CERRAR",))
+        work = db.session.get(ScmTrabajoOt, UUID(work_payload["id"]))
+        order = work.orden_operacion
+        order.salidas[0].articulo.unidad_inventario = "KG"
+        article = ScmArticulo(
+            codigo=f"UN-ACTIVE-{uuid4().hex[:8].upper()}",
+            nombre="Salida UN activa",
+            clase="PIEZA_COLOR",
+            unidad_inventario="UN",
+        )
+        db.session.add(article)
+        db.session.flush()
+        mark_legacy_un(db.session, article)
+        active_output = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id,
+            corrida_fabricacion_id=order.salidas[0].corrida_fabricacion_id,
+            articulo_scm_id=article.id,
+            cantidad_objetivo=1,
+            excedente_objetivo=0,
+            corrida_fabricacion=order.salidas[0].corrida_fabricacion,
+        )
+        db.session.add(active_output)
+        db.session.flush()
+        order.salidas.append(active_output)
+        db.session.flush()
+        _complete_fixture_color_work(creator, work)
+        actor_id, order_id, version = creator.id, order.id, order.version
+        db.session.flush()
+        db.session.expire_all()
+        reloaded_order = db.session.get(ScmOrdenOperacion, order_id)
+        assert {item.articulo.unidad_inventario for item in reloaded_order.salidas} == {"KG", "UN"}
+
+        with pytest.raises(ScmServiceError) as error:
+            close_fabrication_order(
+                db.session,
+                actor_id=actor_id,
+                operation_id=uuid4(),
+                operation_order_id=order_id,
+                data={"version": version},
+            )
+
+        assert error.value.code == "KG_DOCUMENT_MIXED_UNITS"
+
+
+def test_of_kg_close_counts_cancelled_un_output_with_annulled_manga_as_activity(app):
+    with app.app_context():
+        creator, work_payload, kg_manga, _weighed = _weigh_kg_fixture(quantity=100)
+        _grant_capabilities(creator, ("OF_CERRAR",))
+        work = db.session.get(ScmTrabajoOt, UUID(work_payload["id"]))
+        order = work.orden_operacion
+        order.salidas[0].articulo.unidad_inventario = "KG"
+        kg_run = order.salidas[0].corrida_fabricacion
+        article, cancelled_run, output = _add_cancelled_un_output(
+            order, color_produccion_id=kg_run.color_produccion_id
+        )
+        un_lot = ScmLoteArticulo(
+            codigo=f"UN-ACTIVITY-{uuid4().hex[:8].upper()}",
+            articulo_id=article.id,
+            clase="SALIDA_ORDEN_OPERACION",
+            orden_operacion_salida_id=output.id,
+            cantidad_acreditada=0,
+            actor_id=creator.id,
+        )
+        db.session.add(un_lot)
+        db.session.flush()
+        source_values = {
+            column.name: getattr(kg_manga, column.name)
+            for column in ScmManga.__table__.columns
+            if column.name not in {
+                "id", "public_id", "codigo", "secuencia_ot", "lote_articulo_id",
+                "articulo_codigo_snapshot", "articulo_nombre_snapshot", "estado",
+            }
+        }
+        annulled_manga = ScmManga(
+            **source_values,
+            public_id=uuid4(),
+            codigo=f"{kg_manga.codigo}-ANNULLED-UN",
+            secuencia_ot=kg_manga.secuencia_ot + 1,
+            lote_articulo_id=un_lot.id,
+            articulo_codigo_snapshot=article.codigo,
+            articulo_nombre_snapshot=article.nombre,
+            estado="ANULADA",
+        )
+        db.session.add(annulled_manga)
+        db.session.flush()
+        _complete_fixture_color_work(creator, work)
+        actor_id, order_id, version = creator.id, order.id, order.version
+        db.session.flush()
+        db.session.expire_all()
+        reloaded_order = db.session.get(ScmOrdenOperacion, order_id)
+        assert {item.articulo.unidad_inventario for item in reloaded_order.salidas} == {"KG", "UN"}
+        assert ScmManga.query.filter_by(id=annulled_manga.id).one().estado == "ANULADA"
+
+        with pytest.raises(ScmServiceError) as error:
+            close_fabrication_order(
+                db.session,
+                actor_id=actor_id,
+                operation_id=uuid4(),
+                operation_order_id=order_id,
+                data={"version": version},
+            )
+
+        assert error.value.code == "KG_DOCUMENT_MIXED_UNITS"
+        assert cancelled_run.estado == "ANULADA"
+        assert annulled_manga.estado == "ANULADA"
+
+
+def _empty_cancelled_output_for_predicate(*, run_updates=None, output_updates=None):
+    run_values = {
+        "id": uuid4(),
+        "estado": "ANULADA",
+        "lote_color_legacy_id": None,
+        "trabajos_color": [],
+        "corrida_premezclas": [],
+    }
+    output_values = {
+        "id": uuid4(),
+        "corrida_fabricacion": SimpleNamespace(**run_values),
+        "lote_salida_legacy_id": None,
+        "cantidad_real": None,
+        "cantidad_rechazada": None,
+        "asignaciones": [],
+    }
+    run_values.update(run_updates or {})
+    output_values.update(output_updates or {})
+    output_values["corrida_fabricacion"] = SimpleNamespace(**run_values)
+    return SimpleNamespace(**output_values)
+
+
+class _PredicateEvidenceSession:
+    def __init__(self, evidence_by_model=None):
+        self.evidence_by_model = evidence_by_model or {}
+
+    def scalar(self, statement):
+        model = statement.column_descriptions[0]["entity"]
+        return self.evidence_by_model.get(model)
+
+
+@pytest.mark.parametrize(
+    "run_updates,output_updates",
+    [
+        ({"trabajos_color": [SimpleNamespace(estado="ANULADO")]}, {}),
+        ({"corrida_premezclas": [object()]}, {}),
+        ({}, {"cantidad_real": Decimal("0")}),
+        ({}, {"cantidad_rechazada": Decimal("0")}),
+        ({}, {"asignaciones": [object()]}),
+        ({"lote_color_legacy_id": 42}, {}),
+        ({}, {"lote_salida_legacy_id": 42}),
+    ],
+)
+def test_cancelled_output_activity_markers_keep_unit_axis(run_updates, output_updates):
+    output = _empty_cancelled_output_for_predicate(
+        run_updates=run_updates,
+        output_updates=output_updates,
+    )
+
+    assert _cancelled_output_has_no_activity(_PredicateEvidenceSession(), output) is False
+
+
+@pytest.mark.parametrize("requirement_kind", ["material", "prepared"])
+def test_cancelled_output_with_material_requirement_keeps_unit_axis(app, requirement_kind):
+    with app.app_context():
+        creator, _approver, order, active_run, _active_output = _seed_fabrication_order()
+        _article, cancelled_run, output = _add_cancelled_un_output(
+            order, color_produccion_id=active_run.color_produccion_id
+        )
+        category = ScmCategoriaRecepcion.query.first()
+        if category is None:
+            category = ScmCategoriaRecepcion(
+                codigo=f"OF74-{uuid4().hex[:8].upper()}",
+                nombre="Categoría para prueba de requerimiento",
+                modalidad_default="POR_CONFIGURAR",
+                recepcion_habilitada=False,
+            )
+            db.session.add(category)
+            db.session.flush()
+        material = ScmMaterial.query.filter_by(clase="MATERIA_PRIMA").first()
+        if material is None:
+            material = ScmMaterial(
+                codigo=f"OF74-{uuid4().hex[:8].upper()}",
+                nombre="Material para prueba de requerimiento",
+                clase="MATERIA_PRIMA",
+                categoria_recepcion_id=category.id,
+            )
+            db.session.add(material)
+            db.session.flush()
+        recipe = RecetaColorMaestra(
+            color_produccion_id=cancelled_run.color_produccion_id,
+            producto_scope="*",
+            nombre_variante=f"OF74 {uuid4().hex[:8]}",
+            revision=1,
+            estado="APROBADA",
+            base_virgen_kg=25,
+        )
+        db.session.add(recipe)
+        db.session.flush()
+        if requirement_kind == "material":
+            db.session.add(ScmRequerimientoMaterial(
+                corrida_fabricacion_id=cancelled_run.id,
+                material_id=material.id,
+                tipo_componente="MATERIA_PRIMA",
+                cantidad_plan_kg=Decimal("1.000"),
+                receta_revision_id=recipe.id,
+                calculo_snapshot_json={},
+                created_by_id=creator.id,
+            ))
+        else:
+            db.session.add(ScmRequerimientoMaterialPreparado(
+                corrida_fabricacion_id=cancelled_run.id,
+                receta_revision_id=recipe.id,
+                cantidad_requerida_kg=Decimal("1.000"),
+                composicion_hash="a" * 64,
+                composicion_snapshot_json={},
+                created_by_id=creator.id,
+                operation_id=uuid4(),
+            ))
+        db.session.flush()
+
+        assert cancelled_run.trabajos_color == []
+        assert ScmManga.query.join(
+            ScmLoteArticulo,
+            ScmManga.lote_articulo_id == ScmLoteArticulo.id,
+        ).filter(
+            ScmLoteArticulo.orden_operacion_salida_id == output.id
+        ).count() == 0
+        assert _cancelled_output_has_no_activity(db.session, output) is False
+
+
+def test_cancelled_output_with_accredited_lot_keeps_unit_axis():
+    output = _empty_cancelled_output_for_predicate()
+    lot = SimpleNamespace(
+        cantidad_acreditada=Decimal("1.000"),
+        event_time=None,
+        estado_calidad="PLANIFICADO",
+        id=uuid4(),
+    )
+    session = _PredicateEvidenceSession({ScmLoteArticulo: lot})
+
+    assert _cancelled_output_has_no_activity(session, output) is False
+
+
+def test_empty_cancelled_kg_output_does_not_count_as_kg_routing_evidence():
+    kg_cancelled = _empty_cancelled_output_for_predicate()
+    kg_cancelled.articulo = SimpleNamespace(unidad_inventario="KG")
+    active_un = _empty_cancelled_output_for_predicate()
+    active_un.corrida_fabricacion.estado = "EN_EJECUCION"
+    active_un.articulo = SimpleNamespace(unidad_inventario="UN")
+    session = _PredicateEvidenceSession()
+
+    assert _cancelled_output_has_no_activity(session, kg_cancelled) is True
+    assert _cancelled_output_has_no_activity(session, active_un) is False
 
 
 def _auto_final_kg_fixture(app, *, station_code):
