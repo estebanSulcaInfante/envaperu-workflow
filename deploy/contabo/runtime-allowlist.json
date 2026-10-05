@@ -1,5 +1,5 @@
 {
-  "source_sha": "b4cf40709691b9f35b448ed52b535f7286b17cfc",
+  "source_sha": "931e2b711c2b7e519fb2c680619366cdf93a4a77",
   "files": {
     "app/__init__.py": "af72faca760335bda14ed0cc9035f1415987a881ce42c44d0b44368a92003732",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -94,7 +94,7 @@
     "app/services/scm_demo_seed_service.py": "6b48dcce717c86de9a768e095a826dd62e909bfcd83907ef37bf210bc9ed8036",
     "app/services/scm_draft_order_annulment.py": "bca4a5e925dfd766e18bee21f85d577ff2c866afea8ae5fc182679a7477a59f6",
     "app/services/scm_fabrication_contextual_recipe_service.py": "23a844bd53562452a33f00a79686de5e6c19cd9666071a513beb4de221c4556f",
-    "app/services/scm_fabrication_order_service.py": "e27c8838a28045471f7588a081bf32e949ae742f72f2afc8753f758935b98612",
+    "app/services/scm_fabrication_order_service.py": "13ad562ecf4e00fa1d03ccdc398332cb8c3e61ea08b064162000fba060f3ad87",
     "app/services/scm_fulfillment_service.py": "6199bc133ac6914701301df2e1a7158b8bbb9e10ad074637c71e1b1d73e17086",
     "app/services/scm_internal_supply_service.py": "3a4e7de26ec0070e736b7c9d349600f5c141593aaca8432207e8823d02609db5",
     "app/services/scm_inventory_opening_service.py": "d47558eb3b9e1073603410136708c441efc0afff63643927be4f1687e82a1f93",
@@ -102,7 +102,7 @@
     "app/services/scm_inventory_transfer_service.py": "12750a3cf67e8b24aa336b8f9aa1adcaff2dce96f4336d1080178745f8197de4",
     "app/services/scm_kg_custody_service.py": "d44559549ac72f0d2da79379d01681fce69684fa3f43d1bb9f2b2070e1c23b08",
     "app/services/scm_kg_pilot_service.py": "c7ffb1500b47048845f09c6b9aa17f0fd18b660cdf6612a8c634fc1da22af5d6",
-    "app/services/scm_kg_production_service.py": "dbcb6462c6437791beb62713d9c7f88909bf0742ae8b97a44392aa1736a03bdd",
+    "app/services/scm_kg_production_service.py": "17488a192bb26380a040683e86467b32cd685e31db31d0d677a4fb71495b3b81",
     "app/services/scm_kg_pt_availability_export.py": "9285801933676f782d666a1dde77a1b7a3124596c440721b39ca55981c655d84",
     "app/services/scm_kg_pt_availability_service.py": "c172ef1ebd2fa81c4efd37f2859c77f5ce6ec2edbf0b2fd6beaa932e77a113a5",
     "app/services/scm_kg_receipt_service.py": "9a7bfcd62e7c2cbb15b17aaeb17491b022e9a850c99662c51750c95031536e6e",
