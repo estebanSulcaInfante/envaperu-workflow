@@ -52,6 +52,8 @@ from app.services.scm_kg_custody_service import (
     reserve_kg_unit,
     resolve_kg_return,
     withdraw_kg_unit,
+    withdraw_kg_batch,
+    get_kg_withdrawal_batch,
 )
 
 
@@ -315,6 +317,25 @@ def kg_unit_withdraw(unit_id):
 @scm_warehouse_bp.get("/retiros-armado-kg")
 def kg_withdrawals_list():
     return jsonify(list_kg_retiros(db.session, actor_id=_actor_id()))
+
+
+@scm_warehouse_bp.post("/retiros-armado-kg/lotes")
+def kg_withdrawals_batch_create():
+    return jsonify(withdraw_kg_batch(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_operation_id(),
+        data=_body(),
+    )), 201
+
+
+@scm_warehouse_bp.get("/retiros-armado-kg/lotes/<uuid:operation_id>")
+def kg_withdrawals_batch_detail(operation_id):
+    return jsonify(get_kg_withdrawal_batch(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=operation_id,
+    ))
 
 
 @scm_warehouse_bp.get("/retiros-armado-kg/<uuid:retiro_id>")

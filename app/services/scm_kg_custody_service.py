@@ -4,13 +4,14 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from flask import current_app
 from sqlalchemy import and_, func, or_, select
 
 from app.models.scm_articulos import ScmArticulo
 from app.models.scm_auditoria import ScmEvento
+from app.models.scm_ot import ScmEtiquetaManga, ScmManga
 from app.models.scm_inventory_kg import (
     ScmDivisionUnidadKg, ScmEtiquetaUnidadKg, ScmExistenciaMangaKg,
     ScmMedicionUnidadKg, ScmMovimientoInventarioKg, ScmReservaUnidadKg,
@@ -153,7 +154,7 @@ def _scope_unit(session, actor, unit):
     return unit
 
 
-def _unit_by_code(session, code):
+def _unit_by_code(session, code, *, actor=None):
     value = str(code or "").strip()
     # The station may scan either the unit code/public id or the compact
     # label QR.  QR parsing is deliberately strict and never trusts a mass
@@ -167,7 +168,49 @@ def _unit_by_code(session, code):
         pass
     if label_public_id is not None:
         label = session.scalar(select(ScmEtiquetaUnidadKg).where(ScmEtiquetaUnidadKg.public_id == label_public_id))
-        return session.get(ScmUnidadFisicaKg, label.unidad_id) if label else None
+        if label is not None:
+            current_label = session.scalar(select(ScmEtiquetaUnidadKg).where(
+                ScmEtiquetaUnidadKg.unidad_id == label.unidad_id,
+            ).order_by(ScmEtiquetaUnidadKg.version.desc()).limit(1))
+            unit = session.get(ScmUnidadFisicaKg, label.unidad_id)
+            if actor is not None and unit is not None:
+                _scope_unit(session, actor, unit)
+            if current_label is None or current_label.id != label.id:
+                raise ScmServiceError("KG_LABEL_VERSION_CONFLICT", "La etiqueta KG ya no es la versión vigente.", status_code=409)
+            if label.estado == "INVALIDADA":
+                raise ScmServiceError("KG_LABEL_NOT_PRINTABLE", "La etiqueta KG está invalidada.", status_code=409)
+            return unit
+        manga_label = session.scalar(select(ScmEtiquetaManga).where(ScmEtiquetaManga.public_id == label_public_id))
+        if manga_label is not None:
+            if manga_label.tipo != "PREPESAJE":
+                raise ScmServiceError("KG_LABEL_SOURCE_INVALID", "El QR no es una etiqueta PREPESAJE vigente.", status_code=409)
+            if manga_label.estado == "INVALIDADA":
+                raise ScmServiceError("ETIQUETA_INVALIDADA", "La etiqueta fue reemplazada. Escanea la versión vigente.", status_code=409)
+            if manga_label.estado != "IMPRESA":
+                raise ScmServiceError("ETIQUETA_NO_IMPRESA", "La etiqueta PREPESAJE todavía no fue confirmada como impresa.", status_code=409)
+            current_label = session.scalar(select(ScmEtiquetaManga).where(
+                ScmEtiquetaManga.manga_id == manga_label.manga_id,
+                ScmEtiquetaManga.tipo == "PREPESAJE",
+            ).order_by(ScmEtiquetaManga.version.desc()).limit(1))
+            if current_label is None or current_label.id != manga_label.id:
+                raise ScmServiceError("ETIQUETA_VERSION_CONFLICT", "La etiqueta PREPESAJE ya no es la versión vigente.", status_code=409)
+            manga = session.get(ScmManga, manga_label.manga_id)
+            if manga is None or manga.estado == "ANULADA":
+                raise ScmServiceError("MANGA_NO_VIGENTE", "La manga de la etiqueta PREPESAJE no está vigente.", status_code=409)
+            existence = session.scalar(select(ScmExistenciaMangaKg).where(
+                ScmExistenciaMangaKg.manga_id == manga.id,
+                ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+            ))
+            if existence is None or existence.unidad_fisica_kg_id is None:
+                raise ScmServiceError("KG_IDENTITY_MISSING", "La manga no tiene una identidad KG vigente; no se creará ni reconstruirá automáticamente.", status_code=409)
+            unit = session.get(ScmUnidadFisicaKg, existence.unidad_fisica_kg_id)
+            if unit is None:
+                raise ScmServiceError("KG_IDENTITY_MISSING", "La manga no tiene una identidad KG vigente; no se creará ni reconstruirá automáticamente.", status_code=409)
+            if actor is not None:
+                _scope_unit(session, actor, unit)
+            if unit.estado == "HISTORICA":
+                raise ScmServiceError("KG_UNIT_HISTORICAL", "La etiqueta apunta a una identidad KG histórica; usa la identidad vigente.", status_code=409)
+            return unit
     try:
         public_id = UUID(value)
     except (ValueError, TypeError):
@@ -343,8 +386,21 @@ def _delivery_payload(session, retiro):
 
 
 def resolve_kg_return(session, *, actor_id, code, operation_id=None):
-    actor = load_actor(session, actor_id, capability="ABASTECIMIENTO_VER")
-    unit = _unit_by_code(session, code)
+    # The outgoing picking flow already authorizes both preparation and
+    # dispatch.  Keep the legacy read capability valid, but do not broaden
+    # return resolution to either picking capability on its own.
+    actor = load_actor(session, actor_id)
+    if not actor.tiene_capacidad("ABASTECIMIENTO_VER") and not (
+        actor.tiene_capacidad("PICKING_PREPARAR")
+        and actor.tiene_capacidad("PICKING_DESPACHAR")
+    ):
+        raise ScmServiceError(
+            "CAPABILITY_REQUIRED",
+            "El actor requiere ABASTECIMIENTO_VER o las capacidades conjuntas de picking.",
+            status_code=403,
+            details={"capabilities_any": ["ABASTECIMIENTO_VER", "PICKING_PREPARAR+PICKING_DESPACHAR"]},
+        )
+    unit = _unit_by_code(session, code, actor=actor)
     if unit is None:
         raise ScmServiceError("KG_UNIT_NOT_FOUND", "La identidad KG no existe.", status_code=404)
     _scope_unit(session, actor, unit)
@@ -456,6 +512,303 @@ def withdraw_kg_unit(session, *, actor_id, unit_id, operation_id, data):
     session.add(movement); session.flush()
     retiro.items.append(ScmRetiroArmadoKgItem(unidad_id=unit.id, reserva_id=reservation.id, neto_entregado_kg=quantity, movimiento_id=movement.id)); reservation.estado = "RETIRADA"; unit.kg_entregado = quantity; unit.kg_verificados = None; unit.kg_verificados_at = None; unit.medicion_vigente_id = None; unit.recepcion_vigente_id = None; unit.estado_logistico = "RETIRADA_ARMADO"; unit.saldo_id = None; unit.ubicacion_id = None; unit.version += 1; session.flush()
     payload = {"retiro": _delivery_payload(session, retiro), "operation_id": str(operation.operation_id)}; _complete(operation, payload, 201); session.commit(); return payload
+
+
+def _batch_child_operation(session, *, operation_id, actor, endpoint, command):
+    """Create an audit operation used by one causal child of a batch.
+
+    The public idempotency key belongs to the batch operation.  The inventory
+    movement and the retiro each have a uniqueness constraint on operation_id,
+    so they receive deterministic child keys while remaining in the same
+    transaction as the root operation.
+    """
+    operation = ScmOperacion(
+        operation_id=operation_id,
+        endpoint=endpoint,
+        actor_id=actor.id,
+        request_sha256=_hash({"endpoint": endpoint, "actor_id": actor.id, "data": command}),
+    )
+    session.add(operation)
+    session.flush()
+    return operation
+
+
+def _assert_batch_response_scope(session, actor, response):
+    """Re-check scope before returning an idempotent batch response."""
+    for retiro in response.get("retiros", []) if isinstance(response, dict) else []:
+        for item in retiro.get("items", []):
+            unit_data = item.get("unidad") or {}
+            unit_id = unit_data.get("id")
+            if not unit_id:
+                raise ScmServiceError("KG_OPERATION_NOT_FOUND", "La operación de lote no existe.", status_code=404)
+            unit = session.get(ScmUnidadFisicaKg, _uuid_value(unit_id))
+            if unit is None:
+                raise ScmServiceError("KG_OPERATION_NOT_FOUND", "La operación de lote no existe.", status_code=404)
+            _scope_unit(session, actor, unit)
+
+
+def withdraw_kg_batch(session, *, actor_id, operation_id, data):
+    """Withdraw complete KG identities directly to Armado in one commit.
+
+    Reservation rows are intentionally created and consumed inside this
+    transaction.  They are never exposed as an idle operational state.
+    """
+    assert_custody_enabled()
+    actor = load_actor(session, actor_id, capability="PICKING_PREPARAR")
+    load_actor(session, actor_id, capability="PICKING_DESPACHAR")
+    reject_unknown_fields(data, allowed={
+        "items", "motivo_operativo", "tenedor_fisico_id",
+        "documento_destino_tipo", "documento_destino_id",
+    })
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ScmServiceError("ITEMS_REQUIRED", "El lote requiere al menos una unidad.", status_code=400)
+    if len(raw_items) > 500:
+        raise ScmServiceError("ITEMS_TOO_MANY", "El lote supera el máximo de unidades permitido.", status_code=422)
+    destination_type = str(data.get("documento_destino_tipo") or "").strip() or None
+    destination_id = str(data.get("documento_destino_id") or "").strip() or None
+    if bool(destination_type) != bool(destination_id):
+        raise ScmServiceError("KG_CAUSAL_MISMATCH", "documento_destino_tipo e id deben venir juntos.", status_code=422)
+    reason = str(data.get("motivo_operativo") or "").strip() or None
+    if not destination_id and not reason:
+        raise ScmServiceError("KG_OPERATION_REASON_REQUIRED", "Se requiere motivo operativo si no hay documento destino.", status_code=422)
+    holder_id = data.get("tenedor_fisico_id")
+    if isinstance(holder_id, bool) or not isinstance(holder_id, int) or holder_id <= 0:
+        raise ScmServiceError("TENEDOR_FISICO_REQUIRED", "tenedor_fisico_id debe identificar un trabajador activo.", status_code=422)
+    holder = load_actor(session, holder_id)
+
+    normalized_items = []
+    seen = {}
+    for index, raw in enumerate(raw_items):
+        if not isinstance(raw, dict):
+            raise ScmServiceError("ITEM_INVALID", "Cada item debe ser un objeto JSON.", status_code=400, details={"index": index})
+        reject_unknown_fields(raw, allowed={"unit_id", "version"})
+        unit_id = _uuid_value(raw.get("unit_id"))
+        version = expected_version(raw.get("version"))
+        previous = seen.get(unit_id)
+        if previous is not None:
+            if previous != version:
+                raise ScmServiceError("DUPLICATE_UNIT", "La unidad aparece más de una vez con versiones distintas.", status_code=422, details={"unit_id": str(unit_id)})
+            continue
+        seen[unit_id] = version
+        normalized_items.append({"unit_id": str(unit_id), "version": version})
+
+    command = {
+        "items": normalized_items,
+        "motivo_operativo": reason,
+        "tenedor_fisico_id": holder.id,
+        "documento_destino_tipo": destination_type,
+        "documento_destino_id": destination_id,
+    }
+    endpoint = "POST /retiros-armado-kg/lotes"
+    acquire_kg_productive_write_lock(session)
+    operation, replay = _reserve_operation(session, operation_id, endpoint, actor, command)
+    if replay is not None:
+        _assert_batch_response_scope(session, actor, replay)
+        return replay
+
+    try:
+        ids = [UUID(item["unit_id"]) for item in normalized_items]
+        locked_units = session.scalars(select(ScmUnidadFisicaKg).where(
+            ScmUnidadFisicaKg.id.in_(ids)
+        ).order_by(ScmUnidadFisicaKg.id).with_for_update().execution_options(populate_existing=True)).all()
+        by_id = {unit.id: unit for unit in locked_units}
+        if len(by_id) != len(ids):
+            missing = next(unit_id for unit_id in ids if unit_id not in by_id)
+            raise ScmServiceError("KG_UNIT_NOT_FOUND", "La identidad KG no existe.", status_code=404, details={"unit_id": str(missing)})
+
+        # Lock each causal family in UUID order.  The advisory lock above
+        # serializes this endpoint with existing KG writers; the row locks
+        # protect callers that only use the database transaction.
+        units = [_lock_unit_custody(session, by_id[unit_id]) for unit_id in sorted(ids, key=str)]
+        units_by_id = {unit.id: unit for unit in units}
+        warehouses = set()
+        prepared = []
+        required_by_balance = {}
+        for item in normalized_items:
+            unit = units_by_id[UUID(item["unit_id"])]
+            _scope_unit(session, actor, unit)
+            if unit.almacen_responsable_id is None:
+                raise ScmServiceError("WAREHOUSE_SCOPE_REQUIRED", "La identidad no tiene almacén responsable vigente.", status_code=409)
+            warehouses.add(unit.almacen_responsable_id)
+            if unit.version != item["version"]:
+                raise ScmServiceError("VERSION_CONFLICT", "La identidad cambió desde la última lectura.", status_code=409, details={"unit_id": str(unit.id)})
+            if unit.estado != "ACTIVA":
+                raise ScmServiceError("KG_UNIT_COMPETING_OPERATION", "La identidad no está vigente para retiro.", status_code=409, details={"unit_id": str(unit.id)})
+            if unit.estado_calidad not in {"LIBERADA", "SIN_CONTROL"}:
+                raise ScmServiceError("KG_QUALITY_BLOCKED", "La unidad no está liberada y disponible.", status_code=409, details={"unit_id": str(unit.id)})
+            if unit.estado_logistico not in {"RECIBIDA_ALMACEN", "ALMACENADA_CONTROLADA", "DISPONIBLE_PRODUCCION"}:
+                raise ScmServiceError("KG_UNIT_COMPETING_OPERATION", "La unidad no está disponible para retiro completo.", status_code=409, details={"unit_id": str(unit.id)})
+            if _active_reservation(session, unit.id) is not None:
+                raise ScmServiceError("KG_RESERVATION_ALREADY_EXISTS", "La unidad ya tiene una reserva activa.", status_code=409, details={"unit_id": str(unit.id)})
+            quantity = Decimal(unit.kg_verificados or unit.kg_entregado or 0)
+            if not quantity.is_finite() or quantity <= 0:
+                raise ScmServiceError("KG_UNIT_INCOMPLETE", "La unidad no tiene un peso completo disponible para retiro.", status_code=409, details={"unit_id": str(unit.id)})
+            balance = session.scalar(select(ScmSaldoInventarioKg).where(
+                ScmSaldoInventarioKg.id == unit.saldo_id
+            ).with_for_update().execution_options(populate_existing=True))
+            if balance is None or balance.articulo_scm_id != unit.articulo_scm_id:
+                raise ScmServiceError("INVENTORY_CONFLICT", "La identidad no tiene un saldo KG vigente.", status_code=409, details={"unit_id": str(unit.id)})
+            free = Decimal(balance.cantidad_fisica_kg) - Decimal(balance.cantidad_reservada_kg) - Decimal(balance.cantidad_no_disponible_kg)
+            if free < quantity:
+                raise ScmServiceError("INVENTORY_CONFLICT", "El saldo libre no cubre el retiro KG.", status_code=409, details={"unit_id": str(unit.id)})
+            prepared.append((unit, balance, quantity))
+            required_by_balance[balance.id] = required_by_balance.get(balance.id, (balance, Decimal("0")))
+            required_by_balance[balance.id] = (balance, required_by_balance[balance.id][1] + quantity)
+        for balance, required in required_by_balance.values():
+            free = Decimal(balance.cantidad_fisica_kg) - Decimal(balance.cantidad_reservada_kg) - Decimal(balance.cantidad_no_disponible_kg)
+            if free < required:
+                raise ScmServiceError("INVENTORY_CONFLICT", "El saldo libre no cubre el retiro KG completo del lote.", status_code=409)
+        if len(warehouses) != 1:
+            raise ScmServiceError("WAREHOUSE_MISMATCH", "Todas las unidades deben pertenecer al mismo almacén responsable.", status_code=409)
+
+        retiros = []
+        total = Decimal("0")
+        for unit, balance, quantity in prepared:
+            reserve_operation_id = uuid5(operation_id, f"reserve:{unit.id}")
+            retiro_operation_id = uuid5(operation_id, f"retiro:{unit.id}")
+            movement_operation_id = uuid5(operation_id, f"movement:{unit.id}")
+            reservation_operation = _batch_child_operation(
+                session, operation_id=reserve_operation_id, actor=actor,
+                endpoint=f"POST /unidades-kg/{unit.id}/reservas",
+                command={"unit_id": str(unit.id), **command},
+            )
+            retiro_operation = _batch_child_operation(
+                session, operation_id=retiro_operation_id, actor=actor,
+                endpoint=f"POST /unidades-kg/{unit.id}/retiro",
+                command={"unit_id": str(unit.id), **command},
+            )
+            movement_operation = _batch_child_operation(
+                session, operation_id=movement_operation_id, actor=actor,
+                endpoint=f"POST /unidades-kg/{unit.id}/retiro/movimiento",
+                command={"unit_id": str(unit.id), **command},
+            )
+            reservation = ScmReservaUnidadKg(
+                unidad_id=unit.id, cantidad_snapshot_kg=quantity,
+                documento_destino_tipo=destination_type,
+                documento_destino_id=destination_id,
+                motivo_operativo=reason, actor_id=actor.id,
+                operation_id=reservation_operation.operation_id,
+                estado="RETIRADA",
+            )
+            session.add(reservation)
+            balance.cantidad_fisica_kg = Decimal(balance.cantidad_fisica_kg) - quantity
+            balance.cantidad_retirada_kg = Decimal(balance.cantidad_retirada_kg or 0) + quantity
+            balance.version += 1
+            retiro = ScmRetiroArmadoKg(
+                codigo=f"RET-KG-{str(retiro_operation.operation_id)[:8].upper()}",
+                documento_destino_tipo=destination_type,
+                documento_destino_id=destination_id,
+                almacen_responsable_id=unit.almacen_responsable_id,
+                actor_id=actor.id, tenedor_fisico_id=holder.id,
+                motivo_operativo=reason, operation_id=retiro_operation.operation_id,
+            )
+            session.add(retiro)
+            session.flush()
+            movement = ScmMovimientoInventarioKg(
+                saldo_id=balance.id, tipo="RETIRO_ARMADO",
+                cantidad_delta_kg=-quantity,
+                saldo_fisico_resultante_kg=balance.cantidad_fisica_kg,
+                motivo="Retiro directo por lote para Armado",
+                referencia_tipo="RETIRO_ARMADO_KG", referencia_id=str(retiro.id),
+                actor_id=actor.id, operation_id=movement_operation.operation_id,
+                projection_sha256=_hash([str(unit.id), str(operation_id)]),
+                peso_neto_snapshot_kg=quantity, pesada_at_snapshot=_now(),
+                fuente_tipo="CUSTODIA",
+            )
+            session.add(movement)
+            session.flush()
+            retiro.items.append(ScmRetiroArmadoKgItem(
+                unidad_id=unit.id, reserva_id=reservation.id,
+                neto_entregado_kg=quantity, movimiento_id=movement.id,
+            ))
+            reservation_operation.response_json = {"operation_id": str(reserve_operation_id), "estado": "RETIRADA", "unidad_id": str(unit.id)}
+            reservation_operation.estado_http = 201
+            movement_operation.response_json = {"operation_id": str(movement_operation_id), "movimiento_id": str(movement.id)}
+            movement_operation.estado_http = 201
+            unit.kg_entregado = quantity
+            unit.kg_verificados = None
+            unit.kg_verificados_at = None
+            unit.medicion_vigente_id = None
+            unit.recepcion_vigente_id = None
+            unit.estado_logistico = "RETIRADA_ARMADO"
+            unit.saldo_id = None
+            unit.ubicacion_id = None
+            unit.tenedor_fisico_id = holder.id
+            unit.version += 1
+            session.flush()
+            retiro_payload = _delivery_payload(session, retiro)
+            retiro_operation.response_json = {"retiro": retiro_payload, "operation_id": str(retiro_operation_id)}
+            retiro_operation.estado_http = 201
+            session.add(ScmEvento(
+                aggregate_type="RETIRO_ARMADO_KG", aggregate_id=str(retiro.id),
+                tipo="KG_RETIRO_DIRECTO_LOTE", actor_id=actor.id,
+                actor_snapshot=actor_snapshot(actor), motivo=reason,
+                after_json=retiro_payload, operation_id=operation.operation_id,
+            ))
+            retiros.append(retiro_payload)
+            total += quantity
+
+        response = {
+            "operation_id": str(operation.operation_id),
+            "retiros": retiros,
+            "cantidad_unidades": len(retiros),
+            "total_kg": f"{total:.3f}",
+        }
+        _complete(operation, response, 201)
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        # ``_reserve_operation`` uses a nested transaction to make the
+        # idempotency insert race safe.  Some SQLite request harnesses can
+        # release that savepoint before the surrounding transaction starts;
+        # explicitly remove this newly-created incomplete root so a rejected
+        # batch cannot strand an unusable key or masquerade as pending.
+        try:
+            incomplete = session.get(ScmOperacion, operation_id)
+            if incomplete is not None and incomplete.endpoint == endpoint and incomplete.response_json is None:
+                session.delete(incomplete)
+                session.commit()
+        except Exception:
+            session.rollback()
+        raise
+
+
+def get_kg_withdrawal_batch(session, *, actor_id, operation_id):
+    """Recover a completed or pending batch for its owning actor."""
+    actor = load_actor(session, actor_id)
+    operation = session.get(ScmOperacion, operation_id)
+    if operation is None or operation.endpoint != "POST /retiros-armado-kg/lotes":
+        raise ScmServiceError("KG_OPERATION_NOT_FOUND", "La operación de lote no existe.", status_code=404)
+    if operation.actor_id != actor.id:
+        raise ScmServiceError("KG_OPERATION_NOT_FOUND", "La operación de lote no existe.", status_code=404)
+    if operation.response_json is not None:
+        _assert_batch_response_scope(session, actor, operation.response_json)
+        return copy.deepcopy(operation.response_json)
+    event_ids = session.scalars(select(ScmEvento.aggregate_id).where(
+        ScmEvento.operation_id == operation.operation_id,
+        ScmEvento.aggregate_type == "RETIRO_ARMADO_KG",
+    )).all()
+    retiros = []
+    for raw_id in event_ids:
+        try:
+            retiro_id = UUID(str(raw_id))
+        except (TypeError, ValueError):
+            continue
+        retiro = session.get(ScmRetiroArmadoKg, retiro_id)
+        if retiro is None:
+            continue
+        for item in retiro.items:
+            _scope_unit(session, actor, item.unidad)
+        retiros.append(_delivery_payload(session, retiro))
+    for retiro in retiros:
+        _assert_batch_response_scope(session, actor, {"retiros": [retiro]})
+    raise ScmServiceError(
+        "IDEMPOTENCY_OPERATION_INCOMPLETE",
+        "La operación de lote aún no tiene resultado recuperable.",
+        status_code=409,
+    )
 
 
 def capture_kg_measurement(session, *, actor_id, station_id, unit_id, operation_id, data, snapshot=None):
