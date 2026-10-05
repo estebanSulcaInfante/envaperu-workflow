@@ -1,9 +1,9 @@
-# RELEASE SOURCE: 167154600b58f62e536fc1cf7b0764713ab0860d
+# RELEASE SOURCE: ae4181b8ae89bbdaa1f1f92f8920f0fe192ac566
 # PREPARATION ONLY: requires approved administrator handoff before any start.
 # Project name is controlled by Dokploy: envaperuscmpilot-scmpilot-cnxr9n
 services:
   api:
-    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:b5fdcba32bf9ccead3e7234adbdf4ac15f0ce0e33b9246aa2fda8532bdf65164
+    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:4a32d5ab41c7e67a0df5c07954b8aa0007bc51685de9decc158919916b1cb217
     restart: unless-stopped
     init: true
     user: "10001:10001"
