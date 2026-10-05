@@ -1,5 +1,5 @@
 {
-  "source_sha": "ae4181b8ae89bbdaa1f1f92f8920f0fe192ac566",
+  "source_sha": "b4cf40709691b9f35b448ed52b535f7286b17cfc",
   "files": {
     "app/__init__.py": "af72faca760335bda14ed0cc9035f1415987a881ce42c44d0b44368a92003732",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -13,7 +13,7 @@
     "app/api/rutas_scm_kg_pt.py": "a34f4b9fd8ad73dac1cf700523cbfdbf55e49f47c5b406f1e518c5b0653e2bf8",
     "app/api/rutas_scm_packaging_reads.py": "147e080c9e0e04e7846e19202593bc59500c7a3020baeb5037f481b9a45f7f3b",
     "app/api/rutas_scm_reproceso.py": "2a5bf7988f4e1596afde68840ce75dc6a855a7292ef905e08d3734515319ae84",
-    "app/api/rutas_scm_warehouse.py": "e3aebad2afe5598fac752521575094f56870125d6eb5a0e534a81e833941a0bb",
+    "app/api/rutas_scm_warehouse.py": "b45b150f4ddcf3897f6b3d9e5ac3b64b6b47c6c2f2d2cb2868fb285a2397cec4",
     "app/api/rutas_sync.py": "b90df5f5a69d91b0b1c323aad57c27eba2248106ae4a6bdc269a8c4e56fe0e26",
     "app/api/rutas_talonarios.py": "166cc35e658b0ef239e3331f97da2bb14934048fd7e0bbea2ea8171d08c5bdfb",
     "app/api/rutas_trabajadores.py": "fed9469d580ff7e7006071d4b583a83607528bf32af9801b3588cb51d3db2b15",
@@ -100,7 +100,7 @@
     "app/services/scm_inventory_opening_service.py": "d47558eb3b9e1073603410136708c441efc0afff63643927be4f1687e82a1f93",
     "app/services/scm_inventory_service.py": "5bb2fccf198bb6a6b684b7d755880a1eef3bede191ccf5ac60f2a8064840b2cb",
     "app/services/scm_inventory_transfer_service.py": "12750a3cf67e8b24aa336b8f9aa1adcaff2dce96f4336d1080178745f8197de4",
-    "app/services/scm_kg_custody_service.py": "ab0b09ae4c2eeedcdf96c42a2f560d66c88f821354bf5f476bee5fc073f3d0ab",
+    "app/services/scm_kg_custody_service.py": "d44559549ac72f0d2da79379d01681fce69684fa3f43d1bb9f2b2070e1c23b08",
     "app/services/scm_kg_pilot_service.py": "c7ffb1500b47048845f09c6b9aa17f0fd18b660cdf6612a8c634fc1da22af5d6",
     "app/services/scm_kg_production_service.py": "dbcb6462c6437791beb62713d9c7f88909bf0742ae8b97a44392aa1736a03bdd",
     "app/services/scm_kg_pt_availability_export.py": "9285801933676f782d666a1dde77a1b7a3124596c440721b39ca55981c655d84",
@@ -240,6 +240,7 @@
     "migrations/versions/f9a12c3e4d10_add_of_run_net_kg_target.py": "304a9c2af5b9da40778009aa2218c1afe546c479da4f9d6235cb9945737086a8",
     "migrations/versions/fa1b2c3d4e50_add_of_process_and_run_route_snapshots.py": "26392d9e30deff57dedaa61d216f501d8db650d14c1af4650f4bf646a168254c",
     "migrations/versions/fb2c3d4e5f60_grant_scm_article_subtype_check.py": "6b5aec7ded27828200d5a6044bfb81249bc8c7408b8c7ae316a146276d609550",
+    "migrations/versions/fc3d4e5f6071_allow_kg_armado_withdrawal_movements.py": "5c96dadd2649487ec919d181c0fbfd598679932183adaeefa724f398fb4e22ec",
     "requirements.txt": "997b9b593b16f184d63b9499830655723ade0c3e312501a31652b1c81322ffd2",
     "run.py": "3c39bfce280061f10fc9f12bf9185ce33e73cd1546c5b125da5f17011bd8b59d"
   },
