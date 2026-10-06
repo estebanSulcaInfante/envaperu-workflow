@@ -68,6 +68,7 @@ def create_app():
     from app.api.rutas_trabajadores import rutas_trabajadores
     from app.api.rutas_maquinas import rutas_maquinas
     from app.api.rutas_scm import scm_bp
+    from app.api.rutas_scm_assistant import scm_assistant_bp
     from app.api.rutas_scm_packaging_reads import scm_packaging_reads_bp
     from app.api.rutas_scm_reproceso import scm_reprocessing_bp
     from app.api.rutas_scm_warehouse import scm_warehouse_bp
@@ -84,6 +85,7 @@ def create_app():
     app.register_blueprint(rutas_trabajadores)
     app.register_blueprint(rutas_maquinas)
     app.register_blueprint(scm_bp, url_prefix='/api/scm/v1')
+    app.register_blueprint(scm_assistant_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(scm_packaging_reads_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(scm_reprocessing_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(scm_warehouse_bp, url_prefix='/api/scm/v1')
