@@ -13,7 +13,9 @@ IDs. The daily subtotal is never presented as OF progress; accumulated OF
 progress and compatible target comparison remain the responsibility of
 `list_production_progress`.
 
-`as_of_utc` is created on a cache miss and remains unchanged on a cache hit.
+`as_of_utc` is captured from the PostgreSQL transaction snapshot on a cache
+miss (with an injected local clock fallback) and remains unchanged on a cache
+hit.
 The in memory cache key contains actor, permission scope, fixed filters, and
 adapter version. `DailyQueryService.invalidate(actor_id=...)` invalidates one
 actor; omitting the actor invalidates all entries. The bounded audit log stores
