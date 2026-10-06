@@ -11,6 +11,7 @@ from app.extensions import db
 from app.models.scm_ot import (
     ScmAnulacionPesajeManga,
     ScmManga,
+    ScmLoteArticulo,
     ScmPesajeManga,
     ScmTrabajoColor,
     ScmTrabajoOt,
@@ -18,6 +19,7 @@ from app.models.scm_ot import (
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
     ScmOrdenFabricacion,
+    ScmOrdenOperacionSalida,
     ScmOrdenOperacion,
 )
 from app.models.trabajador import Trabajador
@@ -31,6 +33,7 @@ from app.services.scm_production_reports_service import (
     MEASURE_OPTIONS,
     _project_corrected_kg_segments,
     _run_manga_values,
+    list_production_progress_tv,
     _segment_conciliates,
     _valid_kg_segments,
     _history_weight_summary,
@@ -38,6 +41,184 @@ from app.services.scm_production_reports_service import (
     list_production_progress,
 )
 import app.services.scm_production_reports_service as production_reports_service
+
+
+def test_tv_progress_keeps_unit_compatible_outputs_and_real_overproduction(monkeypatch):
+    work = SimpleNamespace(id="work-tv", codigo="TR-TV")
+    kg_article = SimpleNamespace(id=1, codigo="PC-KG", nombre="Pieza roja", unidad_inventario="KG", pieza_color=None)
+    un_article = SimpleNamespace(id=2, codigo="PT-UN", nombre="Caja azul", unidad_inventario="UN", pieza_color=None)
+    kg_output = SimpleNamespace(articulo=kg_article, kg_estandar_objetivo=Decimal("5"), cantidad_objetivo=Decimal("50"))
+    un_output = SimpleNamespace(articulo=un_article, kg_estandar_objetivo=None, cantidad_objetivo=Decimal("10"))
+    corrida = SimpleNamespace(id="corrida-tv", codigo="C-TV", objetivo_neto_kg=Decimal("30"), salidas=[kg_output, un_output])
+    manga_kg = SimpleNamespace(
+        id=1, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=kg_article), _report_segments=[],
+        _report_final_kg=Decimal("6"), _report_open_kg=None,
+        _report_quantity_un=Decimal("40"), _report_weight_corrected=False,
+    )
+    manga_un = SimpleNamespace(
+        id=2, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=un_article), _report_segments=[],
+        _report_final_kg=Decimal("8"), _report_open_kg=None,
+        _report_quantity_un=Decimal("12"), _report_weight_corrected=False,
+    )
+    run = {
+        "orden": SimpleNamespace(id="of-tv", codigo="OF-TV", estado="EN_EJECUCION"),
+        "corrida": corrida, "works": [(work, None, None)], "mangas": {1: manga_kg, 2: manga_un},
+        "color_name": "Rojo", "color_hex": "#AA0000",
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    result = list_production_progress_tv(object(), actor_id=7, filters={})
+
+    kg, units = result["items"][0]["salidas"]
+    assert (kg["unidad"], kg["meta"], kg["tipo_meta"], kg["avance"], kg["pendiente"], kg["porcentaje"], kg["estado_avance"]) == (
+        "KG", 5.0, "ESTANDAR", 6.0, 0, 120.0, "SOBRE_REFERENCIA",
+    )
+    assert units["unidad"] == "UN"
+    assert (units["meta"], units["tipo_meta"], units["avance"], units["pendiente"], units["porcentaje"]) == (10.0, "OBJETIVO", 12.0, 0, 120.0)
+    assert kg["peso_fisico_kg"] == 6.0
+    assert units["peso_fisico_kg"] == 8.0
+    assert kg["meta"] != 30.0  # no copy of the run-level kg net objective to a coproduct.
+
+
+def test_tv_progress_does_not_project_ambiguous_segment_kg_to_each_run():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work_a = SimpleNamespace(id="work-tv-a")
+    work_b = SimpleNamespace(id="work-tv-b")
+    article = SimpleNamespace(id=10)
+    first, second = _segment(1, "0", "4", "4"), _segment(2, "4", "9", "5")
+    first.trabajo, second.trabajo = work_a, work_b
+    manga = SimpleNamespace(
+        id=11, estado="PESADA", trabajo=work_a, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[first, second],
+        _report_final_kg=Decimal("9"), _report_open_kg=None, _report_weight_corrected=False,
+    )
+    a = {"works": [(work_a, None, None)], "mangas": {11: manga}}
+    b = {"works": [(work_b, None, None)], "mangas": {11: manga}}
+    assert _progress_tv_actual(a, 10, "KG") == (Decimal("4"), False)
+    assert _progress_tv_actual(b, 10, "KG") == (Decimal("5"), False)
+
+
+def test_tv_progress_projects_net_correction_before_checking_kg_segments():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work_a, work_b = SimpleNamespace(id="corr-a"), SimpleNamespace(id="corr-b")
+    article = SimpleNamespace(id=12)
+    first, second = _segment(1, "0", "4", "4"), _segment(2, "4", "9", "5")
+    first.trabajo, second.trabajo = work_a, work_b
+    manga = SimpleNamespace(
+        id=12, estado="PESADA", trabajo=work_a, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[first, second],
+        _report_final_kg=Decimal("10"), _report_open_kg=None, _report_weight_corrected=True,
+    )
+    a = {"works": [(work_a, None, None)], "mangas": {12: manga}}
+    b = {"works": [(work_b, None, None)], "mangas": {12: manga}}
+    assert _progress_tv_actual(a, 12, "KG") == (Decimal("4"), False)
+    assert _progress_tv_actual(b, 12, "KG") == (Decimal("6"), False)
+
+
+def test_tv_progress_rejects_broken_kg_ledger_and_only_falls_back_to_valid_un_ledger():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work_a = SimpleNamespace(id="un-a")
+    article = SimpleNamespace(id=13)
+    broken, gap = _segment(1, "0", "4", "4"), _segment(2, "5", "9", "4")
+    broken.trabajo, gap.trabajo = work_a, work_a
+    broken.cantidad_inicio_un, broken.cantidad_fin_un, broken.cantidad_atribuida_un = Decimal("0"), Decimal("5"), Decimal("5")
+    gap.cantidad_inicio_un, gap.cantidad_fin_un, gap.cantidad_atribuida_un = Decimal("6"), Decimal("10"), Decimal("4")
+    manga_kg = SimpleNamespace(
+        id=13, estado="PESADA", trabajo=work_a, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[broken, gap],
+        _report_final_kg=Decimal("9"), _report_open_kg=None, _report_weight_corrected=False,
+        _report_quantity_un=Decimal("10"),
+    )
+    run = {"works": [(work_a, None, None)], "mangas": {13: manga_kg}}
+    assert _progress_tv_actual(run, 13, "KG") == (None, True)
+    assert _progress_tv_actual(run, 13, "UN") == (None, True)
+
+    gap.cantidad_inicio_un, gap.cantidad_fin_un, gap.cantidad_atribuida_un = Decimal("5"), Decimal("10"), Decimal("5")
+    broken.cantidad_inicio_kg = gap.cantidad_inicio_kg = None
+    broken.cantidad_fin_kg = gap.cantidad_fin_kg = None
+    broken.cantidad_atribuida_kg = gap.cantidad_atribuida_kg = None
+    broken.calidad_evidencia_kg = gap.calidad_evidencia_kg = None
+    # With no KG ledger and one effective corrida owner, validated UN spans
+    # prove ownership of the physical net exactly once.
+    assert _progress_tv_actual(run, 13, "KG") == (Decimal("9"), False)
+
+
+def test_tv_progress_exposes_real_physical_kg_when_no_meta_is_available(monkeypatch):
+    work = SimpleNamespace(id="work-no-meta")
+    article = SimpleNamespace(id=90, codigo="PC-NO-META", nombre="Sin objetivo", pieza_color=None)
+    output = SimpleNamespace(articulo=article, kg_estandar_objetivo=None, cantidad_objetivo=None)
+    corrida = SimpleNamespace(id="run-no-meta", codigo="C-NO-META", objetivo_neto_kg=None, estado="EN_EJECUCION", salidas=[output])
+    manga = SimpleNamespace(
+        id=90, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[],
+        _report_final_kg=Decimal("2.0"), _report_open_kg=None,
+        _report_quantity_un=Decimal("0"), _report_weight_corrected=False,
+    )
+    run = {
+        "orden": SimpleNamespace(id="of-no-meta", codigo="OF-NO-META", estado="EN_EJECUCION"),
+        "corrida": corrida, "works": [(work, None, None)], "mangas": {90: manga},
+        "color_name": "Verde", "color_hex": "#008800",
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+    item = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+    assert item["unidad"] is None and item["meta"] is None
+    assert item["estado_avance"] == "SIN_META"
+    assert item["peso_fisico_kg"] == 2.0
+    assert item["avance"] is None and item["porcentaje"] is None
+
+
+def test_tv_progress_honors_historical_un_evidence_when_master_now_says_kg(monkeypatch):
+    work = SimpleNamespace(id="work-of74", codigo="TR-74")
+    # The current catalogue now says KG, but the approved output has no kg
+    # target and the effective pesaje proves a corrected UN quantity.
+    article = SimpleNamespace(id=74, codigo="PC-OF74", nombre="Pieza histórica", unidad_inventario="KG", pieza_color=None)
+    output = SimpleNamespace(articulo=article, kg_estandar_objetivo=None, cantidad_objetivo=Decimal("20"))
+    corrida = SimpleNamespace(id="corrida-of74", codigo="C-OF74", objetivo_neto_kg=None, estado="EN_EJECUCION", salidas=[output])
+    manga = SimpleNamespace(
+        id=74, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[],
+        _report_final_kg=Decimal("1.800"), _report_open_kg=None,
+        _report_quantity_un=Decimal("18"), _report_weight_corrected=True,
+    )
+    run = {
+        "orden": SimpleNamespace(id="of-74", codigo="OF-000074", estado="EN_EJECUCION"),
+        "corrida": corrida, "works": [(work, None, None)], "mangas": {74: manga},
+        "color_name": "Azul", "color_hex": "#0000AA",
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    item = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+    assert item["unidad"] == "UN"
+    assert item["tipo_meta"] == "OBJETIVO"
+    assert (item["meta"], item["avance"], item["pendiente"], item["porcentaje"]) == (20.0, 18.0, 2.0, 90.0)
+    assert item["peso_fisico_kg"] == 1.8
+
+
+def test_tv_progress_zero_goal_has_no_comparison_or_fake_zero_percent(monkeypatch):
+    work = SimpleNamespace(id="work-zero")
+    article = SimpleNamespace(id=80, codigo="PC-ZERO", nombre="Sin referencia", unidad_inventario="KG", pieza_color=None)
+    output = SimpleNamespace(articulo=article, kg_estandar_objetivo=Decimal("0"), cantidad_objetivo=Decimal("10"))
+    corrida = SimpleNamespace(id="run-zero", codigo="C-ZERO", objetivo_neto_kg=None, estado="EN_EJECUCION", salidas=[output])
+    run = {
+        "orden": SimpleNamespace(id="of-zero", codigo="OF-ZERO", estado="EN_EJECUCION"),
+        "corrida": corrida, "works": [(work, None, None)], "mangas": {},
+        "color_name": "Sin color", "color_hex": None,
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+    item = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+    assert item["estado_avance"] == "SIN_META"
+    assert item["meta"] is None
+    assert item["porcentaje"] is None
+    assert item["avance"] is None and item["pendiente"] is None
 from app.services.scm_service_support import ScmServiceError
 
 
@@ -909,6 +1090,161 @@ def test_progress_http_requires_ot_visibility_capability(app, client, scm_config
 
         assert response.status_code == 403
         assert response.get_json()["error"]["details"] == {"capability": "OT_VER"}
+
+
+def test_tv_progress_http_requires_existing_ot_capability_without_writing(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        response = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(seeded["denied"].id)},
+        )
+        assert response.status_code == 403
+        assert response.get_json()["error"]["details"] == {"capability": "OT_VER"}
+        assert not db.session.new
+        assert not db.session.dirty
+
+
+def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, client, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+    from app.models.scm_articulos import ScmArticulo
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabrication = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabrication)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=order.id, codigo="C-OF-TV-REAL", secuencia=11,
+            objetivo_neto_kg=Decimal("10"), estado="EN_EJECUCION",
+        )
+        article = ScmArticulo(
+            codigo="WIP-TV-REAL", nombre="Salida WIP observada",
+            clase="SUBENSAMBLE_WIP", unidad_inventario="KG",
+        )
+        db.session.add_all([corrida, article])
+        db.session.flush()
+        output = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=corrida.id,
+            articulo_scm_id=article.id, cantidad_objetivo=100,
+            kg_estandar_objetivo=10, excedente_objetivo=0,
+        )
+        db.session.add(output)
+        db.session.flush()
+        lot = ScmLoteArticulo(
+            codigo="LOTE-TV-REAL", articulo_id=article.id,
+            clase="SALIDA_ORDEN_OPERACION", orden_operacion_salida_id=output.id,
+            cantidad_acreditada=1,
+        )
+        db.session.add(lot)
+        blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
+        color_work = ScmTrabajoColor.query.filter_by(trabajo_ot_id=blue.id).one()
+        color_work.corrida_fabricacion_id = corrida.id
+        weighed_manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
+        weighed_manga.lote_articulo = lot
+        db.session.commit()
+
+        response = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        order_item = next(item for item in payload["items"] if item["of"] == "OF-OBS-001")
+        row = next(item for item in order_item["salidas"] if item["corrida_id"] == str(corrida.id))
+        assert (row["unidad"], row["tipo_meta"], row["meta"]) == ("KG", "NETA", 10)
+        assert row["avance"] == pytest.approx(11.5)
+        assert row["estado_avance"] == "SOBREPRODUCCION"
+        assert db.session.get(ScmManga, weighed_manga.id).estado == "PENDIENTE_RECEPCION_ALMACEN"
+
+
+def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, scm_config):
+    from test_scm_production_observability import _seed_observability_graph
+    from app.models.scm_articulos import ScmArticulo
+    from app.models.scm_ot import ScmAsignacionPersonalTrabajoOt, ScmTramoMangaTrabajo
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        db.session.add(ScmOrdenFabricacion(orden_operacion_id=order.id))
+        db.session.flush()
+        run_a = ScmCorridaFabricacion(
+            orden_fabricacion_id=order.id, codigo="C-TV-UN-A", secuencia=21, estado="EN_EJECUCION"
+        )
+        run_b = ScmCorridaFabricacion(
+            orden_fabricacion_id=order.id, codigo="C-TV-UN-B", secuencia=22, estado="EN_EJECUCION"
+        )
+        article = ScmArticulo(codigo="WIP-TV-UN", nombre="Salida histórica UN", clase="SUBENSAMBLE_WIP", unidad_inventario="KG")
+        db.session.add_all([run_a, run_b, article])
+        db.session.flush()
+        output_a = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=run_a.id, articulo_scm_id=article.id,
+            cantidad_objetivo=4, kg_estandar_objetivo=None, excedente_objetivo=0,
+        )
+        output_b = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=run_b.id, articulo_scm_id=article.id,
+            cantidad_objetivo=5, kg_estandar_objetivo=None, excedente_objetivo=0,
+        )
+        db.session.add_all([output_a, output_b])
+        db.session.flush()
+        lot = ScmLoteArticulo(
+            codigo="LOTE-TV-UN", articulo_id=article.id, clase="SALIDA_ORDEN_OPERACION",
+            orden_operacion_salida_id=output_a.id, cantidad_acreditada=1,
+        )
+        db.session.add(lot)
+        red = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-ROJO").one()
+        blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
+        ScmTrabajoColor.query.filter_by(trabajo_ot_id=red.id).one().corrida_fabricacion_id = run_a.id
+        ScmTrabajoColor.query.filter_by(trabajo_ot_id=blue.id).one().corrida_fabricacion_id = run_b.id
+        manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
+        manga.lote_articulo = lot
+        weighing = ScmPesajeManga.query.filter_by(manga_id=manga.id).one()
+        from app.models.scm_ot import ScmCorreccionPesajeManga
+        correction = ScmCorreccionPesajeManga.query.filter_by(pesaje_id=weighing.id).one()
+        correction.result_projection_json = {**correction.result_projection_json, "cantidad_confirmada": "9.000", "peso_fisico_neto_kg": "1.800"}
+        assignments = []
+        for work in (red, blue):
+            assignment = ScmAsignacionPersonalTrabajoOt(
+                trabajo_ot_id=work.id, trabajador_id=seeded["full"].id, estado="CERRADA",
+                finalizada_at=weighing.pesada_at, asignada_por_id=seeded["full"].id,
+                finalizada_por_id=seeded["full"].id,
+            )
+            assignments.append(assignment)
+        db.session.add_all(assignments)
+        db.session.flush()
+        db.session.add_all([
+            ScmTramoMangaTrabajo(
+                manga_id=manga.id, trabajo_ot_id=red.id, asignacion_personal_trabajo_id=assignments[0].id,
+                secuencia=1, estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=4,
+                cantidad_atribuida_un=4, created_by_id=seeded["full"].id,
+            ),
+            ScmTramoMangaTrabajo(
+                manga_id=manga.id, trabajo_ot_id=blue.id, asignacion_personal_trabajo_id=assignments[1].id,
+                secuencia=2, estado="CERRADO", cantidad_inicio_un=4, cantidad_fin_un=9,
+                cantidad_atribuida_un=5, created_by_id=seeded["full"].id,
+            ),
+        ])
+        db.session.commit()
+
+        # Exercise the actual SQLAlchemy loader: the legacy KG-only segment
+        # collection must stay empty while the TV ledger keeps both UN spans.
+        loaded = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        rows = {row["corrida"].codigo: row for row in loaded}
+        manga_a = rows["C-TV-UN-A"]["mangas"][manga.id]
+        manga_b = rows["C-TV-UN-B"]["mangas"][manga.id]
+        assert manga_a._report_segments == manga_b._report_segments == []
+        assert len(manga_a._report_all_segments) == len(manga_b._report_all_segments) == 2
+        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-A"], article.id, "UN") == (Decimal("4"), False)
+        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-B"], article.id, "UN") == (Decimal("5"), False)
+        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-A"], article.id, "KG") == (None, True)
+        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-B"], article.id, "KG") == (None, True)
 
 
 def test_progress_http_hides_weights_without_manga_visibility(app, client, scm_config):

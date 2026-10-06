@@ -264,6 +264,7 @@ from app.services.scm_production_reports_service import (
     generate_production_history_xlsx,
     list_production_history,
     list_production_progress,
+    list_production_progress_tv,
 )
 from app.services.scm_manga_detail_service import (
     get_manga_detail,
@@ -1745,6 +1746,15 @@ def observabilidad_resumen():
 @scm_bp.get("/observabilidad/avance-of")
 def observabilidad_avance_of():
     return jsonify(list_production_progress(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+
+@scm_bp.get("/observabilidad/avance-of-tv")
+def observabilidad_avance_of_tv():
+    return jsonify(list_production_progress_tv(
         db.session,
         actor_id=_actor_id(),
         filters=request.args.to_dict(flat=True),

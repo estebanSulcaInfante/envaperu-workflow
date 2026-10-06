@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import copy
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from io import BytesIO
 import json
@@ -266,7 +266,7 @@ def _project_corrected_kg_segments(segments, net):
     return [*ordered[:-1], projected]
 
 
-def _load_rows(session, filters=None):
+def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_runs=False):
     """Load runs and their physical mangas in one normalized in-memory graph."""
     run_filters = filters or {}
     statement = (
@@ -294,6 +294,10 @@ def _load_rows(session, filters=None):
     )
     if run_filters.get("of_ids") is not None:
         statement = statement.where(ScmOrdenOperacion.id.in_(run_filters["of_ids"]))
+    if order_states:
+        statement = statement.where(ScmOrdenOperacion.estado.in_(order_states))
+    if exclude_annulled_runs:
+        statement = statement.where(ScmCorridaFabricacion.estado != "ANULADA")
     rows = session.execute(statement).all()
     runs = {
         corrida.id: {
@@ -482,6 +486,10 @@ def _load_rows(session, filters=None):
                 None,
             )
             final = None if manga.estado == "ANULADA" else _effective_weight(manga, weighings_by_manga.get(manga.id, ()), correction_by_weight, annulment_ids)
+            manga._report_all_segments = [
+                segment for segment in manga.tramos_trabajo
+                if str(getattr(segment, "estado", "")).upper() != "ANULADO"
+            ]
             segments = _valid_kg_segments(manga, {})
             latest_control = controls_by_manga.get(manga.id, [])[-1] if controls_by_manga.get(manga.id) else None
             closure_event = None
@@ -511,6 +519,16 @@ def _load_rows(session, filters=None):
             open_kg = _d(latest_control.peso_neto_kg) if final is None and latest_control is not None and manga.estado != "ANULADA" else None
             manga._report_final_kg = final
             manga._report_open_kg = open_kg
+            quantity_projection = (
+                correction_by_weight.get(current_weighing.id).result_projection_json
+                if current_weighing is not None and current_weighing.id in correction_by_weight
+                else None
+            )
+            manga._report_quantity_un = (
+                _d((quantity_projection or {}).get("cantidad_confirmada", current_weighing.cantidad_confirmada))
+                if current_weighing is not None and current_weighing.id not in annulment_ids and manga.estado != "ANULADA"
+                else None
+            )
             manga._report_segments = segments
             manga._report_weight_corrected = (
                 current_weighing is not None
@@ -744,6 +762,223 @@ def list_production_progress(session, *, actor_id, filters=None):
             "criterio_uniformidad": "Criterio de uniformidad no definido",
         })
     return {"items": items, "as_of": date.today().isoformat(), "visibilidad": {"pesaje": visible, "restriccion": None if visible else "MANGA_PESAJE_VER requerido para ver pesos"}}
+
+
+def _progress_tv_un_ledger_is_valid(manga, segments):
+    quantity = _d(getattr(manga, "_report_quantity_un", None))
+    ordered = sorted(
+        [segment for segment in segments if str(getattr(segment, "estado", "")).upper() != "ANULADO"],
+        key=lambda segment: getattr(segment, "secuencia", 0),
+    )
+    if not ordered or quantity is None:
+        return False
+    previous = Decimal("0")
+    for segment in ordered:
+        start = _d(getattr(segment, "cantidad_inicio_un", None))
+        end = _d(getattr(segment, "cantidad_fin_un", None))
+        attributed = _d(getattr(segment, "cantidad_atribuida_un", None))
+        if start != previous or end is None or end <= start or attributed != end - start:
+            return False
+        previous = end
+    return previous == quantity
+
+
+def _progress_tv_actual(run, article_id, unit):
+    """Return effective evidence for one output, attributed to this run once."""
+    work_ids = {item[0].id for item in run.get("works", ())}
+    total = Decimal("0")
+    evidence = False
+    incomplete = False
+    for manga in run.get("mangas", {}).values():
+        if getattr(manga, "estado", "").upper() == "ANULADA":
+            continue
+        article = getattr(getattr(manga, "lote_articulo", None), "articulo", None)
+        if article is None or getattr(article, "id", None) != article_id:
+            continue
+        owner = effective_work(manga)
+        segments = list(getattr(manga, "_report_all_segments", None) or getattr(manga, "_report_segments", ()) or ())
+        net = _d(getattr(manga, "_report_final_kg", None))
+        open_net = _d(getattr(manga, "_report_open_kg", None))
+        observed = net if net is not None else open_net
+        if segments:
+            corrected_segments = (
+                _project_corrected_kg_segments(segments, observed)
+                if getattr(manga, "_report_weight_corrected", False) and observed is not None
+                else segments
+            )
+            has_kg_ledger = any(
+                _d(getattr(segment, field, None)) is not None
+                for segment in segments
+                for field in ("cantidad_inicio_kg", "cantidad_fin_kg")
+            ) or any(
+                (_d(getattr(segment, "cantidad_atribuida_kg", None)) or Decimal("0")) > 0
+                or bool(getattr(segment, "calidad_evidencia_kg", None))
+                for segment in segments
+            )
+            if unit == "KG" and observed is not None and _segment_conciliates(corrected_segments, observed):
+                attributed = sum((
+                    _d(segment.cantidad_atribuida_kg) or Decimal("0")
+                    for segment in corrected_segments
+                    if (segment_owner := effective_work_for_segment(manga, segment)) is not None
+                    and segment_owner.id in work_ids
+                ), Decimal("0"))
+                if unit == "KG" and net is not None and attributed > 0:
+                    total += attributed
+                    evidence = True
+            elif unit == "KG":
+                segment_owners = {
+                    item.id for segment in corrected_segments
+                    if (item := effective_work_for_segment(manga, segment)) is not None
+                    and str(getattr(segment, "estado", "")).upper() != "ANULADO"
+                }
+                valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
+                if not has_kg_ledger and valid_un and segment_owners and segment_owners <= work_ids and net is not None:
+                    total += net
+                    evidence = True
+                elif segment_owners & work_ids:
+                    incomplete = True
+            elif unit == "UN":
+                valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
+                attributed_un = sum((
+                    _d(getattr(segment, "cantidad_atribuida_un", None)) or Decimal("0")
+                    for segment in corrected_segments
+                    if (segment_owner := effective_work_for_segment(manga, segment)) is not None
+                    and segment_owner.id in work_ids
+                    and str(getattr(segment, "estado", "")).upper() != "ANULADO"
+                ), Decimal("0"))
+                if valid_un and attributed_un > 0:
+                    total += attributed_un
+                    evidence = True
+                elif owner is not None and owner.id in work_ids:
+                    incomplete = True
+            continue
+        if owner is None or owner.id not in work_ids:
+            continue
+        if unit == "KG":
+            if net is not None:
+                total += net
+                evidence = True
+            elif _d(getattr(manga, "_report_quantity_un", None)):
+                incomplete = True
+        else:
+            quantity = _d(getattr(manga, "_report_quantity_un", None))
+            if quantity is not None:
+                total += quantity
+                evidence = True
+            elif net is not None:
+                incomplete = True
+    return (total if evidence else None), incomplete
+
+
+def list_production_progress_tv(session, *, actor_id, filters=None):
+    """Read-only OF-first progress in physical units, never snapshot-derived kg."""
+    actor = load_actor(session, actor_id, capability="OT_VER")
+    visible = actor.tiene_capacidad("MANGA_PESAJE_VER")
+    normalized = _filters(filters, require_dates=False)
+    runs = _load_rows(
+        session,
+        normalized,
+        order_states={"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "ABIERTA", "EN_COBERTURA"},
+        exclude_annulled_runs=True,
+    )
+    grouped = {}
+    for run in runs:
+        order = run["orden"]
+        state = str(getattr(order, "estado", "")).upper()
+        if state not in {"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "ABIERTA", "EN_COBERTURA"}:
+            continue
+        key = getattr(order, "id", None)
+        if key is None:
+            key = order.codigo
+        item = grouped.setdefault(key, {
+            "of_id": str(getattr(order, "id", "")),
+            "of": order.codigo,
+            "estado": state,
+            "corridas": [],
+        })
+        item["corridas"].append(run)
+
+    for item in grouped.values():
+        outputs = []
+        for run in item["corridas"]:
+            corrida = run["corrida"]
+            salidas = list(getattr(corrida, "salidas", ()) or ())
+            for output in salidas:
+                if str(getattr(corrida, "estado", "")).upper() == "ANULADA":
+                    continue
+                article = getattr(output, "articulo", None)
+                if article is None:
+                    continue
+                variant_link = getattr(article, "pieza_color", None)
+                variant = getattr(variant_link, "pieza_color", None)
+                piece = getattr(variant, "pieza_rel", None)
+                corrida_outputs = list(getattr(corrida, "salidas", ()) or ())
+                net_goal = getattr(corrida, "objetivo_neto_kg", None)
+                std_goal = getattr(output, "kg_estandar_objetivo", None)
+                if len(corrida_outputs) == 1 and net_goal is not None:
+                    unit, meta_kind, raw_meta = "KG", "NETA", net_goal
+                elif std_goal is not None:
+                    unit, meta_kind, raw_meta = "KG", "ESTANDAR", std_goal
+                elif getattr(output, "cantidad_objetivo", None) is not None:
+                    unit, meta_kind, raw_meta = "UN", "OBJETIVO", output.cantidad_objetivo
+                else:
+                    unit, meta_kind, raw_meta = None, None, None
+                actual, attribution_incomplete = (
+                    _progress_tv_actual(run, article.id, unit)
+                    if visible and unit else (None, False)
+                )
+                physical_kg, kg_incomplete = (
+                    _progress_tv_actual(run, article.id, "KG")
+                    if visible else (None, False)
+                )
+                physical_kg = None if kg_incomplete else physical_kg
+                meta = _d(raw_meta)
+                if meta is not None and meta <= 0:
+                    meta = None
+                progress = actual
+                remaining = max(meta - actual, Decimal("0")) if meta is not None and actual is not None else None
+                percent = (actual / meta * 100) if meta is not None and meta > 0 and actual is not None else None
+                if not visible:
+                    status = "SIN_PERMISO_PESAJE"
+                elif meta is None or meta <= 0:
+                    status = "SIN_META"
+                elif unit is None:
+                    status = "INCOMPLETO"
+                elif attribution_incomplete:
+                    status = "INCOMPLETO"
+                    progress = remaining = percent = None
+                elif actual is None:
+                    status = "SIN_PESAJES"
+                    progress = remaining = percent = None
+                elif actual > meta:
+                    status = "SOBRE_REFERENCIA" if meta_kind == "ESTANDAR" else "SOBREPRODUCCION"
+                else:
+                    status = "EN_AVANCE" if actual < meta else "COMPLETADA"
+                outputs.append({
+                    "corrida_id": str(corrida.id),
+                    "corrida": corrida.codigo,
+                    "color": run.get("color_name"),
+                    "color_hex": run.get("color_hex"),
+                    "pieza_color_id": getattr(variant, "id", None),
+                    "sku": getattr(variant, "sku", None) or getattr(article, "codigo", None),
+                    "nombre": getattr(article, "nombre", None),
+                    "pieza": getattr(piece, "nombre", None),
+                    "unidad": unit,
+                    "tipo_meta": meta_kind,
+                    "meta": _n(meta),
+                    "avance": _n(progress),
+                    "pendiente": _n(remaining),
+                    "porcentaje": _n(percent),
+                    "peso_fisico_kg": _n(physical_kg),
+                    "estado_avance": status,
+                })
+        item["salidas"] = sorted(outputs, key=lambda row: (row["corrida"], row["sku"] or ""))
+        del item["corridas"]
+    return {
+        "items": sorted(grouped.values(), key=lambda row: (row["of"], row["of_id"])),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "visibilidad": {"pesaje": visible, "restriccion": None if visible else "MANGA_PESAJE_VER requerido para ver avance"},
+    }
 
 
 def _run_group_value(run, name):
