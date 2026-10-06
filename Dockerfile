@@ -1,5 +1,5 @@
 # Usar una imagen oficial de Python ligera
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # Evitar que Python genere archivos .pyc y forzar el log a la consola
 ENV PYTHONDONTWRITEBYTECODE 1
