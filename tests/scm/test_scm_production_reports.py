@@ -1110,6 +1110,9 @@ def test_tv_progress_http_requires_existing_ot_capability_without_writing(app, c
 def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, client, scm_config):
     from test_scm_production_observability import _seed_observability_graph
     from app.models.scm_articulos import ScmArticulo
+    from app.models.molde import Pieza
+    from app.models.producto import PiezaColor
+    from uuid import uuid4
 
     with app.app_context():
         seeded = _seed_observability_graph()
@@ -1121,12 +1124,15 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
             orden_fabricacion_id=order.id, codigo="C-OF-TV-REAL", secuencia=11,
             objetivo_neto_kg=Decimal("10"), estado="EN_EJECUCION",
         )
-        article = ScmArticulo(
-            codigo="WIP-TV-REAL", nombre="Salida WIP observada",
-            clase="SUBENSAMBLE_WIP", unidad_inventario="KG",
-        )
-        db.session.add_all([corrida, article])
+        piece = Pieza(codigo="PZ-TV-REAL", nombre="Cuerpo común", peso_nominal_gr=100)
+        db.session.add_all([corrida, piece])
         db.session.flush()
+        variant = PiezaColor(sku=f"PC-TV-{uuid4().hex[:12]}".upper(), pieza_id=piece.id, piezas=piece.nombre)
+        db.session.add(variant)
+        db.session.flush()
+        from app.services.scm_article_service import _ensure_piece_article
+        _ensure_piece_article(db.session, variant)
+        article = ScmArticulo.query.filter_by(codigo=variant.sku).one()
         output = ScmOrdenOperacionSalida(
             orden_operacion_id=order.id, corrida_fabricacion_id=corrida.id,
             articulo_scm_id=article.id, cantidad_objetivo=100,
@@ -1157,6 +1163,7 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         order_item = next(item for item in payload["items"] if item["of"] == "OF-OBS-001")
         row = next(item for item in order_item["salidas"] if item["corrida_id"] == str(corrida.id))
         assert (row["unidad"], row["tipo_meta"], row["meta"]) == ("KG", "NETA", 10)
+        assert row["pieza_id"] == piece.id
         assert row["avance"] == pytest.approx(11.5)
         assert row["estado_avance"] == "SOBREPRODUCCION"
         assert db.session.get(ScmManga, weighed_manga.id).estado == "PENDIENTE_RECEPCION_ALMACEN"

@@ -959,6 +959,7 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     "corrida": corrida.codigo,
                     "color": run.get("color_name"),
                     "color_hex": run.get("color_hex"),
+                    "pieza_id": getattr(piece, "id", None),
                     "pieza_color_id": getattr(variant, "id", None),
                     "sku": getattr(variant, "sku", None) or getattr(article, "codigo", None),
                     "nombre": getattr(article, "nombre", None),
