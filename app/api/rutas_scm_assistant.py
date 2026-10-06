@@ -16,6 +16,8 @@ from app.services.scm_daily_query_service import (
     LocalProductionDailyAdapter, DailyQueryError,
 )
 from app.services.scm_assistant_gateway import narrate
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from app.services.scm_service_support import ScmServiceError
 
 scm_assistant_bp = Blueprint('scm_assistant', __name__)
@@ -28,7 +30,8 @@ def settings():
             'SCM_OPENCLAW_POLICY_CONFIRMED', 'SCM_OPENCLAW_PRIVATE_HOST',
             'SCM_OPENCLAW_TOKEN_FILE', 'SCM_OPENCLAW_CA_FILE',
             'SCM_ASSISTANT_V2_ENABLED', 'SCM_ASSISTANT_V2_MODEL_CALLS_ENABLED',
-            'SCM_OPENCLAW_BACKEND_MODEL', 'SCM_OPENCLAW_MODEL_VERIFIED')
+            'SCM_OPENCLAW_BACKEND_MODEL', 'SCM_OPENCLAW_MODEL_VERIFIED',
+            'SCM_OPENCLAW_THINKING_LEVEL', 'SCM_OPENCLAW_THINKING_VERIFIED')
     return {k: current_app.config.get(k, os.environ.get(k, '')) for k in keys}
 
 
@@ -174,20 +177,50 @@ def chat():
     body = bounded_body()
     if set(body) - {'query', 'refresh'} or not isinstance(body.get('query'), str) or len(body['query']) > 1000 or not isinstance(body.get('refresh', False), bool):
         raise DailyQueryError('ASSISTANT_INVALID_REQUEST', 'Consulta inválida.', status_code=400)
-    from app.services.scm_assistant_catalogue import plan_query, execute_plan, get_catalogue, CatalogueQueryError
+    from app.services.scm_assistant_catalogue import (
+        plan_query, execute_plan, get_catalogue, CatalogueQueryError,
+        preflight_model_query, review_model_plan, get_model_catalogue,
+    )
+    from app.services.scm_assistant_gateway import propose_read_plan
     started = perf_counter()
+    now = datetime.now(timezone.utc)
     state = current_app.extensions.setdefault('scm_assistant_v2_state', {'cache':DailySummaryCache(), 'audit':DailyQueryLog()})
-    planned = plan_query(body['query'])
-    result = dict(planned)
-    result.update(trace_id=uuid4().hex, results=[], suggestions=get_catalogue().get('suggestions', []))
-    # Deliberately no model call: catalogue routing is deterministic in this candidate.
-    # This flag is independent of the deployed daily narration policy.
-    result['execution_mode'] = 'deterministic_catalogue'
+    preflight = preflight_model_query(body['query'], now=now)
+    planned = preflight or plan_query(body['query'], now=now)
+    if planned.get('status') == 'answered':
+        reviewed = review_model_plan({'status':'answered','plan':planned['plan']}, body['query'], now=now)
+        if reviewed.get('status') == 'answered':
+            reviewed['message'] = planned['message']
+        planned = reviewed
     mode = config.get('SCM_ASSISTANT_PROVIDER') or 'deterministic'
-    result['provider'] = {'mode':mode, 'status':'ACTIVATION_PENDING' if mode=='openclaw' else 'READY', 'usage':None,
-                          'message':'Respuesta calculada por servicios SCM. La sesión del modelo no se comprueba ni utiliza en esta consulta.'}
-    if mode=='openclaw' and not provider_linked(config, actor_id):
-        result['provider']['status'] = 'PROVIDER_NOT_LINKED'
+    provider = {'mode':mode, 'status':'ACTIVATION_PENDING' if mode=='openclaw' else 'READY', 'usage':None}
+    execution_mode = 'deterministic_catalogue'
+    linked = provider_linked(config, actor_id)
+    enabled = str(config.get('SCM_ASSISTANT_V2_MODEL_CALLS_ENABLED')).lower() == 'true'
+    if mode=='openclaw' and enabled:
+        provider['status'] = 'NOT_USED'
+    if mode=='openclaw' and not linked:
+        provider['status'] = 'PROVIDER_NOT_LINKED'
+    # Known recommended questions remain deterministic. Free phrasing reaches the
+    # real adapter only after personal ownership and explicit activation gates.
+    if preflight is None and planned.get('status') != 'answered' and enabled and mode=='openclaw' and linked:
+        execution_mode = 'model_router'
+        if str(config.get('SCM_OPENCLAW_POLICY_CONFIRMED')).lower() != 'true':
+            routed = {'status':'POLICY_NOT_CONFIRMED','usage':None}
+        else:
+            routed = propose_read_plan(body['query'], get_model_catalogue(), config,
+                                       today_lima=now.astimezone(ZoneInfo('America/Lima')).date().isoformat())
+        provider = {key:routed.get(key) for key in ('status','usage')} | {'mode':'openclaw'}
+        if routed.get('status') == 'READY':
+            planned = review_model_plan(routed.get('decision'), body['query'], now=now)
+        else:
+            planned = {'status':'needs_clarification','plan':[],
+                       'message':'No se pudo interpretar la consulta con el proveedor. No se ejecutaron lecturas.',
+                       'clarification':{'question':'Usa una pregunta recomendada o vuelve a intentar cuando el proveedor esté disponible.',
+                                        'fields':['query'],'choices':[]}}
+    result = dict(planned)
+    result.update(trace_id=uuid4().hex, results=[], suggestions=get_catalogue().get('suggestions', []),
+                  provider=provider, execution_mode=execution_mode)
     if planned.get('status') == 'answered':
         with Session(db.engine) as session:
             try:
@@ -202,7 +235,7 @@ def chat():
                 session.rollback()
     state['audit'].append({'actor_id':actor_id, 'trace_id':result['trace_id'], 'query':body['query'],
                            'status':result['status'], 'plan':result['plan'],
-                           'latency_ms':round((perf_counter()-started)*1000,3), 'usage':None})
+                           'latency_ms':round((perf_counter()-started)*1000,3), 'usage':provider.get('usage')})
     return jsonify(result)
 
 

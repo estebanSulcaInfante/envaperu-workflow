@@ -64,7 +64,7 @@ class CatalogueQueryError(ScmServiceError):
 
 
 _WRITE_OR_INJECTION = re.compile(
-    r"(?:--|/\*|\*/|;|\b(?:select|insert|update|delete|drop|alter|truncate|grant|revoke|exec|execute|union\s+select|shell|sql|curl|wget|powershell|rm\s+-)\b|"
+    r"(?:--|/\*|\*/|;|(?:^|\s)/(?:think|model|tools?|exec|shell)\b|\b(?:ignora|ignore|instrucciones|instruction|jailbreak|prompt|select|insert|update|delete|drop|alter|truncate|grant|revoke|exec|execute|union\s+select|shell|sql|curl|wget|powershell|rm\s+-)\b|"
     r"\b(?:crear|crea|actualiza|actualizar|modifica|modificar|elimina|eliminar|borra|borrar|anula|anular|corrige|corregir|inicia|iniciar|cierra|cerrar|recibe|recibir|mueve|mover|imprime|imprimir|escribe|escribir)\b)",
     re.IGNORECASE,
 )
@@ -84,6 +84,8 @@ _MANGA_VALUE_RE = re.compile(
 )
 _COLOR_RE = re.compile(r"\bcolor\s*(?:es\s*)?(?:=|:)?\s*(?P<color>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9_-]{1,39})\b", re.IGNORECASE)
 _SAFE_ENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-/]{0,79}$")
+_SAFE_COLOR_RE = re.compile(r"^[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9 _-]{0,79}$")
+_NEGATION_RE = re.compile(r"\b(?:no|nunca|sin|evita|evitar|no\s+quiero|no\s+necesito|excepto|salvo|menos|excluye|excluir|omite|omitir|distinto\s+de|not|never|without|except|exclude|excludes|omit|omits|don['’]?t|doesn['’]?t)\b", re.IGNORECASE)
 
 
 def _normalize(value: str) -> str:
@@ -170,6 +172,12 @@ def _parse_clause(clause: str, *, now: datetime | None = None) -> dict[str, Any]
     has_manga_marker = bool(re.search(r"\b(?:trazabilidad|historial|detalle)\b", normalized)) or bool(re.search(r"\bmanga\b", normalized))
     of = _extract_of(clause)
     has_progress = bool(re.search(r"\b(?:avance|progreso|produccion acumulada|fabricado)\b", normalized))
+    has_color_marker = bool(re.search(r"\b(?:color|tono)\b", normalized))
+
+    if has_weighing and (has_manga_marker or of is not None or has_color_marker):
+        return {"_clarify": ("El pesaje por período no admite OF, manga ni color como filtro.", "Indica solo el rango de pesajes que deseas consultar.", ["intent"])}
+    if has_manga_marker and (dates or of is not None):
+        return {"_clarify": ("La trazabilidad de manga no admite OF ni fecha de corte.", "Indica únicamente la manga que deseas consultar.", ["intent"])}
 
     # A period is valid only with two explicit endpoints.  Relative phrases
     # such as "esta semana" are intentionally left for clarification.
@@ -201,17 +209,23 @@ def _parse_clause(clause: str, *, now: datetime | None = None) -> dict[str, Any]
         return {"intent": INTENT_MANGA_TRACE, "parameters": manga}
 
     if has_progress and of is not None:
+        if dates:
+            return {"_clarify": ("El avance acumulado no admite una fecha de corte.", "¿Quieres el avance acumulado o un resumen diario para esa fecha?", ["intent", "date_lima"])}
         parameters: dict[str, Any] = {"of": of}
         color_match = _COLOR_RE.search(clause)
         if color_match:
             # Preserve the lexical value; matching is exact in the canonical
             # read model and no Azure/Azul or other fuzzy conversion occurs.
             parameters["color"] = color_match.group("color")
+        elif has_color_marker:
+            return {"_clarify": ("Falta el color exacto de la OF.", "¿Qué color exacto debo usar?", ["color"])}
         return {"intent": INTENT_PRODUCTION_ORDER_PROGRESS, "parameters": parameters}
     if has_progress and re.search(r"\bof\b", normalized):
         return {"_clarify": ("Falta el código de la OF.", "¿Qué OF exacta debo consultar?", ["of"])}
 
     if re.search(r"\b(?:resumen|produccion|produccion diaria|pesajes del dia|que tal fue)\b", normalized):
+        if of is not None or has_color_marker:
+            return {"_clarify": ("El resumen diario no admite OF ni color como filtro.", "¿Quieres el resumen diario o el avance de una OF?", ["intent"])}
         if len(dates) != 1:
             return {"_clarify": ("Falta una fecha para el resumen diario.", "¿Qué fecha Lima debo resumir?", ["date_lima"]), "choices": ["hoy", "ayer"]}
         return {"intent": INTENT_PRODUCTION_DAILY_SUMMARY, "parameters": {"date_lima": dates[0].isoformat()}}
@@ -224,7 +238,20 @@ def plan_query(query: str, now: datetime | None = None) -> dict[str, Any]:
         return _clarification("Necesito una consulta SCM.", "¿Quieres un resumen diario, avance de OF, rango de pesajes o trazabilidad de manga?", ["query"])
     if len(query) > MAX_QUERY_LENGTH:
         return _unsupported("La consulta supera el límite permitido.")
-    if _WRITE_OR_INJECTION.search(query):
+    if _WRITE_OR_INJECTION.search(query) or _NEGATION_RE.search(query):
+        return _unsupported("Solo est�n habilitadas consultas de lectura de SCM.")
+    normalized_query = _normalize(query)
+    has_summary_anchor = bool(re.search(r"\b(?:resumen|pesajes del dia|que tal fue)\b", normalized_query))
+    has_progress_anchor = _extract_of(query) is not None or (bool(re.search(r"\b(?:avance|progreso)\b", normalized_query)) and not has_summary_anchor)
+    dates_in_query = _date_values(query, now=now)
+    if not _CLAUSE_SEPARATOR.search(query) and has_summary_anchor and has_progress_anchor:
+        return _clarification("La consulta mezcla un resumen diario y un avance de OF.", "Separa las lecturas con 'y además' o indica una sola.", ["composition"])
+    if not _CLAUSE_SEPARATOR.search(query) and has_progress_anchor and dates_in_query:
+        return _clarification("El avance acumulado no admite una fecha de corte.", "¿Quieres el avance acumulado de la OF o un resumen diario para esa fecha?", ["intent", "date_lima"], choices=[INTENT_PRODUCTION_ORDER_PROGRESS, INTENT_PRODUCTION_DAILY_SUMMARY])
+    if not _CLAUSE_SEPARATOR.search(query) and has_summary_anchor and _extract_of(query) is not None:
+        return _clarification("El resumen diario no admite una OF.", "¿Quieres el resumen diario o el avance de la OF?", ["intent", "of"], choices=[INTENT_PRODUCTION_DAILY_SUMMARY, INTENT_PRODUCTION_ORDER_PROGRESS])
+    if not _CLAUSE_SEPARATOR.search(query) and re.search(r"\b(?:del?|desde|entre)\s+\d", normalized_query) and not re.search(r"\bpesaj", normalized_query):
+        return _clarification("Un rango de fechas requiere una consulta de pesajes.", "¿Quieres consultar pesajes en ese rango explícito?", ["intent"], choices=[INTENT_WEIGHING_PERIOD])
         return _unsupported("Solo están habilitadas consultas de lectura de SCM.")
     clauses = [part.strip() for part in _CLAUSE_SEPARATOR.split(query) if part.strip()]
     if len(clauses) > MAX_CLAUSES:
@@ -276,7 +303,7 @@ def validate_plan(plan: Any, query: str | None = None) -> str | None:
         elif intent == INTENT_PRODUCTION_ORDER_PROGRESS:
             if set(parameters) - {"of", "color"} or not isinstance(parameters.get("of"), str) or not parameters["of"] or not _SAFE_ENTITY_RE.fullmatch(parameters["of"]):
                 return "El avance requiere el código exacto de la OF."
-            if "color" in parameters and (not isinstance(parameters["color"], str) or not parameters["color"] or not _SAFE_ENTITY_RE.fullmatch(parameters["color"])):
+            if "color" in parameters and (not isinstance(parameters["color"], str) or not parameters["color"] or not _SAFE_COLOR_RE.fullmatch(parameters["color"])):
                 return "El color exacto no es válido."
         elif intent == INTENT_WEIGHING_PERIOD:
             if set(parameters) != {"fecha_desde", "fecha_hasta", "max_weighings"}:
@@ -300,6 +327,208 @@ def validate_plan(plan: Any, query: str | None = None) -> str | None:
             if "id" in parameters and (not isinstance(parameters["id"], int) or isinstance(parameters["id"], bool) or parameters["id"] <= 0):
                 return "El id de manga no es válido."
     return None
+
+
+def _model_result(status: str, message: str, *, plan: list[dict[str, Any]] | None = None, clarification: dict[str, Any] | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"status": status, "message": message, "plan": plan or []}
+    if clarification is not None:
+        result["clarification"] = clarification
+    return result
+
+
+def _explicit_range(clause: str) -> tuple[date, date] | None:
+    match = re.search(
+        r"(?:(?:del?|desde)\s+(?P<start>\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\s+(?:al?|hasta)|entre\s+(?P<start_between>\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\s+y)\s+(?P<end>\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})",
+        clause,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    start = _parse_date_token(match.group("start") or match.group("start_between"))
+    end = _parse_date_token(match.group("end"))
+    return (start, end) if isinstance(start, date) and isinstance(end, date) else None
+
+
+def _model_of_code(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip().upper()
+    if not _SAFE_ENTITY_RE.fullmatch(value):
+        return None
+    if re.fullmatch(r"OF-\d+", value, re.IGNORECASE):
+        return f"OF-{int(value[3:]):06d}"
+    return value
+
+
+def _explicit_color(clause: str) -> str | None:
+    match = re.search(r"\b(?:color|tono)\s*(?:es\s*)?(?:=|:)?\s*(?P<color>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 _-]{1,79}?)(?=\s*(?:[,.!?;]|$|\bpara\b|\bde\b|\ben\b|\bcon\b|\by\b))", clause, re.IGNORECASE)
+    if not match:
+        return None
+    value = " ".join(match.group("color").strip(" .,:;!?-").split())
+    return value if _SAFE_COLOR_RE.fullmatch(value) else None
+
+
+def _ground_model_item(item: dict[str, Any], clause: str, *, now: datetime | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    intent = item["intent"]
+    params = dict(item["parameters"])
+    normalized = dict(params)
+    dates = _date_values(clause, now=now)
+    if re.search(r"\b(?:ventas?|precios?|costos?|costes?|facturas?|clima|weather|sales|prices?|costs?)\b", _normalize(clause)):
+        return None, {"question": "Esta consulta no corresponde a las lecturas de producción disponibles.", "fields": ["intent"], "choices": []}
+    if intent == INTENT_PRODUCTION_DAILY_SUMMARY:
+        if not re.search(r"\b(?:resumen|produccion|pesaj\w*|peso\w*|fabricad\w*|cantidad|kilos?)\b", _normalize(clause)):
+            return None, {"question": "¿Quieres una lectura SCM de producción o pesajes?", "fields": ["intent"], "choices": [INTENT_PRODUCTION_DAILY_SUMMARY]}
+        if _extract_of(clause) is not None or _extract_manga(clause) is not None or _explicit_color(clause) is not None or re.search(r"\b(?:color|tono)\b", _normalize(clause)):
+            return None, {"question": "¿Quieres el avance de una OF o un resumen diario?", "fields": ["intent"], "choices": [INTENT_PRODUCTION_ORDER_PROGRESS, INTENT_PRODUCTION_DAILY_SUMMARY]}
+        if len(dates) != 1:
+            return None, {"question": "¿Qué fecha Lima debo resumir?", "fields": ["date_lima"], "choices": ["hoy", "ayer"]}
+        expected = dates[0].isoformat()
+        requested = _parse_date_token(params.get("date_lima"), now=now)
+        if not isinstance(requested, date) or requested != dates[0]:
+            return None, {"question": "¿Qué fecha Lima debo resumir?", "fields": ["date_lima"], "choices": [expected]}
+        normalized["date_lima"] = expected
+    elif intent == INTENT_PRODUCTION_ORDER_PROGRESS:
+        of = _extract_of(clause)
+        if of is None:
+            return None, {"question": "¿Qué código exacto de OF debo consultar?", "fields": ["of"], "choices": []}
+        if dates or _extract_manga(clause) is not None:
+            return None, {"question": "La consulta mezcla avance y fecha.", "fields": ["intent", "date_lima"], "choices": [INTENT_PRODUCTION_ORDER_PROGRESS, INTENT_PRODUCTION_DAILY_SUMMARY]}
+        if _model_of_code(params.get("of")) != of.upper():
+            return None, {"question": "¿Qué código exacto de OF debo consultar?", "fields": ["of"], "choices": [of]}
+        normalized["of"] = of.upper()
+        query_color = _explicit_color(clause)
+        if "color" in params:
+            if query_color is None:
+                return None, {"question": "¿Qué color exacto debo usar?", "fields": ["color"], "choices": []}
+            if str(params["color"]).casefold() != query_color.casefold():
+                return None, {"question": "¿Qué color exacto debo usar?", "fields": ["color"], "choices": [query_color] if query_color else []}
+            normalized["color"] = query_color
+        elif query_color is not None:
+            return None, {"question": "¿Qué color exacto debo usar?", "fields": ["color"], "choices": [query_color] if query_color else []}
+        elif re.search(r"\b(?:color|tono)\b", _normalize(clause)):
+            return None, {"question": "color", "fields": ["color"], "choices": []}
+    elif intent == INTENT_WEIGHING_PERIOD:
+        if not re.search(r"\bpesaj", _normalize(clause)):
+            return None, {"question": "¿Quieres consultar pesajes en ese período?", "fields": ["intent"], "choices": [INTENT_WEIGHING_PERIOD]}
+        if _extract_of(clause) is not None or _extract_manga(clause) is not None or _explicit_color(clause) is not None or re.search(r"\b(?:color|tono)\b", _normalize(clause)):
+            return None, {"question": "El per�odo de pesajes no admite OF, manga ni color como filtro.", "fields": ["intent"], "choices": [INTENT_WEIGHING_PERIOD]}
+        explicit = _explicit_range(clause)
+        if explicit is None:
+            return None, {"question": "¿Qué inicio y fin explícitos en Lima debo consultar?", "fields": ["fecha_desde", "fecha_hasta"], "choices": []}
+        start, end = explicit
+        if params.get("fecha_desde") != start.isoformat() or params.get("fecha_hasta") != end.isoformat():
+            return None, {"question": "¿Qué inicio y fin explícitos en Lima debo consultar?", "fields": ["fecha_desde", "fecha_hasta"], "choices": [start.isoformat(), end.isoformat()]}
+        normalized["fecha_desde"], normalized["fecha_hasta"] = start.isoformat(), end.isoformat()
+    else:
+        if not re.search(r"\b(?:manga|trazabilidad|detalle|historial)\b", _normalize(clause)):
+            return None, {"question": "¿Quieres la trazabilidad de una manga?", "fields": ["intent"], "choices": [INTENT_MANGA_TRACE]}
+        if dates or _extract_of(clause) is not None or _explicit_color(clause) is not None or re.search(r"\b(?:color|tono)\b", _normalize(clause)):
+            return None, {"question": "La trazabilidad de manga no admite OF ni fecha de corte.", "fields": ["intent"], "choices": [INTENT_MANGA_TRACE]}
+        entity = _extract_manga(clause)
+        if entity is None:
+            return None, {"question": "¿Qué UUID público, código exacto o id de manga debo consultar?", "fields": ["manga"], "choices": []}
+        if entity != params:
+            return None, {"question": "¿Qué UUID público, código exacto o id de manga debo consultar?", "fields": ["manga"], "choices": list(entity.values())}
+        normalized = entity
+    return {"intent": intent, "parameters": normalized}, None
+
+
+def validate_model_plan(plan: Any, query: str, now: datetime | None = None) -> dict[str, Any]:
+    """Review a model-produced data-only plan against literal user evidence.
+
+    This deliberately does not call :func:`plan_query`: an unknown but safe
+    paraphrase may be accepted when every entity and date is explicit in the
+    user's text.  The result is structured so callers can ask for clarification
+    without executing a partial plan.
+    """
+    if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY_LENGTH:
+        return _model_result("unsupported", "La consulta no es válida.")
+    if _WRITE_OR_INJECTION.search(query) or _NEGATION_RE.search(query):
+        return _model_result("unsupported", "Solo se admiten solicitudes afirmativas de lectura SCM.")
+    clauses = [part.strip() for part in _CLAUSE_SEPARATOR.split(query) if part.strip()]
+    if len(clauses) > MAX_CLAUSES:
+        return _model_result("unsupported", "Puedes combinar como máximo dos consultas de lectura.")
+    if isinstance(plan, dict):
+        if set(plan) != {"status", "plan"}:
+            return _model_result("unsupported", "La decisión del modelo contiene campos no admitidos.")
+        if plan.get("status") != "answered":
+            status = plan.get("status")
+            if status == "needs_clarification":
+                return _model_result("needs_clarification", "El plan del modelo requiere aclaración.", clarification={"question": "¿Qué entidad o fecha falta precisar?", "fields": ["plan"], "choices": []})
+            return _model_result("unsupported", "El plan del modelo no solicita una lectura habilitada.")
+        plan = plan.get("plan")
+    reason = validate_plan(plan)
+    if reason:
+        return _model_result("unsupported", reason)
+    if len(plan) != len(clauses):
+        return _model_result("needs_clarification", "La composición del plan no coincide con la consulta.", clarification={"question": "¿Qué consultas deseas combinar?", "fields": ["plan"], "choices": []})
+    grounded: list[dict[str, Any]] = []
+    for item, clause in zip(plan, clauses):
+        normalized_item, clarification = _ground_model_item(item, clause, now=now)
+        if clarification is not None:
+            return _model_result("needs_clarification", "Falta precisar una entidad o fecha de la consulta.", clarification=clarification)
+        grounded.append(normalized_item)
+    return _model_result("answered", "Plan de lectura validado.", plan=grounded)
+
+
+def review_model_plan(decision: Any, query: str, now: datetime | None = None) -> dict[str, Any]:
+    """Validate the exact data-only decision envelope returned by a model."""
+    return validate_model_plan(decision, query, now=now)
+
+
+def preflight_model_query(query: str, now: datetime | None = None) -> dict[str, Any] | None:
+    """Reject unsafe or clearly incomplete text before any model fallback."""
+    if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY_LENGTH:
+        return _model_result("unsupported", "La consulta no es válida.")
+    if _WRITE_OR_INJECTION.search(query) or _NEGATION_RE.search(query):
+        return _model_result("unsupported", "Solo se admiten solicitudes afirmativas de lectura SCM.")
+    normalized = _normalize(query)
+    has_summary_anchor = bool(re.search(r"\b(?:resumen|pesajes del dia|que tal fue)\b", normalized))
+    has_progress_anchor = _extract_of(query) is not None or (bool(re.search(r"\b(?:avance|progreso)\b", normalized)) and not has_summary_anchor)
+    dates_in_query = _date_values(query, now=now)
+    if not _CLAUSE_SEPARATOR.search(query) and has_summary_anchor and has_progress_anchor:
+        return _model_result("needs_clarification", "La consulta mezcla un resumen diario y un avance de OF.", clarification={"question": "Sepáralos con 'y además' o indica cuál necesitas.", "fields": ["composition"], "choices": []})
+    if not _CLAUSE_SEPARATOR.search(query) and has_progress_anchor and dates_in_query:
+        return _model_result("needs_clarification", "El avance acumulado no admite una fecha de corte.", clarification={"question": "¿Quieres el avance acumulado de la OF o un resumen diario para esa fecha?", "fields": ["intent", "date_lima"], "choices": [INTENT_PRODUCTION_ORDER_PROGRESS, INTENT_PRODUCTION_DAILY_SUMMARY]})
+    if not _CLAUSE_SEPARATOR.search(query) and has_summary_anchor and _extract_of(query) is not None:
+        return _model_result("needs_clarification", "El resumen diario no admite una OF.", clarification={"question": "¿Quieres el resumen diario o el avance de la OF?", "fields": ["intent", "of"], "choices": [INTENT_PRODUCTION_DAILY_SUMMARY, INTENT_PRODUCTION_ORDER_PROGRESS]})
+    if not _CLAUSE_SEPARATOR.search(query) and re.search(r"\b(?:del?|desde|entre)\s+\d", normalized) and not re.search(r"\bpesaj", normalized):
+        return _model_result("needs_clarification", "Un rango de fechas requiere una consulta de pesajes.", clarification={"question": "¿Quieres consultar pesajes en ese rango explícito?", "fields": ["intent"], "choices": [INTENT_WEIGHING_PERIOD]})
+    if re.search(r"\b(?:avance|progreso)\b", normalized) and re.search(r"\bof\b", normalized) and _extract_of(query) is None:
+        return _model_result("needs_clarification", "Falta el código exacto de la OF.", clarification={"question": "¿Qué OF exacta debo consultar?", "fields": ["of"], "choices": []})
+    if re.search(r"\b(?:trazabilidad|detalle|historial)\b", normalized) and re.search(r"\bmanga\b", normalized) and _extract_manga(query) is None:
+        return _model_result("needs_clarification", "Falta identificar la manga.", clarification={"question": "¿Qué UUID público, código exacto o id de manga debo consultar?", "fields": ["manga"], "choices": []})
+    if re.search(r"\bpesaj", normalized) and _explicit_range(query) is None and len(_date_values(query, now=now)) != 1:
+        return _model_result("needs_clarification", "Falta el rango explícito de pesajes.", clarification={"question": "¿Qué inicio y fin explícitos en Lima debo consultar?", "fields": ["fecha_desde", "fecha_hasta"], "choices": []})
+    if re.search(r"\b(?:resumen|produccion diaria|pesajes del dia)\b", normalized) and len(_date_values(query, now=now)) != 1:
+        return _model_result("needs_clarification", "Falta una fecha para el resumen diario.", clarification={"question": "¿Qué fecha Lima debo resumir?", "fields": ["date_lima"], "choices": ["hoy", "ayer"]})
+    return None
+
+
+def get_model_catalogue() -> dict[str, Any]:
+    """Strict schema metadata for a future data-only model planner."""
+    schemas = {
+        INTENT_PRODUCTION_DAILY_SUMMARY: {"required": ["date_lima"], "properties": {"date_lima": {"type": "string", "description": "Fecha Lima ISO, hoy o ayer."}}},
+        INTENT_PRODUCTION_ORDER_PROGRESS: {"required": ["of"], "properties": {"of": {"type": "string", "description": "Código exacto de OF."}, "color": {"type": "string", "description": "Color exacto, sin fuzzy matching."}}},
+        INTENT_WEIGHING_PERIOD: {"required": ["fecha_desde", "fecha_hasta", "max_weighings"], "properties": {"fecha_desde": {"type": "string", "format": "date"}, "fecha_hasta": {"type": "string", "format": "date"}, "max_weighings": {"type": "integer", "const": 500}}},
+        INTENT_MANGA_TRACE: {"oneOf": [{"required": ["public_id"]}, {"required": ["codigo"]}, {"required": ["id"]}], "properties": {"public_id": {"type": "string", "format": "uuid"}, "codigo": {"type": "string"}, "id": {"type": "integer", "minimum": 1}}},
+    }
+    for schema in schemas.values():
+        schema.setdefault("type", "object")
+        schema.setdefault("additionalProperties", False)
+    schemas[INTENT_MANGA_TRACE]["oneOf"] = [
+        {"required": ["public_id"], "maxProperties": 1},
+        {"required": ["codigo"], "maxProperties": 1},
+        {"required": ["id"], "maxProperties": 1},
+    ]
+    return {
+        "version": "scm-assistant-model-catalogue-v2",
+        "model_routing": "disabled_by_default",
+        "read_only": True,
+        "intents": [{"intent": intent, "description": {INTENT_PRODUCTION_DAILY_SUMMARY: "Resumen de pesajes efectivos de una fecha Lima.", INTENT_PRODUCTION_ORDER_PROGRESS: "Avance acumulado de una OF.", INTENT_WEIGHING_PERIOD: "Pesajes de un rango explícito de hasta siete días.", INTENT_MANGA_TRACE: "Trazabilidad de una manga exacta."}[intent], "schema": schemas[intent]} for intent in sorted(ALLOWED_INTENTS)],
+        "decision_schema": {"type": "object", "additionalProperties": False, "required": ["status", "plan"], "properties": {"status": {"enum": ["answered", "needs_clarification", "unsupported"]}, "plan": {"type": "array", "maxItems": 2}}},
+        "tool_calls": False,
+    }
 
 
 def get_catalogue() -> dict[str, Any]:
@@ -567,8 +796,12 @@ __all__ = [
     "CatalogueQueryError",
     "execute_plan",
     "get_catalogue",
+    "get_model_catalogue",
     "get_manga_detail",
     "list_production_progress",
     "plan_query",
+    "preflight_model_query",
+    "review_model_plan",
     "validate_plan",
+    "validate_model_plan",
 ]
