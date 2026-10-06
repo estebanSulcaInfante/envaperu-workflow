@@ -20,8 +20,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 6a30b812f4ded92eab496c9aba309a1284f2c4bb
-  RECIPE_SHA: 67ba7889410de3e6b55c318950394a6e5bcd3311
+  SOURCE_SHA: 4c45a11d18660025a8b798b15fdc12f88ff1523d
+  RECIPE_SHA: 3e2fec304d9a5ca74de9a6a20052b1a77608cae4
   PYTHON_BASE: ${{ inputs.python_base }}
   IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
 
@@ -41,7 +41,7 @@ jobs:
       - name: Checkout immutable reviewed recipe
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 67ba7889410de3e6b55c318950394a6e5bcd3311
+          ref: 3e2fec304d9a5ca74de9a6a20052b1a77608cae4
           path: recipe
           persist-credentials: false
       - name: Verify recipe checkout and exact reviewed source CI
@@ -59,7 +59,7 @@ jobs:
       - name: Checkout exact application source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 6a30b812f4ded92eab496c9aba309a1284f2c4bb
+          ref: 4c45a11d18660025a8b798b15fdc12f88ff1523d
           path: source
           persist-credentials: false
       - name: Build from newly generated hashed context
@@ -115,7 +115,7 @@ jobs:
       - name: Checkout immutable reviewed publication checks
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 67ba7889410de3e6b55c318950394a6e5bcd3311
+          ref: 3e2fec304d9a5ca74de9a6a20052b1a77608cae4
           path: recipe
           persist-credentials: false
       - name: Recheck recipe and actual environment policy
