@@ -1,9 +1,9 @@
-# RELEASE SOURCE: 82c4781569e724dd4113c63445cd7e2283850b1d
+# RELEASE SOURCE: 6a30b812f4ded92eab496c9aba309a1284f2c4bb
 # PREPARATION ONLY: requires approved administrator handoff before any start.
 # Project name is controlled by Dokploy: envaperuscmpilot-scmpilot-cnxr9n
 services:
   api:
-    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:e329a0623ea73dd186baa27f8ce28bb325f6f94c69bf7296d763ef6e9a241cf2
+    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:69afd0910821b52d563161252adb61000cbc363b3ff7ccd8fb2b856045fac6e0
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -18,12 +18,24 @@ services:
       - ${SCM_API_ENV_FILE:?Administrator must securely supply API environment file}
     environment:
       SCM_AUTH_MODE: supabase
+      SCM_ASSISTANT_ENABLED: "true"
+      SCM_ASSISTANT_PROVIDER: "openclaw"
+      SCM_ASSISTANT_ACTOR_ID: "1"
+      SCM_ASSISTANT_AUTH_USER_ID: "28044442-3caf-4a92-97e4-212b50aa3c3b"
+      SCM_OPENCLAW_URL: "https://openclaw-scm:18789"
+      SCM_OPENCLAW_PRIVATE_HOST: "openclaw-scm"
+      SCM_OPENCLAW_TOKEN_FILE: "/run/secrets/openclaw-token"
+      SCM_OPENCLAW_CA_FILE: "/run/openclaw/gateway-ca.crt"
+      SCM_OPENCLAW_POLICY_CONFIRMED: "false"
       CATALOG_IMAGE_STORAGE: supabase_s3
       CATALOG_IMAGE_KEEP_DATABASE_COPY: "true"
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
     entrypoint: [python, /prep/start_guard.py]
     command: [gunicorn, run:app, --bind, "0.0.0.0:5000", --workers, "2", --timeout, "60", --graceful-timeout, "30", --max-requests, "1000", --max-requests-jitter, "100", --error-logfile, "-"]
+    volumes:
+      - /opt/openclaw-pilot/secrets/backend-token:/run/secrets/openclaw-token:ro
+      - /opt/openclaw-pilot/gateway-ca.crt:/run/openclaw/gateway-ca.crt:ro
     configs:
       - source: start_guard
         target: /prep/start_guard.py
@@ -39,7 +51,7 @@ services:
       - /tmp:size=67108864,mode=1777
       - /app/logs:size=83886080,uid=10001,gid=10001,mode=0700
       - /app/instance:size=16777216,uid=10001,gid=10001,mode=0700
-    networks: [database, egress, proxy]
+    networks: [database, egress, proxy, openclaw_private]
     labels:
       traefik.enable: "true"
       traefik.docker.network: dokploy-network
@@ -98,6 +110,9 @@ services:
       driver: json-file
       options: {max-size: 10m, max-file: "3"}
 networks:
+  openclaw_private:
+    external: true
+    name: openclaw_scm_private
   database:
     internal: true
   egress: {}
