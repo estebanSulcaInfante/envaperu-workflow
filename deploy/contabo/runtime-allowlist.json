@@ -1,5 +1,5 @@
 {
-  "source_sha": "931e2b711c2b7e519fb2c680619366cdf93a4a77",
+  "source_sha": "82c4781569e724dd4113c63445cd7e2283850b1d",
   "files": {
     "app/__init__.py": "af72faca760335bda14ed0cc9035f1415987a881ce42c44d0b44368a92003732",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -9,7 +9,7 @@
     "app/api/rutas_estaciones_pesaje.py": "f41955bb73ed841b55b23d6916ca0e283b0ec8e6194936cb30eadb5ab8deda84",
     "app/api/rutas_maquinas.py": "27736e46490c3a336a1759c2a3f448c96b5746672487988d175153ad5b13b553",
     "app/api/rutas_produccion.py": "b5df9163c2c941ad6ed5a888f84858a9ce9b072dfb0417b10fc3d08a6df4eb12",
-    "app/api/rutas_scm.py": "f32ffaef4674e7513fc7b50c8e286f2c36db8c61bda4e2d7b4524c87567e8656",
+    "app/api/rutas_scm.py": "8eb4cdf41b0cbdc81c1dea6be7173a0690297a63977b6501f570ecdea362a8a4",
     "app/api/rutas_scm_kg_pt.py": "a34f4b9fd8ad73dac1cf700523cbfdbf55e49f47c5b406f1e518c5b0653e2bf8",
     "app/api/rutas_scm_packaging_reads.py": "147e080c9e0e04e7846e19202593bc59500c7a3020baeb5037f481b9a45f7f3b",
     "app/api/rutas_scm_reproceso.py": "2a5bf7988f4e1596afde68840ce75dc6a855a7292ef905e08d3734515319ae84",
@@ -123,7 +123,7 @@
     "app/services/scm_product_onboarding_service.py": "3efb5284793ff1d12b6d8a94969d582a1264b6b30abf7c71b334635625242143",
     "app/services/scm_production_observability_service.py": "985c63cd8b5e4703fc70673d8fcd54304dbf74f865853da74b09db6593628c31",
     "app/services/scm_production_order_service.py": "9e750a4bb327eedef38436883eb2db5853e77436973bd7ff7827d214be8388ab",
-    "app/services/scm_production_reports_service.py": "7f8fcb9303479311ece26bfcb871f15540f403e3691aa50cc1b4d153ae6d0c92",
+    "app/services/scm_production_reports_service.py": "6b60c96eb19427ebdc4805df44e546067555e7ef7684f625cf665dd6422324aa",
     "app/services/scm_provider_service.py": "244bc374a40f7333ddde3946c72d720cb8d081b12749d1f84e326adfd7837c7e",
     "app/services/scm_purchase_service.py": "51dea612433051ae1505475a16502f742d183f9731235472ba3ad7094caf27df",
     "app/services/scm_reception_draft_service.py": "20ee6917f528383fb723098094cee46931ddffaa26ef7f59e12bfa13ce7ceed5",
