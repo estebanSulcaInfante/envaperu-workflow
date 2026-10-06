@@ -388,6 +388,8 @@ def _ground_model_item(item: dict[str, Any], clause: str, *, now: datetime | Non
             return None, {"question": "¿Qué fecha Lima debo resumir?", "fields": ["date_lima"], "choices": [expected]}
         normalized["date_lima"] = expected
     elif intent == INTENT_PRODUCTION_ORDER_PROGRESS:
+        if not re.search(r"\b(?:avance|progreso|kilos?|kg|terminad[oa]s?|fabricad[oa]s?|produccion|como\s+va|que\s+tal\s+vamos|cuanto\s+llevamos|cantidad)\b", _normalize(clause)):
+            return None, {"question": "¿Quieres consultar el avance acumulado de la OF?", "fields": ["intent"], "choices": [INTENT_PRODUCTION_ORDER_PROGRESS]}
         of = _extract_of(clause)
         if of is None:
             return None, {"question": "¿Qué código exacto de OF debo consultar?", "fields": ["of"], "choices": []}
@@ -406,7 +408,7 @@ def _ground_model_item(item: dict[str, Any], clause: str, *, now: datetime | Non
         elif query_color is not None:
             return None, {"question": "¿Qué color exacto debo usar?", "fields": ["color"], "choices": [query_color] if query_color else []}
         elif re.search(r"\b(?:color|tono)\b", _normalize(clause)):
-            return None, {"question": "color", "fields": ["color"], "choices": []}
+            return None, {"question": "¿Qué color exacto debo usar?", "fields": ["color"], "choices": []}
     elif intent == INTENT_WEIGHING_PERIOD:
         if not re.search(r"\bpesaj", _normalize(clause)):
             return None, {"question": "¿Quieres consultar pesajes en ese período?", "fields": ["intent"], "choices": [INTENT_WEIGHING_PERIOD]}

@@ -240,7 +240,7 @@ def test_recommended_daily_and_of_examples_resolve_canonical_identifiers():
 
 
 @pytest.mark.parametrize("query", ["¿Qué tal vamos con la OF-123 color Azure?", "¿Cuánto llevamos de OF-123 color Azure?"])
-def test_model_progress_accepts_literal_of_without_fixed_verb_vocabulary(query):
+def test_model_progress_accepts_bounded_progress_paraphrases(query):
     decision = {"status": "answered", "plan": [{"intent": catalogue.INTENT_PRODUCTION_ORDER_PROGRESS, "parameters": {"of": "OF-123", "color": "Azure"}}]}
     assert catalogue.review_model_plan(decision, query, now=NOW)["status"] == "answered"
 
@@ -251,5 +251,12 @@ def test_model_progress_accepts_literal_of_without_fixed_verb_vocabulary(query):
 ])
 def test_model_cannot_convert_unsupported_subject_into_production(query, intent, params):
     result = catalogue.review_model_plan({"status": "answered", "plan": [{"intent": intent, "parameters": params}]}, query, now=NOW)
+    assert result["status"] == "needs_clarification"
+    assert result["plan"] == []
+
+
+@pytest.mark.parametrize("query", ["¿Quién es el cliente de OF-123?", "Dame la dirección de entrega de OF-123", "Estado del despacho de OF-123"])
+def test_model_progress_requires_positive_progress_anchor(query):
+    result = catalogue.review_model_plan({"status": "answered", "plan": [{"intent": catalogue.INTENT_PRODUCTION_ORDER_PROGRESS, "parameters": {"of": "OF-123"}}]}, query, now=NOW)
     assert result["status"] == "needs_clarification"
     assert result["plan"] == []
