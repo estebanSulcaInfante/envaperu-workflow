@@ -11,6 +11,7 @@ once authentication is approved; until then it reports ``AUTH_PENDING``.
 from __future__ import annotations
 
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -185,7 +186,7 @@ class DailySummaryCache:
 
 
 class DailyQueryLog:
-    """Bounded in-memory audit log with no query payload or token fields."""
+    """Bounded in-memory audit of actor-scoped queries and measured usage only."""
 
     def __init__(self, *, max_entries: int = 200):
         self._max_entries = max(1, max_entries)
@@ -194,8 +195,8 @@ class DailyQueryLog:
 
     def append(self, entry: Mapping[str, Any]) -> None:
         safe = {
-            key: entry[key]
-            for key in ("trace_id", "actor_id", "intent", "date_lima", "latency_ms", "cache_hit", "status", "query")
+            key: deepcopy(entry[key])
+            for key in ("trace_id", "actor_id", "intent", "date_lima", "latency_ms", "cache_hit", "status", "query", "plan", "usage")
             if key in entry
         }
         with self._lock:
@@ -204,7 +205,7 @@ class DailyQueryLog:
 
     def list(self, *, actor_id: int | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            rows = [dict(item) for item in self._entries]
+            rows = deepcopy(self._entries)
         return rows if actor_id is None else [item for item in rows if item.get("actor_id") == actor_id]
 
 

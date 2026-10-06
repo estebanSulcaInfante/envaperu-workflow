@@ -195,6 +195,7 @@ from app.models.receta_color import (
     RecetaColorNormalizada,
 )
 from app.models.trabajador import Trabajador, RolOperativo
+from app.models.scm_assistant_proposal import ScmAssistantProposal, ScmAssistantProposalRevision
 from app.models.estacion_pesaje import (
     EstacionPesaje,
     EstacionEstadoActual,

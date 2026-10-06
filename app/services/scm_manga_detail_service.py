@@ -321,11 +321,11 @@ def _tramos(manga, visible_weights):
 def _pesajes(session, manga, visible_weights):
     if not visible_weights:
         return _section("restringido", reason="MANGA_PESAJE_VER requerido para ver pesos")
-    pesaje_rows = ScmPesajeManga.query.filter_by(manga_id=manga.id).order_by(ScmPesajeManga.pesada_at, ScmPesajeManga.id).all()
+    pesaje_rows = session.query(ScmPesajeManga).filter_by(manga_id=manga.id).order_by(ScmPesajeManga.pesada_at, ScmPesajeManga.id).all()
     pesajes = []
     for item in pesaje_rows:
-        correction = ScmCorreccionPesajeManga.query.filter_by(pesaje_id=item.id).order_by(ScmCorreccionPesajeManga.id).all()
-        annulment = ScmAnulacionPesajeManga.query.filter_by(pesaje_id=item.id).one_or_none()
+        correction = session.query(ScmCorreccionPesajeManga).filter_by(pesaje_id=item.id).order_by(ScmCorreccionPesajeManga.id).all()
+        annulment = session.query(ScmAnulacionPesajeManga).filter_by(pesaje_id=item.id).one_or_none()
         def projection(value):
             allowed = {"peso_bruto_kg", "tara_kg", "peso_fisico_neto_kg", "cantidad_confirmada", "kg_produccion_ot", "pesada_at", "fecha_local_pesaje", "dias_desfase_operativo", "alerta_fecha"}
             if not isinstance(value, dict):
@@ -360,7 +360,7 @@ def _pesajes(session, manga, visible_weights):
         applied = next(
             (
                 correction for correction in reversed(
-                    ScmCorreccionPesajeManga.query.filter_by(
+                    session.query(ScmCorreccionPesajeManga).filter_by(
                         pesaje_id=active_weighing.id, estado="APLICADA"
                     ).order_by(ScmCorreccionPesajeManga.id).all()
                 )
@@ -540,10 +540,10 @@ def _stock(session, manga, actor_id, visible_weights):
     # Movement history is linked through typed references and the canonical
     # foreign keys.  A bare ``referencia_id`` is unsafe here: integer manga
     # ids and UUID/public ids can collide across aggregates.
-    pesajes = ScmPesajeManga.query.filter_by(manga_id=manga.id).all()
+    pesajes = session.query(ScmPesajeManga).filter_by(manga_id=manga.id).all()
     pesaje_ids = {str(item.public_id) for item in pesajes}
     control_ids = {str(item.public_id) for item in getattr(manga, "controles_peso", ()) or ()}
-    corrections = [correction for pesaje in pesajes for correction in ScmCorreccionPesajeManga.query.filter_by(pesaje_id=pesaje.id).all()]
+    corrections = [correction for pesaje in pesajes for correction in session.query(ScmCorreccionPesajeManga).filter_by(pesaje_id=pesaje.id).all()]
     correction_ids = {str(item.public_id) for item in corrections}
     un_transfer_items = []
     if existence is not None:
