@@ -346,6 +346,30 @@ def _current_label(manga, label_type):
     )
 
 
+def current_postpesaje_source(session, manga):
+    """Return current POSTPESAJE plus the real VIGENTE weighing, if both exist."""
+    if manga is None or manga.estado == "ANULADA":
+        return None
+    post_labels = [label for label in (getattr(manga, "etiquetas", ()) or ()) if label.tipo == "POSTPESAJE"]
+    label = max(post_labels, key=lambda item: (item.version, item.id), default=None)
+    if label is None or label.estado != "IMPRESA" or label.printed_at is None:
+        return None
+    weighing = session.scalar(
+        select(ScmPesajeManga)
+        .where(ScmPesajeManga.manga_id == manga.id, ScmPesajeManga.estado == "VIGENTE")
+        .order_by(ScmPesajeManga.id.desc())
+        .limit(1)
+    )
+    if label is None or weighing is None:
+        return None
+    if session.scalar(select(ScmAnulacionPesajeManga.id).where(ScmAnulacionPesajeManga.pesaje_id == weighing.id)) is not None:
+        return None
+    return {
+        "label": _serialize_label(label),
+        "pesaje": {"public_id": str(weighing.public_id), "estado": weighing.estado},
+    }
+
+
 def _order_ot_identity(manga):
     if manga.trabajo is not None:
         work = manga.trabajo
@@ -1203,8 +1227,8 @@ def _control_label_payload(manga, control, label_id, version):
                 "f",
             )
         ),
-        "manga_id": str(manga.public_id),
-        "artifact_id": str(label_id),
+            "manga_id": str(manga.public_id),
+            "artifact_id": str(label_id),
         "artifact_version": version,
         "qr_required": False,
         **order_identity,
@@ -1326,6 +1350,7 @@ def _post_label_payload(manga, weighing, label_id, version):
             "f",
         ),
         "manga_id": str(manga.public_id),
+        "pesaje_id": str(weighing.public_id),
         "artifact_id": str(label_id),
         "artifact_version": version,
         "qr_required": False,
@@ -2763,6 +2788,7 @@ def get_manga_weighing(session, *, actor_id, manga_id):
         None,
     )
     weighing = active_weighing or (weighings[-1] if weighings else None)
+    current_source = current_postpesaje_source(session, manga)
     corrections = []
     if weighing is not None:
         corrections = (
@@ -2792,6 +2818,7 @@ def get_manga_weighing(session, *, actor_id, manga_id):
             _effective_projection(active_weighing)
             if active_weighing is not None else None
         ),
+        "current_source": current_source,
         "historial": [
             {
                 "pesaje": item.to_dict(),
@@ -3226,6 +3253,7 @@ def approve_weighing_correction(
         ) + 1
         label_id = uuid.uuid4()
         projected_weighing = SimpleNamespace(
+            public_id=weighing.public_id,
             peso_fisico_neto_kg=net,
             kg_produccion_ot=production_kg,
             cantidad_confirmada=quantity,

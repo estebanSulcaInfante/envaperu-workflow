@@ -56,6 +56,9 @@ class Config:
     STATION_CATALOG_ENABLED = (
         os.getenv('STATION_CATALOG_ENABLED', 'false').lower() == 'true'
     )
+    POSTPESAJE_REPRINT_ENABLED = (
+        os.getenv('POSTPESAJE_REPRINT_ENABLED', 'false').strip().lower() == 'true'
+    )
     SCM_RECEPCION_ENABLED = (
         os.getenv('SCM_RECEPCION_ENABLED', 'false').lower() == 'true'
     )

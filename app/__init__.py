@@ -58,7 +58,7 @@ def create_app():
     # --- IMPORTAR MODELOS ---
     # Es crucial importar los modelos aquí para que SQLAlchemy los registre
     # antes de que cualquier blueprint intente usarlos.
-    from app.models import correlativo_catalogo, orden, lote, materiales, recetas, producto, registro, control_peso, scm_catalogos, scm_recepcion, scm_ot, scm_inventory, scm_warehouse, scm_internal_supply, scm_assembly_execution, scm_reproceso, scm_product_onboarding, trabajador, maquina, estacion_pesaje, legacy_pesaje
+    from app.models import correlativo_catalogo, orden, lote, materiales, recetas, producto, registro, control_peso, scm_catalogos, scm_recepcion, scm_ot, scm_inventory, scm_warehouse, scm_internal_supply, scm_assembly_execution, scm_reproceso, scm_product_onboarding, trabajador, maquina, estacion_pesaje, legacy_pesaje, scm_postpesaje_reprint
 
     # --- REGISTRO DE RUTAS ---
     from app.api.rutas_produccion import produccion_bp
@@ -78,6 +78,10 @@ def create_app():
         monitoring_station_bp,
     )
     from app.api.rutas_auth import auth_bp
+    from app.api.rutas_postpesaje_reimpresion import (
+        postpesaje_reprint_bp,
+        postpesaje_reprint_station_bp,
+    )
     
     # Todo lo que esté en ese archivo empezará con /api
     app.register_blueprint(produccion_bp, url_prefix='/api')
@@ -101,6 +105,11 @@ def create_app():
         url_prefix='/api/monitoring/v1',
     )
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
+    app.register_blueprint(postpesaje_reprint_bp, url_prefix='/api/scm/v1')
+    app.register_blueprint(
+        postpesaje_reprint_station_bp,
+        url_prefix='/api/integration/v1',
+    )
 
     from app.cli import register_scm_commands, register_station_commands
 

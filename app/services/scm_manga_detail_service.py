@@ -45,7 +45,7 @@ from app.services.scm_manga_assignment_projection import (
     effective_work,
     effective_work_for_segment,
 )
-from app.services.scm_weighing_service import _effective_projection, _weighing_color_identity
+from app.services.scm_weighing_service import _effective_projection, _weighing_color_identity, current_postpesaje_source
 
 
 def _iso(value):
@@ -648,7 +648,17 @@ def _stock(session, manga, actor_id, visible_weights):
 def _labels(session, manga, actor_id, visible_weights):
     if not visible_weights:
         return _section("restringido", reason="MANGA_PESAJE_VER requerido para proteger datos vinculados a pesaje")
-    items = [{"id": str(item.public_id), "tipo": item.tipo, "version": item.version, "estado": item.estado, "plantilla_version": item.plantilla_version, "generated_at": _iso(item.generated_at), "printed_at": _iso(item.printed_at)} for item in getattr(manga, "etiquetas", ()) or ()]
+    current_source = current_postpesaje_source(session, manga)
+    current_label_id = (current_source or {}).get("label", {}).get("public_id")
+    items = []
+    for item in getattr(manga, "etiquetas", ()) or ():
+        payload = {"id": str(item.public_id), "tipo": item.tipo, "version": item.version, "estado": item.estado, "plantilla_version": item.plantilla_version, "generated_at": _iso(item.generated_at), "printed_at": _iso(item.printed_at)}
+        payload["pesaje"] = (
+            (current_source or {}).get("pesaje")
+            if str(item.public_id) == current_label_id and item.tipo == "POSTPESAJE"
+            else None
+        )
+        items.append(payload)
     actor = load_actor(session, actor_id)
     if not actor.tiene_capacidad("INVENTARIO_VER"):
         return _section("disponible" if items else "sin_datos", items=items)

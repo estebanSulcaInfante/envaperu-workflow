@@ -213,3 +213,9 @@ from app.models.legacy_pesaje import (
     EstacionImportacionPesajeLegacyFila,
     EstacionPesajeLegacy,
 )
+from app.models.scm_postpesaje_reprint import (
+    ScmPostpesajeReprintRequest,
+    ScmPostpesajeReprintItem,
+    ScmPostpesajeReprintJob,
+    ScmPostpesajeReprintAudit,
+)
