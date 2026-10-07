@@ -5,6 +5,7 @@ projections.  It does not create inventory movements, consume BOM sources, or
 turn an estimate into a measured result.
 """
 
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import UUID, uuid4
 
@@ -68,6 +69,79 @@ def automatic_kg_intake_enabled():
         return False
 
 
+def _assert_automatic_intake_cutoff(session, manga, source_at, operation_id):
+    """Cut on measured facts, not on when an empty manga was planned.
+
+    Called under the productive advisory lock and manga row lock. Original
+    source/server times survive corrections, annulments and reopenings. A clean
+    precreated manga may start after T0; historical mass cannot cross the cut.
+    Completed operation replays return before reaching this guard.
+    """
+    from flask import current_app
+    from app.models.scm_auditoria import ScmOperacion
+    from app.models.scm_warehouse import ScmExistenciaManga
+    from app.models.scm_inventory_kg import ScmExistenciaMangaKg
+    raw = current_app.config.get("KG_AUTOMATIC_INTAKE_CUTOFF_AT", "")
+    try:
+        cutoff = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("timezone required")
+    except (TypeError, ValueError):
+        raise ScmServiceError(
+            "KG_INTAKE_CUTOFF_REQUIRED",
+            "El ingreso automatico requiere una fecha de corte explicita con zona horaria.",
+            status_code=409,
+        )
+
+    def utc(value):
+        if not isinstance(value, datetime):
+            return None
+        return (value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value).astimezone(timezone.utc)
+
+    cutoff = cutoff.astimezone(timezone.utc)
+    captured = utc(source_at)
+    operation_at = utc(session.scalar(select(ScmOperacion.created_at).where(
+        ScmOperacion.operation_id == operation_id)))
+    reason = None
+    if captured is None or captured < cutoff:
+        reason = "CAPTURE_BEFORE_CUTOFF"
+    elif operation_at is None or operation_at < cutoff:
+        reason = "OPERATION_BEFORE_CUTOFF"
+    # All states, including annulled/reopened facts. A proposed correction date
+    # cannot replace these original facts or their server receipt timestamps.
+    weighings = session.execute(select(ScmPesajeManga.pesada_at,
+        ScmPesajeManga.created_at, ScmPesajeManga.cantidad_confirmada).where(
+        ScmPesajeManga.manga_id == manga.id)).all()
+    controls = session.execute(select(ScmControlPesoManga.pesado_at,
+        ScmControlPesoManga.created_at, ScmControlPesoManga.conteo_acumulado_un).where(
+        ScmControlPesoManga.manga_id == manga.id)).all()
+    if any(utc(value) is None or utc(value) < cutoff
+           for row in [*weighings, *controls] for value in row[:2]):
+        reason = "HISTORICAL_MEASUREMENT"
+    un_values = [manga.cantidad_confirmada_un, manga.cantidad_contenida_un]
+    un_values.extend(row[2] for row in [*weighings, *controls])
+    for row in session.execute(select(ScmTramoMangaTrabajo.cantidad_inicio_un,
+            ScmTramoMangaTrabajo.cantidad_fin_un, ScmTramoMangaTrabajo.cantidad_atribuida_un).where(
+            ScmTramoMangaTrabajo.manga_id == manga.id)):
+        un_values.extend(row)
+    if any(Decimal(value or 0) != 0 for value in un_values) or session.scalar(
+        select(ScmExistenciaManga.id).where(ScmExistenciaManga.manga_id == manga.id,
+            ScmExistenciaManga.estado_logistico != "REVERSADA").limit(1)) is not None:
+        reason = "LIVE_UN_PROJECTION"
+    for received_at, origin in session.execute(select(ScmExistenciaMangaKg.recibida_at,
+            ScmExistenciaMangaKg.resuelta_por).where(ScmExistenciaMangaKg.manga_id == manga.id)):
+        if origin == "KG_HISTORY_RECOVERY" or utc(received_at) is None or utc(received_at) < cutoff:
+            reason = "HISTORICAL_KG_EXISTENCE"
+    if reason:
+        raise ScmServiceError(
+            "KG_INTAKE_CUTOVER_REVIEW_REQUIRED",
+            "La captura o historia de la manga requiere conciliacion separada del corte. La operacion no fue aplicada; conserve el UUID y contacte al responsable.",
+            status_code=409,
+            details={"manga_id": str(manga.public_id), "cutoff_at": cutoff.isoformat(),
+                     "source_at": captured.isoformat() if captured else None, "reason": reason},
+        )
+
+
 def _production_location(session, *, article_class=None):
     from flask import current_app
     from app.models.scm_inventory import ScmUbicacionInventario
@@ -126,7 +200,20 @@ def sync_kg_production_inventory(
     mass.  Receipt later changes the location of this same existence.
     """
     if not force and not automatic_kg_intake_enabled():
+        from app.models.scm_inventory_kg import ScmExistenciaMangaKg
+        existing_stock = session.scalar(select(ScmExistenciaMangaKg.id).where(
+            ScmExistenciaMangaKg.manga_id == manga.id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        ))
+        if existing_stock is not None:
+            raise ScmServiceError(
+                "KG_INTAKE_DISABLED_WITH_EXISTENCE",
+                "El ingreso KG esta deshabilitado. No se puede cambiar el peso de una manga con existencia sin actualizar su inventario.",
+                status_code=409,
+            )
         return None
+    if not force:
+        _assert_automatic_intake_cutoff(session, manga, source_at, operation_id)
     from hashlib import sha256
     from app.models.scm_articulos import ScmArticulo
     from app.models.scm_inventory import ScmUbicacionInventario
@@ -403,11 +490,15 @@ def close_kg_from_last_control(
     active.motivo_cierre = reason
     manga.estado = "PENDIENTE_RECEPCION_ALMACEN"
     manga.version += 1
-    inventory = sync_kg_production_inventory(
-        session, actor_id=actor.id, manga=manga, net_kg=final_net,
-        operation_id=operation.operation_id, source_type="CONTROL_CIERRE",
-        source_id=latest.public_id, source_at=latest.pesado_at, final=True,
-    )
+    try:
+        inventory = sync_kg_production_inventory(
+            session, actor_id=actor.id, manga=manga, net_kg=final_net,
+            operation_id=operation.operation_id, source_type="CONTROL_CIERRE",
+            source_id=latest.public_id, source_at=latest.pesado_at, final=True,
+        )
+    except Exception:
+        session.rollback()
+        raise
     response = {
         "manga": _serialize_manga(manga),
         "control_fuente": latest.to_dict(),

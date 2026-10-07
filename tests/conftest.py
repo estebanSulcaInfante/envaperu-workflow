@@ -12,6 +12,7 @@ def app():
     app = create_app()
     app.config.update({
         "TESTING": True,
+        "KG_AUTOMATIC_INTAKE_CUTOFF_AT": "1970-01-01T00:00:00+00:00",
         "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:"
     })
 

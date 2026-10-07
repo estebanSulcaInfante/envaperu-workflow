@@ -70,6 +70,11 @@ class Config:
     KG_AUTOMATIC_INTAKE_ENABLED = (
         os.getenv('KG_AUTOMATIC_INTAKE_ENABLED', 'false').strip().lower() == 'true'
     )
+    # Required for automatic intake: captures and original physical facts before
+    # this timezone-aware boundary require separate reconciliation.
+    KG_AUTOMATIC_INTAKE_CUTOFF_AT = os.getenv(
+        'KG_AUTOMATIC_INTAKE_CUTOFF_AT', ''
+    ).strip()
     PT_MANUAL_WRITE_ENABLED = (
         os.getenv('PT_MANUAL_WRITE_ENABLED', 'false').strip().lower() == 'true'
     )
