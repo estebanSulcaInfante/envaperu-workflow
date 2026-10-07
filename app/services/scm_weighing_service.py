@@ -53,6 +53,7 @@ from app.services.scm_alert_service import (
     upsert_operational_alert,
 )
 from app.services.scm_color_identity import serialize_color_identity
+from app.services.scm_postpesaje_identity import build_postpesaje_identity
 from app.services.scm_service_support import (
     ScmServiceError,
     acquire_kg_productive_write_lock,
@@ -1356,6 +1357,11 @@ def _post_label_payload(manga, weighing, label_id, version):
         "qr_required": False,
         **_order_ot_identity(manga),
     }
+    payload["identidad_producto"] = build_postpesaje_identity(
+        manga,
+        payload["generated_at"],
+        current_work=closing_work,
+    )
     if fabricated_theoretical_kg is not None:
         payload["peso_fabricado_teorico_kg"] = format(
             fabricated_theoretical_kg, "f"

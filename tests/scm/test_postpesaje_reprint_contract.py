@@ -56,6 +56,11 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app):
             db.session, station_id=station.station_id, print_job_id=UUID(weighed["print_job_id"]),
             data={"results": [{"label_id": str(post.public_id), "estado": "IMPRESA", "printer_name": "TSC"}]},
         )
+        # A later catalog rename must not alter the frozen POST identity used
+        # by preview/confirm/claim.
+        piece = post.manga.lote_articulo.articulo.pieza_color.pieza_color.pieza_rel
+        piece.nombre = "Asa piloto RENOMBRADA DESPUES"
+        db.session.flush()
         pesaje = ScmPesajeManga.query.filter_by(manga_id=post.manga_id, estado="VIGENTE").one()
         import app.services.scm_postpesaje_reprint_service as service
         preview = service.preview_reprint(db.session, actor_id=creator.id, data={"station_id": station.station_id, "items": [{"source_label_id": str(post.public_id), "pesaje_id": str(pesaje.public_id), "copias": 2}]})
@@ -67,6 +72,15 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app):
         assert claim["copias"] == 2
         assert claim["payload"]["document_type"] == "POSTPESAJE"
         assert "qr" not in claim["payload"]
+        identity = claim["payload"]["identidad_producto"]
+        assert identity["version"] == 1
+        assert identity["mode"] == "CATALOG_SNAPSHOT"
+        assert identity["pieza"]["codigo"] == "PZ-C-000001"
+        assert identity["pieza"]["nombre"] == "Asa piloto"
+        assert identity["variante"]["sku"] == "PC-C-000001"
+        assert identity["provenance"]["piece_source"] == "CATALOG_AT_POST_EMISSION"
+        assert isinstance(claim["payload"]["pieza_color"], str)
+        assert isinstance(claim["payload"]["color"], str)
         receipt = service.acknowledge_reprint_job(db.session, station_id=station.station_id, job_id=UUID(claim["copy_job_id"]), data={"attempt_id": str(attempt_id), "result": "NOT_EMITTED", "expected_bytes": 100, "bytes_written": 0, "document_started": False, "write_attempted": True, "simulated": False, "job_id": 77, "error": "fixture", "rendered_payload_hash": claim["payload_hash"], "renderer_version": "POSTPESAJE_COPY_TSPL_1", "printer_name": "FIXTURE"})
         assert receipt["result"] == "NOT_EMITTED"
         from app.services.scm_weighing_service import current_postpesaje_source

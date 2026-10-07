@@ -34,6 +34,7 @@ from app.models.scm_postpesaje_reprint import (
 from app.models.estacion_pesaje import EstacionPesaje
 from app.services.scm_service_support import ScmServiceError, load_actor
 from app.services.scm_manga_assignment_projection import effective_work
+from app.services.scm_postpesaje_identity import validate_stored_identity
 
 
 CAPABILITY = "MANGA_ETIQUETA_POST_REIMPRIMIR"
@@ -190,6 +191,12 @@ def _source(session, source_label_id, source_pesaje_id=None):
     )
     if payload.get("pieza_color") is not None and str(payload["pieza_color"]) != str(canonical_piece):
         raise ScmServiceError("SOURCE_MISMATCH", "La etiqueta pertenece a otra pieza/color.", status_code=409)
+    if not validate_stored_identity(payload.get("identidad_producto"), manga):
+        raise ScmServiceError(
+            "SOURCE_PAYLOAD_IDENTITY_INVALID",
+            "La identidad estructurada de la etiqueta no coincide con el snapshot fuente.",
+            status_code=409,
+        )
     for key in ("color", "color_nombre"):
         if payload.get(key) is not None and manga.color_snapshot is not None and str(payload[key]) != str(manga.color_snapshot):
             raise ScmServiceError("SOURCE_MISMATCH", "La etiqueta pertenece a otro color.", status_code=409)
