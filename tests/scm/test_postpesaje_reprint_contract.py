@@ -15,7 +15,8 @@ from app.services.scm_postpesaje_reprint_service import (
 from app.services.scm_service_support import ScmServiceError
 
 
-def test_real_postpesaje_preview_confirm_claim_ack_contract(app):
+@pytest.mark.parametrize("legacy_fixture", [False, True], ids=["catalog", "legacy"])
+def test_real_postpesaje_preview_confirm_claim_ack_contract(app, legacy_fixture):
     """Exercise the source resolver with the repository's real OT fixture."""
     from test_scm_ot_service import _print_color_manga, _seed_fabrication_order, acknowledge_station_print_job
     from app.extensions import db
@@ -28,6 +29,11 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app):
     app.config["POSTPESAJE_REPRINT_ENABLED"] = True
     with app.app_context():
         creator, _approver, order, run, _output = _seed_fabrication_order()
+        if legacy_fixture:
+            piece_color = _output.articulo.pieza_color.pieza_color
+            piece_color.pieza_id = None
+            piece_color.pieza_rel = None
+            db.session.flush()
         capability = ScmCapacidad(codigo="MANGA_ETIQUETA_POST_REIMPRIMIR", nombre="Reimpresion postpesaje", activo=True)
         role = RolOperativo(codigo="REPRINT_FIXTURE", nombre="REPRINT_FIXTURE", activo=True, capacidades=[capability])
         creator.roles.append(role)
@@ -56,11 +62,12 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app):
             db.session, station_id=station.station_id, print_job_id=UUID(weighed["print_job_id"]),
             data={"results": [{"label_id": str(post.public_id), "estado": "IMPRESA", "printer_name": "TSC"}]},
         )
-        # A later catalog rename must not alter the frozen POST identity used
-        # by preview/confirm/claim.
-        piece = post.manga.lote_articulo.articulo.pieza_color.pieza_color.pieza_rel
-        piece.nombre = "Asa piloto RENOMBRADA DESPUES"
-        db.session.flush()
+        if not legacy_fixture:
+            # A later catalog rename must not alter the frozen POST identity
+            # used by preview/confirm/claim.
+            piece = post.manga.lote_articulo.articulo.pieza_color.pieza_color.pieza_rel
+            piece.nombre = "Asa piloto RENOMBRADA DESPUES"
+            db.session.flush()
         pesaje = ScmPesajeManga.query.filter_by(manga_id=post.manga_id, estado="VIGENTE").one()
         import app.services.scm_postpesaje_reprint_service as service
         preview = service.preview_reprint(db.session, actor_id=creator.id, data={"station_id": station.station_id, "items": [{"source_label_id": str(post.public_id), "pesaje_id": str(pesaje.public_id), "copias": 2}]})
@@ -74,11 +81,20 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app):
         assert "qr" not in claim["payload"]
         identity = claim["payload"]["identidad_producto"]
         assert identity["version"] == 1
-        assert identity["mode"] == "CATALOG_SNAPSHOT"
-        assert identity["pieza"]["codigo"] == "PZ-C-000001"
-        assert identity["pieza"]["nombre"] == "Asa piloto"
-        assert identity["variante"]["sku"] == "PC-C-000001"
-        assert identity["provenance"]["piece_source"] == "CATALOG_AT_POST_EMISSION"
+        assert isinstance(claim["payload_hash"], str)
+        assert claim["payload_hash"] == _hash(claim["payload"])
+        assert claim["source_payload_hash"] == original_hash
+        if legacy_fixture:
+            assert identity["mode"] == "LEGACY_MANGA_SNAPSHOT"
+            assert identity["pieza"] is None
+            assert identity["variante"]["catalog_version"] is None
+            assert identity["provenance"]["piece_source"] == "LEGACY_MANGA_SNAPSHOT"
+        else:
+            assert identity["mode"] == "CATALOG_SNAPSHOT"
+            assert identity["pieza"]["codigo"] == "PZ-C-000001"
+            assert identity["pieza"]["nombre"] == "Asa piloto"
+            assert identity["variante"]["sku"] == "PC-C-000001"
+            assert identity["provenance"]["piece_source"] == "CATALOG_AT_POST_EMISSION"
         assert isinstance(claim["payload"]["pieza_color"], str)
         assert isinstance(claim["payload"]["color"], str)
         receipt = service.acknowledge_reprint_job(db.session, station_id=station.station_id, job_id=UUID(claim["copy_job_id"]), data={"attempt_id": str(attempt_id), "result": "NOT_EMITTED", "expected_bytes": 100, "bytes_written": 0, "document_started": False, "write_attempted": True, "simulated": False, "job_id": 77, "error": "fixture", "rendered_payload_hash": claim["payload_hash"], "renderer_version": "POSTPESAJE_COPY_TSPL_1", "printer_name": "FIXTURE"})
@@ -92,7 +108,11 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app):
         assert post.payload_json == original_payload
         assert post.payload_hash == original_hash
         assert original_job.payload_hash == original_job_payload
-        out = Path(__file__).resolve().parents[2].parent / "output" / "post_reprint_contract_claim.json"
+        filename = (
+            "post_reprint_contract_claim_legacy.json"
+            if legacy_fixture else "post_reprint_contract_claim.json"
+        )
+        out = Path(__file__).resolve().parents[2].parent / "output" / filename
         out.parent.mkdir(exist_ok=True)
         out.write_text(json.dumps(claim, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
