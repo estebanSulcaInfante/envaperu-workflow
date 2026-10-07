@@ -15,7 +15,11 @@ from app.services.scm_postpesaje_reprint_service import (
 from app.services.scm_service_support import ScmServiceError
 
 
-@pytest.mark.parametrize("legacy_fixture", [False, True], ids=["catalog", "legacy"])
+@pytest.mark.parametrize(
+    "legacy_fixture",
+    [False, True, "legacy_nullable"],
+    ids=["catalog", "legacy", "legacy_nullable"],
+)
 def test_real_postpesaje_preview_confirm_claim_ack_contract(app, legacy_fixture):
     """Exercise the source resolver with the repository's real OT fixture."""
     from test_scm_ot_service import _print_color_manga, _seed_fabrication_order, acknowledge_station_print_job
@@ -47,6 +51,14 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app, legacy_fixture)
         )
         work = created["trabajo_color"]
         manga_id = created["trabajo_color"]["mangas"][0]["public_id"]
+        if legacy_fixture == "legacy_nullable":
+            from app.models.scm_ot import ScmManga
+            nullable_manga = ScmManga.query.filter_by(
+                public_id=UUID(manga_id)
+            ).one()
+            nullable_manga.pieza_color_sku_snapshot = None
+            nullable_manga.color_snapshot = None
+            db.session.flush()
         station, prelabel = _print_color_manga(actor=creator, manga_id=manga_id, station_code="PESAJE-REPRINT-CONTRACT")
         transition_color_work(db.session, actor_id=creator.id, work_id=UUID(work["id"]), operation_id=uuid4(), data={"version": work["version"]}, action="iniciar")
         weighed = confirm_manga_weighing(
@@ -89,6 +101,9 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app, legacy_fixture)
             assert identity["pieza"] is None
             assert identity["variante"]["catalog_version"] is None
             assert identity["provenance"]["piece_source"] == "LEGACY_MANGA_SNAPSHOT"
+            if legacy_fixture == "legacy_nullable":
+                assert identity["variante"]["sku"] is None
+                assert identity["color"]["nombre"] is None
         else:
             assert identity["mode"] == "CATALOG_SNAPSHOT"
             assert identity["pieza"]["codigo"] == "PZ-C-000001"
@@ -96,7 +111,10 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app, legacy_fixture)
             assert identity["variante"]["sku"] == "PC-C-000001"
             assert identity["provenance"]["piece_source"] == "CATALOG_AT_POST_EMISSION"
         assert isinstance(claim["payload"]["pieza_color"], str)
-        assert isinstance(claim["payload"]["color"], str)
+        assert (
+            isinstance(claim["payload"]["color"], str)
+            or claim["payload"]["color"] is None
+        )
         receipt = service.acknowledge_reprint_job(db.session, station_id=station.station_id, job_id=UUID(claim["copy_job_id"]), data={"attempt_id": str(attempt_id), "result": "NOT_EMITTED", "expected_bytes": 100, "bytes_written": 0, "document_started": False, "write_attempted": True, "simulated": False, "job_id": 77, "error": "fixture", "rendered_payload_hash": claim["payload_hash"], "renderer_version": "POSTPESAJE_COPY_TSPL_1", "printer_name": "FIXTURE"})
         assert receipt["result"] == "NOT_EMITTED"
         from app.services.scm_weighing_service import current_postpesaje_source
@@ -109,8 +127,11 @@ def test_real_postpesaje_preview_confirm_claim_ack_contract(app, legacy_fixture)
         assert post.payload_hash == original_hash
         assert original_job.payload_hash == original_job_payload
         filename = (
-            "post_reprint_contract_claim_legacy.json"
-            if legacy_fixture else "post_reprint_contract_claim.json"
+            "post_reprint_contract_claim_legacy_nullable.json"
+            if legacy_fixture == "legacy_nullable"
+            else "post_reprint_contract_claim_legacy.json"
+            if legacy_fixture
+            else "post_reprint_contract_claim.json"
         )
         out = Path(__file__).resolve().parents[2].parent / "output" / filename
         out.parent.mkdir(exist_ok=True)

@@ -20,6 +20,8 @@ def _public_id(value):
 
 
 def _text(value, *, required=True):
+    if value is None and not required:
+        return True
     if not isinstance(value, str):
         return False
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
