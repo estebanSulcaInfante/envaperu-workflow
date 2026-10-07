@@ -638,6 +638,7 @@ def test_postgres_dos_correcciones_concurrentes_conservan_totales_del_plan(
     with app.app_context():
         app.config["KG_AUTOMATIC_INTAKE_ENABLED"] = True
         app.config["KG_PRODUCTION_LOCATION_CODE"] = "PILOT-CORRECTION-PG"
+        app.config["KG_AUTOMATIC_INTAKE_CUTOFF_AT"] = "2026-09-19T00:00:00+00:00"
         if Linea.query.first() is None:
             db.session.add(Linea(codigo=990001, nombre="Linea KG correccion"))
         if Familia.query.first() is None:
