@@ -182,7 +182,7 @@ def _calculate_run_composition(run, recipe):
     )
     runner_kg = (
         Decimal(run.ciclos_objetivo or 0)
-        * Decimal(run.orden_fabricacion.snapshot_peso_colada_gr or 0)
+        * Decimal(run.snapshot_peso_colada_efectivo_gr or 0)
         / Decimal("1000")
     )
     resin_base_kg = output_kg + runner_kg

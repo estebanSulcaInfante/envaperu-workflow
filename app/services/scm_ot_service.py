@@ -2038,9 +2038,7 @@ def _create_color_work_model(
         receta_hash_snapshot=run.receta_hash,
         cavidades_snapshot=int(cavities),
         peso_neto_snapshot_g=net_weight,
-        peso_colada_snapshot_g=(
-            order.fabricacion.snapshot_peso_colada_gr or 0
-        ),
+        peso_colada_snapshot_g=(run.snapshot_peso_colada_efectivo_gr or 0),
     )
     session.add(work)
     session.flush()

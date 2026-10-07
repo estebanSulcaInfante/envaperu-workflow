@@ -256,7 +256,7 @@ def generate_material_requirements(session, *, actor_id, operation_id, fabricati
             )
             runner_kg = (
                 Decimal(run.ciclos_objetivo or 0)
-                * Decimal(order.fabricacion.snapshot_peso_colada_gr or 0)
+                * Decimal(run.snapshot_peso_colada_efectivo_gr or 0)
                 / Decimal("1000")
             )
             resin_base_kg = output_kg + runner_kg

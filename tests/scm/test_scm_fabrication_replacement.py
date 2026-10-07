@@ -39,7 +39,7 @@ from app.services.scm_packaging_service import (
 from app.services.scm_route_service import _content_hash
 
 
-def _seed_released_order(app, *, direct_assignment=False):
+def _seed_released_order(app, *, direct_assignment=False, run_colada=None):
     with app.app_context():
         actor = Trabajador.query.filter_by(codigo="TRB-01").one()
         actor.roles.append(RolOperativo.query.filter_by(codigo="JEFE_PRODUCCION").one())
@@ -91,6 +91,7 @@ def _seed_released_order(app, *, direct_assignment=False):
             codigo=f"{old.codigo}-C01", secuencia=1,
             color_produccion_id=color.id, receta_revision_id=recipe.id,
             receta_hash="c" * 64, ciclos_objetivo=12, estado="LIBERADA",
+            snapshot_peso_colada_gr=run_colada,
             meta_kg_legacy=Decimal("18.000000"),
         )
         fabrication.corridas.append(run)
@@ -125,7 +126,9 @@ def _replace(client, order_id, actor_id, *, version=1, reason="Corregir receta",
 
 
 def test_replacement_is_atomic_and_preserves_snapshots(app, client, scm_config):
-    order_id, actor_id, run_id, recipe_id = _seed_released_order(app)
+    order_id, actor_id, run_id, recipe_id = _seed_released_order(
+        app, run_colada=Decimal("4.2500")
+    )
     key = uuid4()
     response = _replace(client, order_id, actor_id, key=key)
     assert response.status_code == 201, response.json
@@ -135,6 +138,8 @@ def test_replacement_is_atomic_and_preserves_snapshots(app, client, scm_config):
     assert body["sucesora"]["id"] != order_id
     assert body["sucesora"]["reemplazo"]["anterior"]["id"] == order_id
     assert body["sucesora"]["corridas"][0]["receta_revision_id"] is None
+    assert body["sucesora"]["corridas"][0]["snapshot_peso_colada_gr"] == "4.2500"
+    assert body["sucesora"]["corridas"][0]["snapshot_peso_colada_efectivo_gr"] == "4.2500"
     assert body["sucesora"]["corridas"][0]["salidas"][0]["cantidad_objetivo"] == "120.000"
     assert body["sucesora"]["corridas"][0]["salidas"][0]["kg_estandar_objetivo"] == "1.800000"
     replay = _replace(client, order_id, actor_id, version=1, key=key)
@@ -146,6 +151,7 @@ def test_replacement_is_atomic_and_preserves_snapshots(app, client, scm_config):
         old = db.session.get(ScmOrdenOperacion, UUID(order_id))
         assert old.estado == "ANULADA"
         assert old.fabricacion.corridas[0].receta_revision_id == recipe_id
+        assert old.fabricacion.corridas[0].snapshot_peso_colada_gr == Decimal("4.2500")
         assert ScmEvento.query.filter_by(aggregate_id=order_id, tipo="OF_REPLACED").count() == 1
 
 

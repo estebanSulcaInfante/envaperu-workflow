@@ -49,7 +49,9 @@ def _headers(actor_id):
     }
 
 
-def _seed_two_jar_runs_with_one_recipe():
+def _seed_two_jar_runs_with_one_recipe(
+    *, header_colada=10, run_coladas=(None, None),
+):
     planner = Trabajador.query.filter_by(codigo="TRB-01").one()
     planner.roles.append(
         RolOperativo.query.filter_by(codigo="JEFE_PRODUCCION").one()
@@ -142,7 +144,7 @@ def _seed_two_jar_runs_with_one_recipe():
             orden_operacion=order,
             snapshot_tiempo_ciclo_seg=20,
             snapshot_horas_turno=8,
-            snapshot_peso_colada_gr=10,
+            snapshot_peso_colada_gr=header_colada,
         )
         run = ScmCorridaFabricacion(
             orden_fabricacion=fabrication,
@@ -151,6 +153,7 @@ def _seed_two_jar_runs_with_one_recipe():
             color_produccion_id=color.id,
             receta_revision_id=recipe.id,
             ciclos_objetivo=100,
+            snapshot_peso_colada_gr=run_coladas[sequence - 1],
             estado="LIBERADA",
         )
         output = ScmOrdenOperacionSalida(
@@ -613,6 +616,28 @@ def test_opm_consolida_dos_corridas_compatibles_sin_sobrecobertura(
     )
     assert duplicated.status_code == 409
     assert duplicated.get_json()["error"]["code"] == "PREPARED_REQUIREMENT_ALREADY_COVERED"
+
+
+def test_preparacion_usa_override_cero_y_fallback_de_cabecera_por_corrida(
+    app, client, scm_config
+):
+    with app.app_context():
+        planner_id, _recipe_id, run_ids, _resin_id = (
+            _seed_two_jar_runs_with_one_recipe(
+                header_colada=2,
+                run_coladas=(Decimal("0"), None),
+            )
+        )
+
+    expected = ("10.000", "10.200")
+    for run_id, amount in zip(run_ids, expected):
+        generated = client.post(
+            "/api/scm/v1/requerimientos-preparacion/calcular",
+            headers=_headers(planner_id),
+            json={"corrida_fabricacion_id": str(run_id)},
+        )
+        assert generated.status_code == 200, generated.get_json()
+        assert generated.get_json()["cantidad_requerida_kg"] == amount
 
 
 def test_colas_cursor_y_destino_operacional_global_son_canónicos(

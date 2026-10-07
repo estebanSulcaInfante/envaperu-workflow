@@ -543,7 +543,7 @@ def _seed_normalized_order():
     return creator, approver, order, output
 
 
-def _seed_fabrication_order():
+def _seed_fabrication_order(*, header_colada=10, run_colada=None):
     creator, approver, legacy_order, legacy_output = (
         _seed_normalized_order()
     )
@@ -566,7 +566,7 @@ def _seed_fabrication_order():
         maquina_prevista_id=legacy_order.maquina_id,
         snapshot_tiempo_ciclo_seg=10,
         snapshot_horas_turno=8,
-        snapshot_peso_colada_gr=10,
+        snapshot_peso_colada_gr=header_colada,
     )
     run = ScmCorridaFabricacion(
         orden_fabricacion=fabrication,
@@ -574,6 +574,7 @@ def _seed_fabrication_order():
         secuencia=1,
         color_produccion_id=legacy_lot.color_produccion_id,
         ciclos_objetivo=250,
+        snapshot_peso_colada_gr=run_colada,
         estado="LIBERADA",
     )
     canonical_output = ScmOrdenOperacionSalida(
@@ -1067,7 +1068,7 @@ def test_m2_multipieza_materializa_salidas_y_cupos_separados(app):
 def test_ot_maquina_contiene_varios_trabajos_color_y_ejecucion_exclusiva(app):
     with app.app_context():
         creator, _approver, order, first_run, first_output = (
-            _seed_fabrication_order()
+            _seed_fabrication_order(header_colada=2, run_colada=Decimal("0"))
         )
         second_run = ScmCorridaFabricacion(
             orden_fabricacion=order.fabricacion,
@@ -1155,6 +1156,10 @@ def test_ot_maquina_contiene_varios_trabajos_color_y_ejecucion_exclusiva(app):
         )["trabajo_color"]
         assert first["codigo"].endswith("-TC01")
         assert second["codigo"].endswith("-TC02")
+        first_model = db.session.get(ScmTrabajoOt, UUID(first["id"]))
+        second_model = db.session.get(ScmTrabajoOt, UUID(second["id"]))
+        assert first_model.trabajo_color.peso_colada_snapshot_g == Decimal("0")
+        assert second_model.trabajo_color.peso_colada_snapshot_g == Decimal("2")
         assert ScmTrabajoOt.query.count() == 2
         assert ScmTrabajoColor.query.count() == 2
 

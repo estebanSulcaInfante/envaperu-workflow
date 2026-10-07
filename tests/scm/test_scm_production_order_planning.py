@@ -611,6 +611,7 @@ def test_create_and_release_exceptional_fabrication_order(
                 "receta_revision_id": approved_recipe_id,
                 "ciclos_objetivo": 50,
                 "objetivo_neto_kg": 5,
+                "snapshot_peso_colada_gr": 0,
                 "salidas": [{
                     "articulo_scm_id": article_id,
                     "cantidad_por_ciclo": 2,
@@ -622,6 +623,64 @@ def test_create_and_release_exceptional_fabrication_order(
     )
     assert created.status_code == 201
     body = created.get_json()
+    assert body["corridas"][0]["snapshot_peso_colada_gr"] == "0.0000"
+    assert body["corridas"][0]["snapshot_peso_colada_efectivo_gr"] == "0.0000"
+
+    def patch_run_snapshot(current, *, include_override, override=None):
+        run = current["corridas"][0]
+        run_patch = {
+            "id": run["id"],
+            "color_produccion_id": run["color_produccion_id"],
+            "receta_revision_id": run["receta_revision_id"],
+            "ciclos_objetivo": run["ciclos_objetivo"],
+            "objetivo_neto_kg": run["objetivo_neto_kg"],
+            "salidas": [{
+                "id": output["id"],
+                "cantidad_por_ciclo": output["cantidad_por_ciclo_snapshot"],
+                "peso_unitario_g": output["peso_unitario_snapshot_g"],
+            } for output in run["salidas"]],
+        }
+        if include_override:
+            run_patch["snapshot_peso_colada_gr"] = override
+        return {
+            "version": current["version"],
+            "molde_id": current["molde_id"],
+            "maquina_prevista_id": current["maquina_prevista_id"],
+            "snapshot_tiempo_ciclo_seg": current["snapshot_tiempo_ciclo_seg"],
+            "snapshot_horas_turno": current["snapshot_horas_turno"],
+            "snapshot_peso_colada_gr": current["snapshot_peso_colada_gr"],
+            "proceso": current["snapshot_proceso"],
+            "corridas": [run_patch],
+        }
+
+    def patch_order(current, *, include_override, override=None):
+        return client.patch(
+            f"/api/scm/v1/ordenes-fabricacion/{current['id']}",
+            headers={
+                "X-Actor-Id": str(actor_id),
+                "Idempotency-Key": str(uuid4()),
+            },
+            json=patch_run_snapshot(
+                current, include_override=include_override, override=override,
+            ),
+        )
+
+    omitted = patch_order(body, include_override=False)
+    assert omitted.status_code == 200, omitted.get_json()
+    assert omitted.get_json()["corridas"][0]["snapshot_peso_colada_gr"] == "0.0000"
+    cleared = patch_order(omitted.get_json(), include_override=True, override=None)
+    assert cleared.status_code == 200, cleared.get_json()
+    body = cleared.get_json()
+    assert body["corridas"][0]["snapshot_peso_colada_gr"] is None
+    assert body["corridas"][0]["snapshot_peso_colada_efectivo_gr"] == "10.0000"
+    negative = patch_order(body, include_override=True, override=-0.0001)
+    assert negative.status_code == 422
+    assert negative.get_json()["error"]["code"] == "INVALID_QUANTITY"
+    body = client.get(
+        f"/api/scm/v1/ordenes-fabricacion/{body['id']}",
+        headers={"X-Actor-Id": str(actor_id)},
+    ).get_json()
+    assert body["corridas"][0]["snapshot_peso_colada_gr"] is None
     assert body["proceso_requerido"] == "INYECCION"
     assert body["codigo"] == "OF-000001"
     assert body["fecha_necesidad"] is None

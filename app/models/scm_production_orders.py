@@ -538,6 +538,10 @@ class ScmCorridaFabricacion(db.Model):
             name="ck_scm_corrida_objetivo_neto_kg",
         ),
         db.CheckConstraint(
+            "snapshot_peso_colada_gr IS NULL OR snapshot_peso_colada_gr >= 0",
+            name="ck_scm_corrida_peso_colada_nonnegative",
+        ),
+        db.CheckConstraint(
             "estado IN "
             "('BORRADOR', 'LIBERADA', 'EN_EJECUCION', 'COMPLETADA', "
             "'ANULADA')",
@@ -589,6 +593,7 @@ class ScmCorridaFabricacion(db.Model):
     receta_hash = db.Column(db.String(64), nullable=True)
     ciclos_objetivo = db.Column(db.Integer, nullable=True)
     objetivo_neto_kg = db.Column(db.Numeric(15, 6), nullable=True)
+    snapshot_peso_colada_gr = db.Column(db.Numeric(12, 4), nullable=True)
     operacion_ruta_revision_id = db.Column(
         db.Integer,
         db.ForeignKey("scm_operacion_ruta.id", ondelete="RESTRICT"),
@@ -630,6 +635,17 @@ class ScmCorridaFabricacion(db.Model):
         back_populates="corrida_fabricacion",
         lazy="selectin",
     )
+
+    @property
+    def snapshot_peso_colada_efectivo_gr(self):
+        if self.snapshot_peso_colada_gr is not None:
+            return self.snapshot_peso_colada_gr
+        fabrication = self.orden_fabricacion
+        return (
+            fabrication.snapshot_peso_colada_gr
+            if fabrication is not None
+            else None
+        )
 
 
 class ScmOrdenOperacionSalida(db.Model):

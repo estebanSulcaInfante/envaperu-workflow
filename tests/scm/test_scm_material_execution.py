@@ -24,7 +24,7 @@ def _headers(actor_id, *, idempotent=False):
     return result
 
 
-def _seed_us010b():
+def _seed_us010b(*, header_colada=10, run_colada=None):
     planner = Trabajador.query.filter_by(codigo="TRB-01").one()
     planner.roles.append(RolOperativo.query.filter_by(codigo="JEFE_PRODUCCION").one())
     warehouse = Trabajador(
@@ -100,12 +100,13 @@ def _seed_us010b():
     )
     fabrication = ScmOrdenFabricacion(
         orden_operacion=order, snapshot_tiempo_ciclo_seg=20,
-        snapshot_horas_turno=8, snapshot_peso_colada_gr=10,
+        snapshot_horas_turno=8, snapshot_peso_colada_gr=header_colada,
     )
     run = ScmCorridaFabricacion(
         orden_fabricacion=fabrication, codigo="OF-US010B-C01", secuencia=1,
         color_produccion_id=color.id, receta_revision_id=recipe.id,
-        ciclos_objetivo=100, estado="LIBERADA",
+        ciclos_objetivo=100, snapshot_peso_colada_gr=run_colada,
+        estado="LIBERADA",
     )
     output = ScmOrdenOperacionSalida(
         orden_operacion=order, corrida_fabricacion=run,
@@ -190,6 +191,25 @@ def test_requerir_reservar_emitir_y_devolver_sin_consumir(app, client, scm_confi
     assert by_location["PREPARACION_PRODUCCION"]["cantidad_reservada"] == "3.000"
     # Emision y devolucion trasladan custodia; no crean CONSUMO.
     assert all(value["tipo"] != "CONSUMO" for value in balances.get_json().get("movimientos", []))
+
+
+def test_requerimientos_usan_override_de_colada_cero_por_corrida(app, client, scm_config):
+    with app.app_context():
+        planner_id, _warehouse_id, order_id, _run_id, resin_id, pigment_id = (
+            _seed_us010b(header_colada=2, run_colada=Decimal("0"))
+        )
+
+    generated = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/requerimientos-material/generar",
+        headers=_headers(planner_id, idempotent=True), json={},
+    )
+    assert generated.status_code == 201, generated.get_json()
+    quantities = {
+        item["material"]["id"]: item["cantidad_plan_kg"]
+        for item in generated.get_json()["items"]
+    }
+    assert quantities[resin_id] == "10.000"
+    assert quantities[pigment_id] == "0.040"
 
 
 def test_reserva_es_atomica_si_falta_un_componente(app, client, scm_config):

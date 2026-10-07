@@ -96,6 +96,16 @@ def _positive_decimal(value, field, *, integral=False, allow_zero=False):
     return parsed
 
 
+def _optional_colada_snapshot(value):
+    if value is None:
+        return None
+    return _positive_decimal(
+        value,
+        "snapshot_peso_colada_gr",
+        allow_zero=True,
+    )
+
+
 def _run_cycles(
     *,
     minimum_cycles,
@@ -482,6 +492,16 @@ def _serialize_run(session, run):
         "operacion_ruta": route_operation_dto(run.operacion_ruta),
         "ciclos_objetivo": run.ciclos_objetivo,
         "objetivo_neto_kg": _decimal_text(run.objetivo_neto_kg, 6),
+        "snapshot_peso_colada_gr": (
+            _decimal_text(run.snapshot_peso_colada_gr, 4)
+            if run.snapshot_peso_colada_gr is not None
+            else None
+        ),
+        "snapshot_peso_colada_efectivo_gr": (
+            _decimal_text(run.snapshot_peso_colada_efectivo_gr, 4)
+            if run.snapshot_peso_colada_efectivo_gr is not None
+            else None
+        ),
         "kg_neto_por_ciclo": _decimal_text(kg_neto_por_ciclo, 6),
         "kg_neto_alcanzable": _decimal_text(kg_neto_alcanzable, 6),
         "redondeo_kg": _decimal_text(redondeo_kg, 6),
@@ -1286,6 +1306,7 @@ def replace_fabrication_order(
                 receta_hash=None,
                 ciclos_objetivo=run.ciclos_objetivo,
                 objetivo_neto_kg=run.objetivo_neto_kg,
+                snapshot_peso_colada_gr=run.snapshot_peso_colada_gr,
                 operacion_ruta_revision_id=run.operacion_ruta_revision_id,
                 operacion_ruta_hash=run.operacion_ruta_hash,
                 estado="BORRADOR",
@@ -1522,6 +1543,7 @@ def create_exceptional_fabrication_order(
                     "ciclos_objetivo",
                     "objetivo_neto_kg",
                     "operacion_ruta_revision_id",
+                    "snapshot_peso_colada_gr",
                     "salidas",
                 },
             )
@@ -1703,6 +1725,9 @@ def create_exceptional_fabrication_order(
                 receta_hash=None,
                 ciclos_objetivo=cycles,
                 objetivo_neto_kg=objective,
+                snapshot_peso_colada_gr=_optional_colada_snapshot(
+                    raw_run.get("snapshot_peso_colada_gr")
+                ),
                 operacion_ruta_revision_id=(
                     raw_run.get("operacion_ruta_revision_id")
                 ),
@@ -1963,6 +1988,7 @@ def update_fabrication_order(
                     "id", "color_produccion_id", "receta_revision_id",
                     "ciclos_objetivo", "objetivo_neto_kg",
                     "operacion_ruta_revision_id", "salidas",
+                    "snapshot_peso_colada_gr",
                 },
             )
             run = runs_by_id[str(raw_run["id"])]
@@ -2105,6 +2131,7 @@ def update_fabrication_order(
                     "ciclos_objetivo",
                     "objetivo_neto_kg",
                     "operacion_ruta_revision_id",
+                    "snapshot_peso_colada_gr",
                     "salidas",
                 },
             )
@@ -2275,6 +2302,10 @@ def update_fabrication_order(
             run.receta_revision_id = recipe_id
             run.ciclos_objetivo = cycles
             run.objetivo_neto_kg = objective
+            if "snapshot_peso_colada_gr" in raw_run:
+                run.snapshot_peso_colada_gr = _optional_colada_snapshot(
+                    raw_run["snapshot_peso_colada_gr"]
+                )
             for output, per_cycle, unit_weight, required in prepared:
                 actual = Decimal(cycles) * per_cycle
                 output.cantidad_por_ciclo_snapshot = per_cycle
