@@ -256,8 +256,7 @@
     "migrations/versions/fd4e5f607182_assistant_proposals.py": "0774cc40d1269dcbe9d023b34cfe051c7bb5f4e2e2c2cf8744e8ad26cc3bde5c",
     "migrations/versions/fe5f60718293_add_run_colada_snapshot.py": "84f3aefac286d34b1158247703e9fefb75f019e6e61300c6b6cb748a0fba3c14",
     "requirements.txt": "997b9b593b16f184d63b9499830655723ade0c3e312501a31652b1c81322ffd2",
-    "run.py": "3c39bfce280061f10fc9f12bf9185ce33e73cd1546c5b125da5f17011bd8b59d",
-    "app/templates/excel/OrdenProduccion/Book2.xlsx": "e19e491e3756460d27210ab951906ba79ac6d9e03d3ecf6f03a023403aac1eb1"
+    "run.py": "3c39bfce280061f10fc9f12bf9185ce33e73cd1546c5b125da5f17011bd8b59d"
   },
   "excluded_runtime_resources": [
     "app/templates/OCR/RegistroDiarioProduccion/image.png",

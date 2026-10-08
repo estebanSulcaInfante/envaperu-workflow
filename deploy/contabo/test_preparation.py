@@ -10,6 +10,14 @@ import unittest
 from unittest.mock import patch
 ROOT=Path(__file__).parent
 
+def _reject_duplicate_keys(pairs):
+    result={}
+    for key,value in pairs:
+        if key in result:
+            raise ValueError(f'duplicate JSON key: {key}')
+        result[key]=value
+    return result
+
 def load(name):
     spec=importlib.util.spec_from_file_location(name,ROOT/(name+'.py'))
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
@@ -64,7 +72,10 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaises(ValueError):gate.validate(env,{'branch_policies':[{'name':'*'}]})
 
     def test_runtime_template_is_explicit_and_other_resources_stay_out(self):
-        manifest=json.loads((ROOT/'runtime-allowlist.json').read_text())
+        manifest=json.loads(
+            (ROOT/'runtime-allowlist.json').read_text(),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
         self.assertIn('app/templates/excel/OrdenProduccion/Book2.xlsx',manifest['files'])
         self.assertEqual(len(manifest['approved_templates']),1)
         self.assertEqual(len(manifest['excluded_runtime_resources']),8)
