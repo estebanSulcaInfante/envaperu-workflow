@@ -17,28 +17,28 @@ services:
     env_file:
       - ${SCM_API_ENV_FILE:?Administrator must securely supply API environment file}
     environment:
-      SCM_AUTH_MODE: supabase
-      SCM_ASSISTANT_ENABLED: "true"
-      SCM_ASSISTANT_PROVIDER: "openclaw"
-      SCM_ASSISTANT_ACTOR_ID: "1"
-      SCM_ASSISTANT_AUTH_USER_ID: "28044442-3caf-4a92-97e4-212b50aa3c3b"
-      SCM_OPENCLAW_URL: "https://openclaw-scm:18789"
-      SCM_OPENCLAW_PRIVATE_HOST: "openclaw-scm"
-      SCM_OPENCLAW_TOKEN_FILE: "/run/secrets/openclaw-token"
-      SCM_OPENCLAW_CA_FILE: "/run/openclaw/gateway-ca.crt"
-      SCM_OPENCLAW_POLICY_CONFIRMED: "false"
-      POSTPESAJE_REPRINT_ENABLED: "true"
-      KG_RECEIPT_WRITE_ENABLED: "true"
-      KG_CUSTODY_WRITE_ENABLED: "true"
-      KG_AUTOMATIC_INTAKE_ENABLED: "true"
-      # Explicit YAML string: Dokploy must not coerce this ISO instant into a
-      # Go time rendering ("2026-10-08 18:16:04 +0000 UTC").
-      KG_AUTOMATIC_INTAKE_CUTOFF_AT: !!str 2026-10-08T18:16:04Z
-      KG_PRODUCTION_LOCATION_CODE: "PRODUCCION_KG"
-      CATALOG_IMAGE_STORAGE: supabase_s3
-      CATALOG_IMAGE_KEEP_DATABASE_COPY: "true"
-      PYTHONDONTWRITEBYTECODE: "1"
-      PYTHONUNBUFFERED: "1"
+      - SCM_AUTH_MODE=supabase
+      - SCM_ASSISTANT_ENABLED=true
+      - SCM_ASSISTANT_PROVIDER=openclaw
+      - SCM_ASSISTANT_ACTOR_ID=1
+      - SCM_ASSISTANT_AUTH_USER_ID=28044442-3caf-4a92-97e4-212b50aa3c3b
+      - SCM_OPENCLAW_URL=https://openclaw-scm:18789
+      - SCM_OPENCLAW_PRIVATE_HOST=openclaw-scm
+      - SCM_OPENCLAW_TOKEN_FILE=/run/secrets/openclaw-token
+      - SCM_OPENCLAW_CA_FILE=/run/openclaw/gateway-ca.crt
+      - SCM_OPENCLAW_POLICY_CONFIRMED=false
+      - POSTPESAJE_REPRINT_ENABLED=true
+      - KG_RECEIPT_WRITE_ENABLED=true
+      - KG_CUSTODY_WRITE_ENABLED=true
+      - KG_AUTOMATIC_INTAKE_ENABLED=true
+      # List syntax keeps the ISO instant inside a KEY=value scalar so
+      # Dokploy cannot coerce it into a Go time rendering.
+      - KG_AUTOMATIC_INTAKE_CUTOFF_AT=2026-10-08T18:16:04Z
+      - KG_PRODUCTION_LOCATION_CODE=PRODUCCION_KG
+      - CATALOG_IMAGE_STORAGE=supabase_s3
+      - CATALOG_IMAGE_KEEP_DATABASE_COPY=true
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
     entrypoint: [python, /prep/start_guard.py]
     command: [gunicorn, run:app, --bind, "0.0.0.0:5000", --workers, "2", --timeout, "60", --graceful-timeout, "30", --max-requests, "1000", --max-requests-jitter, "100", --error-logfile, "-"]
     volumes:
