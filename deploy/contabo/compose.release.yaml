@@ -31,7 +31,9 @@ services:
       KG_RECEIPT_WRITE_ENABLED: "true"
       KG_CUSTODY_WRITE_ENABLED: "true"
       KG_AUTOMATIC_INTAKE_ENABLED: "true"
-      KG_AUTOMATIC_INTAKE_CUTOFF_AT: "2026-10-08T18:16:04Z"
+      # Explicit YAML string: Dokploy must not coerce this ISO instant into a
+      # Go time rendering ("2026-10-08 18:16:04 +0000 UTC").
+      KG_AUTOMATIC_INTAKE_CUTOFF_AT: !!str 2026-10-08T18:16:04Z
       KG_PRODUCTION_LOCATION_CODE: "PRODUCCION_KG"
       CATALOG_IMAGE_STORAGE: supabase_s3
       CATALOG_IMAGE_KEEP_DATABASE_COPY: "true"
