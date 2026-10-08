@@ -7,9 +7,9 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 167154600b58f62e536fc1cf7b0764713ab0860d.
-check_ci.py accepts only GitHub Actions run 36900452865, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/render-provisional-dashboard,
+Application source is fixed to 8e21ee31ed8cf0c20c5b25800c4ea171cc312d4f.
+check_ci.py accepts only GitHub Actions run 37802364547, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/kg-intake-cutover-20261007,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
@@ -20,7 +20,7 @@ pins that reviewed recipe. Both commits require review. Actions are pinned to SH
 
 ## Runtime files and templates
 
-runtime-allowlist.json enumerates 239 approved files with SHA-256 hashes.
+runtime-allowlist.json enumerates 256 approved files with SHA-256 hashes.
 build_context.py creates a NEW context from these bytes; the source checkout is
 never sent to Docker. Unexpected files in the checkout do not enter the context.
 Every approved byte must match the fixed source; symlinks/escaping paths fail.
