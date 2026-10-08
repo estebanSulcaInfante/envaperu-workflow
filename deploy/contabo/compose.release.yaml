@@ -61,6 +61,7 @@ services:
       - /app/instance:size=16777216,uid=10001,gid=10001,mode=0700
     networks: [database, egress, proxy, openclaw_private]
     labels:
+      enva.scm.config-revision: "kg-cutoff-iso-v1"
       traefik.enable: "true"
       traefik.docker.network: dokploy-network
       traefik.http.routers.scm-pilot-api-http.rule: Host(`api-scm.envaperu.pe`)
