@@ -27,9 +27,6 @@ class ScmPostpesajeReprintRequest(db.Model):
         db.UniqueConstraint(
             "operation_id", name="uq_scm_postpesaje_reprint_request_operation"
         ),
-        db.UniqueConstraint(
-            "request_id", name="uq_scm_postpesaje_reprint_request_public_id"
-        ),
     )
 
     request_id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

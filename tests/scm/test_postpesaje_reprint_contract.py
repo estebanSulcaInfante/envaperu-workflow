@@ -15,6 +15,20 @@ from app.services.scm_postpesaje_reprint_service import (
 from app.services.scm_service_support import ScmServiceError
 
 
+def test_request_id_is_only_the_primary_identity_constraint():
+    from sqlalchemy import UniqueConstraint
+    from app.models.scm_postpesaje_reprint import ScmPostpesajeReprintRequest
+
+    table = ScmPostpesajeReprintRequest.__table__
+
+    assert list(table.primary_key.columns.keys()) == ["request_id"]
+    assert not any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_scm_postpesaje_reprint_request_public_id"
+        for constraint in table.constraints
+    )
+
+
 @pytest.mark.parametrize(
     "legacy_fixture",
     [False, True, "legacy_nullable"],
