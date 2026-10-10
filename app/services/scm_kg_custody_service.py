@@ -16,15 +16,17 @@ from app.models.scm_inventory_kg import (
     ScmDivisionUnidadKg, ScmEtiquetaUnidadKg, ScmExistenciaMangaKg,
     ScmMedicionUnidadKg, ScmMovimientoInventarioKg, ScmReservaUnidadKg,
     ScmRetiroArmadoKg, ScmRetiroArmadoKgItem, ScmSaldoInventarioKg,
-    ScmUnidadFisicaKg,
+    ScmUnidadFisicaKg, _decimal,
 )
 from app.models.scm_inventory import ScmUbicacionInventario
 from app.models.scm_auditoria import ScmOperacion
 from app.services.scm_kg_receipt_service import _assert_kg_location_scope
+from app.services.scm_manga_assignment_projection import effective_work
 from app.services.scm_service_support import (
     ScmServiceError, actor_snapshot, expected_version, load_actor,
     acquire_kg_productive_write_lock, reject_unknown_fields, required_text,
 )
+from app.services.scm_weighing_service import _weighing_color_identity
 
 
 def assert_custody_enabled():
@@ -454,6 +456,55 @@ def resolve_kg_return(session, *, actor_id, code, operation_id=None):
             "return_locations": return_locations, "label": _labels_payload(session, unit)}
 
 
+def _outgoing_identity_dto(session, unit):
+    existence = session.get(ScmExistenciaMangaKg, unit.recepcion_vigente_id) if unit.recepcion_vigente_id else None
+    manga = existence.manga if existence is not None else None
+    work = effective_work(manga) if manga is not None else None
+    operation = getattr(work, "orden_operacion", None)
+    order = getattr(work, "orden_trabajo", None) if work is not None else None
+    order = order or getattr(manga, "ot", None)
+    article = unit.articulo
+    piece_variant = getattr(getattr(article, "pieza_color", None), "pieza_color", None)
+    piece = getattr(piece_variant, "pieza_rel", None)
+    color = _weighing_color_identity(manga, work) if manga is not None else None
+    if color is None and getattr(manga, "color_snapshot", None):
+        color = {"id": None, "nombre": manga.color_snapshot, "hex": None, "base": None, "familia": None}
+    return {
+        "of": getattr(operation, "codigo", None),
+        "ot": getattr(order, "codigo_ot", None),
+        "m": getattr(manga, "codigo", None),
+        "pieza": {
+            "codigo": getattr(manga, "pieza_color_sku_snapshot", None)
+            or getattr(piece_variant, "sku", None)
+            or getattr(article, "codigo", None),
+            "nombre": getattr(piece, "nombre", None) or getattr(article, "nombre", None),
+        },
+        "color": color,
+    }
+
+
+def _outgoing_unit_dto(session, unit):
+    article = unit.articulo
+    return {
+        "id": str(unit.id),
+        "public_id": str(unit.public_id),
+        "codigo": unit.codigo,
+        "version": unit.version,
+        "estado": unit.estado,
+        "estado_logistico": unit.estado_logistico,
+        "estado_calidad": unit.estado_calidad,
+        "kg_entregado": _decimal(unit.kg_entregado),
+        "kg_verificados": _decimal(unit.kg_verificados),
+        "articulo": {
+            "id": article.id,
+            "codigo": article.codigo,
+            "nombre": article.nombre,
+            "clase": article.clase,
+        } if article is not None else None,
+        "identidad": _outgoing_identity_dto(session, unit),
+    }
+
+
 def resolve_kg_outgoing(session, *, actor_id, code):
     """Resolve a scan for the direct Armado flow without return details."""
     actor = load_actor(session, actor_id)
@@ -480,7 +531,7 @@ def resolve_kg_outgoing(session, *, actor_id, code):
             "La identidad no est� vigente para retiro.",
             status_code=409,
         )
-    return {"unit": unit.to_dict()}
+    return {"unit": _outgoing_unit_dto(session, unit)}
 
 
 def reserve_kg_unit(session, *, actor_id, unit_id, operation_id, data):

@@ -13,9 +13,14 @@ from copy import copy
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from io import BytesIO
+import hashlib
+import hmac
 import json
+import os
+import re
 from uuid import UUID
 
+from flask import current_app, has_app_context
 from openpyxl import Workbook
 from sqlalchemy import or_, select
 from sqlalchemy.orm import noload, selectinload
@@ -870,10 +875,173 @@ def _progress_tv_actual(run, article_id, unit):
     return (total if evidence else None), incomplete
 
 
+def _tv_identity_value(value):
+    """Serialize an identity component without falling back to display text."""
+    return None if value is None else str(value)
+
+
+def _tv_group_hmac_secret():
+    """Return the configured server secret required for opaque TV groups."""
+    configured = (
+        current_app.config.get("SECRET_KEY")
+        if has_app_context()
+        else None
+    ) or os.environ.get("SECRET_KEY")
+    if isinstance(configured, bytes):
+        secret = configured
+    elif isinstance(configured, str):
+        secret = configured.encode("utf-8")
+    else:
+        secret = b""
+    if len(secret) < 16:
+        raise RuntimeError("TV_GROUP_ID_SECRET_NOT_CONFIGURED")
+    return secret
+
+
+def _tv_contexts(run):
+    """Return the canonical OT contexts carried by a run.
+
+    A run can be continued by more than one work row, but the TV card grain is
+    the OT context, not the first row encountered by the loader.  Keeping all
+    work rows for the same OT lets the attribution helper deduplicate physical
+    contributions while still keeping different OTs apart.
+    """
+    contexts = list(run.get("contexts") or ())
+    if contexts:
+        return contexts
+    if "contexts" not in run and run.get("works"):
+        # Small service fixtures and legacy callers predate the normalized
+        # context list.  Preserve their work ownership for compatibility;
+        # production loader records always carry ``contexts`` explicitly.
+        return [
+            {"work": work, "color_work": color_work, "ot": ot}
+            for work, color_work, ot in run["works"]
+        ]
+    if run.get("ot") is not None or run.get("work") is not None:
+        return [{
+            "work": run.get("work"),
+            "color_work": run.get("color_work"),
+            "ot": run.get("ot"),
+        }]
+    return [None]
+
+
+def _tv_context_identity(run, context, *, expose_mold=True):
+    """Build the server-owned TV card identity and its explicit caveats."""
+    context = context or {}
+    ot = context.get("ot")
+    color_work = context.get("color_work")
+    order = run.get("orden")
+    corrida = run.get("corrida")
+    molde_id, molde_name = _context_mold_identity(run, context)
+    color_id = run.get("color_id")
+    if color_id is None and color_work is not None:
+        color_id = getattr(color_work, "color_id_snapshot", None)
+    of_id = _tv_identity_value(getattr(order, "id", None))
+    ot_id = _tv_identity_value(
+        getattr(ot, "public_id", None) or getattr(ot, "id", None)
+    )
+    corrida_id = _tv_identity_value(getattr(corrida, "id", None))
+    molde_id = _tv_identity_value(molde_id)
+    color_id = _tv_identity_value(color_id)
+    identity = {
+        "of_id": of_id,
+        "ot_id": ot_id,
+        "corrida_id": corrida_id,
+        "color_id": color_id,
+    }
+    if expose_mold:
+        identity["molde_id"] = molde_id
+    legacy_fixture = (
+        "contexts" not in run
+        and context is not None
+        and not context.get("ot")
+        and not context.get("color_work")
+    )
+    issues = [
+        label for label, value in (
+            ("OF_ID_AUSENTE", of_id),
+            ("OT_ID_AUSENTE", ot_id),
+            ("CORRIDA_ID_AUSENTE", corrida_id),
+            ("MOLDE_ID_AUSENTE", molde_id),
+            ("COLOR_ID_AUSENTE", color_id),
+        ) if value is None and not legacy_fixture
+    ]
+    public_issues = issues if expose_mold else [
+        issue for issue in issues if "MOLDE" not in issue
+    ]
+    # Missing identity must never cause unrelated rows to collapse into one
+    # card.  The corrida/run marker keeps each ambiguous source visible.
+    group_parts = (of_id, ot_id, corrida_id, molde_id, color_id)
+    if issues:
+        source_marker = _tv_identity_value(
+            getattr(context.get("work"), "id", None)
+            or getattr(corrida, "id", None)
+            or getattr(corrida, "codigo", None)
+            or "fila"
+        )
+        group_parts_with_source = (*group_parts, source_marker)
+        group_id = "incompleto:" + "|".join(
+            value or "?" for value in group_parts_with_source
+        )
+    else:
+        group_id = "|".join(value or "?" for value in group_parts)
+    if not expose_mold:
+        # OF_VER controls whether the document/mold identity may leave the
+        # server. HMAC the full canonical key (including mold) to keep cards
+        # deterministic and separately grouped without exposing any IDs or
+        # permitting offline guessing from public candidate identities.
+        digest_source = "\x1f".join(value or "?" for value in (*group_parts, group_id))
+        group_id = "tvgrp-" + hmac.new(
+            _tv_group_hmac_secret(),
+            digest_source.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()[:24]
+    if expose_mold:
+        identity["molde_nombre"] = molde_name
+    else:
+        # Retain the server-side canonical value long enough to detect a
+        # conflicting context, then remove it before serializing the item.
+        identity["_canonical_molde_id"] = molde_id
+    identity.update({
+        "group_id": group_id,
+        "identity_status": "COMPLETA" if not public_issues else "INCOMPLETA",
+        "identity_issues": public_issues,
+        "_legacy_fixture": legacy_fixture,
+    })
+    return identity
+
+
+def _tv_group_run(run, contexts):
+    """Limit attribution to the canonical OT contexts in one TV card."""
+    work_ids = set()
+    selected_contexts = []
+    for context in contexts:
+        if context is None:
+            continue
+        work = context.get("work")
+        if work is not None and getattr(work, "id", None) not in work_ids:
+            work_ids.add(work.id)
+            selected_contexts.append(context)
+    scoped = dict(run)
+    scoped["contexts"] = selected_contexts
+    scoped["works"] = [
+        (context.get("work"), context.get("color_work"), context.get("ot"))
+        for context in selected_contexts
+    ]
+    scoped["work"] = selected_contexts[0].get("work") if selected_contexts else None
+    scoped["color_work"] = selected_contexts[0].get("color_work") if selected_contexts else None
+    scoped["ot"] = selected_contexts[0].get("ot") if selected_contexts else None
+    if not selected_contexts and "contexts" not in run:
+        scoped["works"] = list(run.get("works") or ())
+    return scoped
+
+
 def list_production_progress_tv(session, *, actor_id, filters=None):
-    """Read-only OF-first progress in physical units, never snapshot-derived kg."""
+    """Read-only progress, one card per canonical OF/OT/run/mold/color key."""
     actor = load_actor(session, actor_id, capability="OT_VER")
     visible = actor.tiene_capacidad("MANGA_PESAJE_VER")
+    can_view_of = actor.tiene_capacidad("OF_VER")
     normalized = _filters(filters, require_dates=False)
     runs = _load_rows(
         session,
@@ -887,28 +1055,75 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
         state = str(getattr(order, "estado", "")).upper()
         if state not in {"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "ABIERTA", "EN_COBERTURA"}:
             continue
-        key = getattr(order, "id", None)
-        if key is None:
-            key = order.codigo
-        item = grouped.setdefault(key, {
-            "of_id": str(getattr(order, "id", "")),
-            "of": order.codigo,
-            "estado": state,
-            "corridas": [],
-        })
-        item["corridas"].append(run)
+        contexts = _tv_contexts(run)
+        context_identities = [
+            (context, _tv_context_identity(run, context, expose_mold=can_view_of))
+            for context in contexts
+        ]
+        identity_shapes = defaultdict(set)
+        for _context, identity in context_identities:
+            identity_shapes[
+                (identity["of_id"], identity["ot_id"], identity["corrida_id"])
+            ].add((identity.get("_canonical_molde_id", identity.get("molde_id")), identity["color_id"]))
+        for context, identity in context_identities:
+            base = (identity["of_id"], identity["ot_id"], identity["corrida_id"])
+            if len(identity_shapes[base]) > 1:
+                identity["identity_status"] = "INCOMPLETA"
+                identity["identity_issues"] = [
+                    *identity["identity_issues"], "IDENTIDAD_CONFLICTIVA"
+                ]
+                identity["group_id"] = f"conflicto:{identity['group_id']}"
+            key = identity["group_id"]
+            legacy_fixture = identity.pop("_legacy_fixture", False)
+            identity.pop("_canonical_molde_id", None)
+            item = grouped.setdefault(key, {
+                "group_id": key,
+                "identity": identity,
+                "of_id": identity["of_id"],
+                "of": getattr(order, "codigo", None),
+                "estado": state,
+                "ot_id": identity["ot_id"],
+                "ot": getattr(context.get("ot") if context else None, "codigo_ot", None),
+                "corrida_id": identity["corrida_id"],
+                "corrida": getattr(run["corrida"], "codigo", None),
+                "color_id": identity["color_id"],
+                "color": run.get("color_name") or getattr(context.get("color_work") if context else None, "color_nombre_snapshot", None),
+                "color_hex": run.get("color_hex") if isinstance(run.get("color_hex"), str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", run.get("color_hex")) else None,
+                "salidas": [],
+                "_legacy_fixture": legacy_fixture,
+                "_runs": [],
+                "_contexts": [],
+            })
+            if can_view_of:
+                item["molde_visible"] = True
+                item["molde_id"] = identity.get("molde_id")
+                item["molde"] = {
+                    "codigo": identity.get("molde_id"),
+                    "nombre": identity.get("molde_nombre"),
+                } if identity.get("molde_id") or identity.get("molde_nombre") else None
+            if all(existing is not run for existing in item["_runs"]):
+                item["_runs"].append(run)
+            item["_contexts"].append(context)
 
     for item in grouped.values():
         outputs = []
-        for run in item["corridas"]:
+        seen_output_ids = set()
+        # The key includes corrida_id, so this list normally has one run.  The
+        # set/loop remains defensive for loader retries or repeated contexts.
+        for run in item["_runs"]:
             corrida = run["corrida"]
             salidas = list(getattr(corrida, "salidas", ()) or ())
+            scoped_run = _tv_group_run(run, item["_contexts"])
             for output in salidas:
                 if str(getattr(corrida, "estado", "")).upper() == "ANULADA":
                     continue
                 article = getattr(output, "articulo", None)
                 if article is None:
                     continue
+                output_id = getattr(output, "id", None) or getattr(article, "id", None)
+                if output_id in seen_output_ids:
+                    continue
+                seen_output_ids.add(output_id)
                 variant_link = getattr(article, "pieza_color", None)
                 variant = getattr(variant_link, "pieza_color", None)
                 piece = getattr(variant, "pieza_rel", None)
@@ -924,11 +1139,11 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                 else:
                     unit, meta_kind, raw_meta = None, None, None
                 actual, attribution_incomplete = (
-                    _progress_tv_actual(run, article.id, unit)
+                    _progress_tv_actual(scoped_run, article.id, unit)
                     if visible and unit else (None, False)
                 )
                 physical_kg, kg_incomplete = (
-                    _progress_tv_actual(run, article.id, "KG")
+                    _progress_tv_actual(scoped_run, article.id, "KG")
                     if visible else (None, False)
                 )
                 physical_kg = None if kg_incomplete else physical_kg
@@ -938,7 +1153,15 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                 progress = actual
                 remaining = max(meta - actual, Decimal("0")) if meta is not None and actual is not None else None
                 percent = (actual / meta * 100) if meta is not None and meta > 0 and actual is not None else None
-                if not visible:
+                piece_identity_incomplete = (
+                    getattr(piece, "id", None) is None
+                    and not item.get("_legacy_fixture")
+                )
+                identity_incomplete = item["identity"]["identity_status"] != "COMPLETA" or piece_identity_incomplete
+                if identity_incomplete:
+                    status = "INCOMPLETO"
+                    progress = remaining = percent = None
+                elif not visible:
                     status = "SIN_PERMISO_PESAJE"
                 elif meta is None or meta <= 0:
                     status = "SIN_META"
@@ -957,8 +1180,8 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                 outputs.append({
                     "corrida_id": str(corrida.id),
                     "corrida": corrida.codigo,
-                    "color": run.get("color_name"),
-                    "color_hex": run.get("color_hex"),
+                    "color": item["color"],
+                    "color_hex": item["color_hex"],
                     "pieza_id": getattr(piece, "id", None),
                     "pieza_color_id": getattr(variant, "id", None),
                     "sku": getattr(variant, "sku", None) or getattr(article, "codigo", None),
@@ -974,11 +1197,17 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     "estado_avance": status,
                 })
         item["salidas"] = sorted(outputs, key=lambda row: (row["corrida"], row["sku"] or ""))
-        del item["corridas"]
+        del item["_runs"]
+        del item["_contexts"]
+        del item["_legacy_fixture"]
     return {
-        "items": sorted(grouped.values(), key=lambda row: (row["of"], row["of_id"])),
+        "items": sorted(grouped.values(), key=lambda row: (row["of"] or "", row["group_id"])),
         "as_of": datetime.now(timezone.utc).isoformat(),
-        "visibilidad": {"pesaje": visible, "restriccion": None if visible else "MANGA_PESAJE_VER requerido para ver avance"},
+        "visibilidad": {
+            "pesaje": visible,
+            "of": can_view_of,
+            "restriccion": None if visible else "MANGA_PESAJE_VER requerido para ver avance",
+        },
     }
 
 

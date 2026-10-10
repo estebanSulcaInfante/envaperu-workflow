@@ -1,6 +1,8 @@
 from decimal import Decimal
 from io import BytesIO
 from datetime import date
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +43,235 @@ from app.services.scm_production_reports_service import (
     list_production_progress,
 )
 import app.services.scm_production_reports_service as production_reports_service
+
+
+def test_tv_progress_groups_one_card_per_canonical_run_identity_and_keeps_piece_breakdown(monkeypatch):
+    """TV-02 RED: visual labels must not collapse distinct production runs."""
+    work_a = SimpleNamespace(id="work-a", codigo="TR-A")
+    work_b = SimpleNamespace(id="work-b", codigo="TR-B")
+    ot_a = SimpleNamespace(id=101, public_id="ot-a", codigo_ot="OT-101", fecha=date(2026, 10, 10), estado="EN_EJECUCION")
+    ot_b = SimpleNamespace(id=102, public_id="ot-b", codigo_ot="OT-102", fecha=date(2026, 10, 10), estado="EN_EJECUCION")
+    color_a = SimpleNamespace(id=7, codigo="AZUL", nombre="Azul", hex_referencia="#123456")
+    color_b = SimpleNamespace(id=8, codigo="AZUL", nombre="Azul", hex_referencia="#123456")
+    piece_a = SimpleNamespace(id=11, nombre="Pieza A")
+    piece_b = SimpleNamespace(id=12, nombre="Pieza B")
+    article_a = SimpleNamespace(id=201, codigo="PC-A", nombre="Salida A", pieza_color=SimpleNamespace(pieza_color=SimpleNamespace(id=301, sku="PC-A", pieza_rel=piece_a)))
+    article_b = SimpleNamespace(id=202, codigo="PC-B", nombre="Salida B", pieza_color=SimpleNamespace(pieza_color=SimpleNamespace(id=302, sku="PC-B", pieza_rel=piece_b)))
+    outputs = [
+        SimpleNamespace(articulo=article_a, kg_estandar_objetivo=Decimal("2"), cantidad_objetivo=Decimal("10")),
+        SimpleNamespace(articulo=article_b, kg_estandar_objetivo=Decimal("3"), cantidad_objetivo=Decimal("10")),
+    ]
+    runs = []
+    for corrida_id, corrida_code, work, ot, color in (
+        ("corrida-a", "C-A", work_a, ot_a, color_a),
+        ("corrida-b", "C-B", work_b, ot_b, color_b),
+    ):
+        color_work = SimpleNamespace(
+            molde_codigo_snapshot="ML-1", color_id_snapshot=color.id,
+            color_nombre_snapshot=color.nombre,
+        )
+        corrida = SimpleNamespace(
+            id=corrida_id, codigo=corrida_code, estado="EN_EJECUCION",
+            objetivo_neto_kg=None, color_produccion=color, salidas=outputs,
+        )
+        runs.append({
+            "orden": SimpleNamespace(id="of-1", codigo="OF-1", estado="EN_EJECUCION", molde_id="ML-1"),
+            "corrida": corrida,
+            "works": [(work, color_work, ot)],
+            "contexts": [{"work": work, "color_work": color_work, "ot": ot}],
+            "mangas": {}, "moldes": {"ML-1": SimpleNamespace(codigo="ML-1", nombre="Molde 1")},
+            "color_name": color.nombre, "color_id": color.id, "color_code": color.codigo,
+            "color_hex": color.hex_referencia, "molde": SimpleNamespace(codigo="ML-1", nombre="Molde 1"),
+        })
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: runs)
+
+    result = list_production_progress_tv(object(), actor_id=7, filters={})
+
+    assert len(result["items"]) == 2
+    assert {item["group_id"] for item in result["items"]} == {
+        "of-1|ot-a|corrida-a|ML-1|7",
+        "of-1|ot-b|corrida-b|ML-1|8",
+    }
+    assert all(len(item["salidas"]) == 2 for item in result["items"])
+    assert all(item["identity"]["molde_id"] == "ML-1" for item in result["items"])
+
+
+def test_tv_progress_deduplicates_outputs_when_one_run_has_multiple_context_rows(monkeypatch):
+    """TV-02 GREEN: repeated OT context rows cannot duplicate physical output."""
+    work_a = SimpleNamespace(id="work-a")
+    work_b = SimpleNamespace(id="work-b")
+    ot = SimpleNamespace(id=101, public_id="ot-a", codigo_ot="OT-101")
+    color_work_a = SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7)
+    color_work_b = SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7)
+    piece = SimpleNamespace(id=11, nombre="Pieza A")
+    article = SimpleNamespace(
+        id=201, codigo="PC-A", nombre="Salida A",
+        pieza_color=SimpleNamespace(pieza_color=SimpleNamespace(id=301, sku="PC-A", pieza_rel=piece)),
+    )
+    output = SimpleNamespace(articulo=article, kg_estandar_objetivo=Decimal("2"), cantidad_objetivo=Decimal("10"))
+    run = {
+        "orden": SimpleNamespace(id="of-1", codigo="OF-1", estado="EN_EJECUCION", molde_id="ML-1"),
+        "corrida": SimpleNamespace(
+            id="corrida-a", codigo="C-A", estado="EN_EJECUCION", objetivo_neto_kg=None,
+            color_produccion=SimpleNamespace(id=7, codigo="AZUL", nombre="Azul", hex_referencia="#123456"),
+            salidas=[output],
+        ),
+        "works": [(work_a, color_work_a, ot), (work_b, color_work_b, ot)],
+        "contexts": [
+            {"work": work_a, "color_work": color_work_a, "ot": ot},
+            {"work": work_b, "color_work": color_work_b, "ot": ot},
+        ],
+        "mangas": {}, "moldes": {"ML-1": SimpleNamespace(codigo="ML-1", nombre="Molde 1")},
+        "color_name": "Azul", "color_id": 7, "color_code": "AZUL", "color_hex": "#123456",
+        "molde": SimpleNamespace(codigo="ML-1", nombre="Molde 1"),
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    result = list_production_progress_tv(object(), actor_id=7, filters={})
+
+    assert len(result["items"]) == 1
+    assert len(result["items"][0]["salidas"]) == 1
+
+
+def test_tv_progress_marks_missing_canonical_identity_without_fake_percentage(monkeypatch):
+    """TV-02 RED/GREEN: missing OT/mold/color identity stays explicit."""
+    work = SimpleNamespace(id="work-a")
+    piece = SimpleNamespace(id=11, nombre="Pieza A")
+    article = SimpleNamespace(
+        id=201, codigo="PC-A", nombre="Salida A",
+        pieza_color=SimpleNamespace(pieza_color=SimpleNamespace(id=301, sku="PC-A", pieza_rel=piece)),
+    )
+    run = {
+        "orden": SimpleNamespace(id="of-1", codigo="OF-1", estado="EN_EJECUCION", molde_id=None),
+        "corrida": SimpleNamespace(
+            id="corrida-a", codigo="C-A", estado="EN_EJECUCION", objetivo_neto_kg=None,
+            color_produccion=SimpleNamespace(id=None, codigo="AZUL", nombre="Transparente", hex_referencia=None),
+            salidas=[SimpleNamespace(articulo=article, kg_estandar_objetivo=Decimal("2"), cantidad_objetivo=Decimal("10"))],
+        ),
+        "works": [(work, None, None)],
+        "contexts": [{"work": work, "color_work": SimpleNamespace(molde_codigo_snapshot=None, color_id_snapshot=None), "ot": None}],
+        "mangas": {}, "moldes": {}, "color_name": "Transparente", "color_id": None, "color_hex": None,
+        "molde": None,
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    row = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+
+    assert row["identity"]["identity_status"] == "INCOMPLETA"
+    assert row["color_hex"] is None
+    assert row["salidas"][0]["porcentaje"] is None
+    assert row["salidas"][0]["estado_avance"] == "INCOMPLETO"
+
+
+def test_tv_progress_redacts_mold_identity_without_of_permission(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "tv-02-server-secret-for-tests")
+    work = SimpleNamespace(id="work-authority")
+    ot = SimpleNamespace(id=101, public_id="ot-authority", codigo_ot="OT-101")
+    color_work = SimpleNamespace(molde_codigo_snapshot="ML-SECRET", color_id_snapshot=7)
+    run = {
+        "orden": SimpleNamespace(id="of-authority", codigo="OF-AUTH", estado="EN_EJECUCION"),
+        "corrida": SimpleNamespace(
+            id="corrida-authority", codigo="C-AUTH", estado="EN_EJECUCION",
+            color_produccion=SimpleNamespace(id=7, nombre="Azul", hex_referencia="#123456"),
+            salidas=[],
+        ),
+        "works": [(work, color_work, ot)],
+        "contexts": [{"work": work, "color_work": color_work, "ot": ot}],
+        "moldes": {"ML-SECRET": SimpleNamespace(codigo="ML-SECRET", nombre="Molde secreto")},
+        "color_name": "Azul", "color_id": 7, "color_hex": "#123456",
+    }
+    actor = SimpleNamespace(tiene_capacidad=lambda capability: capability != "OF_VER")
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: actor)
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    hidden = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+
+    assert "molde_visible" not in hidden
+    assert hidden["group_id"].startswith("tvgrp-")
+    assert "molde_id" not in hidden
+    assert "molde" not in hidden
+    assert "molde_id" not in hidden["identity"]
+    assert "molde_nombre" not in hidden["identity"]
+    assert all("MOLDE" not in issue for issue in hidden["identity"]["identity_issues"])
+    assert "ML-SECRET" not in hidden["group_id"]
+    simple_sha = hashlib.sha256(
+        "of-authority|ot-authority|corrida-authority|ML-SECRET|7".encode("utf-8")
+    ).hexdigest()[:24]
+    assert hidden["group_id"] != f"tvgrp-{simple_sha}"
+    hidden_again = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+    assert hidden_again["group_id"] == hidden["group_id"]
+    color_work.molde_codigo_snapshot = None
+    hidden_incomplete = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+    assert "molde_visible" not in hidden_incomplete
+    assert hidden_incomplete["identity"]["identity_status"] == hidden["identity"]["identity_status"]
+    assert all("MOLDE" not in issue for issue in hidden_incomplete["identity"]["identity_issues"])
+    public_without_mold = {
+        key: ({inner_key: inner_value for inner_key, inner_value in value.items() if inner_key != "group_id"}
+              if key == "identity" else value)
+        for key, value in hidden_incomplete.items() if key != "group_id"
+    }
+    public_with_mold = {
+        key: ({inner_key: inner_value for inner_key, inner_value in value.items() if inner_key != "group_id"}
+              if key == "identity" else value)
+        for key, value in hidden.items() if key != "group_id"
+    }
+    assert public_without_mold == public_with_mold
+    assert "molde" not in json.dumps(hidden_incomplete).lower()
+    color_work.molde_codigo_snapshot = "ML-SECRET"
+
+    monkeypatch.delenv("SECRET_KEY")
+    with pytest.raises(RuntimeError, match="TV_GROUP_ID_SECRET_NOT_CONFIGURED"):
+        list_production_progress_tv(object(), actor_id=7, filters={})
+
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _capability: True),
+    )
+    visible = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+    assert visible["molde_visible"] is True
+    assert visible["molde_id"] == "ML-SECRET"
+    assert visible["molde"]["nombre"] == "Molde secreto"
+    assert visible["identity"]["molde_id"] == "ML-SECRET"
+
+
+def test_tv_progress_separates_incomplete_identity_by_work_source_marker(monkeypatch):
+    work_a = SimpleNamespace(id="work-missing-a")
+    work_b = SimpleNamespace(id="work-missing-b")
+    ot = SimpleNamespace(id=101, public_id="ot-shared", codigo_ot="OT-SHARED")
+    corrida = SimpleNamespace(
+        id="corrida-shared", codigo="C-SHARED", estado="EN_EJECUCION",
+        color_produccion=SimpleNamespace(id=None, nombre="Azul", hex_referencia=None),
+        salidas=[],
+    )
+    run = {
+        "orden": SimpleNamespace(id="of-shared", codigo="OF-SHARED", estado="EN_EJECUCION"),
+        "corrida": corrida,
+        "works": [(work_a, None, ot), (work_b, None, ot)],
+        "contexts": [
+            {"work": work_a, "color_work": SimpleNamespace(molde_codigo_snapshot=None, color_id_snapshot=None), "ot": ot},
+            {"work": work_b, "color_work": SimpleNamespace(molde_codigo_snapshot=None, color_id_snapshot=None), "ot": ot},
+        ],
+        "moldes": {}, "color_name": "Azul", "color_id": None, "color_hex": None,
+    }
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _capability: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    items = list_production_progress_tv(object(), actor_id=7, filters={})["items"]
+
+    assert len(items) == 2
+    assert {item["group_id"] for item in items} == {
+        "incompleto:of-shared|ot-shared|corrida-shared|?|?|work-missing-a",
+        "incompleto:of-shared|ot-shared|corrida-shared|?|?|work-missing-b",
+    }
+    assert all(item["identity"]["identity_status"] == "INCOMPLETA" for item in items)
 
 
 def test_tv_progress_keeps_unit_compatible_outputs_and_real_overproduction(monkeypatch):
@@ -1115,6 +1346,7 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
     from uuid import uuid4
 
     with app.app_context():
+        app.config["SECRET_KEY"] = "tv-02-server-secret-for-tests"
         seeded = _seed_observability_graph()
         order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
         fabrication = ScmOrdenFabricacion(orden_operacion_id=order.id)
@@ -1149,6 +1381,11 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
         color_work = ScmTrabajoColor.query.filter_by(trabajo_ot_id=blue.id).one()
         color_work.corrida_fabricacion_id = corrida.id
+        # TV-02 now requires a complete canonical card identity.  The seeded
+        # graph predates the snapshot fields, so make this fixture explicit
+        # instead of treating visual names as identity.
+        color_work.molde_codigo_snapshot = "ML-OBS"
+        color_work.color_id_snapshot = 1
         weighed_manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
         weighed_manga.lote_articulo = lot
         db.session.commit()

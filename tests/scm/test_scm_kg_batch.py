@@ -189,6 +189,26 @@ def test_outgoing_resolver_accepts_joint_picking_but_legacy_return_does_not(app)
         assert error.value.details["capability"] == "ABASTECIMIENTO_VER"
 
 
+def test_outgoing_resolver_returns_scoped_canonical_identity_dto(app):
+    with app.app_context():
+        actor, units = _batch_ready(app)
+        unit = units[0]
+        existence = db.session.get(ScmExistenciaMangaKg, unit.recepcion_vigente_id)
+        manga = existence.manga
+        work = manga.trabajo
+        resolved = resolve_kg_outgoing(db.session, actor_id=actor.id, code=unit.codigo)
+
+        dto = resolved["unit"]
+        identity = dto["identidad"]
+        assert identity["of"] == work.orden_operacion.codigo
+        assert identity["ot"] == manga.ot.codigo_ot
+        assert identity["m"] == manga.codigo
+        assert identity["pieza"]["codigo"] == manga.pieza_color_sku_snapshot
+        assert set(identity) == {"of", "ot", "m", "pieza", "color"}
+        assert "ubicacion" not in dto
+        assert "tara_contexto" not in dto
+
+
 def _prepesaje_qr(label):
     return json.dumps({"v": 1, "label_id": str(label.public_id)})
 
