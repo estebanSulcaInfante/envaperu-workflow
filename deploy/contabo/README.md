@@ -7,9 +7,9 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 8e21ee31ed8cf0c20c5b25800c4ea171cc312d4f.
-check_ci.py accepts only GitHub Actions run 37802364547, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/kg-intake-cutover-20261007,
+Application source is fixed to da72a177d7d1e2d130819c865348d0d8d360e291.
+check_ci.py accepts only GitHub Actions run 38077365117, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/warehouse-qr-tv-release-20261010,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
