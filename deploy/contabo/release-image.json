@@ -1,12 +1,12 @@
 {
-  "source_sha": "da72a177d7d1e2d130819c865348d0d8d360e291",
-  "recipe_sha": "0044438159e2f1d751cc2c79cf76617f2d393267",
-  "workflow_sha": "46bf84a187363d9b770c4a4d4cfbc4b326359394",
+  "source_sha": "987c50816e84c0a59ae90731323aa8a8f74917e9",
+  "recipe_sha": "baccd7031807d9e7dc9b55d716dbaff0ac5be4ba",
+  "workflow_sha": "202a7058162a18b269bb421d9a631c949ed04d00",
   "python_base": "python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f",
-  "api_image": "ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:567256a0f016ca58cad926b4e50ee4207b743e4632c338ec871606edb30014fc",
-  "archive_sha256": "824da81bb430cb76e8b3d045aaa9e5c91390e81efe41fefaf4e018f360369895",
-  "image_id": "sha256:28e6b28c5ba7c978de667bdf7ba60e24236a47c1cab0d87f832b7f6b20d47c09",
-  "run_id": "38078393501",
+  "api_image": "ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:a03a951a3d73239e2ecd9cce5443268c4569338ea87c87916602fd97ad32d21f",
+  "archive_sha256": "8c9a6855b68290bec3e383d3fe7bbc8fa703f69a0ef1a95e12f3735280f193e1",
+  "image_id": "sha256:45cf07f6e4e315c47f740ac4af0e192284dd2aef01814f98362065a576f32a7d",
+  "run_id": "38965849691",
   "run_attempt": "1",
   "deployed": false
 }

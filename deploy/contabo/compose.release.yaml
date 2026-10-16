@@ -1,9 +1,9 @@
-# RELEASE SOURCE: da72a177d7d1e2d130819c865348d0d8d360e291
+# RELEASE SOURCE: 987c50816e84c0a59ae90731323aa8a8f74917e9
 # PREPARATION ONLY: requires approved administrator handoff before any start.
 # Project name is controlled by Dokploy: envaperuscmpilot-scmpilot-cnxr9n
 services:
   api:
-    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:567256a0f016ca58cad926b4e50ee4207b743e4632c338ec871606edb30014fc
+    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:a03a951a3d73239e2ecd9cce5443268c4569338ea87c87916602fd97ad32d21f
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -37,6 +37,7 @@ services:
       - KG_PRODUCTION_LOCATION_CODE=PRODUCCION_KG
       - CATALOG_IMAGE_STORAGE=supabase_s3
       - CATALOG_IMAGE_KEEP_DATABASE_COPY=true
+      - SECRET_KEY=${SECRET_KEY:?Administrator must securely supply application signing secret}
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
     entrypoint: [python, /prep/start_guard.py]
