@@ -3,8 +3,8 @@ import json
 import os
 import re
 import urllib.request
-SOURCE_SHA='dc22fbde21eb0d1e3d1685148e2eabd0ac5de32e'
-RUN_ID=38958518142
+SOURCE_SHA='242d82594c648a9c75abd791baa640d05bf97fe5'
+RUN_ID=38959791172
 BRANCH='codex/warehouse-qr-tv-kg-release-20261016'
 REPOSITORY='estebanSulcaInfante/envaperu-workflow'
 def validate_inputs(source_sha, python_base):

@@ -1,5 +1,5 @@
 {
-  "source_sha": "dc22fbde21eb0d1e3d1685148e2eabd0ac5de32e",
+  "source_sha": "242d82594c648a9c75abd791baa640d05bf97fe5",
   "files": {
     "app/__init__.py": "7ec9b0d2139086b2ce808894982961c14c62bda682b8f220a0ba6f61b6dee814",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -182,7 +182,7 @@
     "migrations/versions/e5a72c4d9f10_add_physical_inventory_units.py": "70abb0a5285851a3dc0f5a6343165d961991f1813433f0176bd492b1ea5e7a62",
     "migrations/versions/f02b00ae2e67_legacy_schema_baseline.py": "98e32d808a901e42fca9abcb8be1bfe897ab95559fbcd214643903c8e6363f82",
     "migrations/versions/f074de2410ac_merge_post_reprint_into_kg_of0928.py": "3e28c5057be280e86404dc3636e49d9e5b3c04481ff4edadfe33262706b8c7b3",
-    "migrations/versions/b7f31e9c120a_global_kg_inventory_policy.py": "d01fb4e1745f01a2749200603373c8ee103602af75eca46875f77e42697f975c",
+    "migrations/versions/b7f31e9c120a_global_kg_inventory_policy.py": "6d2829f114b9cdbfa42b8c8d7b5d02b42fb0c11bdc7ab15dc49bc687f10013e7",
     "migrations/versions/f16b3d9e5a42_expand_op_of_oe_document_model.py": "23964f59e399972588f192fcd5ab84b484589073d9ec53d6b1cf063fb8c32b9b",
     "migrations/versions/f27c4e0a6b53_backfill_legacy_orders_as_fabrication.py": "c9be5106e1f20f1b7b54fb0619717d0115231a68b5069d94a680246be256bf8c",
     "migrations/versions/f38d5f1b7c64_add_document_capabilities_and_uuid_audit.py": "56031bf895b0ad9a8d27aae91b27ce430cf40155ea0064615f95cc701ec13d37",
