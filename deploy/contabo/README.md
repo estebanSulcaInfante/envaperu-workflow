@@ -7,12 +7,16 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to da72a177d7d1e2d130819c865348d0d8d360e291.
-check_ci.py accepts only GitHub Actions run 38077365117, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/warehouse-qr-tv-release-20261010,
+Application source is fixed to d2c3fc4332f56e13097605e270231812a0f31da1.
+check_ci.py accepts only GitHub Actions run 38957052220, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/warehouse-qr-tv-kg-release-20261016,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
+
+The approved source combines the already-operational global KG policy and migration
+with the reviewed TV mold-color and warehouse QR identity changes. The image must
+preserve revision b7f31e9c120a instead of reverting to the previous head.
 
 The workflow checks out the deployment recipe at a literal commit SHA, separately
 from the source. Recipe files are committed first; a following workflow-only commit
@@ -20,7 +24,7 @@ pins that reviewed recipe. Both commits require review. Actions are pinned to SH
 
 ## Runtime files and templates
 
-runtime-allowlist.json enumerates 256 approved files with SHA-256 hashes.
+runtime-allowlist.json enumerates 257 approved files with SHA-256 hashes.
 build_context.py creates a NEW context from these bytes; the source checkout is
 never sent to Docker. Unexpected files in the checkout do not enter the context.
 Every approved byte must match the fixed source; symlinks/escaping paths fail.
