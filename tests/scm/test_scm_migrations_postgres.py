@@ -38,6 +38,7 @@ UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
 PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
 OPM_PREPARED_MATERIAL_REVISION = "c3a91f6e2d47"
 ARTICLE_FUNCTION_GRANT_BASE_REVISION = "fa1b2c3d4e50"
+GLOBAL_KG_POLICY_BASE_REVISION = "f074de2410ac"
 HEAD_REVISION = ScriptDirectory(str(BACKEND_ROOT / "migrations")).get_current_head()
 
 
@@ -107,6 +108,30 @@ def _run_flask_db_failure(schema_url, *args):
     )
     assert result.returncode != 0, result.stdout + result.stderr
     return result
+
+
+def _upgrade_head_after_global_kg_recovery(schema_url, schema_engine):
+    """Model the required data-recovery gate before installing KG policy."""
+    _run_flask_db(schema_url, "upgrade", GLOBAL_KG_POLICY_BASE_REVISION)
+    with schema_engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE scm_articulo
+            SET unidad_inventario = 'KG'
+            WHERE clase IN ('PIEZA_COLOR', 'SUBENSAMBLE_WIP')
+        """))
+    _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+
+
+def _downgrade_after_global_kg_policy(schema_url, schema_engine, target):
+    """Undo the test recovery before crossing older KG downgrade guards."""
+    _run_flask_db(schema_url, "downgrade", GLOBAL_KG_POLICY_BASE_REVISION)
+    with schema_engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE scm_articulo
+            SET unidad_inventario = 'UN'
+            WHERE clase IN ('PIEZA_COLOR', 'SUBENSAMBLE_WIP')
+        """))
+    _run_flask_db(schema_url, "downgrade", target)
 
 
 def _repeat_article_subtype_grant_upgrade(connection):
@@ -2685,7 +2710,7 @@ def test_article_r1_backfills_catalogs_and_enforces_deferred_subtype():
                     )
             """))
 
-        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        _upgrade_head_after_global_kg_recovery(schema_url, schema_engine)
 
         with schema_engine.connect() as connection:
             assert connection.execute(text("""
@@ -2745,7 +2770,11 @@ def test_article_r1_backfills_catalogs_and_enforces_deferred_subtype():
             immutable_error.value.orig
         ).lower()
 
-        _run_flask_db(schema_url, "downgrade", "b7e9f1a4d510")
+        _downgrade_after_global_kg_policy(
+            schema_url,
+            schema_engine,
+            "b7e9f1a4d510",
+        )
         assert "scm_articulo" not in inspect(
             schema_engine
         ).get_table_names()
@@ -3448,7 +3477,7 @@ def test_molde_pieza_migration_preserva_identidades_y_bloquea_downgrade_nm():
                 ("SKU-MIG-105", 105),
             ]
 
-        _run_flask_db(schema_url, "upgrade", "head")
+        _upgrade_head_after_global_kg_recovery(schema_url, schema_engine)
         with schema_engine.connect() as connection:
             assert connection.execute(text("""
                 SELECT id, pieza_id
