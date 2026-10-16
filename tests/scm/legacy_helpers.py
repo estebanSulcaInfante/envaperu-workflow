@@ -36,6 +36,8 @@ def mark_legacy_un(session, article):
     finally:
         if sqlite:
             session.execute(text("PRAGMA ignore_check_constraints = OFF"))
+        elif postgres:
+            session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
     session.expire(article)
     session.refresh(article)
     assert article.unidad_inventario == "UN"
