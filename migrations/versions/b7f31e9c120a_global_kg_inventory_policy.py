@@ -33,6 +33,18 @@ def _supports_transaction_timeout(bind):
     version = bind.exec_driver_sql("SHOW server_version_num").scalar_one()
     return int(version) >= POSTGRES_TRANSACTION_TIMEOUT_MIN_VERSION
 
+
+def _render_policy_sql(bind, sql):
+    """Render the reviewed SQL into Alembic's active PostgreSQL schema."""
+    schema = bind.exec_driver_sql("SELECT current_schema()").scalar_one()
+    quoted_schema = bind.dialect.identifier_preparer.quote_schema(schema)
+    rendered = sql.replace("public.", f"{quoted_schema}.")
+    return rendered.replace(
+        "SET search_path TO 'pg_catalog', 'public'",
+        f"SET search_path TO pg_catalog, {quoted_schema}",
+    )
+
+
 def _run_policy_sql(sql, expected_sha256):
     if sha256(sql.encode("utf-8")).hexdigest().upper() != expected_sha256:
         raise RuntimeError("KG_ARTICLE_POLICY_SQL_HASH_MISMATCH")
@@ -46,7 +58,7 @@ def _run_policy_sql(sql, expected_sha256):
     bind.exec_driver_sql(f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY})")
     if monotonic() - started > MAX_TRANSACTION_SECONDS:
         raise RuntimeError("KG_ARTICLE_POLICY_LOCK_DEADLINE_EXCEEDED")
-    bind.exec_driver_sql(sql)
+    bind.exec_driver_sql(_render_policy_sql(bind, sql))
     if monotonic() - started > MAX_TRANSACTION_SECONDS:
         raise RuntimeError("KG_ARTICLE_POLICY_TRANSACTION_DEADLINE_EXCEEDED")
 
