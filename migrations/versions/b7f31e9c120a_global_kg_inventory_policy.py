@@ -25,6 +25,13 @@ DOWNGRADE_SQL = "-- Exact rollback for future_policy.sql. Not applied.\n-- Fails
 
 ADVISORY_LOCK_KEY = 20260919005
 MAX_TRANSACTION_SECONDS = 3.0
+POSTGRES_TRANSACTION_TIMEOUT_MIN_VERSION = 170000
+
+
+def _supports_transaction_timeout(bind):
+    """PostgreSQL added transaction_timeout in version 17."""
+    version = bind.exec_driver_sql("SHOW server_version_num").scalar_one()
+    return int(version) >= POSTGRES_TRANSACTION_TIMEOUT_MIN_VERSION
 
 def _run_policy_sql(sql, expected_sha256):
     if sha256(sql.encode("utf-8")).hexdigest().upper() != expected_sha256:
@@ -33,7 +40,8 @@ def _run_policy_sql(sql, expected_sha256):
     started = monotonic()
     bind.exec_driver_sql("SET LOCAL lock_timeout = '500ms'")
     bind.exec_driver_sql("SET LOCAL statement_timeout = '3s'")
-    bind.exec_driver_sql("SET LOCAL transaction_timeout = '3s'")
+    if _supports_transaction_timeout(bind):
+        bind.exec_driver_sql("SET LOCAL transaction_timeout = '3s'")
     bind.exec_driver_sql("SET LOCAL idle_in_transaction_session_timeout = '3s'")
     bind.exec_driver_sql(f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY})")
     if monotonic() - started > MAX_TRANSACTION_SECONDS:
