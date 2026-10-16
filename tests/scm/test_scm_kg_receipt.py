@@ -266,8 +266,9 @@ def test_kg_receipt_is_net_measured_and_not_plan_units(app, article_class):
         db.session.flush()
         manga = ScmManga.query.filter_by(public_id=UUID(created["mangas"][0]["public_id"])).one()
         article = manga.lote_articulo.articulo
-        article.clase = article_class
         activate_article_for_kg(db.session, article_id=article.id)
+        article.clase = article_class
+        db.session.flush()
         db.session.commit()
         app.config["KG_RECEIPT_WRITE_ENABLED"] = True
 

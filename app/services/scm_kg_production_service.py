@@ -69,8 +69,646 @@ def automatic_kg_intake_enabled():
         return False
 
 
+def _complete_active_control_recovery(session, manga, current_operation_id, cutoff, source_at):
+    """Recognize only the exact audited control-history bundle for this manga.
+
+    Recovery is a projection of an existing control, never a rewrite of that
+    control. The current manga must satisfy the full live control/final and
+    first-segment continuity checks. The companion manga is checked only
+    against its immutable source control and original recovery movement,
+    existence references, and complete child/parent operation audit bundle;
+    later legitimate weighing, finalization, custody, or consumption does not
+    change that historical proof. Partial or drifted bundles stay blocked.
+    """
+    import hashlib
+    import json
+    from datetime import datetime, timezone
+    from uuid import UUID, uuid5
+    from sqlalchemy import inspect as sa_inspect
+    from app.models.scm_auditoria import ScmEvento, ScmOperacion
+    from app.models.scm_inventory_kg import ScmExistenciaMangaKg, ScmMovimientoInventarioKg, ScmSaldoInventarioKg
+    from app.services.scm_ot_service import _operation_hash
+    namespace = UUID("e898117f-cac3-4cbd-aead-d43c9e8e3f18")
+    expected_manifest_sha256 = "9971fc19e26d1490fc313620f423612750cda734906dc0afb53eee7a073bcc21"
+    def utc(value):
+        if not isinstance(value, datetime):
+            return None
+        return (value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value).astimezone(timezone.utc)
+
+    def row_hash(row, excluded=()):
+        values = {}
+        for attribute in sa_inspect(type(row)).column_attrs:
+            key = attribute.key
+            if key in excluded:
+                continue
+            value = getattr(row, key)
+            if isinstance(value, datetime):
+                value = value.isoformat()
+                if "." in value:
+                    head, tail = value.split(".", 1)
+                    fraction, suffix = tail[:6], tail[6:]
+                    value = head + "." + fraction.rstrip("0") + suffix if fraction.rstrip("0") else head + suffix
+            elif isinstance(value, Decimal):
+                value = float(value)
+            elif hasattr(value, "hex") and type(value).__name__ == "UUID":
+                value = str(value)
+            values[key] = value
+        return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode()).hexdigest()
+
+    controls = session.scalars(
+        select(ScmControlPesoManga)
+        .where(ScmControlPesoManga.manga_id == manga.id)
+        .order_by(ScmControlPesoManga.created_at, ScmControlPesoManga.id)
+    ).all()
+    segments = session.scalars(
+        select(ScmTramoMangaTrabajo)
+        .where(ScmTramoMangaTrabajo.manga_id == manga.id)
+        .order_by(ScmTramoMangaTrabajo.secuencia)
+    ).all()
+    if not controls or len(segments) != 1:
+        return False
+    control, segment = controls[0], segments[0]
+    permitted_sources = {
+        "970a4edc-f6b8-4f65-bc07-47dcf63274c8": (831, 258, Decimal("5.700"), "90497e8553631128bda56554ec1a9755a8cd4e0e87779621c1bc98f6a0ddd15e", "52884b9e96fd1541d5198fde5c6db329cc5b936f857f2498c73f8f4343aa0c99", "86d855aa5c0b535e93dc863250d01609c9d4c4d3ea6eab2cab4436d49b939d07", "859218c7481ee3d02d866e6e7ac7e50cc3dff4596cc0287295abd92f8b6038b7", "00f92bebed99cc94772893761c8be0b9116bbcd4b19a7e04d7d5c7ee7be2d101", "e4513155-7349-44b8-89bd-4fcb8cda4e88", "be72e1d4-e5b5-48b5-b606-2a5920156484"),
+        "0f39985e-c3ad-4c93-9223-4a07d8a208dd": (1642, 224, Decimal("4.700"), "8be0d1fc467091a63e1e648f5cd55a05a07fee1da1f2c3f30029696f8742394d", "abb3ac7a835e413120dd8cc6db4829ebb461956026f8c9aa698062abd464ab78", "572d16daec82f0ba86319a4a1403f1d6cd030cdc8191a3be0402f40fc561c62e", "98404eb1c3c63d56288f130dc822f6a202993a6d5dcc58be5690df2a88006809", "d6a3c527d152e3565da927af1c10ef14ee51bca300067b9e06561c4ac95cb975", "0a34bda6-bdef-4977-8412-066ebecc857b", "4ef9641e-1631-4f69-bf00-c7df0a485471"),
+    }
+    def peer_recovery_bundle_valid(peer_source_id):
+        """Verify the immutable recovery audit bundle for both sources."""
+        expected_source_ids = [
+            "0f39985e-c3ad-4c93-9223-4a07d8a208dd",
+            "970a4edc-f6b8-4f65-bc07-47dcf63274c8",
+        ]
+        if peer_source_id not in expected_source_ids:
+            return False
+        expected_child_ids = [
+            str(uuid5(namespace, "active-control-source:" + source_id))
+            for source_id in expected_source_ids
+        ]
+        parent_id = uuid5(namespace, "active-control-manifest:" + expected_manifest_sha256)
+        parent_request = {
+            "manifest_sha256": expected_manifest_sha256,
+            "source_control_public_ids": expected_source_ids,
+            "source_count": 2,
+            "delta_kg": "10.400",
+            "actor_id": 1,
+            "location_id": 9,
+        }
+        recovery_reason = (
+            "Recuperacion auditada de control activo; NET historico sin unidad "
+            "fisica, QR ni atribucion NETO_MEDIDO."
+        )
+        expected_sources = []
+        for source_id in expected_source_ids:
+            permitted = permitted_sources[source_id]
+            peer = session.get(ScmManga, permitted[0])
+            if peer is None or str(peer.public_id) != permitted[8]:
+                return False
+            control_rows = session.scalars(select(ScmControlPesoManga).where(
+                ScmControlPesoManga.manga_id == peer.id,
+                ScmControlPesoManga.public_id == UUID(source_id),
+            )).all()
+            if len(control_rows) != 1:
+                return False
+            baseline = control_rows[0]
+            net = Decimal(baseline.peso_neto_kg).quantize(KG_QUANTUM)
+            if (
+                str(baseline.public_id) != source_id
+                or baseline.manga_id != permitted[0]
+                or net != permitted[2]
+                or row_hash(baseline) != permitted[3]
+                or baseline.tipo != "AVANCE_KG"
+                or baseline.unidad_evidencia != "UN"
+                or baseline.conteo_acumulado_un is not None
+                or utc(baseline.pesado_at) is None
+            ):
+                return False
+
+            child_id = uuid5(namespace, "active-control-source:" + source_id)
+            existence_rows = session.scalars(select(ScmExistenciaMangaKg).where(
+                ScmExistenciaMangaKg.manga_id == peer.id
+            )).all()
+            movement_rows = session.scalars(select(ScmMovimientoInventarioKg).where(
+                ScmMovimientoInventarioKg.operation_id == child_id
+            )).all()
+            source_movements = session.scalars(select(ScmMovimientoInventarioKg).where(
+                ScmMovimientoInventarioKg.referencia_tipo == "CONTROL_PESO_MANGA",
+                ScmMovimientoInventarioKg.referencia_id == source_id,
+            )).all()
+            child_events = session.scalars(select(ScmEvento).where(
+                ScmEvento.operation_id == child_id
+            )).all()
+            if (
+                len(existence_rows) != 1
+                or len(movement_rows) != 1
+                or len(source_movements) != 1
+                or len(child_events) != 1
+            ):
+                return False
+            existence = existence_rows[0]
+            recovery_move = movement_rows[0]
+            child_event = child_events[0]
+            if source_movements[0].id != recovery_move.id:
+                return False
+
+            # Pin the movement to its original, unique article/location ledger
+            # scope. The existence may have moved; its current saldo is irrelevant.
+            original_saldos = session.scalars(select(ScmSaldoInventarioKg).where(
+                ScmSaldoInventarioKg.articulo_scm_id == permitted[1],
+                ScmSaldoInventarioKg.ubicacion_id == 9,
+            )).all()
+            if len(original_saldos) != 1:
+                return False
+            original_saldo = original_saldos[0]
+            # Reconstruct only the immutable ledger prefix through this
+            # recovery movement. Later postings and the live saldo snapshot
+            # may legitimately change after the peer bundle was recorded.
+            original_chain = session.scalars(select(ScmMovimientoInventarioKg).where(
+                ScmMovimientoInventarioKg.saldo_id == original_saldo.id
+            ).order_by(ScmMovimientoInventarioKg.created_at, ScmMovimientoInventarioKg.id)).all()
+            running_original = Decimal("0.000")
+            recovery_result = None
+            for ledger_row in original_chain:
+                if ledger_row.saldo_fisico_resultante_kg is None:
+                    return False
+                running_original += Decimal(ledger_row.cantidad_delta_kg).quantize(KG_QUANTUM)
+                running_original = running_original.quantize(KG_QUANTUM)
+                recorded_result = Decimal(ledger_row.saldo_fisico_resultante_kg).quantize(KG_QUANTUM)
+                if running_original < 0 or recorded_result != running_original:
+                    return False
+                if ledger_row.id == recovery_move.id:
+                    recovery_result = recorded_result
+                    break
+            if recovery_result is None:
+                return False
+
+            recovery_hash = hashlib.sha256(
+                f"CONTROL_PESO:{source_id}:{net}:".encode()
+            ).hexdigest()
+            if (
+                existence.resuelta_por != "KG_HISTORY_RECOVERY"
+                or existence.manga_id != peer.id
+                or existence.articulo_scm_id != permitted[1]
+                or existence.operation_id != child_id
+                or existence.movimiento_ingreso_id != recovery_move.id
+                or recovery_move.saldo_id != original_saldo.id
+                or recovery_move.operation_id != child_id
+                or recovery_move.tipo != "INGRESO_PRODUCCION"
+                or recovery_move.actor_id != 1
+                or recovery_move.motivo != recovery_reason
+                or recovery_move.referencia_tipo != "CONTROL_PESO_MANGA"
+                or recovery_move.referencia_id != source_id
+                or recovery_move.fuente_tipo != "KG_HISTORY_RECOVERY"
+                or recovery_move.atributo_proceso != "PROCESO"
+                or recovery_move.pesaje_public_id is not None
+                or recovery_move.correccion_aplicada_public_id is not None
+                or recovery_move.projection_sha256 != recovery_hash
+                or Decimal(recovery_move.cantidad_delta_kg).quantize(KG_QUANTUM) != net
+                or Decimal(recovery_move.peso_neto_snapshot_kg).quantize(KG_QUANTUM) != net
+                or recovery_move.pesada_at_snapshot != baseline.pesado_at
+                or utc(recovery_move.created_at) is None
+                or utc(recovery_move.created_at) < cutoff
+                or recovery_move.actor_id != 1
+                or recovery_move.fuente_tipo != "KG_HISTORY_RECOVERY"
+                or recovery_result != Decimal(recovery_move.saldo_fisico_resultante_kg).quantize(KG_QUANTUM)
+            ):
+                return False
+
+            expected_after = {
+                "manifest_sha256": expected_manifest_sha256,
+                "manifest_parent_operation_id": str(parent_id),
+                "source_control_public_id": source_id,
+                "source_type": "CONTROL_PESO_MANGA",
+                "manga_public_id": permitted[8],
+                "net_kg": format(net, "f"),
+                "source_at": baseline.pesado_at.isoformat(),
+                "existence_id": str(existence.id),
+                "movement_id": str(recovery_move.id),
+                "child_operation_id": str(child_id),
+                "unidad_fisica_creada": False,
+                "qr_creado": False,
+                "physical_units_created": 0,
+                "qrs_created": 0,
+                "current_physical_count_performed": False,
+                "accounting_availability_from_measured_net": True,
+                "delta_kg": format(net, "f"),
+            }
+            child_request = {
+                "manifest_sha256": expected_manifest_sha256,
+                "source_control_public_id": source_id,
+            }
+            child = session.get(ScmOperacion, child_id)
+            child_response = {**expected_after, "status": "APPLIED"}
+            if (
+                child is None
+                or child.operation_id != child_id
+                or child.endpoint != "/kg/history-controls/active/v1/" + source_id
+                or child.actor_id != 1
+                or child.estado_http != 201
+                or child.request_sha256 != _operation_hash(child.endpoint, 1, child_request)
+                or child.response_json != child_response
+                or (utc(child.created_at) is None or utc(child.created_at) < cutoff)
+                or child_event.operation_id != child_id
+                or child_event.aggregate_type != "MANGA"
+                or child_event.aggregate_id != str(peer.id)
+                or child_event.tipo != "KG_ACTIVE_CONTROL_HISTORY_RECOVERED"
+                or child_event.actor_id != 1
+                or child_event.motivo != recovery_reason
+                or (utc(child_event.occurred_at) is None or utc(child_event.occurred_at) < cutoff)
+                or child_event.after_json != expected_after
+            ):
+                return False
+
+            # Check the source facts captured in the child event. Manga and
+            # segment live state can evolve after recovery; their audit snapshot
+            # remains tied to the manifested identities and initial states.
+            before = child_event.before_json or {}
+            control_before = before.get("control") or {}
+            if (
+                control_before != {
+                    "public_id": source_id,
+                    "peso_neto_kg": format(net, "f"),
+                    "unidad_evidencia": "UN",
+                    "conteo_acumulado_un": None,
+                    "pesado_at": baseline.pesado_at.isoformat(),
+                    "created_at": baseline.created_at.isoformat(),
+                }
+                or before.get("manga") != {
+                    "public_id": permitted[8],
+                    "estado": "EN_LLENADO",
+                }
+                or (before.get("segment") or {}).get("id") != permitted[9]
+                or (before.get("segment") or {}).get("estado") != "ACTIVO"
+                or before.get("existing_kg_existence") is not False
+                or before.get("existing_kg_movement") is not False
+            ):
+                return False
+            expected_sources.append(expected_after)
+
+        parent = session.get(ScmOperacion, parent_id)
+        parent_events = session.scalars(select(ScmEvento).where(
+            ScmEvento.operation_id == parent_id
+        )).all()
+        expected_parent_after = {
+            "manifest_sha256": expected_manifest_sha256,
+            "manifest": parent_request,
+            "sources": expected_sources,
+            "source_count": 2,
+            "delta_kg": "10.400",
+            "physical_units_created": 0,
+            "qrs_created": 0,
+            "current_physical_count_performed": False,
+            "accounting_availability_from_measured_net": True,
+            "status": "APPLIED",
+        }
+        if (
+            parent is None
+            or parent.operation_id != parent_id
+            or parent.endpoint != "/kg/history-controls/active/manifest/v1"
+            or parent.actor_id != 1
+            or parent.estado_http != 201
+            or parent.request_sha256 != _operation_hash(parent.endpoint, 1, parent_request)
+            or parent.response_json != expected_parent_after
+            or (utc(parent.created_at) is None or utc(parent.created_at) < cutoff)
+            or len(parent_events) != 1
+        ):
+            return False
+        parent_event = parent_events[0]
+        return bool(
+            parent_event.operation_id == parent_id
+            and parent_event.tipo == "KG_ACTIVE_CONTROL_HISTORY_MANIFEST_APPLIED"
+            and parent_event.aggregate_type == "KG_RECOVERY_BATCH"
+            and parent_event.aggregate_id == str(parent_id)
+            and parent_event.actor_id == 1
+            and parent_event.motivo == recovery_reason
+            and utc(parent_event.occurred_at) is not None
+            and utc(parent_event.occurred_at) >= cutoff
+            and parent_event.before_json == {
+                "source_count": 0,
+                "delta_kg": "0.000",
+                "manifest_sha256": expected_manifest_sha256,
+            }
+            and parent_event.after_json == expected_parent_after
+        )
+
+    source_id = str(control.public_id)
+    permitted_source = permitted_sources.get(source_id)
+    if (
+        permitted_source is None
+        or permitted_source[0] != manga.id
+        or permitted_source[1] != manga.lote_articulo.articulo_id
+        or Decimal(control.peso_neto_kg).quantize(KG_QUANTUM) != permitted_source[2]
+        or row_hash(control) != permitted_source[3]
+        or row_hash(manga, {"estado", "version"}) != permitted_source[4]
+        or row_hash(manga.lote_articulo.articulo, {"unidad_inventario", "version", "updated_at"}) != permitted_source[6]
+        or control.tipo != "AVANCE_KG"
+        or control.unidad_evidencia != "UN"
+        or control.conteo_acumulado_un is not None
+        or utc(control.pesado_at) is None
+        or any(
+            live.tipo != "AVANCE_KG"
+            or live.unidad_evidencia != "KG"
+            or live.conteo_acumulado_un is not None
+            or utc(live.pesado_at) is None or utc(live.pesado_at) < cutoff
+            or utc(live.created_at) is None or utc(live.created_at) < cutoff
+            for live in controls[1:]
+        )
+        or manga.anulada_at is not None
+        or segment.secuencia != 1
+        or segment.cantidad_inicio_un is None
+        or Decimal(segment.cantidad_inicio_un) != 0
+        or Decimal(segment.cantidad_atribuida_un or 0) != 0
+        or len(manga.reaperturas) != 0
+        or manga.correccion_asignacion is not None
+    ):
+        return False
+    segment_mutable = {"estado", "cerrada_at", "motivo_cierre", "cantidad_fin_kg", "cantidad_atribuida_kg"}
+    segment_final_mutable = segment_mutable | {"calidad_evidencia_kg"}
+    current_finals = session.scalars(select(ScmPesajeManga).where(
+        ScmPesajeManga.manga_id == manga.id,
+        ScmPesajeManga.estado == "VIGENTE",
+    )).all()
+    if not current_finals:
+        segment_identity_ok = (
+            segment.calidad_evidencia_kg is None
+            and row_hash(segment, segment_mutable) == permitted_source[5]
+        )
+    else:
+        segment_identity_ok = (
+            segment.calidad_evidencia_kg == "MEDIDA_DIRECTA"
+            and row_hash(segment, segment_final_mutable) == permitted_source[7]
+        )
+    if not segment_identity_ok:
+        return False
+    if not current_finals:
+        current_controls = [c for c in controls[1:] if c.operation_id == current_operation_id]
+        source_shape_ok = (
+            manga.estado == "EN_LLENADO"
+            and segment.estado == "ACTIVO"
+            and segment.cantidad_fin_un is None
+            and Decimal(segment.cantidad_inicio_kg or 0) == 0
+            and Decimal(segment.cantidad_atribuida_kg or 0) == 0
+            and len(current_controls) == 1
+            and utc(current_controls[0].pesado_at) == utc(source_at)
+            and utc(current_controls[0].created_at) is not None
+            and utc(current_controls[0].created_at) >= cutoff
+            and not session.scalar(select(ScmMovimientoInventarioKg.id).where(
+                ScmMovimientoInventarioKg.operation_id == current_operation_id
+            ))
+        )
+    else:
+        # The normal final weighing inserts its source and closes the segment
+        # before calling this gate in the same transaction. Admit only that
+        # current operation's sole post-cutover final, from the exact 0 -> NET
+        # segment; an earlier final, reopen, or closed baseline is ineligible.
+        final = current_finals[0] if len(current_finals) == 1 else None
+        final_net = Decimal(final.peso_fisico_neto_kg).quantize(KG_QUANTUM) if final else None
+        source_shape_ok = bool(
+            final is not None
+            and final.operation_id == current_operation_id
+            and final.pesada_at is not None
+            and final.pesada_at >= cutoff
+            and final.created_at is not None
+            and utc(final.created_at) is not None
+            and utc(final.created_at) >= cutoff
+            and utc(final.pesada_at) == utc(source_at)
+            and manga.estado == "PESADA"
+            and segment.estado == "CERRADO"
+            and segment.cantidad_fin_un is None
+            and Decimal(segment.cantidad_inicio_kg or 0) == 0
+            and Decimal(segment.cantidad_fin_kg or 0) == final_net
+            and Decimal(segment.cantidad_atribuida_kg or 0) == final_net
+            and segment.cerrada_at == final.pesada_at
+        )
+    if not source_shape_ok:
+        return False
+    existence_rows = session.scalars(
+        select(ScmExistenciaMangaKg)
+        .where(ScmExistenciaMangaKg.manga_id == manga.id)
+    ).all()
+    if len(existence_rows) != 1:
+        return False
+    existence = existence_rows[0]
+    if (
+        existence.resuelta_por != "KG_HISTORY_RECOVERY"
+        or existence.manga_id != manga.id
+        or existence.articulo_scm_id != manga.lote_articulo.articulo_id
+        or existence.recibida_por_id != 1
+        or (existence.unidad_fisica_kg_id is not None and len(controls) == 1)
+        or existence.etiqueta_resuelta_id is not None
+        or existence.sesion_id is not None
+        or existence.pesaje_public_id is not None
+        or existence.correccion_aplicada_public_id is not None
+        or existence.estado_logistico != "EN_PRODUCCION"
+        or existence.estado_calidad != "SIN_CONTROL"
+        or existence.atributo_proceso != "PROCESO"
+        or existence.origen_tipo != "PRODUCCION"
+        or Decimal(existence.cantidad_reservada_kg or 0) != 0
+    ):
+        return False
+    movement = session.get(ScmMovimientoInventarioKg, existence.movimiento_ingreso_id)
+    if movement is None:
+        return False
+    saldo = session.get(ScmSaldoInventarioKg, movement.saldo_id)
+    if saldo is None or saldo.id != existence.saldo_id or saldo.articulo_scm_id != existence.articulo_scm_id or saldo.ubicacion_id != existence.ubicacion_id:
+        return False
+    movement_chain = session.scalars(select(ScmMovimientoInventarioKg).where(
+        ScmMovimientoInventarioKg.saldo_id == saldo.id
+    ).order_by(ScmMovimientoInventarioKg.created_at, ScmMovimientoInventarioKg.id)).all()
+    running = Decimal("0.000")
+    found_recovery_movement = False
+    for chain_row in movement_chain:
+        running += Decimal(chain_row.cantidad_delta_kg).quantize(KG_QUANTUM)
+        if running < 0 or Decimal(chain_row.saldo_fisico_resultante_kg).quantize(KG_QUANTUM) != running:
+            return False
+        if chain_row.id == movement.id:
+            found_recovery_movement = True
+    if not found_recovery_movement or running != Decimal(saldo.cantidad_fisica_kg).quantize(KG_QUANTUM):
+        return False
+    live_attributes = session.execute(select(ScmExistenciaMangaKg.atributo_proceso).where(
+        ScmExistenciaMangaKg.saldo_id == saldo.id,
+        ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+    )).scalars().all()
+    has_process = any(value in {"PROCESO", "MIXTA"} for value in live_attributes)
+    has_finished = any(value in {"TERMINADA", "MIXTA"} for value in live_attributes)
+    expected_attribute = "MIXTA" if has_process and has_finished else "TERMINADA" if has_finished else "PROCESO"
+    if saldo.atributo_proceso != expected_attribute:
+        return False
+    net = Decimal(control.peso_neto_kg).quantize(KG_QUANTUM)
+    projection_hash = hashlib.sha256(
+        f"CONTROL_PESO:{source_id}:{net}:".encode()
+    ).hexdigest()
+    child_id = uuid5(namespace, "active-control-source:" + source_id)
+    if (
+        existence.operation_id != child_id
+        or movement.operation_id != child_id
+        or movement.saldo_id != existence.saldo_id
+        or movement.tipo != "INGRESO_PRODUCCION"
+        or movement.actor_id != 1
+        or movement.referencia_tipo != "CONTROL_PESO_MANGA"
+        or movement.referencia_id != source_id
+        or movement.pesaje_public_id is not None
+        or movement.correccion_aplicada_public_id is not None
+        or movement.fuente_tipo != "KG_HISTORY_RECOVERY"
+        or movement.atributo_proceso != "PROCESO"
+        or Decimal(movement.cantidad_delta_kg).quantize(KG_QUANTUM) != net
+        or Decimal(movement.peso_neto_snapshot_kg).quantize(KG_QUANTUM) != net
+        or Decimal(movement.peso_neto_snapshot_kg).quantize(KG_QUANTUM) != net
+        or movement.pesada_at_snapshot != control.pesado_at
+        or movement.projection_sha256 != projection_hash
+    ):
+        return False
+    previous_live = [c for c in controls[1:] if c.operation_id != current_operation_id]
+    chain_net = net
+    for live_control in previous_live:
+        live_net = Decimal(live_control.peso_neto_kg).quantize(KG_QUANTUM)
+        live_op = session.get(ScmOperacion, live_control.operation_id)
+        rows = session.scalars(select(ScmMovimientoInventarioKg).where(
+            ScmMovimientoInventarioKg.operation_id == live_control.operation_id
+        )).all()
+        if (
+            live_op is None or utc(live_op.created_at) is None or utc(live_op.created_at) < cutoff
+            or len(rows) != 1 or live_net <= chain_net
+        ):
+            return False
+        live_move = rows[0]
+        live_hash = hashlib.sha256(
+            f"CONTROL_PESO:{live_control.public_id}:{live_net}:".encode()
+        ).hexdigest()
+        if (
+            live_move.saldo_id != movement.saldo_id
+            or live_move.tipo != "INGRESO_PRODUCCION"
+            or live_move.referencia_tipo != "CONTROL_PESO_MANGA"
+            or live_move.referencia_id != str(live_control.public_id)
+            or live_move.fuente_tipo != "KG_AUTO_PRODUCCION"
+            or live_move.pesada_at_snapshot != live_control.pesado_at
+            or live_move.projection_sha256 != live_hash
+            or Decimal(live_move.peso_neto_snapshot_kg).quantize(KG_QUANTUM) != live_net
+            or Decimal(live_move.cantidad_delta_kg).quantize(KG_QUANTUM) != live_net - chain_net
+        ):
+            return False
+        chain_net = live_net
+    expected_current = previous_live[-1] if previous_live else control
+    expected_current_net = Decimal(expected_current.peso_neto_kg).quantize(KG_QUANTUM)
+    expected_current_hash = hashlib.sha256(
+        f"CONTROL_PESO:{expected_current.public_id}:{expected_current_net}:".encode()
+    ).hexdigest()
+    expected_current_at = expected_current.pesado_at
+    expected_identity = bool(previous_live)
+    if (
+        Decimal(existence.peso_neto_snapshot_kg).quantize(KG_QUANTUM) != expected_current_net
+        or Decimal(existence.cantidad_fisica_kg).quantize(KG_QUANTUM) != expected_current_net
+        or existence.pesada_at_snapshot != expected_current_at
+        or existence.projection_sha256 != expected_current_hash
+        or bool(existence.unidad_fisica_kg_id) != expected_identity
+    ):
+        return False
+    child = session.get(ScmOperacion, child_id)
+    events = session.scalars(
+        select(ScmEvento).where(ScmEvento.operation_id == child_id)
+    ).all()
+    if child is None or len(events) != 1:
+        return False
+    event = events[0]
+    after = event.after_json or {}
+    parent_raw = after.get("manifest_parent_operation_id")
+    if not parent_raw:
+        return False
+    try:
+        from uuid import UUID
+        parent_id = UUID(str(parent_raw))
+    except (TypeError, ValueError):
+        return False
+    parent = session.get(ScmOperacion, parent_id)
+    parent_events = session.scalars(
+        select(ScmEvento).where(ScmEvento.operation_id == parent_id)
+    ).all()
+    parent_manifest = after.get("manifest_sha256")
+    parent_after = parent_events[0].after_json if len(parent_events) == 1 else None
+    parent_source_rows = (parent_after or {}).get("sources") or []
+    parent_source = next((row for row in parent_source_rows
+                          if row.get("source_control_public_id") == source_id), None)
+    expected_parent_id = uuid5(namespace, "active-control-manifest:" + expected_manifest_sha256)
+    expected_source_ids = ["0f39985e-c3ad-4c93-9223-4a07d8a208dd", "970a4edc-f6b8-4f65-bc07-47dcf63274c8"]
+    expected_child_ids = [str(uuid5(namespace, "active-control-source:" + value)) for value in expected_source_ids]
+    parent_request = {
+        "manifest_sha256": expected_manifest_sha256,
+        "source_control_public_ids": expected_source_ids,
+        "source_count": 2,
+        "delta_kg": "10.400",
+        "actor_id": 1,
+        "location_id": 9,
+    }
+    child_request = {"manifest_sha256": expected_manifest_sha256, "source_control_public_id": source_id}
+    expected_bundle = {
+        "source_control_public_id": source_id,
+        "manga_public_id": str(manga.public_id),
+        "net_kg": format(net, "f"),
+        "source_at": control.pesado_at.isoformat(),
+        "existence_id": str(existence.id),
+        "movement_id": str(movement.id),
+        "child_operation_id": str(child_id),
+        "manifest_parent_operation_id": str(parent_id),
+    }
+    if (
+        child.endpoint != "/kg/history-controls/active/v1/" + source_id
+        or child.actor_id != 1
+        or child.estado_http != 201
+        or child.request_sha256 != _operation_hash(child.endpoint, 1, child_request)
+        or child.response_json != {**after, "status": "APPLIED"}
+        or event.aggregate_type != "MANGA"
+        or event.aggregate_id != str(manga.id)
+        or event.tipo != "KG_ACTIVE_CONTROL_HISTORY_RECOVERED"
+        or event.actor_id != 1
+        or event.after_json is None
+        or any(after.get(key) != value for key, value in expected_bundle.items())
+        or parent_manifest != expected_manifest_sha256
+        or parent is None
+        or parent.operation_id != expected_parent_id
+        or parent.actor_id != 1
+        or parent.endpoint != "/kg/history-controls/active/manifest/v1"
+        or parent.estado_http != 201
+        or parent.request_sha256 != _operation_hash(parent.endpoint, 1, parent_request)
+        or len(parent_events) != 1
+        or parent_events[0].tipo != "KG_ACTIVE_CONTROL_HISTORY_MANIFEST_APPLIED"
+        or parent_events[0].aggregate_type != "KG_RECOVERY_BATCH"
+        or parent_events[0].aggregate_id != str(expected_parent_id)
+        or parent_events[0].actor_id != 1
+        or parent_after is None
+        or parent.response_json != parent_events[0].after_json
+        or parent_after.get("manifest_sha256") != parent_manifest
+        or parent_after.get("source_count") != 2
+        or parent_after.get("status") != "APPLIED"
+        or parent_after.get("manifest") != parent_request
+        or [row.get("source_control_public_id") for row in parent_source_rows] != expected_source_ids
+        or len({row.get("source_control_public_id") for row in parent_source_rows}) != 2
+        or [row.get("child_operation_id") for row in parent_source_rows] != expected_child_ids
+        or len({row.get("child_operation_id") for row in parent_source_rows}) != 2
+        or parent_source is None
+        or parent_source.get("existence_id") != str(existence.id)
+        or parent_source.get("movement_id") != str(movement.id)
+        or parent_source.get("child_operation_id") != str(child_id)
+        or after.get("source_type") != "CONTROL_PESO_MANGA"
+        or after.get("unidad_fisica_creada") is not False
+        or after.get("qr_creado") is not False
+        or after.get("current_physical_count_performed") is not False
+        or after.get("accounting_availability_from_measured_net") is not True
+    ):
+        return False
+    peer_source_id = (
+        "970a4edc-f6b8-4f65-bc07-47dcf63274c8"
+        if source_id == "0f39985e-c3ad-4c93-9223-4a07d8a208dd"
+        else "0f39985e-c3ad-4c93-9223-4a07d8a208dd"
+    )
+    if not peer_recovery_bundle_valid(peer_source_id):
+        return False
+    # Never waive guards for a historical source capture, an old operation,
+    # a live UN projection, or a different reason. Only the measured-history
+    # blocker may be suppressed after the full recovery bundle is proved.
+    return True
+
+
 def _assert_automatic_intake_cutoff(session, manga, source_at, operation_id):
-    """Cut on measured facts, not on when an empty manga was planned.
+    """Cut on measured facts, allowing only a verified active-control recovery.
 
     Called under the productive advisory lock and manga row lock. Original
     source/server times survive corrections, annulments and reopenings. A clean
@@ -107,16 +745,19 @@ def _assert_automatic_intake_cutoff(session, manga, source_at, operation_id):
         reason = "CAPTURE_BEFORE_CUTOFF"
     elif operation_at is None or operation_at < cutoff:
         reason = "OPERATION_BEFORE_CUTOFF"
-    # All states, including annulled/reopened facts. A proposed correction date
-    # cannot replace these original facts or their server receipt timestamps.
     weighings = session.execute(select(ScmPesajeManga.pesada_at,
         ScmPesajeManga.created_at, ScmPesajeManga.cantidad_confirmada).where(
         ScmPesajeManga.manga_id == manga.id)).all()
     controls = session.execute(select(ScmControlPesoManga.pesado_at,
         ScmControlPesoManga.created_at, ScmControlPesoManga.conteo_acumulado_un).where(
         ScmControlPesoManga.manga_id == manga.id)).all()
-    if any(utc(value) is None or utc(value) < cutoff
-           for row in [*weighings, *controls] for value in row[:2]):
+    historical_measurement = any(
+        utc(value) is None or utc(value) < cutoff
+        for row in [*weighings, *controls] for value in row[:2]
+    )
+    if historical_measurement and _complete_active_control_recovery(session, manga, operation_id, cutoff, source_at):
+        historical_measurement = False
+    if historical_measurement and reason is None:
         reason = "HISTORICAL_MEASUREMENT"
     un_values = [manga.cantidad_confirmada_un, manga.cantidad_contenida_un]
     un_values.extend(row[2] for row in [*weighings, *controls])
@@ -127,10 +768,16 @@ def _assert_automatic_intake_cutoff(session, manga, source_at, operation_id):
     if any(Decimal(value or 0) != 0 for value in un_values) or session.scalar(
         select(ScmExistenciaManga.id).where(ScmExistenciaManga.manga_id == manga.id,
             ScmExistenciaManga.estado_logistico != "REVERSADA").limit(1)) is not None:
-        reason = "LIVE_UN_PROJECTION"
-    for received_at, origin in session.execute(select(ScmExistenciaMangaKg.recibida_at,
-            ScmExistenciaMangaKg.resuelta_por).where(ScmExistenciaMangaKg.manga_id == manga.id)):
-        if origin == "KG_HISTORY_RECOVERY" or utc(received_at) is None or utc(received_at) < cutoff:
+        if reason is None:
+            reason = "LIVE_UN_PROJECTION"
+    kg_rows = session.execute(select(ScmExistenciaMangaKg.recibida_at,
+            ScmExistenciaMangaKg.resuelta_por).where(ScmExistenciaMangaKg.manga_id == manga.id)).all()
+    historical_kg_existence = any(
+        origin == "KG_HISTORY_RECOVERY" or utc(received_at) is None or utc(received_at) < cutoff
+        for received_at, origin in kg_rows
+    )
+    if historical_kg_existence and not _complete_active_control_recovery(session, manga, operation_id, cutoff, source_at):
+        if reason is None:
             reason = "HISTORICAL_KG_EXISTENCE"
     if reason:
         raise ScmServiceError(
@@ -140,8 +787,6 @@ def _assert_automatic_intake_cutoff(session, manga, source_at, operation_id):
             details={"manga_id": str(manga.public_id), "cutoff_at": cutoff.isoformat(),
                      "source_at": captured.isoformat() if captured else None, "reason": reason},
         )
-
-
 def _production_location(session, *, article_class=None):
     from flask import current_app
     from app.models.scm_inventory import ScmUbicacionInventario
@@ -390,7 +1035,39 @@ def sync_kg_production_inventory(
             unit.kg_verificados = total
             unit.kg_verificados_at = source_at or utc_now()
             unit.version += 1
-    if final:
+        elif existence.resuelta_por == "KG_HISTORY_RECOVERY" and delta >= 0:
+            # A new, real weighing/control after recovery establishes the
+            # physical identity even when final NET equals the recovered NET.
+            # Idempotent replays return before the inventory projection.
+            from app.services.scm_kg_receipt_service import _kg_identity_for_receipt
+            unit, label = _kg_identity_for_receipt(
+                session, existence=existence, article=article,
+                location=location, quantity=total, manga=manga,
+            )
+            unit.estado_logistico = "DISPONIBLE_PRODUCCION" if final else "EN_PRODUCCION"
+            unit.estado_calidad = "SIN_CONTROL"
+            unit.atributo_proceso = "TERMINADA" if final else "PROCESO"
+            unit.kg_entregado = total
+            unit.kg_verificados = total
+            existence.unidad_fisica_kg_id = unit.id
+    if existence.resuelta_por == "KG_HISTORY_RECOVERY":
+        # Reconcile this shared balance only when it contains this recovered
+        # history. Other capture flows preserve their established semantics.
+        attributes = session.execute(select(ScmExistenciaMangaKg.atributo_proceso).where(
+            ScmExistenciaMangaKg.articulo_scm_id == article.id,
+            ScmExistenciaMangaKg.ubicacion_id == location.id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+            ScmExistenciaMangaKg.id != existence.id,
+        )).scalars().all()
+        attributes.append(existence.atributo_proceso)
+        has_process = any(value in {"PROCESO", "MIXTA"} for value in attributes)
+        has_finished = any(value in {"TERMINADA", "MIXTA"} for value in attributes)
+        balance.atributo_proceso = (
+            "MIXTA" if has_process and has_finished
+            else "TERMINADA" if has_finished
+            else "PROCESO"
+        )
+    elif final:
         balance.atributo_proceso = "TERMINADA"
     elif balance.atributo_proceso == "TERMINADA":
         balance.atributo_proceso = "MIXTA"

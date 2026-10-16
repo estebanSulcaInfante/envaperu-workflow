@@ -153,6 +153,12 @@ def deactivate_article_from_kg(session, *, article_id):
         raise ScmServiceError("ARTICLE_NOT_FOUND", "El articulo no existe.", status_code=404)
     if article.unidad_inventario != "KG":
         return article
+    if article.clase in KG_CLASSES:
+        raise ScmServiceError(
+            "KG_ARTICLE_POLICY_IMMUTABLE",
+            "Las piezas y subensambles WIP deben conservar KG como unidad oficial.",
+            status_code=409,
+        )
     balance_rows = session.scalars(select(ScmSaldoInventarioKg).where(ScmSaldoInventarioKg.articulo_scm_id == article.id).with_for_update()).all()
     if any(Decimal(value or 0) != 0 for balance in balance_rows for value in (balance.cantidad_fisica_kg, balance.cantidad_reservada_kg, balance.cantidad_no_disponible_kg)):
         raise ScmServiceError("KG_DOWNGRADE_NONZERO", "El sublibro KG conserva saldo.", status_code=409)

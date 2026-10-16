@@ -22,6 +22,7 @@ from app.services.scm_kg_recovery_service import (
     _source_ids,
 )
 from app.services.scm_kg_service import deactivate_article_from_kg
+from legacy_helpers import mark_legacy_un
 import app.services.scm_kg_pilot_service as kg_pilot_service
 import app.services.scm_kg_recovery_service as recovery_service
 from app.services.scm_kg_pilot_service import prepare_kg_pilot
@@ -41,9 +42,9 @@ def _seed_recovery_service_fixture(app, *, station_code):
         _seed_aggregate_color_work(quantity=120)
     )
     article = output.articulo
-    # New piece-color rows are KG by policy.  Move this article to UN through
-    # the governed route to represent the historical omission KG009 recovers.
-    deactivate_article_from_kg(db.session, article_id=article.id)
+    # Represent the pre-policy historical omission without reopening a
+    # productive downgrade path that the global KG policy now forbids.
+    mark_legacy_un(db.session, article)
     db.session.flush()
     work_id = UUID(created["trabajo_color"]["id"])
     transition_color_work(
@@ -455,7 +456,7 @@ def test_kg009_late_deadline_rolls_back_final_unit_of_work(app, monkeypatch):
         assert db.session.get(ScmArticulo, article_id).unidad_inventario == "UN"
 
 
-def test_kg009_governed_deactivation_bypasses_guard_only_after_checks(app):
+def test_kg009_deactivation_is_closed_by_global_policy(app):
     with app.app_context():
         article = ScmArticulo(
             codigo=f"KG009-GUARD-{uuid4().hex[:8].upper()}",
@@ -473,11 +474,10 @@ def test_kg009_governed_deactivation_bypasses_guard_only_after_checks(app):
         article = db.session.get(ScmArticulo, article.id)
         assert article.unidad_inventario == "KG"
 
-        deactivated = deactivate_article_from_kg(
-            db.session, article_id=article.id
-        )
-        db.session.commit()
-        assert deactivated.unidad_inventario == "UN"
+        with pytest.raises(ScmServiceError) as error:
+            deactivate_article_from_kg(db.session, article_id=article.id)
+        assert error.value.code == "KG_ARTICLE_POLICY_IMMUTABLE"
+        assert db.session.get(ScmArticulo, article.id).unidad_inventario == "KG"
 
 
 def test_kg009_real_pilot_replay_releases_session(app):
@@ -485,7 +485,7 @@ def test_kg009_real_pilot_replay_releases_session(app):
         creator, _approver, _order, _run, output, *_ = (
             _seed_aggregate_color_work(quantity=120)
         )
-        deactivate_article_from_kg(db.session, article_id=output.articulo.id)
+        mark_legacy_un(db.session, output.articulo)
         _grant_capabilities(creator, ["ALMACEN_CONFIG_ADMINISTRAR"])
         db.session.commit()
         args = dict(

@@ -65,6 +65,11 @@ class ScmArticulo(db.Model):
             name="ck_scm_articulo_kg_class",
         ),
         db.CheckConstraint(
+            "clase NOT IN ('PIEZA_COLOR', 'SUBENSAMBLE_WIP') "
+            "OR (unidad_inventario = 'KG' AND unidad_base = 'UN')",
+            name="ck_scm_articulo_kg_inventory_policy_v1",
+        ),
+        db.CheckConstraint(
             "codigo = upper(trim(codigo)) AND length(codigo) > 0",
             name="ck_scm_articulo_codigo_normalizado",
         ),
