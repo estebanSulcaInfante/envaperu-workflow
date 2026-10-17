@@ -7,15 +7,15 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 987c50816e84c0a59ae90731323aa8a8f74917e9.
-check_ci.py accepts only GitHub Actions run 38964537258, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/warehouse-qr-tv-kg-release-20261016,
+Application source is fixed to 46eccd17c4a2514fd2ee95899c84863b7c1a9b56.
+check_ci.py accepts only GitHub Actions run 39005813138, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/tv-color-total-release-20261017,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
 
 The approved source combines the already-operational global KG policy and migration
-with the reviewed TV mold-color and warehouse QR identity changes. The image must
+with the reviewed TV total-color aggregation and warehouse QR identity changes. The image must
 preserve revision b7f31e9c120a instead of reverting to the previous head.
 
 The workflow checks out the deployment recipe at a literal commit SHA, separately
