@@ -90,8 +90,8 @@ def test_tv_progress_groups_one_card_per_canonical_run_identity_and_keeps_piece_
 
     assert len(result["items"]) == 2
     assert {item["group_id"] for item in result["items"]} == {
-        "of-1|ot-a|corrida-a|ML-1|7",
-        "of-1|ot-b|corrida-b|ML-1|8",
+        "of-1|corrida-a|ML-1|7",
+        "of-1|corrida-b|ML-1|8",
     }
     assert all(len(item["salidas"]) == 2 for item in result["items"])
     assert all(item["identity"]["molde_id"] == "ML-1" for item in result["items"])
@@ -206,7 +206,7 @@ def test_tv_progress_redacts_mold_identity_without_of_permission(monkeypatch):
     color_work.molde_codigo_snapshot = None
     hidden_incomplete = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
     assert "molde_visible" not in hidden_incomplete
-    assert hidden_incomplete["identity"]["identity_status"] == hidden["identity"]["identity_status"]
+    assert hidden_incomplete["identity"]["identity_status"] == "INCOMPLETA"
     assert all("MOLDE" not in issue for issue in hidden_incomplete["identity"]["identity_issues"])
     public_without_mold = {
         key: ({inner_key: inner_value for inner_key, inner_value in value.items() if inner_key != "group_id"}
@@ -218,7 +218,8 @@ def test_tv_progress_redacts_mold_identity_without_of_permission(monkeypatch):
               if key == "identity" else value)
         for key, value in hidden.items() if key != "group_id"
     }
-    assert public_without_mold == public_with_mold
+    assert public_without_mold["identity"]["identity_status"] == "INCOMPLETA"
+    assert public_with_mold["identity"]["identity_status"] == "COMPLETA"
     assert "molde" not in json.dumps(hidden_incomplete).lower()
     color_work.molde_codigo_snapshot = "ML-SECRET"
 
@@ -268,8 +269,8 @@ def test_tv_progress_separates_incomplete_identity_by_work_source_marker(monkeyp
 
     assert len(items) == 2
     assert {item["group_id"] for item in items} == {
-        "incompleto:of-shared|ot-shared|corrida-shared|?|?|work-missing-a",
-        "incompleto:of-shared|ot-shared|corrida-shared|?|?|work-missing-b",
+        "incompleto:of-shared|corrida-shared|?|?|work-missing-a",
+        "incompleto:of-shared|corrida-shared|?|?|work-missing-b",
     }
     assert all(item["identity"]["identity_status"] == "INCOMPLETA" for item in items)
 
@@ -465,6 +466,246 @@ def _segment(sequence, start, end, attributed, quality="MEDIDA_DIRECTA", attribu
         cerrada_at=None,
         calidad_evidencia_kg=quality,
     )
+
+
+def _tv_aggregate_run(*, corrida_id="run-aggregate", works=None, contexts=None,
+                      mangas=None, color_id=7, color_name="Azul", output_meta="5"):
+    works = works or [SimpleNamespace(id="work-a")]
+    contexts = contexts or [
+        {"work": works[0], "color_work": SimpleNamespace(
+            molde_codigo_snapshot="ML-1", color_id_snapshot=color_id,
+        ), "ot": SimpleNamespace(id=1, public_id="ot-a", codigo_ot="OT-A")}
+    ]
+    piece = SimpleNamespace(id=11, nombre="Pieza azul")
+    article = SimpleNamespace(
+        id=201, codigo="PC-A", nombre="Salida azul",
+        pieza_color=SimpleNamespace(pieza_color=SimpleNamespace(
+            id=301, sku="PC-A", pieza_rel=piece,
+        )),
+    )
+    output = SimpleNamespace(
+        id=401, articulo=article, kg_estandar_objetivo=Decimal(output_meta),
+        cantidad_objetivo=Decimal("10"),
+    )
+    corrida = SimpleNamespace(
+        id=corrida_id, codigo=f"C-{corrida_id}", estado="EN_EJECUCION",
+        objetivo_neto_kg=None,
+        color_produccion=SimpleNamespace(
+            id=color_id, codigo=color_name.upper(), nombre=color_name,
+            hex_referencia="#123456",
+        ), salidas=[output],
+    )
+    return {
+        "orden": SimpleNamespace(
+            id="of-aggregate", codigo="OF-AGG", estado="EN_EJECUCION",
+            molde_id="ML-1",
+        ),
+        "corrida": corrida,
+        "works": [(context["work"], context.get("color_work"), context.get("ot")) for context in contexts],
+        "contexts": contexts,
+        "mangas": mangas or {},
+        "moldes": {"ML-1": SimpleNamespace(codigo="ML-1", nombre="Molde 1")},
+        "color_name": color_name, "color_id": color_id,
+        "color_code": color_name.upper(), "color_hex": "#123456",
+        "molde": SimpleNamespace(codigo="ML-1", nombre="Molde 1"),
+    }
+
+
+def _tv_manga(manga_id, work, kg, *, segments=None):
+    article = SimpleNamespace(id=201)
+    return SimpleNamespace(
+        id=manga_id, estado="PESADA", trabajo=work,
+        correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=segments or [], _report_final_kg=Decimal(str(kg)),
+        _report_open_kg=None, _report_quantity_un=None,
+        _report_weight_corrected=False,
+    )
+
+
+def test_tv_progress_consolidates_two_ots_into_one_output_target(monkeypatch):
+    work_a, work_b = SimpleNamespace(id="work-a"), SimpleNamespace(id="work-b")
+    contexts = [
+        {"work": work_a, "color_work": SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7),
+         "ot": SimpleNamespace(id=1, public_id="ot-a", codigo_ot="OT-A")},
+        {"work": work_b, "color_work": SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7),
+         "ot": SimpleNamespace(id=2, public_id="ot-b", codigo_ot="OT-B")},
+    ]
+    mangas = {1: _tv_manga(1, work_a, "2"), 2: _tv_manga(2, work_b, "3")}
+    run = _tv_aggregate_run(works=[work_a, work_b], contexts=contexts, mangas=mangas)
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    item = list_production_progress_tv(object(), actor_id=7, filters={})["items"]
+
+    assert len(item) == 1
+    output = item[0]["salidas"]
+    assert len(output) == 1
+    assert (output[0]["meta"], output[0]["avance"], output[0]["porcentaje"]) == (5.0, 5.0, 100.0)
+    assert item[0]["ot_ids"] == ["ot-a", "ot-b"]
+    assert {entry["codigo"] for entry in item[0]["ots"]} == {"OT-A", "OT-B"}
+
+
+def test_tv_progress_does_not_double_count_manga_shared_by_contexts(monkeypatch):
+    work_a, work_b = SimpleNamespace(id="work-a"), SimpleNamespace(id="work-b")
+    contexts = [
+        {"work": work_a, "color_work": SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7),
+         "ot": SimpleNamespace(id=1, public_id="ot-a", codigo_ot="OT-A")},
+        {"work": work_b, "color_work": SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7),
+         "ot": SimpleNamespace(id=2, public_id="ot-b", codigo_ot="OT-B")},
+    ]
+    # The same physical manga is present once in the normalized run and is
+    # owned by only work A, even though the run has two OT contexts.
+    run = _tv_aggregate_run(works=[work_a, work_b], contexts=contexts,
+                            mangas={1: _tv_manga(1, work_a, "2")})
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    output = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+
+    assert output["avance"] == 2.0
+    assert output["porcentaje"] == 40.0
+
+
+def test_tv_progress_keeps_different_runs_separate_even_with_same_color_name(monkeypatch):
+    runs = [
+        _tv_aggregate_run(corrida_id="run-a", color_name="Azul"),
+        _tv_aggregate_run(corrida_id="run-b", color_name="Azul"),
+    ]
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: runs)
+
+    items = list_production_progress_tv(object(), actor_id=7, filters={})["items"]
+
+    assert len(items) == 2
+    assert {item["corrida_id"] for item in items} == {"run-a", "run-b"}
+
+
+def test_tv_progress_allows_missing_ot_when_core_identity_and_evidence_are_attributable(monkeypatch):
+    work = SimpleNamespace(id="work-no-ot")
+    context = {"work": work, "color_work": SimpleNamespace(
+        molde_codigo_snapshot="ML-1", color_id_snapshot=7,
+    ), "ot": None}
+    run = _tv_aggregate_run(works=[work], contexts=[context],
+                            mangas={1: _tv_manga(1, work, "5")})
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    item = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+    output = item["salidas"][0]
+
+    assert output["porcentaje"] == 100.0
+    assert "OT_ID_AUSENTE" in item["provenance"]["issues"]
+    assert item["identity"]["identity_status"] == "COMPLETA"
+
+
+def test_tv_progress_keeps_percentage_null_when_kg_is_not_attributable(monkeypatch):
+    work = SimpleNamespace(id="work-owned")
+    foreign_work = SimpleNamespace(id="work-foreign")
+    segment = _segment(1, "0", "5", "5")
+    segment.trabajo = foreign_work
+    run = _tv_aggregate_run(works=[work], mangas={
+        1: _tv_manga(1, work, "5", segments=[segment]),
+    })
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    output = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+
+    assert output["avance"] is None
+    assert output["porcentaje"] is None
+    assert output["estado_avance"] == "SIN_PESAJES"
+
+
+def test_tv_progress_preserves_meta_but_hides_weighted_progress_without_permission(monkeypatch):
+    work = SimpleNamespace(id="work-restricted")
+    run = _tv_aggregate_run(works=[work], mangas={1: _tv_manga(1, work, "5")})
+    actor = SimpleNamespace(tiene_capacidad=lambda capability: capability != "MANGA_PESAJE_VER")
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: actor)
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    output = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+
+    assert output["meta"] == 5.0
+    assert output["avance"] is None
+    assert output["porcentaje"] is None
+    assert output["estado_avance"] == "SIN_PERMISO_PESAJE"
+
+
+def test_tv_actual_ignores_known_foreign_mass_but_marks_own_plus_ownerless_incomplete():
+    work = SimpleNamespace(id="work-owned")
+    foreign = SimpleNamespace(id="work-foreign")
+    ownerless = _segment(2, "3", "5", "2")
+    ownerless.trabajo = None
+    own = _segment(1, "0", "3", "3")
+    own.trabajo = work
+    foreign_only = _tv_manga(1, work, "5", segments=[_segment(1, "0", "5", "5")])
+    foreign_only._report_segments[0].trabajo = foreign
+    own_plus_unknown = _tv_manga(2, work, "5", segments=[own, ownerless])
+    run = {"works": [(work, None, None)], "mangas": {1: foreign_only, 2: own_plus_unknown}}
+
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    assert _progress_tv_actual({"works": run["works"], "mangas": {1: foreign_only}}, 201, "KG") == (None, False)
+    assert _progress_tv_actual({"works": run["works"], "mangas": {2: own_plus_unknown}}, 201, "KG") == (None, True)
+
+
+def test_tv_actual_marks_no_segments_ownerless_physical_mass_incomplete():
+    work = SimpleNamespace(id="work-owned")
+    ownerless = _tv_manga(1, None, "2")
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    assert _progress_tv_actual({"works": [(work, None, None)], "mangas": {1: ownerless}}, 201, "KG") == (None, True)
+
+
+def test_tv_group_id_and_ot_order_do_not_depend_on_context_order(monkeypatch):
+    work_a, work_b = SimpleNamespace(id="work-a"), SimpleNamespace(id="work-b")
+    context_a = {"work": work_a, "color_work": SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7),
+                 "ot": SimpleNamespace(id=2, public_id="ot-b", codigo_ot="OT-B")}
+    context_b = {"work": work_b, "color_work": SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7),
+                 "ot": SimpleNamespace(id=1, public_id="ot-a", codigo_ot="OT-A")}
+    runs = [
+        _tv_aggregate_run(works=[work_a, work_b], contexts=[context_a, context_b]),
+        _tv_aggregate_run(works=[work_a, work_b], contexts=[context_b, context_a]),
+    ]
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: runs[:1])
+    first = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: runs[1:])
+    second = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]
+
+    assert first["group_id"] == second["group_id"] == "of-aggregate|run-aggregate|ML-1|7"
+    assert first["ots"] == second["ots"] == [
+        {"id": "ot-a", "codigo": "OT-A"}, {"id": "ot-b", "codigo": "OT-B"},
+    ]
+    assert first["ot_id"] is second["ot_id"] is None
+    assert first["ot"] is second["ot"] is None
+    assert first["identity"]["ot_id"] is second["identity"]["ot_id"] is None
+
+
+def test_tv_mold_missing_has_same_cardinality_and_state_with_or_without_of_permission(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "tv-02-server-secret-for-tests")
+    work = SimpleNamespace(id="work-mold-missing")
+    context = {"work": work, "color_work": SimpleNamespace(molde_codigo_snapshot=None, color_id_snapshot=7),
+               "ot": SimpleNamespace(id=1, public_id="ot-a", codigo_ot="OT-A")}
+    run = _tv_aggregate_run(works=[work], contexts=[context], mangas={1: _tv_manga(1, work, "2")})
+    run["orden"].molde_id = None
+    run["moldes"] = {}
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+    visible_actor = SimpleNamespace(tiene_capacidad=lambda _capability: True)
+    hidden_actor = SimpleNamespace(tiene_capacidad=lambda capability: capability != "OF_VER")
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: visible_actor)
+    visible = list_production_progress_tv(object(), actor_id=7, filters={})
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: hidden_actor)
+    hidden = list_production_progress_tv(object(), actor_id=7, filters={})
+
+    assert len(visible["items"]) == len(hidden["items"]) == 1
+    visible_row = visible["items"][0]["salidas"][0]
+    hidden_row = hidden["items"][0]["salidas"][0]
+    assert (visible_row["estado_avance"], visible_row["avance"], visible_row["porcentaje"]) == (
+        hidden_row["estado_avance"], hidden_row["avance"], hidden_row["porcentaje"],
+    ) == ("INCOMPLETO", None, None)
+    assert visible["items"][0]["identity"]["identity_status"] == hidden["items"][0]["identity"]["identity_status"] == "INCOMPLETA"
 
 
 def test_kg_segments_require_zero_continuity_and_exact_net():
@@ -1343,6 +1584,7 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
     from app.models.scm_articulos import ScmArticulo
     from app.models.molde import Pieza
     from app.models.producto import PiezaColor
+    from app.models.registro import RegistroDiarioProduccion
     from uuid import uuid4
 
     with app.app_context():
@@ -1404,6 +1646,94 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         assert row["avance"] == pytest.approx(11.5)
         assert row["estado_avance"] == "SOBREPRODUCCION"
         assert db.session.get(ScmManga, weighed_manga.id).estado == "PENDIENTE_RECEPCION_ALMACEN"
+
+
+def test_tv_progress_http_consolidates_real_multi_ot_contexts(app, client, scm_config):
+    """Endpoint/DB regression: one corrida with two OTs yields one card."""
+    from test_scm_production_observability import _seed_observability_graph
+    from app.models.scm_articulos import ScmArticulo
+    from app.models.molde import Pieza
+    from app.models.producto import PiezaColor
+    from app.models.registro import RegistroDiarioProduccion
+    from uuid import uuid4
+
+    with app.app_context():
+        app.config["SECRET_KEY"] = "tv-02-server-secret-for-tests"
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabrication = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabrication)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=order.id, codigo="C-OF-TV-MULTI-OT", secuencia=12,
+            objetivo_neto_kg=Decimal("10"), estado="EN_EJECUCION",
+        )
+        piece = Pieza(codigo="PZ-TV-MULTI", nombre="Pieza multi OT", peso_nominal_gr=100)
+        db.session.add_all([corrida, piece])
+        db.session.flush()
+        variant = PiezaColor(sku=f"PC-TV-MULTI-{uuid4().hex[:10]}".upper(), pieza_id=piece.id, piezas=piece.nombre)
+        db.session.add(variant)
+        db.session.flush()
+        from app.services.scm_article_service import _ensure_piece_article
+        _ensure_piece_article(db.session, variant)
+        article = ScmArticulo.query.filter_by(codigo=variant.sku).one()
+        output = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=corrida.id,
+            articulo_scm_id=article.id, cantidad_objetivo=100,
+            kg_estandar_objetivo=10, excedente_objetivo=0,
+        )
+        db.session.add(output)
+        db.session.flush()
+        lot = ScmLoteArticulo(
+            codigo="LOTE-TV-MULTI", articulo_id=article.id,
+            clase="SALIDA_ORDEN_OPERACION", orden_operacion_salida_id=output.id,
+            cantidad_acreditada=1,
+        )
+        db.session.add(lot)
+        red = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-ROJO").one()
+        blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
+        for work in (red, blue):
+            color_work = ScmTrabajoColor.query.filter_by(trabajo_ot_id=work.id).one()
+            color_work.corrida_fabricacion_id = corrida.id
+            color_work.molde_codigo_snapshot = "ML-OBS"
+            color_work.color_id_snapshot = 1
+        second_ot = RegistroDiarioProduccion(
+            codigo_ot="OT-OBS-FAB-2", codigo_ot_sintetico=False,
+            estado="EN_EJECUCION", tipo_ot="FABRICACION", fecha=date(2026, 8, 10),
+            turno="DIA", maquina_id=1, responsable_id=seeded["full"].id,
+            maquinista_previsto_id=seeded["full"].id, created_by_id=seeded["full"].id,
+        )
+        db.session.add(second_ot)
+        db.session.flush()
+        second_work = ScmTrabajoOt(
+            orden_trabajo_id=second_ot.id, codigo="TC-OBS-VERDE",
+            secuencia=1, estado="EN_EJECUCION", orden_operacion_id=order.id,
+            cantidad_objetivo_un=100, cantidad_confirmada_un=0,
+            created_by_id=seeded["full"].id,
+        )
+        db.session.add(second_work)
+        db.session.flush()
+        db.session.add(ScmTrabajoColor(
+            trabajo_ot_id=second_work.id, corrida_fabricacion_id=corrida.id,
+            color_nombre_snapshot="AZUL", molde_codigo_snapshot="ML-OBS",
+            color_id_snapshot=1,
+        ))
+        weighed_manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
+        weighed_manga.lote_articulo = lot
+        db.session.commit()
+
+        response = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        )
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        cards = [item for item in payload["items"] if item["corrida_id"] == str(corrida.id)]
+        assert len(cards) == 1
+        assert cards[0]["group_id"].startswith("tvgrp-") or cards[0]["group_id"] == f"{order.id}|{corrida.id}|ML-OBS|1"
+        assert len(cards[0]["ots"]) == 2
+        assert len(cards[0]["salidas"]) == 1
 
 
 def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, scm_config):

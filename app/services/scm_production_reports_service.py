@@ -820,6 +820,13 @@ def _progress_tv_actual(run, article_id, unit):
                 or bool(getattr(segment, "calidad_evidencia_kg", None))
                 for segment in segments
             )
+            segment_owners = [
+                effective_work_for_segment(manga, segment)
+                for segment in corrected_segments
+                if str(getattr(segment, "estado", "")).upper() != "ANULADO"
+            ]
+            has_ownerless_segment = any(owner is None for owner in segment_owners)
+            has_own_segment = any(getattr(owner, "id", None) in work_ids for owner in segment_owners if owner is not None)
             if unit == "KG" and observed is not None and _segment_conciliates(corrected_segments, observed):
                 attributed = sum((
                     _d(segment.cantidad_atribuida_kg) or Decimal("0")
@@ -827,20 +834,22 @@ def _progress_tv_actual(run, article_id, unit):
                     if (segment_owner := effective_work_for_segment(manga, segment)) is not None
                     and segment_owner.id in work_ids
                 ), Decimal("0"))
-                if unit == "KG" and net is not None and attributed > 0:
+                if net is not None and attributed > 0 and not has_ownerless_segment:
                     total += attributed
                     evidence = True
+                elif net is not None and (has_ownerless_segment or has_own_segment):
+                    # A known foreign owner is safely ignored.  An absent
+                    # owner, even alongside attributable mass, makes the
+                    # objective incomplete because the physical net cannot be
+                    # fully assigned.
+                    incomplete = True
             elif unit == "KG":
-                segment_owners = {
-                    item.id for segment in corrected_segments
-                    if (item := effective_work_for_segment(manga, segment)) is not None
-                    and str(getattr(segment, "estado", "")).upper() != "ANULADO"
-                }
                 valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
-                if not has_kg_ledger and valid_un and segment_owners and segment_owners <= work_ids and net is not None:
+                segment_owner_ids = {owner.id for owner in segment_owners if owner is not None}
+                if not has_kg_ledger and valid_un and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment and net is not None:
                     total += net
                     evidence = True
-                elif segment_owners & work_ids:
+                elif has_ownerless_segment or has_own_segment:
                     incomplete = True
             elif unit == "UN":
                 valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
@@ -851,13 +860,21 @@ def _progress_tv_actual(run, article_id, unit):
                     and segment_owner.id in work_ids
                     and str(getattr(segment, "estado", "")).upper() != "ANULADO"
                 ), Decimal("0"))
-                if valid_un and attributed_un > 0:
+                if valid_un and attributed_un > 0 and not has_ownerless_segment:
                     total += attributed_un
                     evidence = True
-                elif owner is not None and owner.id in work_ids:
+                elif has_ownerless_segment or has_own_segment:
                     incomplete = True
             continue
-        if owner is None or owner.id not in work_ids:
+        if owner is None:
+            # A manga with physical evidence but no current owner is not a
+            # foreign contribution: it is an attribution failure.
+            if net is not None or _d(getattr(manga, "_report_quantity_un", None)) is not None:
+                incomplete = True
+            continue
+        if owner.id not in work_ids:
+            # Known foreign ownership is outside this objective and is ignored
+            # without making the current objective incomplete.
             continue
         if unit == "KG":
             if net is not None:
@@ -896,6 +913,18 @@ def _tv_group_hmac_secret():
     if len(secret) < 16:
         raise RuntimeError("TV_GROUP_ID_SECRET_NOT_CONFIGURED")
     return secret
+
+
+def _tv_canonical_group_id(parts, *, expose_mold=True, incomplete=False):
+    """Build an OT-independent, deterministic public card identifier."""
+    values = tuple(value if value is not None else "?" for value in parts)
+    if not expose_mold:
+        digest_source = "\x1f".join(values)
+        return "tvgrp-" + hmac.new(
+            _tv_group_hmac_secret(), digest_source.encode("utf-8"), hashlib.sha256,
+        ).hexdigest()[:24]
+    prefix = "incompleto:" if incomplete else ""
+    return prefix + "|".join(values)
 
 
 def _tv_contexts(run):
@@ -1037,8 +1066,60 @@ def _tv_group_run(run, contexts):
     return scoped
 
 
+def _tv_aggregate_identity(run, context, *, expose_mold=True):
+    """Return the TV identity at the color/output grain.
+
+    OT is provenance for this report, not part of the aggregation key.  Keep
+    the legacy identity as the public fallback for a single context, while
+    deriving a separate canonical key that can safely merge several OT rows.
+    Missing core identity (OF, corrida, mold or color) still gets a source
+    marker so unrelated historical rows are never silently collapsed.  A
+    missing OT alone is therefore a note, not a reason to block the total.
+    """
+    identity = _tv_context_identity(run, context, expose_mold=expose_mold)
+    canonical_mold = identity.get("_canonical_molde_id", identity.get("molde_id"))
+    core = (
+        identity.get("of_id"),
+        identity.get("corrida_id"),
+        _tv_identity_value(canonical_mold),
+        identity.get("color_id"),
+    )
+    missing = [
+        label for label, value in (
+            ("OF_ID_AUSENTE", core[0]),
+            ("CORRIDA_ID_AUSENTE", core[1]),
+            ("MOLDE_ID_AUSENTE", core[2]),
+            ("COLOR_ID_AUSENTE", core[3]),
+        ) if value is None
+    ]
+    if identity.get("_legacy_fixture"):
+        # Compatibility for small service fixtures that intentionally omit
+        # persisted identity relations; their tests exercise evidence math.
+        missing = []
+    source = _tv_identity_value(
+        getattr((context or {}).get("work"), "id", None)
+        or getattr(run.get("corrida"), "id", None)
+        or getattr(run.get("corrida"), "codigo", None)
+        or "fila"
+    )
+    canonical_key = (*core, source) if missing else core
+    identity["group_id"] = _tv_canonical_group_id(
+        canonical_key, expose_mold=expose_mold, incomplete=bool(missing),
+    )
+    identity["_aggregate_key"] = canonical_key
+    identity["_aggregate_missing"] = missing
+    identity["_canonical_molde_id"] = _tv_identity_value(canonical_mold)
+    identity["_ot_missing"] = identity.get("ot_id") is None
+    return identity
+
+
 def list_production_progress_tv(session, *, actor_id, filters=None):
-    """Read-only progress, one card per canonical OF/OT/run/mold/color key."""
+    """Read-only progress, one card per OF/run/mold/color objective.
+
+    OT rows are collected as secondary provenance under that objective.  The
+    physical ledger and output targets are evaluated once for the merged set
+    of work contexts, so neither targets nor manga evidence are multiplied.
+    """
     actor = load_actor(session, actor_id, capability="OT_VER")
     visible = actor.tiene_capacidad("MANGA_PESAJE_VER")
     can_view_of = actor.tiene_capacidad("OF_VER")
@@ -1057,33 +1138,58 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
             continue
         contexts = _tv_contexts(run)
         context_identities = [
-            (context, _tv_context_identity(run, context, expose_mold=can_view_of))
+            (context, _tv_aggregate_identity(run, context, expose_mold=can_view_of))
             for context in contexts
         ]
         identity_shapes = defaultdict(set)
         for _context, identity in context_identities:
             identity_shapes[
-                (identity["of_id"], identity["ot_id"], identity["corrida_id"])
+                (identity["of_id"], identity["corrida_id"])
             ].add((identity.get("_canonical_molde_id", identity.get("molde_id")), identity["color_id"]))
         for context, identity in context_identities:
-            base = (identity["of_id"], identity["ot_id"], identity["corrida_id"])
+            base = (identity["of_id"], identity["corrida_id"])
             if len(identity_shapes[base]) > 1:
                 identity["identity_status"] = "INCOMPLETA"
                 identity["identity_issues"] = [
                     *identity["identity_issues"], "IDENTIDAD_CONFLICTIVA"
                 ]
-                identity["group_id"] = f"conflicto:{identity['group_id']}"
-            key = identity["group_id"]
+                conflict_source = _tv_identity_value(
+                    getattr((context or {}).get("work"), "id", None)
+                    or identity.get("group_id")
+                )
+                identity["_aggregate_key"] = (*identity["_aggregate_key"], conflict_source)
+                identity["group_id"] = _tv_canonical_group_id(
+                    identity["_aggregate_key"], expose_mold=can_view_of, incomplete=True,
+                )
+            # OT is deliberately absent from the aggregation key.  A missing
+            # OT is represented in provenance and does not block calculation
+            # while missing core identity remains isolated by source marker.
+            key = identity["_aggregate_key"]
             legacy_fixture = identity.pop("_legacy_fixture", False)
+            missing_core = identity.pop("_aggregate_missing", [])
             identity.pop("_canonical_molde_id", None)
+            identity.pop("_aggregate_key", None)
+            identity["identity_issues"] = [
+                issue for issue in identity.get("identity_issues", [])
+                if issue not in {"OF_ID_AUSENTE", "CORRIDA_ID_AUSENTE"}
+            ]
+            if missing_core or "IDENTIDAD_CONFLICTIVA" in identity.get("identity_issues", []):
+                identity["identity_status"] = "INCOMPLETA"
+            else:
+                # OT_ID_AUSENTE is retained as provenance, but it does not
+                # invalidate an otherwise attributable color objective.
+                identity["identity_status"] = "COMPLETA"
             item = grouped.setdefault(key, {
-                "group_id": key,
+                "group_id": identity["group_id"],
                 "identity": identity,
                 "of_id": identity["of_id"],
                 "of": getattr(order, "codigo", None),
                 "estado": state,
                 "ot_id": identity["ot_id"],
                 "ot": getattr(context.get("ot") if context else None, "codigo_ot", None),
+                "ot_ids": [],
+                "ots": [],
+                "provenance": {"issues": []},
                 "corrida_id": identity["corrida_id"],
                 "corrida": getattr(run["corrida"], "codigo", None),
                 "color_id": identity["color_id"],
@@ -1094,6 +1200,38 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                 "_runs": [],
                 "_contexts": [],
             })
+            ot_id = identity.get("ot_id")
+            ot_code = getattr(context.get("ot") if context else None, "codigo_ot", None)
+            if ot_id is not None or ot_code is not None:
+                ot_entry = {"id": ot_id, "codigo": ot_code}
+                if ot_entry not in item["ots"]:
+                    item["ots"].append(ot_entry)
+                if ot_id is not None and ot_id not in item["ot_ids"]:
+                    item["ot_ids"].append(ot_id)
+            elif "OT_ID_AUSENTE" not in item["provenance"]["issues"]:
+                item["provenance"]["issues"].append("OT_ID_AUSENTE")
+            item["provenance"]["issues"].extend(
+                issue for issue in identity.get("identity_issues", [])
+                if issue not in item["provenance"]["issues"]
+            )
+            if missing_core:
+                item["provenance"]["issues"].extend(
+                    issue for issue in missing_core
+                    if can_view_of or issue != "MOLDE_ID_AUSENTE"
+                    if issue not in item["provenance"]["issues"]
+                )
+            if item["identity"].get("identity_status") != "COMPLETA" or identity.get("identity_status") == "INCOMPLETA":
+                item["identity"]["identity_status"] = "INCOMPLETA"
+                item["identity"]["identity_issues"] = list(dict.fromkeys(
+                    [
+                        *item["identity"].get("identity_issues", []),
+                        *(
+                            missing_core
+                            if can_view_of
+                            else [issue for issue in missing_core if issue != "MOLDE_ID_AUSENTE"]
+                        ),
+                    ]
+                ))
             if can_view_of:
                 item["molde_visible"] = True
                 item["molde_id"] = identity.get("molde_id")
@@ -1106,6 +1244,23 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
             item["_contexts"].append(context)
 
     for item in grouped.values():
+        item["ots"] = sorted(
+            item["ots"],
+            key=lambda value: (str(value.get("codigo") or ""), str(value.get("id") or "")),
+        )
+        item["ot_ids"] = sorted(item["ot_ids"], key=str)
+        # OT is secondary provenance at the consolidated color/piece grain.
+        # Never leak whichever context happened to be loaded first when a
+        # card contains multiple OTs; retain singular compatibility only for
+        # exactly one known provenance entry.
+        if len(item["ots"]) == 1:
+            item["ot_id"] = item["ots"][0].get("id")
+            item["ot"] = item["ots"][0].get("codigo")
+            item["identity"]["ot_id"] = item["ot_id"]
+        else:
+            item["ot_id"] = None
+            item["ot"] = None
+            item["identity"]["ot_id"] = None
         outputs = []
         seen_output_ids = set()
         # The key includes corrida_id, so this list normally has one run.  The
@@ -1157,7 +1312,10 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     getattr(piece, "id", None) is None
                     and not item.get("_legacy_fixture")
                 )
-                identity_incomplete = item["identity"]["identity_status"] != "COMPLETA" or piece_identity_incomplete
+                identity_incomplete = (
+                    item["identity"]["identity_status"] != "COMPLETA"
+                    or piece_identity_incomplete
+                )
                 if identity_incomplete:
                     status = "INCOMPLETO"
                     progress = remaining = percent = None
