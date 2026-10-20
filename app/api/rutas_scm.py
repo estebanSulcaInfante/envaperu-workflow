@@ -270,6 +270,10 @@ from app.services.scm_manga_detail_service import (
     get_manga_detail,
     list_manga_history,
 )
+from app.services.scm_manga_explorer_service import (
+    generate_manga_explorer_xlsx,
+    list_manga_explorer,
+)
 from app.services.scm_product_onboarding_service import (
     apply_onboarding_image,
     apply_onboarding_step,
@@ -1695,6 +1699,15 @@ def observabilidad_mangas_listar():
     ))
 
 
+@scm_bp.get("/observabilidad/mangas-fabricacion")
+def observabilidad_mangas_fabricacion_listar():
+    return jsonify(list_manga_explorer(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    ))
+
+
 
 @scm_bp.get("/observabilidad/trabajos-impresion")
 def observabilidad_trabajos_impresion_listar():
@@ -1787,6 +1800,21 @@ def observabilidad_manga_detalle(public_id):
         actor_id=_actor_id(),
         public_id=public_id,
     ))
+
+
+@scm_bp.get("/observabilidad/mangas-fabricacion/export.xlsx")
+def observabilidad_mangas_exportar():
+    workbook = generate_manga_explorer_xlsx(
+        db.session,
+        actor_id=_actor_id(),
+        filters=request.args.to_dict(flat=True),
+    )
+    return send_file(
+        workbook,
+        as_attachment=True,
+        download_name="mangas-fabricacion.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @scm_bp.get("/observabilidad/produccion-historica/export.xlsx")
