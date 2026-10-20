@@ -1,5 +1,5 @@
 {
-  "source_sha": "6439be216d1ca92340bbc577c168a16c25bd8381",
+  "source_sha": "5f9a548811f971da6fe63c5df7d9eb09316f3043",
   "files": {
     "app/__init__.py": "7ec9b0d2139086b2ce808894982961c14c62bda682b8f220a0ba6f61b6dee814",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -119,7 +119,7 @@
     "app/services/scm_legacy_kit_precondition.py": "406bd3f5baf88c6a229242c33f0dab9164e5405d7674aa00cf1bc8481991fcee",
     "app/services/scm_manga_assignment_projection.py": "edb9d702a9967143f2a453922ef9dd73b8aa43076e48a1e469bff724d696f48b",
     "app/services/scm_manga_detail_service.py": "93cf64a4cdc3a8210c6632701b0f55440655e322a16373cb29e346380af0b7ae",
-    "app/services/scm_manga_explorer_service.py": "cc74ca8918b425581a4e3774cb7f975fbebd2f770b704d1abcc3791e4dd730e4",
+    "app/services/scm_manga_explorer_service.py": "2827d273ed6ed9f6817346529d6bcf785ef6baf21a72b6f127b85895c4d12d54",
     "app/services/scm_material_catalog_service.py": "4e9f337e121c0684a8e8930023da10c0af1719cc327e3aef1934a451a6c64d06",
     "app/services/scm_material_execution_service.py": "e7cc8f1b54b18a1bfacbdc28c8690c40806860f16a6032933a5581f3f2b35f39",
     "app/services/scm_material_service.py": "6f242c718e5e17a9ce2f46401016cb9f31c7ad677ce2502939bf1ff4e674d72d",

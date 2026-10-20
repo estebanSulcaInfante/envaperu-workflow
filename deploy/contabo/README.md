@@ -7,16 +7,17 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 6439be216d1ca92340bbc577c168a16c25bd8381.
-check_ci.py accepts only GitHub Actions run 39382589661, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/mangas-explorer-release-20261020,
+Application source is fixed to 5f9a548811f971da6fe63c5df7d9eb09316f3043.
+check_ci.py accepts only GitHub Actions run 39500155347, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/mangas-density-export-release-20261020,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
 
 The approved source combines the already-operational global KG policy and migration
 with the reviewed TV total-color aggregation, warehouse QR identity changes, and
-the additive Fabricación manga explorer / summary and detailed Excel export. The image must
+the additive Fabricación manga explorer / summary and detailed Excel export, including
+compact rows, maquinistas, date criteria, recipe materials, mold and approximate cycles. The image must
 preserve revision b7f31e9c120a instead of reverting to the previous head.
 
 The workflow checks out the deployment recipe at a literal commit SHA, separately
