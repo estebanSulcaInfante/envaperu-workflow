@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 46eccd17c4a2514fd2ee95899c84863b7c1a9b56
+  SOURCE_SHA: 6439be216d1ca92340bbc577c168a16c25bd8381
   RECIPE_SHA: 9187ab33eaf4105043b20fa32a7291d28c0aa7fa
   PYTHON_BASE: ${{ inputs.python_base }}
   IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
@@ -59,7 +59,7 @@ jobs:
       - name: Checkout exact application source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 46eccd17c4a2514fd2ee95899c84863b7c1a9b56
+          ref: 6439be216d1ca92340bbc577c168a16c25bd8381
           path: source
           persist-credentials: false
       - name: Build from newly generated hashed context

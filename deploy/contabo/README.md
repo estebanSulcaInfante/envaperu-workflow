@@ -7,15 +7,16 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 46eccd17c4a2514fd2ee95899c84863b7c1a9b56.
-check_ci.py accepts only GitHub Actions run 39005813138, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/tv-color-total-release-20261017,
+Application source is fixed to 6439be216d1ca92340bbc577c168a16c25bd8381.
+check_ci.py accepts only GitHub Actions run 39382589661, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/mangas-explorer-release-20261020,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
 
 The approved source combines the already-operational global KG policy and migration
-with the reviewed TV total-color aggregation and warehouse QR identity changes. The image must
+with the reviewed TV total-color aggregation, warehouse QR identity changes, and
+the additive Fabricación manga explorer / summary and detailed Excel export. The image must
 preserve revision b7f31e9c120a instead of reverting to the previous head.
 
 The workflow checks out the deployment recipe at a literal commit SHA, separately
@@ -24,7 +25,7 @@ pins that reviewed recipe. Both commits require review. Actions are pinned to SH
 
 ## Runtime files and templates
 
-runtime-allowlist.json enumerates 257 approved files with SHA-256 hashes.
+runtime-allowlist.json enumerates 258 approved files with SHA-256 hashes.
 build_context.py creates a NEW context from these bytes; the source checkout is
 never sent to Docker. Unexpected files in the checkout do not enter the context.
 Every approved byte must match the fixed source; symlinks/escaping paths fail.

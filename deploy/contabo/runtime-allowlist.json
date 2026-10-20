@@ -1,5 +1,5 @@
 {
-  "source_sha": "46eccd17c4a2514fd2ee95899c84863b7c1a9b56",
+  "source_sha": "6439be216d1ca92340bbc577c168a16c25bd8381",
   "files": {
     "app/__init__.py": "7ec9b0d2139086b2ce808894982961c14c62bda682b8f220a0ba6f61b6dee814",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -10,7 +10,7 @@
     "app/api/rutas_maquinas.py": "27736e46490c3a336a1759c2a3f448c96b5746672487988d175153ad5b13b553",
     "app/api/rutas_postpesaje_reimpresion.py": "a85fe9cee664e4403c87ab0fe8f35ce095d2c91f587b96b11a61346661038b0f",
     "app/api/rutas_produccion.py": "b5df9163c2c941ad6ed5a888f84858a9ce9b072dfb0417b10fc3d08a6df4eb12",
-    "app/api/rutas_scm.py": "8eb4cdf41b0cbdc81c1dea6be7173a0690297a63977b6501f570ecdea362a8a4",
+    "app/api/rutas_scm.py": "4bb6ab8e357c1ea45d4b0a791aa6d6e555c82c3faad1df35cdb4dadd902c73d3",
     "app/api/rutas_scm_assistant.py": "f6bece1f073141b7224b891d59ccf8327ba51789327e3b39e22ca35f519922f9",
     "app/api/rutas_scm_kg_pt.py": "a34f4b9fd8ad73dac1cf700523cbfdbf55e49f47c5b406f1e518c5b0653e2bf8",
     "app/api/rutas_scm_packaging_reads.py": "147e080c9e0e04e7846e19202593bc59500c7a3020baeb5037f481b9a45f7f3b",
@@ -119,6 +119,7 @@
     "app/services/scm_legacy_kit_precondition.py": "406bd3f5baf88c6a229242c33f0dab9164e5405d7674aa00cf1bc8481991fcee",
     "app/services/scm_manga_assignment_projection.py": "edb9d702a9967143f2a453922ef9dd73b8aa43076e48a1e469bff724d696f48b",
     "app/services/scm_manga_detail_service.py": "93cf64a4cdc3a8210c6632701b0f55440655e322a16373cb29e346380af0b7ae",
+    "app/services/scm_manga_explorer_service.py": "cc74ca8918b425581a4e3774cb7f975fbebd2f770b704d1abcc3791e4dd730e4",
     "app/services/scm_material_catalog_service.py": "4e9f337e121c0684a8e8930023da10c0af1719cc327e3aef1934a451a6c64d06",
     "app/services/scm_material_execution_service.py": "e7cc8f1b54b18a1bfacbdc28c8690c40806860f16a6032933a5581f3f2b35f39",
     "app/services/scm_material_service.py": "6f242c718e5e17a9ce2f46401016cb9f31c7ad677ce2502939bf1ff4e674d72d",
