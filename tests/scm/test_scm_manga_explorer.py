@@ -1,5 +1,6 @@
 from io import BytesIO
 from datetime import date, datetime, timezone
+from decimal import Decimal
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,16 +34,20 @@ from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial
 from app.models.scm_articulos import ScmArticulo
 from app.models.materiales import MateriaPrima
 from app.models.molde import Molde
+from app.models.maquina import Maquina, TipoMaquina
 from app.models.receta_color import RecetaColorLinea, RecetaColorMaestra
+from app.models.trabajador import Trabajador
 from app.services.scm_assignment_correction_service import apply_assignment_correction
 from app.services.scm_ot_service import create_fabrication_ot_header
 from app.services.scm_manga_explorer_service import (
+    _audit_rows,
     _canonical_color_hex,
     _export_rows,
     _material_recipe_context,
     _production_context,
     _safe_cell,
     _worker_projection,
+    audit_fields,
     detail_fields,
     key_fields,
 )
@@ -385,9 +390,12 @@ def test_manga_explorer_final_date_filters_before_limit_and_cursor(app, client, 
         assert "Fecha del pesaje final" in headers
         assert "Criterio de fecha: Fecha del pesaje final" in workbook["Detalle"]["A1"].comment.text
         final_date = headers.index("Fecha del pesaje final")
-        assert {row[final_date].date() for row in workbook["Detalle"].iter_rows(min_row=2, values_only=True)} == {
+        final_values = list(workbook["Detalle"].iter_rows(min_row=2, values_only=True))
+        assert {row[final_date].date() for row in final_values} == {
             date(2026, 8, 10), date(2026, 8, 12),
         }
+        assert all(isinstance(row[final_date], (date, datetime)) for row in final_values)
+        assert workbook["Detalle"].cell(row=2, column=final_date + 1).number_format == "dd/mm/yyyy"
 
 
 def test_manga_explorer_final_date_requires_weight_permission(app, client, scm_config):
@@ -399,6 +407,35 @@ def test_manga_explorer_final_date_requires_weight_permission(app, client, scm_c
         )
         assert response.status_code == 403
         assert response.get_json()["error"]["code"] == "MANGA_PESAJE_PERMISSION_REQUIRED"
+
+
+def test_manga_explorer_correction_quantity_source_is_explicit_or_preserved(app, client, scm_config):
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        correction = ScmCorreccionPesajeManga.query.filter_by(estado="APLICADA").one()
+        correction.pesaje.fuente_cantidad = "RESPONSABLE_ARMADO"
+        db.session.commit()
+        response = client.get(
+            "/api/scm/v1/observabilidad/mangas-fabricacion",
+            headers=_headers(seeded["full"]),
+        )
+        assert response.status_code == 200
+        item = next(
+            item for item in response.get_json()["items"]
+            if item["manga"]["codigo"] == "M-OT-OBS-FAB-02"
+        )
+        assert item["manga"]["pesaje"]["fuente_cantidad"] == "RESPONSABLE_ARMADO"
+        correction.proposed_json = {"cantidad_confirmada": "96.000"}
+        db.session.commit()
+        response = client.get(
+            "/api/scm/v1/observabilidad/mangas-fabricacion",
+            headers=_headers(seeded["full"]),
+        )
+        item = next(
+            item for item in response.get_json()["items"]
+            if item["manga"]["codigo"] == "M-OT-OBS-FAB-02"
+        )
+        assert item["manga"]["pesaje"]["fuente_cantidad"] == "CORRECCION_AUTORIZADA"
 
 
 def test_manga_explorer_rejects_final_cursor_after_real_manga_annulment_event(app, client, scm_config):
@@ -487,12 +524,14 @@ def test_manga_explorer_supports_uuid_search_and_export_modes(app, client, scm_c
         )
         assert exported.status_code == 200
         workbook = load_workbook(BytesIO(exported.data), read_only=False, data_only=False)
-        assert workbook.sheetnames == ["Criterios", "Resumen", "Detalle"]
+        assert workbook.sheetnames == ["Resumen", "Detalle", "Auditoría", "Criterios"]
         criteria = list(workbook["Criterios"].iter_rows(values_only=True))
-        assert criteria[0] == ("Criterio de fecha", "Fecha de OT")
-        assert criteria[5][0] == "Conjunto exportado"
-        assert next(workbook["Resumen"].iter_rows(values_only=True))[0] == "Fecha de OT"
-        assert next(workbook["Detalle"].iter_rows(values_only=True))[0] == "Fecha de OT"
+        assert criteria[0] == ("Campo", "Descripción")
+        assert criteria[1] == ("Criterio de fecha", "Fecha de OT")
+        assert criteria[6][0] == "Campo aplicado"
+        assert criteria[7][0] == "Conjunto exportado"
+        assert next(workbook["Resumen"].iter_rows(values_only=True))[0] == "Tipo máquina"
+        assert next(workbook["Detalle"].iter_rows(values_only=True))[0] == "Tipo máquina"
         assert "Cohorte por OT origen" in workbook["Resumen"]["A1"].comment.text
         assert "no reparto diario de masa" in workbook["Detalle"]["A1"].comment.text
         assert "Maquinistas" in next(workbook["Resumen"].iter_rows(values_only=True))
@@ -503,12 +542,14 @@ def test_manga_explorer_supports_uuid_search_and_export_modes(app, client, scm_c
             headers=_headers(seeded["full"]),
         )
         empty_workbook = load_workbook(BytesIO(empty_export.data), read_only=False, data_only=False)
-        assert empty_workbook.sheetnames == ["Criterios", "Resumen", "Detalle"]
-        assert empty_workbook["Criterios"]["B1"].value == "Fecha de OT"
+        assert empty_workbook.sheetnames == ["Resumen", "Detalle", "Auditoría", "Criterios"]
+        assert empty_workbook["Criterios"]["B2"].value == "Fecha de OT"
         assert empty_workbook["Resumen"].max_row == 1
         assert empty_workbook["Detalle"].max_row == 1
+        assert empty_workbook["Auditoría"].max_row == 1
         assert list(next(empty_workbook["Resumen"].iter_rows(values_only=True))) == key_fields()
         assert list(next(empty_workbook["Detalle"].iter_rows(values_only=True))) == detail_fields()
+        assert list(next(empty_workbook["Auditoría"].iter_rows(values_only=True))) == audit_fields()
 
 
 def test_manga_explorer_export_rows_deduplicates_workers_and_sums_each_manga_once():
@@ -544,14 +585,104 @@ def test_manga_explorer_export_rows_deduplicates_workers_and_sums_each_manga_onc
     assert len(detail) == 2
     assert detail[0]["Maquinistas"] == "Ana, Bruno"
     assert isinstance(detail[0]["Fecha del pesaje final"], date)
-    assert detail[0]["Estado fecha final"] == "VIGENTE"
+    assert detail[0]["Estado fecha final"] == "Fecha final vigente"
     assert list(detail[0]).count("KG final vigente") == 1
     assert len(summary) == 1
     assert summary[0]["Maquinistas"] == "Ana, Bruno"
     assert summary[0]["Mangas"] == 2
     assert summary[0]["Fecha del pesaje final"] is None
-    assert summary[0]["Estado fecha final"].startswith("MÚLTIPLES:")
+    assert summary[0]["Estado fecha final"].startswith("Varias fechas finales:")
     assert summary[0]["KG final vigente"] == 8.0
+
+
+def test_manga_explorer_export_quantity_requires_observed_un_article():
+    base = {
+        "ot": {"fecha_operativa": "2026-08-10", "turno": "DÍA", "codigo": "OT-Q"},
+        "recurso": {}, "upstream": {"orden": {"codigo": "OF-Q"}},
+        "maquinistas": [], "maquinistas_cobertura": "SIN_ASIGNACION",
+        "visibilidad": {"pesaje": True},
+        "produccion": {},
+    }
+    kg_item = {
+        **base,
+        "manga": {
+            "codigo": "M-Q-KG", "public_id": "m-q-kg", "estado_operativo": "CERRADA",
+            "color": "Azul", "articulo": {"nombre": "Pieza KG", "codigo": "PK", "unidad_inventario": "KG"},
+            "pesaje": {
+                "estado": "VIGENTE", "fecha_local_pesaje": "2026-08-10",
+                "peso_fisico_neto_kg": 3, "cantidad_confirmada": 7,
+                "fuente_cantidad": "PLAN_CONFIRMADO_POR_PESAJE",
+            },
+        },
+    }
+    un_item = {
+        **base,
+        "manga": {
+            "codigo": "M-Q-UN", "public_id": "m-q-un", "estado_operativo": "CERRADA",
+            "color": "Azul", "articulo": {"nombre": "Pieza UN", "codigo": "PU", "unidad_inventario": "UN"},
+            "pesaje": {
+                "estado": "VIGENTE", "fecha_local_pesaje": "2026-08-10",
+                "peso_fisico_neto_kg": 3, "cantidad_confirmada": 7,
+                "fuente_cantidad": "PLAN_CONFIRMADO_POR_PESAJE",
+            },
+        },
+    }
+    plan_un_item = {
+        **un_item,
+        "manga": {
+            **un_item["manga"],
+            "codigo": "M-Q-PLAN-UN",
+        },
+    }
+    _summary, detail = _export_rows({"items": [kg_item, un_item, plan_un_item]})
+    by_code = {row["Manga"]: row for row in detail}
+    assert by_code["M-Q-KG"]["Cantidad por bulto"] is None
+    assert "no acreditada como UN" in by_code["M-Q-KG"]["Observación"]
+    assert by_code["M-Q-UN"]["Cantidad por bulto"] is None
+    assert "no acreditada como UN" in by_code["M-Q-UN"]["Observación"]
+    assert by_code["M-Q-PLAN-UN"]["Cantidad por bulto"] is None
+    assert "no acreditada como UN" in by_code["M-Q-PLAN-UN"]["Observación"]
+    audit = _audit_rows(detail)
+    audit_by_code = {row["Manga"]: row for row in audit}
+    assert audit_by_code["M-Q-PLAN-UN"]["Cantidad UN acreditada"] is None
+    assert "no acreditada como UN" in audit_by_code["M-Q-PLAN-UN"]["Observación técnica"]
+
+
+def test_manga_explorer_export_quantity_keeps_observed_un_source():
+    item = {
+        "ot": {"fecha_operativa": "2026-08-10", "turno": "DÍA", "codigo": "OT-Q"},
+        "recurso": {}, "upstream": {"orden": {"codigo": "OF-Q"}},
+        "maquinistas": [], "maquinistas_cobertura": "SIN_ASIGNACION",
+        "visibilidad": {"pesaje": True}, "produccion": {},
+        "manga": {
+            "codigo": "M-Q-OBS-UN", "public_id": "m-q-obs-un", "estado_operativo": "CERRADA",
+            "color": "Azul", "articulo": {"nombre": "Pieza UN", "codigo": "PU", "unidad_inventario": "UN"},
+            "pesaje": {
+                "estado": "VIGENTE", "fecha_local_pesaje": "2026-08-10",
+                "peso_fisico_neto_kg": 3, "cantidad_confirmada": 7,
+                "fuente_cantidad": "RESPONSABLE_ARMADO",
+            },
+        },
+    }
+    _summary, detail = _export_rows({"items": [item]})
+    assert detail[0]["Cantidad por bulto"] == 7
+
+
+def test_manga_explorer_summary_does_not_count_annulled_as_pending():
+    item = {
+        "ot": {"fecha_operativa": "2026-08-10", "turno": "DÍA", "codigo": "OT-A"},
+        "recurso": {}, "upstream": {"orden": {"codigo": "OF-A"}},
+        "maquinistas": [], "maquinistas_cobertura": "SIN_ASIGNACION",
+        "visibilidad": {"pesaje": True},
+        "manga": {
+            "codigo": "M-A", "public_id": "m-a", "estado_operativo": "ANULADA",
+            "color": "Rojo", "articulo": {"nombre": "Pieza", "codigo": "P"},
+            "pesaje": None,
+        },
+    }
+    summary, _detail = _export_rows({"items": [item]})
+    assert summary[0]["Mangas anuladas"] == 1
+    assert summary[0]["Pendientes de pesaje"] == 0
 
 
 def test_manga_explorer_export_projects_recipe_materials_and_snapshot_cycles_without_cross_output_sum():
@@ -616,6 +747,23 @@ def test_manga_explorer_recipe_projection_excludes_pigments_and_marks_missing_or
     projected = _material_recipe_context(recipe, recipe_id=9, recipe_hash="h")
     assert [item["codigo"] for item in projected["materials"]] == ["MP-1", "MP-2"]
     assert projected["materials"][0]["tipo"] == "VIRGEN"
+    complete_recipe = SimpleNamespace(id=11, revision=1, lineas=[
+        SimpleNamespace(id=10, orden=1, tipo_componente="MATERIA_PRIMA", material=material, cantidad="0.4", unidad="FRACCION"),
+        SimpleNamespace(id=11, orden=2, tipo_componente="MATERIA_PRIMA", material=second, cantidad="0.2", unidad="FRACCION"),
+        SimpleNamespace(id=12, orden=3, tipo_componente="MATERIA_PRIMA", material=material, cantidad="0.4", unidad="FRACCION"),
+    ])
+    complete_projection = _material_recipe_context(complete_recipe, recipe_id=11, recipe_hash="h11")
+    assert complete_projection["fraccion_virgen_receta"] == Decimal("0.8")
+    incomplete_recipe = SimpleNamespace(id=12, revision=1, lineas=[
+        SimpleNamespace(id=13, orden=1, tipo_componente="MATERIA_PRIMA", material=material, cantidad="0.4", unidad="FRACCION"),
+        SimpleNamespace(id=14, orden=2, tipo_componente="MATERIA_PRIMA", material=second, cantidad="0.2", unidad="FRACCION"),
+    ])
+    assert _material_recipe_context(incomplete_recipe, recipe_id=12, recipe_hash="h12")["fraccion_virgen_receta"] is None
+    negative_recipe = SimpleNamespace(id=13, revision=1, lineas=[
+        SimpleNamespace(id=15, orden=1, tipo_componente="MATERIA_PRIMA", material=material, cantidad="-0.1", unidad="FRACCION"),
+        SimpleNamespace(id=16, orden=2, tipo_componente="MATERIA_PRIMA", material=second, cantidad="1.1", unidad="FRACCION"),
+    ])
+    assert _material_recipe_context(negative_recipe, recipe_id=13, recipe_hash="h13")["fraccion_virgen_receta"] is None
     missing_type = SimpleNamespace(codigo="MP-3", nombre="Sin subtipo", clase="MATERIA_PRIMA", materia_prima=None)
     missing_recipe = SimpleNamespace(id=10, revision=1, lineas=[
         SimpleNamespace(id=4, orden=1, tipo_componente="MATERIA_PRIMA", material=missing_type),
@@ -669,11 +817,11 @@ def test_manga_explorer_export_criteria_normalizes_state_and_matches_rows(app, c
         assert exported.status_code == 200
         workbook = load_workbook(BytesIO(exported.data), read_only=False, data_only=False)
         criteria = list(workbook["Criterios"].iter_rows(values_only=True))
-        assert criteria[4] == ("Estado", "PESADA")
+        assert criteria[5] == ("Estado", "Pesada")
         rows = list(workbook["Detalle"].iter_rows(values_only=True))
-        state_index = rows[0].index("Estado")
+        state_index = rows[0].index("Estado operativo")
         assert rows[1:]
-        assert all(row[state_index] == "PESADA" for row in rows[1:])
+        assert all(row[state_index] == "Pesada" for row in rows[1:])
 
 
 @pytest.mark.parametrize("query", [
@@ -692,7 +840,7 @@ def test_manga_explorer_export_criteria_escapes_formula_like_search(query, app, 
         )
         assert exported.status_code == 200
         workbook = load_workbook(BytesIO(exported.data), read_only=False, data_only=False)
-        cell = workbook["Criterios"]["B4"]
+        cell = workbook["Criterios"]["B5"]
         assert cell.value == "'" + query.casefold()
         assert cell.data_type == "s"
 
@@ -703,6 +851,11 @@ def _add_real_export_context():
 
     work = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
     manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-03").one()
+    fixture_type = TipoMaquina(codigo="XLSX-INY", nombre="HT200A", proceso="INYECCION")
+    fixture_machine = Maquina(codigo="XLSX-MAQ", nombre="Prensa fixture", tipo_maquina=fixture_type)
+    db.session.add(fixture_machine)
+    db.session.flush()
+    work.orden_trabajo.maquina_id = fixture_machine.id
     article = manga.lote_articulo.articulo if manga.lote_articulo else ScmArticulo.query.first()
     if article is None:
         article = ScmArticulo(
@@ -763,9 +916,10 @@ def _add_real_export_context():
     )
     db.session.add(recipe)
     db.session.flush()
+    fractions = ("0.40", "0.20", "0.40")
     db.session.add_all([
         RecetaColorLinea(receta_id=recipe.id, material_id=materials[index].scm_material_id,
-                         tipo_componente="MATERIA_PRIMA", cantidad="0.20", unidad="FRACCION", orden=index)
+                         tipo_componente="MATERIA_PRIMA", cantidad=fractions[index], unidad="FRACCION", orden=index)
         for index in range(3)
     ])
     corrida = ScmCorridaFabricacion(
@@ -808,6 +962,17 @@ def _add_real_export_context():
         db.session.add(lot)
         db.session.flush()
         manga.lote_articulo_id = lot.id
+    if manga.asignacion_personal_trabajo is None:
+        machine_worker = Trabajador.query.filter_by(codigo="TRB-01").one()
+        assignment = ScmAsignacionPersonalTrabajoOt(
+            trabajo=work,
+            trabajador=machine_worker,
+            estado="PREVISTA",
+            asignada_por_id=machine_worker.id,
+        )
+        db.session.add(assignment)
+        db.session.flush()
+        manga.asignacion_personal_trabajo = assignment
     db.session.commit()
 
 
@@ -830,8 +995,10 @@ def test_manga_explorer_real_export_fixture_contains_new_traceability_fields(app
             assert "Material 3" in headers
             assert "Molde" in headers and "Ciclos aproximados" in headers
             rows = list(workbook[sheet_name].iter_rows(values_only=True))
+            assert any(row[headers.index("Tipo máquina")] == "INYECCION" for row in rows[1:])
             assert any(row[headers.index("Ciclos aproximados")] is not None for row in rows[1:])
             assert any(row[headers.index("Tipo materia prima")] == "VIRGEN, SEGUNDA" for row in rows[1:])
+            assert any(row[headers.index("Fracción virgen (receta)")] == 0.8 for row in rows[1:])
             cycle_column = next(
                 cell.column for cell in workbook[sheet_name][1]
                 if cell.value == "Ciclos aproximados"
@@ -839,6 +1006,47 @@ def test_manga_explorer_real_export_fixture_contains_new_traceability_fields(app
             assert workbook[sheet_name].cell(row=2, column=cycle_column).number_format == "0.0"
         if target:
             Path(target).write_bytes(response.data)
+
+
+def test_manga_explorer_export_keeps_operational_columns_before_audit(app, client, scm_config):
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        _add_real_export_context()
+        response = client.get(
+            "/api/scm/v1/observabilidad/mangas-fabricacion/export.xlsx?vista=AMBOS",
+            headers=_headers(seeded["full"]),
+        )
+        assert response.status_code == 200
+        workbook = load_workbook(BytesIO(response.data), read_only=False, data_only=False)
+        assert workbook.sheetnames == ["Resumen", "Detalle", "Auditoría", "Criterios"]
+        summary_headers = list(next(workbook["Resumen"].iter_rows(values_only=True)))
+        detail_headers = list(next(workbook["Detalle"].iter_rows(values_only=True)))
+        audit_headers = list(next(workbook["Auditoría"].iter_rows(values_only=True)))
+        expected_operational = [
+            "Tipo máquina", "Máquina", "Fecha de OT", "Maquinistas",
+            "Tipo materia prima", "Material 1", "Material 2", "Material 3", "Molde",
+            "Pieza-Color", "Ciclos aproximados", "Peso real (kg)", "Turno", "Cantidad por bulto",
+            "Bultos pesados", "N°OF", "Fracción virgen (receta)",
+        ]
+        assert summary_headers[:len(expected_operational)] == expected_operational
+        assert detail_headers[:len(expected_operational)] == expected_operational
+        assert "Receta hash" not in summary_headers
+        assert "Receta hash" not in detail_headers
+        assert "Receta hash" in audit_headers
+        assert "Estado datos producción" in audit_headers
+        assert summary_headers[-1] == "Referencia grupo"
+        assert detail_headers[-1] == "Referencia grupo"
+        assert "Fracción virgen (receta)" in summary_headers
+        assert workbook["Resumen"].cell(row=2, column=summary_headers.index("Fracción virgen (receta)") + 1).number_format == "0.0%"
+        assert workbook["Detalle"].auto_filter.ref.startswith("A1:")
+        assert workbook["Detalle"].freeze_panes == "A2"
+        assert workbook["Auditoría"].max_row > 1
+        assert workbook["Resumen"]["A1"].fill.fgColor.rgb.endswith("1F4E78")
+        assert workbook["Resumen"]["A1"].font.color.type == "rgb"
+        audit_rows = list(workbook["Auditoría"].iter_rows(min_row=2, values_only=True))
+        assert any(row[audit_headers.index("Proceso máquina")] == "INYECCION" for row in audit_rows)
+        assert any(row[audit_headers.index("Nombre tipo máquina")] == "HT200A" for row in audit_rows)
+        assert any(row[detail_headers.index("Maquinistas")] != "Sin maquinista asignado" for row in workbook["Detalle"].iter_rows(min_row=2, values_only=True))
 
 
 def test_manga_explorer_export_production_projection_queries_are_bulk_bounded(app, client, scm_config):
@@ -997,6 +1205,102 @@ def test_manga_explorer_search_uses_effective_ot_after_auditable_corrections(app
         assert superseded_id not in search_ids(first["superseded_correction_work"].codigo)
 
 
+def test_manga_explorer_search_matches_effective_of_without_resolvable_plan(app, client, scm_config):
+    """The visible OF remains searchable when its plan/OP link is absent."""
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        source = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
+        source_work = source.trabajo
+        operation = ScmOrdenOperacion(
+            codigo="OF-NOPLAN-001",
+            tipo="FABRICACION",
+            origen_demanda="EXCEPCIONAL",
+            propuesta_clave="OF-NOPLAN-001",
+            estado="EN_EJECUCION",
+            created_by_id=seeded["full"].id,
+        )
+        db.session.add(operation)
+        db.session.flush()
+        work = ScmTrabajoOt(
+            orden_trabajo_id=source.ot_id,
+            codigo="TC-NOPLAN-001",
+            tipo="COLOR",
+            secuencia=3,
+            estado="PLANIFICADO",
+            orden_operacion_id=operation.id,
+            cantidad_objetivo_un=100,
+            cantidad_confirmada_un=0,
+            created_by_id=seeded["full"].id,
+        )
+        work.trabajo_color = ScmTrabajoColor(
+            corrida_fabricacion_id=source_work.trabajo_color.corrida_fabricacion_id,
+            color_nombre_snapshot=source_work.trabajo_color.color_nombre_snapshot,
+            molde_codigo_snapshot=source_work.trabajo_color.molde_codigo_snapshot,
+        )
+        db.session.add(work)
+        db.session.flush()
+        source.trabajo = work
+        db.session.commit()
+
+        response = client.get(
+            "/api/scm/v1/observabilidad/mangas-fabricacion",
+            query_string={"q": operation.codigo, "limit": 100},
+            headers=_headers(seeded["full"]),
+        )
+
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert str(source.public_id) in {
+            item["manga"]["public_id"] for item in payload["items"]
+        }
+        item = next(
+            item for item in payload["items"]
+            if item["manga"]["public_id"] == str(source.public_id)
+        )
+        assert item["upstream"]["orden"]["codigo"] == operation.codigo
+        assert item["upstream"]["op"] is None
+        assert item["upstream"]["plan"] is None
+
+
+def test_manga_explorer_search_direct_of_survives_unrelated_segment(app, client, scm_config):
+    """A segment on another manga must not globally suppress direct OF rows."""
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        direct = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
+        segmented = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-03").one()
+        assignment = segmented.asignacion_personal_trabajo
+        if assignment is None:
+            assignment = ScmAsignacionPersonalTrabajoOt(
+                trabajo=segmented.trabajo,
+                trabajador=Trabajador.query.filter_by(codigo="TRB-01").one(),
+                estado="PREVISTA",
+                asignada_por_id=seeded["full"].id,
+            )
+            db.session.add(assignment)
+            db.session.flush()
+        db.session.add(ScmTramoMangaTrabajo(
+            manga=segmented,
+            trabajo=segmented.trabajo,
+            asignacion_personal_trabajo=assignment,
+            secuencia=1,
+            estado="ACTIVO",
+            cantidad_inicio_un=0,
+            cantidad_atribuida_un=0,
+            created_by_id=seeded["full"].id,
+        ))
+        db.session.commit()
+
+        operation_code = direct.trabajo.orden_operacion.codigo
+        response = client.get(
+            "/api/scm/v1/observabilidad/mangas-fabricacion",
+            query_string={"q": operation_code, "limit": 100},
+            headers=_headers(seeded["full"]),
+        )
+        assert response.status_code == 200
+        ids = {item["manga"]["public_id"] for item in response.get_json()["items"]}
+        assert str(direct.public_id) in ids
+
+
 @pytest.mark.parametrize("limit", [1, 25, 100])
 def test_manga_explorer_uses_bounded_projection_queries(app, client, scm_config, limit):
     with app.app_context():
@@ -1060,9 +1364,12 @@ def test_manga_explorer_export_uses_canonical_final_and_excludes_annulled_weight
         by_manga = {row[headers.index("Manga")]: row for row in rows[1:]}
         corrected = by_manga["M-OT-OBS-FAB-02"]
         annulled = by_manga["M-OT-OBS-FAB-04"]
-        assert corrected[headers.index("KG final vigente")] == 11.5
-        assert annulled[headers.index("KG final vigente")] is None
-        assert annulled[headers.index("Estado pesaje")] == "SIN_PESAJE_VIGENTE"
+        assert corrected[headers.index("Peso real (kg)")] == 11.5
+        assert annulled[headers.index("Peso real (kg)")] is None
+        audit_headers = next(workbook["Auditoría"].iter_rows(values_only=True))
+        audit_rows = list(workbook["Auditoría"].iter_rows(min_row=2, values_only=True))
+        annulled_audit = next(row for row in audit_rows if row[audit_headers.index("Manga")] == "M-OT-OBS-FAB-04")
+        assert annulled_audit[audit_headers.index("Estado pesaje")] == "SIN_PESAJE_VIGENTE"
 
 
 def test_export_without_weighing_permission_is_explicitly_restricted(app, client, scm_config):
@@ -1078,10 +1385,11 @@ def test_export_without_weighing_permission_is_explicitly_restricted(app, client
         detail_headers = next(workbook["Detalle"].iter_rows(values_only=True))
         assert "Mangas con pesaje restringido" in summary_headers
         assert "KG abierto" not in detail_headers
-        assert "Estado pesaje" in detail_headers
+        audit_headers = next(workbook["Auditoría"].iter_rows(values_only=True))
+        assert "Estado pesaje" in audit_headers
         summary_rows = list(workbook["Resumen"].iter_rows(min_row=2, values_only=True))
         restricted_index = summary_headers.index("Mangas con pesaje restringido")
-        open_index = summary_headers.index("Mangas abiertas")
+        open_index = summary_headers.index("Pendientes de pesaje")
         assert any(row[restricted_index] for row in summary_rows)
         assert all(row[open_index] in (None, 0) for row in summary_rows)
 

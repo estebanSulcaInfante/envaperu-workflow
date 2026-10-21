@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 from openpyxl import Workbook
 from openpyxl.comments import Comment
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 from openpyxl.styles import Alignment
 from sqlalchemy import String, and_, cast, exists, func, or_, select
 from sqlalchemy.orm import aliased, selectinload
@@ -64,6 +64,11 @@ MAX_LIMIT = 100
 COLOR_HEX_PATTERN = re.compile(r"#[0-9a-fA-F]{6}")
 OPEN_MANGA_STATES = {
     "PLANIFICADA", "PREETIQUETADA", "EN_ARMADO", "CONTINUIDAD_PENDIENTE", "EN_LLENADO",
+}
+QUANTITY_UN_SOURCES = {
+    "RESPONSABLE_ARMADO",
+    "CORRECCION_AUTORIZADA",
+    "CIERRE_PARCIAL_SUPERVISADO",
 }
 
 
@@ -337,6 +342,8 @@ def _material_recipe_context(recipe, *, recipe_id, recipe_hash, conflict=False):
             "revision": None,
             "materials": [],
             "status": "CONFLICTO_REFERENCIA_RECETA",
+            "fraccion_virgen_receta": None,
+            "fraccion_virgen_estado": "CONFLICTO_REFERENCIA_RECETA",
         }
     if recipe is None:
         return {
@@ -345,6 +352,8 @@ def _material_recipe_context(recipe, *, recipe_id, recipe_hash, conflict=False):
             "revision": None,
             "materials": [],
             "status": "RECETA_AUSENTE",
+            "fraccion_virgen_receta": None,
+            "fraccion_virgen_estado": "RECETA_AUSENTE",
         }
     lines = [line for line in (getattr(recipe, "lineas", ()) or ())
              if getattr(line, "tipo_componente", None) == "MATERIA_PRIMA"]
@@ -356,8 +365,32 @@ def _material_recipe_context(recipe, *, recipe_id, recipe_hash, conflict=False):
             "tipo": getattr(getattr(material, "materia_prima", None), "tipo", None),
             "codigo": getattr(material, "codigo", None),
             "nombre": getattr(material, "nombre", None),
+            "cantidad": _decimal(getattr(line, "cantidad", None)),
+            "unidad": getattr(line, "unidad", None),
+            "base_kg": _decimal(getattr(line, "base_kg", None)),
         })
     missing_type = any(item.get("tipo") is None for item in materials)
+    complete_fraction = bool(materials) and all(
+        item.get("tipo") in {"VIRGEN", "SEGUNDA"}
+        and item.get("cantidad") is not None
+        and item.get("cantidad") >= 0
+        and item.get("unidad") == "FRACCION"
+        for item in materials
+    )
+    total_fraction = sum(
+        (item["cantidad"] for item in materials if item.get("cantidad") is not None),
+        Decimal("0"),
+    )
+    virgin_fraction = sum(
+        (item["cantidad"] for item in materials
+         if item.get("tipo") == "VIRGEN" and item.get("cantidad") is not None),
+        Decimal("0"),
+    )
+    fraction = (
+        virgin_fraction
+        if complete_fraction and abs(total_fraction - Decimal("1")) <= Decimal("0.000001")
+        else None
+    )
     return {
         "id": recipe.id,
         "hash": recipe_hash,
@@ -366,6 +399,13 @@ def _material_recipe_context(recipe, *, recipe_id, recipe_hash, conflict=False):
         "status": (
             "SIN_MATERIA_PRIMA" if not materials
             else ("TIPO_MATERIA_PRIMA_AUSENTE" if missing_type else "OK")
+        ),
+        "fraccion_virgen_receta": fraction,
+        "fraccion_virgen_estado": (
+            "OK" if fraction is not None else (
+                "RECETA_SIN_PROPORCIONES_COMPLETAS" if materials
+                else "SIN_MATERIA_PRIMA"
+            )
         ),
     }
 
@@ -429,7 +469,15 @@ def _production_context(
         "materias_primas": recipe_context["materials"],
         "tipo_maquina": (machine_types or {}).get(getattr(getattr(work, "orden_trabajo", None), "id", None)),
         "maquina": (machines or {}).get(getattr(getattr(work, "orden_trabajo", None), "id", None)),
+        "tipo_maquina_nombre": (
+            (machines or {}).get(getattr(getattr(work, "orden_trabajo", None), "id", None)) or {}
+        ).get("tipo_nombre"),
+        "tipo_maquina_proceso": (
+            (machines or {}).get(getattr(getattr(work, "orden_trabajo", None), "id", None)) or {}
+        ).get("proceso"),
         "receta": recipe_context,
+        "fraccion_virgen_receta": recipe_context["fraccion_virgen_receta"],
+        "fraccion_virgen_estado": recipe_context["fraccion_virgen_estado"],
         "molde": {"codigo": mold_code, "nombre": mold_name, "status": mold_status, "nombre_fuente": mold_name_source},
         "salida": {
             "id": str(output.id) if output else None,
@@ -529,7 +577,8 @@ def _bulk_production_context(session, rows):
                 Maquina.id.label("machine_id"),
                 Maquina.codigo.label("machine_code"),
                 Maquina.nombre.label("machine_name"),
-                TipoMaquina.nombre.label("machine_type"),
+                TipoMaquina.nombre.label("machine_type_name"),
+                TipoMaquina.proceso.label("machine_process"),
             )
             .join(Maquina, Maquina.id == RegistroDiarioProduccion.maquina_id)
             .join(TipoMaquina, TipoMaquina.id == Maquina.tipo_maquina_id)
@@ -538,8 +587,10 @@ def _bulk_production_context(session, rows):
             machines[row.ot_id] = {
                 "tipo": "MAQUINA", "id": row.machine_id,
                 "codigo": row.machine_code, "nombre": row.machine_name,
+                "tipo_nombre": row.machine_type_name,
+                "proceso": row.machine_process,
             }
-            machine_types[row.ot_id] = row.machine_type
+            machine_types[row.ot_id] = row.machine_process
     context = {}
     for manga, _origin_ot in rows:
         work = effective_work(manga)
@@ -827,10 +878,10 @@ def _collect(session, *, actor_id, raw_filters=None, paginate=True, include_prod
                 direct_work.id == ScmManga.trabajo_ot_id,
                 ~exists(select(direct_segment.id).where(
                     direct_segment.manga_id == ScmManga.id,
-                )),
+                ).correlate(ScmManga)),
                 ~exists(select(direct_correction.id).where(
                     direct_correction.manga_id == ScmManga.id,
-                )),
+                ).correlate(ScmManga)),
                 work_match(direct_work, direct_operation, direct_ot, direct_color),
             )
         )
@@ -925,10 +976,10 @@ def _collect(session, *, actor_id, raw_filters=None, paginate=True, include_prod
         origin_context = and_(
             ~exists(select(direct_segment.id).where(
                 direct_segment.manga_id == ScmManga.id,
-            )),
+            ).correlate(ScmManga)),
             ~exists(select(direct_correction.id).where(
                 direct_correction.manga_id == ScmManga.id,
-            )),
+            ).correlate(ScmManga)),
             or_(
                 RegistroDiarioProduccion.codigo_ot.ilike(term),
                 RegistroDiarioProduccion.maquina_codigo_snapshot.ilike(term),
@@ -992,18 +1043,38 @@ def _collect(session, *, actor_id, raw_filters=None, paginate=True, include_prod
         if pesaje is None or manga.estado == "ANULADA":
             return None
         correction = correction_by_pesaje.get(pesaje.id)
-        projection = dict(correction.result_projection_json) if correction else {
+        if correction:
+            projection = dict(correction.result_projection_json or {})
+            proposed = correction.proposed_json or {}
+            if "cantidad_confirmada" in proposed:
+                projection["fuente_cantidad"] = "CORRECCION_AUTORIZADA"
+            elif pesaje.fuente_cantidad in QUANTITY_UN_SOURCES:
+                # A weight/date-only correction may preserve the immutable
+                # weighing source, but it must not invent a new observation.
+                projection["fuente_cantidad"] = pesaje.fuente_cantidad
+            else:
+                projection["fuente_cantidad"] = None
+        else:
+            projection = {
+            "peso_bruto_kg": format(pesaje.peso_bruto_kg, "f"),
+            "tara_kg": format(pesaje.tara_kg, "f"),
             "peso_fisico_neto_kg": format(pesaje.peso_fisico_neto_kg, "f"),
             "cantidad_confirmada": format(pesaje.cantidad_confirmada, "f"),
+            "fuente_cantidad": pesaje.fuente_cantidad,
+            "tara_fuente": pesaje.tara_fuente,
             "kg_produccion_ot": format(pesaje.kg_produccion_ot, "f"),
             "pesada_at": pesaje.pesada_at.isoformat(),
             "fecha_local_pesaje": pesaje.fecha_local_pesaje.isoformat(),
-        }
+            }
         return {
             "pesaje_id": str(pesaje.public_id),
             "estado": "VIGENTE",
+            "peso_bruto_kg": _number(projection.get("peso_bruto_kg")),
+            "tara_kg": _number(projection.get("tara_kg")),
             "peso_fisico_neto_kg": _number(projection.get("peso_fisico_neto_kg")),
             "cantidad_confirmada": _number(projection.get("cantidad_confirmada")),
+            "fuente_cantidad": projection.get("fuente_cantidad"),
+            "tara_fuente": projection.get("tara_fuente"),
             "kg_produccion_ot": _number(projection.get("kg_produccion_ot")),
             "pesada_at": projection.get("pesada_at"),
             "fecha_local_pesaje": projection.get("fecha_local_pesaje"),
@@ -1068,6 +1139,12 @@ def _safe_cell(value):
     return value
 
 
+def _human_label(value, fallback="Sin estado"):
+    if value in (None, ""):
+        return fallback
+    return str(value).replace("_", " ").capitalize()
+
+
 def _export_rows(payload):
     detail_rows = []
     groups = {}
@@ -1091,9 +1168,20 @@ def _export_rows(payload):
         worker_text = ", ".join(dict.fromkeys(worker_names)) or "Sin maquinista asignado"
         final_date = weighing.get("fecha_local_pesaje") if weights_visible and weighing.get("estado") == "VIGENTE" else None
         final_date_value = date.fromisoformat(final_date) if final_date else None
+        gross = weighing.get("peso_bruto_kg") if final_kg is not None else None
+        tare = weighing.get("tara_kg") if final_kg is not None else None
+        quantity_source = weighing.get("fuente_cantidad")
+        quantity_unit = article.get("unidad_inventario")
+        quantity_is_un = quantity_unit in {"UN", "UND", "UNIDAD"}
+        quantity_is_observed = quantity_source in QUANTITY_UN_SOURCES
+        confirmed_quantity = (
+            weighing.get("cantidad_confirmada")
+            if final_kg is not None and quantity_is_un and quantity_is_observed
+            else None
+        )
         final_date_state = (
-            "RESTRINGIDA" if not weights_visible
-            else ("VIGENTE" if final_date else "SIN_PESAJE_FINAL_VIGENTE")
+            "Fecha final restringida" if not weights_visible
+            else ("Fecha final vigente" if final_date else "Sin pesaje final vigente")
         )
         worker_coverage = item.get("maquinistas_cobertura") or ("COMPLETA" if worker_names else "SIN_ASIGNACION")
         production = item.get("produccion") or {}
@@ -1101,6 +1189,9 @@ def _export_rows(payload):
         materials = production.get("materias_primas") or []
         mold = production.get("molde") or {}
         output = production.get("salida") or {}
+        article_name = article.get("nombre") or "Pieza sin nombre"
+        color_name = manga.get("color") or "Color no indicado"
+        piece_color = f"{article_name} · {color_name}"
         denominator = (_decimal(output.get("cantidad_por_ciclo_snapshot")) or Decimal("0")) * (
             _decimal(output.get("peso_unitario_snapshot_g")) or Decimal("0")
         )
@@ -1126,18 +1217,38 @@ def _export_rows(payload):
             status for status in (recipe.get("status"), mold.get("status"), output.get("status"))
             if status and status != "OK"
         ) or "OK"
+        if not weights_visible:
+            weighing_observation = "Peso no autorizado"
+        elif final_kg is not None:
+            weighing_observation = "Pesaje final vigente"
+        elif manga.get("estado_operativo") == "ANULADA":
+            weighing_observation = "Manga anulada sin pesaje final"
+        else:
+            weighing_observation = "Pendiente de pesaje final"
+        if confirmed_quantity is not None:
+            quantity_observation = None
+        elif final_kg is not None and (not quantity_is_un or not quantity_is_observed):
+            quantity_observation = "Cantidad por bulto no acreditada como UN"
+        else:
+            quantity_observation = "Cantidad por bulto no registrada"
+        row_observations = [observation for observation in (weighing_observation, quantity_observation) if observation]
+        fraction = production.get("fraccion_virgen_receta")
+        fraction = float(fraction) if fraction is not None else None
         row = {
             "Fecha de OT": date.fromisoformat(ot["fecha_operativa"]),
             "Fecha del pesaje final": final_date_value,
             "Estado fecha final": final_date_state,
             "Turno": ot.get("turno"), "Máquina": resource.get("nombre"), "Código máquina": resource.get("codigo"),
             "N°OF": (item.get("upstream", {}).get("orden") or {}).get("codigo"), "N°OT": ot.get("codigo"),
-            "Pieza": article.get("nombre"), "Código pieza": article.get("codigo"), "Color": manga.get("color"),
+            "Pieza": article_name, "Código pieza": article.get("codigo"), "Color": color_name,
+            "Pieza-Color": piece_color,
             "Maquinistas": worker_text,
             "Cobertura maquinistas": worker_coverage,
             "Manga": manga.get("codigo"), "ID manga": manga.get("public_id"), "Estado": manga.get("estado_operativo"),
             "KG final vigente": final_kg, "Estado pesaje": weighing_state,
             "Tipo máquina": production.get("tipo_maquina"),
+            "Nombre tipo máquina": production.get("tipo_maquina_nombre"),
+            "Proceso máquina": production.get("tipo_maquina_proceso") or production.get("tipo_maquina"),
             "Tipo materia prima": production.get("tipo_materia_prima"),
             "Receta ID": recipe.get("id"),
             "Receta revisión": recipe.get("revision"),
@@ -1149,7 +1260,23 @@ def _export_rows(payload):
             "Ciclos aproximados": cycles,
             "Estado ciclos aproximados": cycles_state,
             "Estado datos producción": production_status,
+            "Estado receta": recipe.get("status"),
+            "Estado molde": mold.get("status"),
+            "Estado salida": output.get("status"),
             "Base técnica ciclos": output.get("id"),
+            "Peso real (kg)": final_kg,
+            "Peso bruto (kg)": gross,
+            "Tara (kg)": tare,
+            "Cantidad por bulto": confirmed_quantity,
+            "Bultos pesados": 1 if final_kg is not None else 0,
+            "Fracción virgen (receta)": fraction,
+            "Estado fracción virgen": production.get("fraccion_virgen_estado"),
+            "Hora del pesaje": weighing.get("pesada_at") if final_kg is not None else None,
+            "Fuente cantidad": weighing.get("fuente_cantidad") if final_kg is not None else None,
+            "Situación del pesaje": weighing_observation,
+            "Observación": "; ".join(row_observations),
+            "Estado operativo": _human_label(manga.get("estado_operativo")),
+            "_estado_operativo_code": manga.get("estado_operativo"),
         }
         for index, material in enumerate(material_text, start=1):
             row[f"Material {index}"] = material
@@ -1158,12 +1285,17 @@ def _export_rows(payload):
             "Fecha de OT", "Turno", "Máquina", "Código máquina", "N°OF", "Pieza",
             "Código pieza", "Color", "Receta ID", "Receta revisión", "Receta hash", "Código molde", "Base técnica ciclos",
         ))
+        row["_group_key"] = key
         summary = groups.setdefault(key, {
             field: row[field]
             for field in ("Fecha de OT", "Turno", "Máquina", "Código máquina", "N°OF", "Pieza", "Código pieza", "Color",
                           "Tipo máquina", "Tipo materia prima", "Receta ID", "Receta revisión", "Receta hash", "Identidad receta", "Molde", "Código molde",
                           "Fuente nombre molde", "Estado datos producción", "Base técnica ciclos")
         })
+        summary["Pieza-Color"] = row["Pieza-Color"]
+        summary["Nombre tipo máquina"] = row["Nombre tipo máquina"]
+        summary["Proceso máquina"] = row["Proceso máquina"]
+        summary["Fracción virgen (receta)"] = row["Fracción virgen (receta)"]
         for index, material in enumerate(material_text, start=1):
             summary.setdefault(f"Material {index}", material)
         summary.setdefault("Maquinistas", [])
@@ -1173,11 +1305,19 @@ def _export_rows(payload):
         summary.setdefault("Mangas", 0)
         summary.setdefault("Mangas abiertas", 0)
         summary.setdefault("Mangas con pesaje restringido", 0)
+        summary.setdefault("Mangas anuladas", 0)
+        summary.setdefault("Bultos pesados", 0)
+        summary.setdefault("Pendientes de pesaje", 0)
         summary.setdefault("KG final vigente", 0.0)
         summary.setdefault("_has_final_kg", False)
+        summary.setdefault("_gross_values", [])
+        summary.setdefault("_tare_values", [])
+        summary.setdefault("_quantity_values", [])
+        summary.setdefault("_fraction_values", [])
         summary.setdefault("Ciclos aproximados", 0.0)
         summary.setdefault("_has_cycles", False)
         summary.setdefault("_cycle_states", set())
+        summary.setdefault("_group_key", key)
         summary["Mangas"] += 1
         if worker_text != "Sin maquinista asignado":
             summary["Maquinistas"] = list(dict.fromkeys(summary["Maquinistas"] + worker_text.split(", ")))
@@ -1189,9 +1329,23 @@ def _export_rows(payload):
             summary["Mangas con pesaje restringido"] += 1
         elif final_kg is None and manga.get("estado_operativo") in OPEN_MANGA_STATES:
             summary["Mangas abiertas"] += 1
+            summary["Pendientes de pesaje"] += 1
+        elif final_kg is None and manga.get("estado_operativo") == "ANULADA":
+            summary["Mangas anuladas"] += 1
+        elif final_kg is None:
+            summary["Pendientes de pesaje"] += 1
         elif final_kg is not None:
             summary["KG final vigente"] += float(final_kg)
             summary["_has_final_kg"] = True
+            summary["Bultos pesados"] += 1
+            if gross is not None:
+                summary["_gross_values"].append(float(gross))
+            if tare is not None:
+                summary["_tare_values"].append(float(tare))
+            if confirmed_quantity is not None:
+                summary["_quantity_values"].append(float(confirmed_quantity))
+        if fraction is not None:
+            summary["_fraction_values"].append(fraction)
         summary["_cycle_states"].add(cycles_state)
         if cycles is not None:
             summary["Ciclos aproximados"] += cycles
@@ -1201,14 +1355,14 @@ def _export_rows(payload):
         row["Maquinistas"] = ", ".join(row["Maquinistas"]) or "Sin maquinista asignado"
         final_dates = row.pop("_final_dates", set())
         final_date_states = row.pop("_final_date_states", set())
-        if len(final_dates) == 1 and final_date_states <= {"VIGENTE"}:
+        if len(final_dates) == 1 and final_date_states <= {"Fecha final vigente"}:
             row["Fecha del pesaje final"] = next(iter(final_dates))
         else:
             row["Fecha del pesaje final"] = None
         if len(final_dates) > 1:
-            row["Estado fecha final"] = "MÚLTIPLES: " + ", ".join(sorted(item.isoformat() for item in final_dates))
-            if final_date_states - {"VIGENTE"}:
-                row["Estado fecha final"] += "; " + "; ".join(sorted(final_date_states - {"VIGENTE"}))
+            row["Estado fecha final"] = "Varias fechas finales: " + ", ".join(sorted(item.isoformat() for item in final_dates))
+            if final_date_states - {"Fecha final vigente"}:
+                row["Estado fecha final"] += "; " + "; ".join(sorted(final_date_states - {"Fecha final vigente"}))
         elif final_date_states:
             row["Estado fecha final"] = "; ".join(sorted(final_date_states))
         else:
@@ -1222,47 +1376,195 @@ def _export_rows(payload):
             row["Mangas abiertas"] = None
         if not row.pop("_has_final_kg", False):
             row["KG final vigente"] = None
+        gross_values = row.pop("_gross_values", [])
+        tare_values = row.pop("_tare_values", [])
+        quantity_values = row.pop("_quantity_values", [])
+        fraction_values = row.pop("_fraction_values", [])
+        row["Peso real (kg)"] = row["KG final vigente"]
+        row["Peso bruto (kg)"] = sum(gross_values) if len(gross_values) == row["Bultos pesados"] and gross_values else None
+        row["Tara (kg)"] = sum(tare_values) if len(tare_values) == row["Bultos pesados"] and tare_values else None
+        row["Cantidad por bulto"] = (
+            quantity_values[0]
+            if quantity_values and len(set(quantity_values)) == 1 and len(quantity_values) == row["Bultos pesados"]
+            else None
+        )
+        row["Fracción virgen (receta)"] = (
+            fraction_values[0] if fraction_values and len(set(fraction_values)) == 1 else None
+        )
+        status_parts = []
+        if row["Bultos pesados"]:
+            status_parts.append(f"{row['Bultos pesados']} bultos pesados")
+        if row["Pendientes de pesaje"]:
+            status_parts.append(f"{row['Pendientes de pesaje']} pendientes de pesaje")
+        if row["Mangas con pesaje restringido"]:
+            status_parts.append(f"{row['Mangas con pesaje restringido']} con peso no autorizado")
+        if row["Mangas anuladas"]:
+            status_parts.append(f"{row['Mangas anuladas']} anuladas")
+        row["Situación del pesaje"] = "; ".join(status_parts) or "Sin pesajes"
+        observations = []
+        if row["Cantidad por bulto"] is None and row["Bultos pesados"]:
+            observations.append("Cantidad por bulto ausente o variable")
+        if row["Fracción virgen (receta)"] is None:
+            observations.append("Fracción virgen no acreditada")
+        row["Observación"] = "; ".join(observations)
+        row["Pieza-Color"] = row.get("Pieza-Color") or f"{row.get('Pieza') or 'Pieza sin nombre'} · {row.get('Color') or 'Color no indicado'}"
         cycle_states = row.pop("_cycle_states", set())
         if not row.pop("_has_cycles", False):
             row["Ciclos aproximados"] = None
         row["Estado ciclos aproximados"] = "; ".join(sorted(cycle_states)) or "SIN_KG_FINAL"
+    group_refs = {
+        key: f"G-{index:04d}"
+        for index, key in enumerate(groups, start=1)
+    }
+    for row in summary_rows:
+        row["Referencia grupo"] = group_refs[row["_group_key"]]
+        row.pop("_group_key", None)
+    for row in detail_rows:
+        row["Referencia grupo"] = group_refs[row["_group_key"]]
+        row.pop("_group_key", None)
+        row["Peso real (kg)"] = row["KG final vigente"]
     return summary_rows, detail_rows
 
 
 def key_fields(max_materials=2):
-    fields = ["Fecha de OT", "Fecha del pesaje final", "Estado fecha final", "Turno", "Máquina", "Tipo máquina", "Código máquina", "N°OF", "Pieza", "Código pieza", "Color", "Maquinistas", "Cobertura maquinistas", "Receta ID", "Receta revisión", "Receta hash", "Identidad receta", "Tipo materia prima"]
+    fields = [
+        "Tipo máquina", "Máquina", "Fecha de OT", "Maquinistas",
+        "Tipo materia prima",
+    ]
     fields.extend(f"Material {index}" for index in range(1, max(2, max_materials) + 1))
-    fields.extend(["Molde", "Código molde", "Fuente nombre molde", "Mangas", "Mangas abiertas", "Mangas con pesaje restringido", "KG final vigente", "Ciclos aproximados", "Estado ciclos aproximados", "Estado datos producción", "Base técnica ciclos"])
+    fields.extend([
+        "Molde", "Pieza-Color", "Ciclos aproximados", "Peso real (kg)", "Turno",
+        "Cantidad por bulto", "Bultos pesados", "N°OF", "Fracción virgen (receta)",
+        "Fecha del pesaje final", "Estado fecha final", "Peso bruto (kg)", "Tara (kg)", "Situación del pesaje",
+        "Mangas", "Pendientes de pesaje", "Mangas con pesaje restringido", "Mangas anuladas",
+        "Observación", "Referencia grupo",
+    ])
     return fields
 
 
 def detail_fields(max_materials=2):
-    fields = ["Fecha de OT", "Fecha del pesaje final", "Estado fecha final", "Turno", "Máquina", "Tipo máquina", "Código máquina", "N°OF", "N°OT", "Pieza", "Código pieza", "Color", "Maquinistas", "Cobertura maquinistas", "Receta ID", "Receta revisión", "Receta hash", "Identidad receta", "Tipo materia prima"]
+    fields = [
+        "Tipo máquina", "Máquina", "Fecha de OT", "Maquinistas",
+        "Tipo materia prima",
+    ]
     fields.extend(f"Material {index}" for index in range(1, max(2, max_materials) + 1))
-    fields.extend(["Molde", "Código molde", "Fuente nombre molde", "Manga", "ID manga", "Estado", "KG final vigente", "Estado pesaje", "Ciclos aproximados", "Estado ciclos aproximados", "Estado datos producción", "Base técnica ciclos"])
+    fields.extend([
+        "Molde", "Pieza-Color", "Ciclos aproximados", "Peso real (kg)", "Turno",
+        "Cantidad por bulto", "Bultos pesados", "N°OF", "Fracción virgen (receta)",
+        "Fecha del pesaje final", "Estado fecha final", "Peso bruto (kg)", "Tara (kg)", "Situación del pesaje",
+        "Manga", "N°OT", "Estado operativo", "Observación", "Referencia grupo",
+    ])
     return fields
 
 
+def audit_fields():
+    return [
+        "Referencia grupo", "Manga", "ID manga", "N°OF", "N°OT", "Fecha de OT", "Estado operativo",
+        "Estado pesaje", "Fecha del pesaje final", "Estado fecha final", "Hora del pesaje", "Peso bruto (kg)", "Tara (kg)",
+        "Peso neto (kg)", "Cantidad UN acreditada", "Fuente cantidad", "Tipo máquina", "Proceso máquina",
+        "Nombre tipo máquina", "Código máquina", "Tipo materia prima", "Fracción virgen (receta)",
+        "Estado fracción virgen", "Receta ID", "Receta revisión", "Receta hash", "Molde", "Código molde",
+        "Salida/base ciclos", "Estado receta", "Estado molde", "Estado salida", "Estado datos producción",
+        "Cobertura maquinistas", "Observación técnica",
+    ]
+
+
+def _audit_rows(detail_rows):
+    """Build one traceability row per physical manga.
+
+    Operational sheets intentionally omit immutable identifiers and technical
+    diagnostics.  Keeping them here makes a workbook useful for review
+    without making the production-facing table unreadable.
+    """
+    rows = []
+    for source in detail_rows:
+        rows.append({
+            "Referencia grupo": source.get("Referencia grupo"),
+            "Manga": source.get("Manga"),
+            "ID manga": source.get("ID manga"),
+            "N°OF": source.get("N°OF"),
+            "N°OT": source.get("N°OT"),
+            "Fecha de OT": source.get("Fecha de OT"),
+            "Estado operativo": source.get("_estado_operativo_code") or source.get("Estado operativo"),
+            "Estado pesaje": source.get("Estado pesaje"),
+            "Fecha del pesaje final": source.get("Fecha del pesaje final"),
+            "Estado fecha final": source.get("Estado fecha final"),
+            "Hora del pesaje": source.get("Hora del pesaje"),
+            "Peso bruto (kg)": source.get("Peso bruto (kg)"),
+            "Tara (kg)": source.get("Tara (kg)"),
+            "Peso neto (kg)": source.get("KG final vigente"),
+            "Cantidad UN acreditada": source.get("Cantidad por bulto"),
+            "Fuente cantidad": source.get("Fuente cantidad"),
+            "Tipo máquina": source.get("Tipo máquina"),
+            "Proceso máquina": source.get("Proceso máquina"),
+            "Nombre tipo máquina": source.get("Nombre tipo máquina"),
+            "Código máquina": source.get("Código máquina"),
+            "Tipo materia prima": source.get("Tipo materia prima"),
+            "Fracción virgen (receta)": source.get("Fracción virgen (receta)"),
+            "Estado fracción virgen": source.get("Estado fracción virgen"),
+            "Receta ID": source.get("Receta ID"),
+            "Receta revisión": source.get("Receta revisión"),
+            "Receta hash": source.get("Receta hash"),
+            "Molde": source.get("Molde"),
+            "Código molde": source.get("Código molde"),
+            "Salida/base ciclos": source.get("Base técnica ciclos"),
+            "Estado receta": source.get("Estado receta"),
+            "Estado molde": source.get("Estado molde"),
+            "Estado salida": source.get("Estado salida"),
+            "Estado datos producción": source.get("Estado datos producción"),
+            "Cobertura maquinistas": source.get("Cobertura maquinistas"),
+            "Observación técnica": source.get("Observación"),
+        })
+    return rows
+
+
 def _style_export_columns(sheet, headers):
-    """Give only the added traceability columns enough room to be readable."""
+    """Apply a small, typed, readable layout to every exported column."""
     widths = {
-        "Tipo máquina": 18, "Tipo materia prima": 18, "Receta ID": 12,
+        "Referencia grupo": 16, "Tipo máquina": 18, "Máquina": 20, "Fecha de OT": 14,
+        "Maquinistas": 28, "Tipo materia prima": 18,
         "Receta revisión": 15, "Receta hash": 18, "Identidad receta": 34,
         "Material 1": 22, "Material 2": 22, "Material 3": 22,
-        "Molde": 22, "Código molde": 16, "Fuente nombre molde": 28,
-        "Ciclos aproximados": 18, "Estado ciclos aproximados": 24,
+        "Molde": 22, "Pieza-Color": 30, "Código molde": 16, "Fuente nombre molde": 28,
+        "Ciclos aproximados": 18, "Peso real (kg)": 16, "Cantidad por bulto": 18,
+        "Bultos pesados": 16, "Fracción virgen (receta)": 22, "Fecha del pesaje final": 22,
+        "Estado fecha final": 34,
+        "Turno": 12, "N°OF": 16, "N°OT": 16, "Manga": 18, "ID manga": 38,
+        "Peso bruto (kg)": 16, "Tara (kg)": 14, "Peso neto (kg)": 16,
+        "Hora del pesaje": 22, "Situación del pesaje": 30,
+        "Pendientes de pesaje": 20, "Mangas con pesaje restringido": 28, "Mangas anuladas": 18,
+        "Observación": 34, "Observación técnica": 34, "Estado ciclos aproximados": 24,
         "Estado datos producción": 28, "Base técnica ciclos": 24,
+        "Salida/base ciclos": 24, "Estado operativo": 18, "Estado pesaje": 20,
+        "Estado fracción virgen": 30, "Proceso máquina": 18, "Nombre tipo máquina": 24,
+        "Código máquina": 18, "Cantidad UN acreditada": 18, "Fuente cantidad": 22,
+        "Estado receta": 28, "Estado molde": 28, "Estado salida": 28,
+        "Cobertura maquinistas": 24,
     }
     for index, header in enumerate(headers, start=1):
-        if header not in widths and not header.startswith("Material "):
-            continue
-        width = widths.get(header, 22)
+        width = widths.get(header, 22 if header.startswith("Material ") else 16)
         column = sheet.cell(row=1, column=index).column_letter
         sheet.column_dimensions[column].width = width
         for cell in sheet[column]:
+            if cell.row == 1:
+                cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+                cell.fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+            else:
+                cell.font = Font(name="Arial", size=10)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
             if header == "Ciclos aproximados" and cell.row > 1:
                 cell.number_format = "0.0"
+            elif header in {"Peso real (kg)", "Peso bruto (kg)", "Tara (kg)", "Peso neto (kg)"} and cell.row > 1:
+                cell.number_format = "0.00"
+            elif header in {"Fracción virgen (receta)"} and cell.row > 1:
+                cell.number_format = "0.0%"
+            elif header in {"Fecha de OT", "Fecha del pesaje final"} and cell.row > 1:
+                cell.number_format = "dd/mm/yyyy"
+            elif header == "Hora del pesaje" and cell.row > 1:
+                cell.number_format = "dd/mm/yyyy hh:mm"
+    sheet.freeze_panes = "A2"
+    sheet.sheet_view.showGridLines = False
+    sheet.auto_filter.ref = f"A1:{sheet.cell(row=max(1, sheet.max_row), column=max(1, len(headers))).coordinate}"
 
 
 def generate_manga_explorer_xlsx(session, *, actor_id, filters=None):
@@ -1278,49 +1580,74 @@ def generate_manga_explorer_xlsx(session, *, actor_id, filters=None):
     date_type = parsed["fecha_tipo"]
     payload = _collect(session, actor_id=actor_id, raw_filters=raw, paginate=False, include_production=True)
     summary_rows, detail_rows = _export_rows(payload)
+    audit_rows = _audit_rows(detail_rows)
+    max_materials = max(
+        (len((item.get("produccion") or {}).get("materias_primas") or []) for item in payload["items"]),
+        default=2,
+    )
     workbook = Workbook()
     workbook.remove(workbook.active)
     criterion = "Fecha del pesaje final" if date_type == "PESAJE_FINAL" else "Fecha de OT"
+
+    def append_data_sheet(title, headers, rows):
+        sheet = workbook.create_sheet(title)
+        sheet.append(headers)
+        for row in rows:
+            sheet.append([_safe_cell(row.get(header)) for header in headers])
+        _style_export_columns(sheet, headers)
+        sheet["A1"].comment = Comment(
+            f"Criterio de fecha: {criterion}. Cohorte por OT origen; no reparto diario de masa. "
+            "Ciclos: base snapshot por salida; no aditivo entre coproductos.",
+            "EnvaPeru",
+        )
+        return sheet
+
+    if mode in {"RESUMIDO", "AMBOS"}:
+        append_data_sheet("Resumen", key_fields(max_materials), summary_rows)
+    if mode in {"DETALLADO", "AMBOS"}:
+        append_data_sheet("Detalle", detail_fields(max_materials), detail_rows)
+    append_data_sheet("Auditoría", audit_fields(), audit_rows)
+
+    # Keep the applied scope in a visible, typed worksheet rather than hiding
+    # it in a header comment that is easy to miss in an exported file.
     criteria_sheet = workbook.create_sheet("Criterios")
     criteria_rows = [
         ["Criterio de fecha", criterion],
         ["Desde", parsed["fecha_desde"].isoformat() if parsed["fecha_desde"] else "Todas"],
         ["Hasta", parsed["fecha_hasta"].isoformat() if parsed["fecha_hasta"] else "Todas"],
         ["Búsqueda", parsed["q"] or "Todas"],
-        ["Estado", parsed["estado_manga"] or "Todos"],
+        ["Estado", _human_label(parsed["estado_manga"], "Todos")],
+        ["Campo aplicado", "Fecha del pesaje final (fecha_local_pesaje del final vigente)" if date_type == "PESAJE_FINAL" else "Fecha de OT (origen)"],
         ["Conjunto exportado", "Completo según filtros; el cursor de la tabla no limita el Excel"],
+        ["Resumen", "Una fila por cohorte operativa; KG y ciclos no se duplican por maquinista ni coproducto"],
+        ["Detalle", "Una fila por manga física; una pesada vigente aporta su KG una sola vez"],
+        ["Cantidad por bulto", "Sólo se muestra como Cantidad UN acreditada cuando la fuente observada declara unidades (UN); KG, plan o fuente ambigua quedan vacíos y explicados."],
         ["Ciclos aproximados", "KG final vigente × 1000 / (cantidad por ciclo snapshot × peso unitario snapshot g); no suma coproductos"],
-        ["Receta vs consumo", "La receta es el snapshot del Trabajo; no representa consumo real de materiales."],
+        ["Receta vs consumo", "Materiales y fracción virgen son snapshot de receta; no representan consumo real de materiales."],
+        ["Tipo máquina", "Proviene del proceso actual del catálogo TipoMaquina; el nombre/modelo se conserva separado en Auditoría."],
         ["Agrupación de ciclos", "Resumen separa receta, molde y salida/base técnica; los coproductos no se suman entre sí."],
+        ["Campos no disponibles", "Se dejan vacíos con observación; no se estiman unidades desde KG ni se inventan horas o mermas."],
+        ["Estados de pesaje", "Pesaje final vigente; Pendiente de pesaje final; Peso no autorizado; Manga anulada sin pesaje final."],
+        ["Dimensiones", "La cohorte se agrupa por Fecha OT, turno, máquina, N°OF, Pieza-Color, receta, molde y salida/base; Detalle conserva una fila por manga física."],
+        ["Ausente vs cero", "Celda vacía significa fuente ausente/no acreditada; cero sólo se conserva cuando la fuente lo registra."],
+        ["Columnas omitidas", "Por falta de fuente no se inventan HoraIngreso, HorasTrab, documento, merma ni chancaca; UUID, hash y estados técnicos quedan en Auditoría."],
     ]
+    criteria_sheet.append(["Campo", "Descripción"])
     for values in criteria_rows:
         criteria_sheet.append([_safe_cell(value) for value in values])
-    for cell in criteria_sheet["A"]:
-        cell.font = Font(bold=True)
-    if mode in {"RESUMIDO", "AMBOS"}:
-        sheet = workbook.create_sheet("Resumen")
-        max_materials = max((len((item.get("produccion") or {}).get("materias_primas") or []) for item in payload["items"]), default=2)
-        headers = key_fields(max_materials)
-        sheet.append(headers)
-        for cell in sheet[1]:
-            cell.font = Font(bold=True)
-        _style_export_columns(sheet, headers)
-        sheet["A1"].comment = Comment(f"Criterio de fecha: {criterion}. Cohorte por OT origen; no reparto diario de masa. Ciclos: base snapshot por salida; no aditivo entre coproductos.", "EnvaPeru")
-        for row in summary_rows:
-            sheet.append([_safe_cell(row.get(header)) for header in headers])
-        _style_export_columns(sheet, headers)
-    if mode in {"DETALLADO", "AMBOS"}:
-        sheet = workbook.create_sheet("Detalle")
-        max_materials = max((len((item.get("produccion") or {}).get("materias_primas") or []) for item in payload["items"]), default=2)
-        headers = detail_fields(max_materials)
-        sheet.append(headers)
-        for cell in sheet[1]:
-            cell.font = Font(bold=True)
-        _style_export_columns(sheet, headers)
-        sheet["A1"].comment = Comment(f"Criterio de fecha: {criterion}. Cohorte por OT origen; no reparto diario de masa. Ciclos: base snapshot por salida; no aditivo entre coproductos.", "EnvaPeru")
-        for row in detail_rows:
-            sheet.append([_safe_cell(row.get(header)) for header in headers])
-        _style_export_columns(sheet, headers)
+    _style_export_columns(criteria_sheet, ["Campo", "Descripción"])
+    criteria_sheet.column_dimensions["A"].width = 24
+    criteria_sheet.column_dimensions["B"].width = 100
+    for cell in criteria_sheet["A"][1:]:
+        cell.font = Font(name="Arial", size=10, bold=True)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    for cell in criteria_sheet["B"][1:]:
+        cell.font = Font(name="Arial", size=10)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    criteria_sheet.freeze_panes = "A2"
+    criteria_sheet.sheet_view.showGridLines = False
+    criteria_sheet.auto_filter.ref = f"A1:B{max(1, criteria_sheet.max_row)}"
+
     output = BytesIO()
     workbook.save(output)
     output.seek(0)
