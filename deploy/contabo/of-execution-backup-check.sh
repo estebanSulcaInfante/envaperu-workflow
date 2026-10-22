@@ -6,6 +6,7 @@ test_container=enva-of-execution-restore-20261022
 backup_dir=/var/backups/envaperu-scm/releases/of-estados-20261022
 dump="$backup_dir/pre-migracion.dump"
 test -s "$dump"
+test "$(sha256sum "$dump" | cut -d' ' -f1)" = b9d8e341153e653ca5b1bca3915e6232fe1605175e3d77ea9838f3b8bbfcb4cc
 upgrade="$backup_dir/of-execution-upgrade.sql"
 test -f "$upgrade"
 test "$(sha256sum "$upgrade" | cut -d' ' -f1)" = fa67f97c6acc1731b6a1cc0c383d201e06ee6b77e75b889d5b9035991f0c35e9
@@ -27,7 +28,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 ready=no
 for i in $(seq 1 30); do
-  if docker exec "$test_container" pg_isready -U postgres >/dev/null 2>&1; then ready=yes; break; fi
+  # The image's temporary init server only listens on its Unix socket. Wait
+  # for final TCP readiness so pg_restore cannot race its planned shutdown.
+  if docker exec "$test_container" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then ready=yes; break; fi
   sleep 1
 done
 test "$ready" = yes
