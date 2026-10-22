@@ -4,9 +4,9 @@ set -eu
 db=envaperuscmpilot-scmpilot-cnxr9n-db-1
 test_container=enva-of-execution-restore-20261022
 backup_dir=/var/backups/envaperu-scm/releases/of-estados-20261022
-dump="$backup_dir/pre-migracion.dump"
+dump="$backup_dir/pre-migracion-final-20261022T1950.dump"
 test -s "$dump"
-test "$(sha256sum "$dump" | cut -d' ' -f1)" = b9d8e341153e653ca5b1bca3915e6232fe1605175e3d77ea9838f3b8bbfcb4cc
+test "$(sha256sum "$dump" | cut -d' ' -f1)" = 1d71c09eaa0866bdf50e489743c21cf02a4ab7287d3a9d5ffb3f01b1a0a83f81
 upgrade="$backup_dir/of-execution-upgrade.sql"
 test -f "$upgrade"
 test "$(sha256sum "$upgrade" | cut -d' ' -f1)" = fa67f97c6acc1731b6a1cc0c383d201e06ee6b77e75b889d5b9035991f0c35e9
@@ -34,12 +34,12 @@ for i in $(seq 1 30); do
   sleep 1
 done
 test "$ready" = yes
-docker exec "$test_container" pg_restore --list /backup/pre-migracion.dump >/dev/null
+docker exec "$test_container" pg_restore --list /backup/pre-migracion-final-20261022T1950.dump >/dev/null
 # Policy role names are required even with --no-owner --no-acl. Mirror only
 # the two observed SCM policy roles, without login or production credentials.
 docker exec "$test_container" psql -U postgres -d postgres -X -v ON_ERROR_STOP=1 \
   -c "CREATE ROLE scm_api NOLOGIN; CREATE ROLE scm_reader NOLOGIN;"
-docker exec "$test_container" pg_restore -U postgres -d scm_pilot --no-owner --no-acl --exit-on-error /backup/pre-migracion.dump
+docker exec "$test_container" pg_restore -U postgres -d scm_pilot --no-owner --no-acl --exit-on-error /backup/pre-migracion-final-20261022T1950.dump
 facts() {
   for table in scm_manga scm_pesaje_manga scm_existencia_manga scm_existencia_manga_kg scm_movimiento_inventario scm_movimiento_inventario_kg scm_movimiento_material_inventario scm_movimiento_material_preparado; do
     docker exec "$test_container" psql -U postgres -d scm_pilot -X -Atc \
