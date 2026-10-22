@@ -789,7 +789,16 @@ def _summary_parse(filters):
     if state not in _SUMMARY_STATES:
         # A concrete documented state is accepted; the DB constraint is the
         # authority for the exact list and this avoids silently changing it.
-        state_values = {"BORRADOR", "LIBERADA", "PROGRAMADA", "EN_EJECUCION", "CERRADA", "ANULADA"}
+        state_values = {
+            "BORRADOR",
+            "LIBERADA",
+            "PROGRAMADA",
+            "EN_EJECUCION",
+            "PAUSADA",
+            "CANCELADA",
+            "CERRADA",
+            "ANULADA",
+        }
         if state not in state_values:
             raise ScmServiceError(
                 "INVALID_OF_STATE", "estado no es un estado de OF valido.",

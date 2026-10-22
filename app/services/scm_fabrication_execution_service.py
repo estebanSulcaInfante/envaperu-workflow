@@ -51,6 +51,11 @@ def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def _ordered_by_id(items):
+    """Return relationship/query collections in a stable fingerprint order."""
+    return sorted(items, key=lambda item: str(item.id))
+
+
 def _load_works(session, order_id, *, lock=False):
     statement = select(ScmTrabajoOt).where(
         ScmTrabajoOt.orden_operacion_id == order_id,
@@ -118,12 +123,12 @@ def _impact(session, order, action, works):
     mangas = session.scalars(
         select(ScmManga).join(
             ScmTrabajoOt, ScmTrabajoOt.id == ScmManga.trabajo_ot_id,
-        ).where(ScmTrabajoOt.orden_operacion_id == order.id)
+        ).where(ScmTrabajoOt.orden_operacion_id == order.id).order_by(ScmManga.id)
     ).all()
     tramos = session.scalars(
         select(ScmTramoMangaTrabajo).join(
             ScmTrabajoOt, ScmTrabajoOt.id == ScmTramoMangaTrabajo.trabajo_ot_id,
-        ).where(ScmTrabajoOt.orden_operacion_id == order.id)
+        ).where(ScmTrabajoOt.orden_operacion_id == order.id).order_by(ScmTramoMangaTrabajo.id)
     ).all()
     corrida_ids = [run.id for run in (order.fabricacion.corridas if order.fabricacion else ())]
     reservations = []
@@ -132,8 +137,13 @@ def _impact(session, order, action, works):
             select(ScmReservaMaterial).join(ScmRequerimientoMaterial).where(
                 ScmReservaMaterial.estado == "ACTIVA",
                 ScmRequerimientoMaterial.corrida_fabricacion_id.in_(corrida_ids),
-            )
+            ).order_by(ScmReservaMaterial.id)
         ).all()
+    works = _ordered_by_id(works)
+    mangas = _ordered_by_id(mangas)
+    tramos = _ordered_by_id(tramos)
+    reservations = _ordered_by_id(reservations)
+    outputs = _ordered_by_id(order.salidas)
     produced = [{
         "salida_id": str(output.id),
         # The canonical output article carries the inventory unit.  Do not
@@ -142,11 +152,11 @@ def _impact(session, order, action, works):
         "cantidad_objetivo": format(output.cantidad_objetivo, "f"),
         "cantidad_real": format(output.cantidad_real, "f") if output.cantidad_real is not None else None,
         "cantidad_rechazada": format(output.cantidad_rechazada, "f") if output.cantidad_rechazada is not None else None,
-    } for output in order.salidas]
+    } for output in outputs]
     residuals = []
     assignment_fingerprint = []
-    for output in order.salidas:
-        for assignment in output.asignaciones:
+    for output in outputs:
+        for assignment in _ordered_by_id(output.asignaciones):
             assignment_fingerprint.append({
                 "id": str(assignment.id),
                 "version": assignment.version,
@@ -179,14 +189,16 @@ def _impact(session, order, action, works):
             .where(
                 ScmSaldoWipSalida.trabajo_color_id.in_(work_ids),
                 ScmReservaWipSalida.estado == "CREDITO_EN_LINEA_PENDIENTE",
-            )
+            ).order_by(ScmReservaWipSalida.id)
         ).all()
         prepared_reservations = session.scalars(
             select(ScmReservaMaterialPreparado).where(
                 ScmReservaMaterialPreparado.trabajo_ot_id.in_(work_ids),
                 ScmReservaMaterialPreparado.estado == "ACTIVA",
-            )
+            ).order_by(ScmReservaMaterialPreparado.id)
         ).all()
+    inline_wip = _ordered_by_id(inline_wip)
+    prepared_reservations = _ordered_by_id(prepared_reservations)
     blockers = []
     executable = [work for work in works if work.estado in {"PLANIFICADO", "EN_EJECUCION"}]
     if action == "PAUSAR":
@@ -225,7 +237,7 @@ def _impact(session, order, action, works):
         "version": order.version,
         "estado": order.estado,
         "works": [{"id": str(w.id), "estado": w.estado, "version": w.version, "previo": w.estado_previo_pausa} for w in works],
-        "mangas": [{"id": m.id, "estado": m.estado, "version": m.version} for m in mangas],
+        "mangas": [{"id": str(m.id), "estado": m.estado, "version": m.version} for m in mangas],
         "tramos": [{"id": str(t.id), "estado": t.estado} for t in tramos],
         "reservas": [{"id": str(r.id), "estado": r.estado, "emitida": r.emitida_neta_kg, "consumida": r.cantidad_consumida_kg} for r in reservations],
         # Produced facts and demand fulfillment are mutable authorities during
