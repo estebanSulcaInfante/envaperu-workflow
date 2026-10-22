@@ -4673,7 +4673,13 @@ def transition_ot(
         ot = session.scalar(
             select(RegistroDiarioProduccion)
             .where(RegistroDiarioProduccion.public_id == public_id)
+            # The initial probe above may have loaded a stale PLANIFICADA
+            # instance while another transaction annulled the same OT.  The
+            # row lock must refresh that identity-map entry before validating
+            # version/state; otherwise iniciar can overwrite ANULADA after
+            # waiting for the annulment transaction to commit.
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if ot.trabajos_ot and action != "cerrar":
             raise ScmServiceError(
