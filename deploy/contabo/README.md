@@ -7,9 +7,9 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 5e9cbb7db638c55e196e5935c82348ac2c0cf9d9.
-check_ci.py accepts only GitHub Actions run 39639588339, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/mangas-readable-report-release-20261021,
+Application source is fixed to e013031ae8946793bb48ca14d67ece6f7d9318b0.
+check_ci.py accepts only GitHub Actions run 39819520184, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/of-execution-release-20261022,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.

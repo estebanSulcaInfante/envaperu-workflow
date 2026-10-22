@@ -3,9 +3,9 @@ import json
 import os
 import re
 import urllib.request
-SOURCE_SHA='5e9cbb7db638c55e196e5935c82348ac2c0cf9d9'
-RUN_ID=39639588339
-BRANCH='codex/mangas-readable-report-release-20261021'
+SOURCE_SHA='e013031ae8946793bb48ca14d67ece6f7d9318b0'
+RUN_ID=39819520184
+BRANCH='codex/of-execution-release-20261022'
 REPOSITORY='estebanSulcaInfante/envaperu-workflow'
 def validate_inputs(source_sha, python_base):
     if source_sha!=SOURCE_SHA: raise ValueError('Only reviewed source SHA is approved')
