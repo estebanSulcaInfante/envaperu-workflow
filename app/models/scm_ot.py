@@ -415,7 +415,7 @@ class ScmTrabajoOt(db.Model):
         ),
         db.CheckConstraint(
             "estado IN ('PLANIFICADO', 'EN_EJECUCION', 'PAUSADO', "
-            "'COMPLETADO', 'ANULADO')",
+            "'COMPLETADO', 'CANCELADO', 'ANULADO')",
             name="ck_scm_trabajo_ot_estado",
         ),
         db.CheckConstraint(
@@ -514,6 +514,7 @@ class ScmTrabajoOt(db.Model):
     completada_at = db.Column(db.DateTime(timezone=True), nullable=True)
     anulada_at = db.Column(db.DateTime(timezone=True), nullable=True)
     motivo_pausa = db.Column(db.String(500), nullable=True)
+    estado_previo_pausa = db.Column(db.String(24), nullable=True)
     motivo_anulacion = db.Column(db.String(500), nullable=True)
     created_by_id = db.Column(
         db.Integer,

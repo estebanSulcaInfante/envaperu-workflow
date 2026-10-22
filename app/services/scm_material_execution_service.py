@@ -28,6 +28,7 @@ from app.models.scm_prepared_material import (
     ScmRequerimientoMaterialPreparado,
 )
 from app.services.scm_inventory_service import _positive_quantity, _reserve_operation
+from app.services.scm_execution_guards import ensure_of_accepts_execution_write
 from app.services.scm_service_support import (
     ScmServiceError,
     actor_snapshot,
@@ -227,6 +228,9 @@ def generate_material_requirements(session, *, actor_id, operation_id, fabricati
         )
         if order is None or order.tipo != "FABRICACION" or order.fabricacion is None:
             raise ScmServiceError("OF_NOT_FOUND", "La orden de fabricacion no existe.", status_code=404)
+        ensure_of_accepts_execution_write(
+            session, order.id, action="generar requerimientos de material"
+        )
         if order.estado not in ("LIBERADA", "PROGRAMADA", "EN_EJECUCION"):
             raise ScmServiceError(
                 "OF_NOT_RELEASED", "La OF debe estar liberada antes de requerir materiales.",
@@ -339,6 +343,11 @@ def reserve_run_materials(session, *, actor_id, operation_id, run_id):
         if replay is not None:
             return replay
         run = _load_run(session, run_id)
+        ensure_of_accepts_execution_write(
+            session,
+            run.orden_fabricacion.orden_operacion_id,
+            action="reservar materiales",
+        )
         requirements = session.scalars(
             select(ScmRequerimientoMaterial)
             .where(ScmRequerimientoMaterial.corrida_fabricacion_id == run.id)
@@ -444,6 +453,11 @@ def emit_reserved_material(session, *, actor_id, operation_id, reservation_id, d
         ).with_for_update())
         if reservation is None:
             raise ScmServiceError("MATERIAL_RESERVATION_NOT_FOUND", "La reserva no existe.", status_code=404)
+        ensure_of_accepts_execution_write(
+            session,
+            reservation.requerimiento.corrida.orden_fabricacion.orden_operacion_id,
+            action="emitir materiales",
+        )
         if reservation.estado != "ACTIVA" or Decimal(reservation.emitida_neta_kg) + quantity > Decimal(reservation.cantidad_kg):
             raise ScmServiceError("MATERIAL_EMISSION_EXCEEDS_RESERVATION", "La emision excede el saldo reservado.", status_code=409)
         source = session.scalar(select(ScmSaldoMaterialInventario).where(

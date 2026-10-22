@@ -210,6 +210,8 @@ CAPACIDADES_SCM_INICIALES = (
     ("OF_LIBERAR", "Liberar ordenes de fabricacion"),
     ("OF_CERRAR", "Cerrar ordenes de fabricacion y acreditar demanda"),
     ("OF_ANULAR", "Anular ordenes de fabricacion"),
+    ("OF_PAUSAR_EJECUCION", "Pausar y reanudar la ejecucion de OF"),
+    ("OF_CANCELAR_EJECUCION", "Cancelar definitivamente la ejecucion de OF"),
     ("OA_VER", "Consultar ordenes de armado"),
     # Se crea mediante la migración F3, pero no entra al seed general porque
     # GERENTE_GENERAL hereda todo este catálogo. La asignación inicial exige
@@ -354,6 +356,7 @@ ROLES_SCM_INICIALES = (
             "OT_CREAR",
             "OT_INICIAR",
             "OT_CERRAR",
+            "OF_PAUSAR_EJECUCION",
             "PLAN_MANGA_ADMINISTRAR",
             "MANGA_PLANIFICAR",
             "MANGA_EXTRA_SOLICITAR",
@@ -504,6 +507,8 @@ ROLES_SCM_INICIALES = (
             "OF_LIBERAR",
             "OF_CERRAR",
             "OF_ANULAR",
+            "OF_PAUSAR_EJECUCION",
+            "OF_CANCELAR_EJECUCION",
             "OA_LIBERAR",
             "OA_EJECUTAR",
             "OA_ANULAR",

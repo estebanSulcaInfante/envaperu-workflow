@@ -523,6 +523,31 @@ def _tv_manga(manga_id, work, kg, *, segments=None):
     )
 
 
+def test_tv_progress_excludes_released_without_work_but_keeps_legacy_active(monkeypatch):
+    runs = []
+    for state in ("LIBERADA", "EN_EJECUCION", "PAUSADA", "CANCELADA"):
+        run = _tv_aggregate_run(corrida_id=f"run-{state}")
+        run["orden"] = SimpleNamespace(
+            id=f"of-{state}", codigo=f"OF-{state}", estado=state, molde_id="ML-1",
+        )
+        # Explicitly clear after the helper: its `works or [...]` default
+        # intentionally supplies work for other report scenarios.
+        if state in {"LIBERADA", "EN_EJECUCION"}:
+            run["works"] = []
+            run["contexts"] = []
+        runs.append(run)
+    monkeypatch.setattr(
+        production_reports_service, "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: runs)
+
+    items = list_production_progress_tv(object(), actor_id=7, filters={})["items"]
+
+    assert [item["estado"] for item in items] == ["EN_EJECUCION"]
+    assert items[0]["of_id"] == "of-EN_EJECUCION"
+
+
 def test_tv_progress_consolidates_two_ots_into_one_output_target(monkeypatch):
     work_a, work_b = SimpleNamespace(id="work-a"), SimpleNamespace(id="work-b")
     contexts = [

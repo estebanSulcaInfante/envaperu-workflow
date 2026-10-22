@@ -1136,6 +1136,11 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
         state = str(getattr(order, "estado", "")).upper()
         if state not in {"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "ABIERTA", "EN_COBERTURA"}:
             continue
+        # A released OF without any own work is planning noise for TV.  Legacy
+        # active OFs without a work FK remain visible because their historical
+        # production facts still need an operational card.
+        if state == "LIBERADA" and not run.get("works"):
+            continue
         contexts = _tv_contexts(run)
         context_identities = [
             (context, _tv_aggregate_identity(run, context, expose_mold=can_view_of))

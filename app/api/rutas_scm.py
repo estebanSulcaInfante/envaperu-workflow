@@ -158,6 +158,10 @@ from app.services.scm_fabrication_order_service import (
     replace_fabrication_order,
     update_fabrication_order,
 )
+from app.services.scm_fabrication_execution_service import (
+    execute_execution_command,
+    get_execution_impact,
+)
 from app.services.scm_fabrication_contextual_recipe_service import (
     create_contextual_fabrication_recipe,
 )
@@ -1192,6 +1196,43 @@ def orden_fabricacion_liberar(order_id):
         operation_order_id=order_id,
         expected_resource_version=payload.get("version"),
     ))
+
+
+@scm_bp.get("/ordenes-fabricacion/<uuid:order_id>/impacto-ejecucion")
+def orden_fabricacion_impacto_ejecucion(order_id):
+    return jsonify(get_execution_impact(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=order_id,
+        action=request.args.get("accion"),
+    ))
+
+
+def _execution_command(order_id, action):
+    payload = _json_body()
+    return jsonify(execute_execution_command(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=order_id,
+        action=action,
+        command=payload,
+        idempotency_key=_idempotency_key(),
+    ))
+
+
+@scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/pausar-ejecucion")
+def orden_fabricacion_pausar_ejecucion(order_id):
+    return _execution_command(order_id, "PAUSAR")
+
+
+@scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/reanudar-ejecucion")
+def orden_fabricacion_reanudar_ejecucion(order_id):
+    return _execution_command(order_id, "REANUDAR")
+
+
+@scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/cancelar-ejecucion")
+def orden_fabricacion_cancelar_ejecucion(order_id):
+    return _execution_command(order_id, "CANCELAR")
 
 
 @scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/anular")

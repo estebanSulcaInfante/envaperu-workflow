@@ -80,6 +80,7 @@ from app.services.scm_service_support import (
     reject_unknown_fields,
     required_text,
 )
+from app.services.scm_execution_guards import ensure_of_accepts_execution_write
 from app.services.scm_manga_assignment_projection import (
     effective_assignment,
     effective_plan_assignment,
@@ -2495,10 +2496,12 @@ def add_color_work(
         },
     )
     try:
+        # Lock protocol is aggregate OF -> existing child work -> physical OT.
+        # Read the OT identity first, then take the OF guard lock before the
+        # ordered child/OT locks so this insertion cannot deadlock lifecycle.
         ot = session.scalar(
             select(RegistroDiarioProduccion)
             .where(RegistroDiarioProduccion.public_id == ot_id)
-            .with_for_update()
         )
         if (
             ot is None
@@ -2508,6 +2511,22 @@ def add_color_work(
             raise ScmServiceError(
                 "OT_NOT_FOUND", "La OT de fabricacion no existe.", status_code=404
             )
+        ensure_of_accepts_execution_write(session, ot.orden_operacion_id, action="crear trabajo")
+        # Lifecycle commands lock the OF and then every existing child work
+        # before touching the shared OT.  Acquire the same ordered child set
+        # here; otherwise a pause holding work -> OT could deadlock an
+        # insertion holding OT -> duplicate-work row.
+        session.scalars(
+            select(ScmTrabajoOt)
+            .where(ScmTrabajoOt.orden_trabajo_id == ot.id)
+            .order_by(ScmTrabajoOt.id)
+            .with_for_update(of=ScmTrabajoOt)
+        ).all()
+        ot = session.scalar(
+            select(RegistroDiarioProduccion)
+            .where(RegistroDiarioProduccion.public_id == ot_id)
+            .with_for_update()
+        )
         if ot.estado not in ("PLANIFICADA", "EN_EJECUCION"):
             raise ScmServiceError(
                 "INVALID_STATE_TRANSITION",
@@ -2811,7 +2830,20 @@ def _close_work_assignment(
 
 
 def _recompute_parent_state(session, work):
-    parent = work.orden_trabajo
+    # Lifecycle commands serialize OF -> work -> OT.  Re-acquire the shared OT
+    # row explicitly after the work lock so a sibling OF cannot observe or
+    # overwrite a partially recomputed parent state.
+    parent = session.scalar(
+        select(RegistroDiarioProduccion)
+        .where(RegistroDiarioProduccion.id == work.orden_trabajo_id)
+        .with_for_update(of=RegistroDiarioProduccion)
+    )
+    if parent is None:
+        raise ScmServiceError(
+            "OT_NOT_FOUND",
+            "La OT compartida ya no existe; no se puede recalcular su estado.",
+            status_code=409,
+        )
     states = session.scalars(
         select(ScmTrabajoOt.estado).where(
             ScmTrabajoOt.orden_trabajo_id == parent.id
@@ -3067,6 +3099,22 @@ def transition_color_work(
     acquire_kg_productive_write_lock(session)
     reject_unknown_fields(data, allowed={"version", "motivo"})
     try:
+        # Lock the aggregate OF before the child work.  Lifecycle commands
+        # use the same order->work protocol; probing the FK first avoids a
+        # work->OF deadlock while preserving the normal not-found response.
+        operation_owner = session.scalar(
+            select(ScmTrabajoOt.orden_operacion_id).where(
+                ScmTrabajoOt.id == work_id,
+                ScmTrabajoOt.tipo == "COLOR",
+            )
+        )
+        if operation_owner is None:
+            _load_color_work(session, work_id)
+        ensure_of_accepts_execution_write(
+            session,
+            operation_owner,
+            action=f"{action} trabajo",
+        )
         work = _load_color_work(session, work_id, lock=True)
         _validate_work_parent(work)
         version = expected_version(data.get("version"))
@@ -3381,6 +3429,17 @@ def add_work_mangas(
         return replay
     reject_unknown_fields(data, allowed={"plan_linea_id", "cantidad_un"})
     try:
+        operation_owner = session.scalar(
+            select(ScmTrabajoOt.orden_operacion_id).where(
+                ScmTrabajoOt.id == work_id,
+                ScmTrabajoOt.tipo == "COLOR",
+            )
+        )
+        if operation_owner is None:
+            _load_color_work(session, work_id)
+        ensure_of_accepts_execution_write(
+            session, operation_owner, action="agregar mangas"
+        )
         work = _load_color_work(session, work_id, lock=True)
         if work.estado not in {"PLANIFICADO", "EN_EJECUCION", "PAUSADO"}:
             raise ScmServiceError(
@@ -3564,6 +3623,17 @@ def assign_color_work_worker(
         },
     )
     try:
+        operation_owner = session.scalar(
+            select(ScmTrabajoOt.orden_operacion_id).where(
+                ScmTrabajoOt.id == work_id,
+                ScmTrabajoOt.tipo == "COLOR",
+            )
+        )
+        if operation_owner is None:
+            _load_color_work(session, work_id)
+        ensure_of_accepts_execution_write(
+            session, operation_owner, action="asignar relevo"
+        )
         work = _load_color_work(session, work_id, lock=True)
         if work.estado in {"COMPLETADO", "ANULADO"}:
             raise ScmServiceError(
@@ -4589,15 +4659,22 @@ def transition_ot(
     if replay is not None:
         return replay
     try:
+        # Match OF lifecycle lock ordering: resolve the OT, lock its OF
+        # aggregate, then lock the physical OT before changing its state.
         ot = session.scalar(
             select(RegistroDiarioProduccion)
             .where(RegistroDiarioProduccion.public_id == public_id)
-            .with_for_update()
         )
         if ot is None or ot.codigo_ot_sintetico:
             raise ScmServiceError(
                 "OT_NOT_FOUND", "La OT SCM no existe.", status_code=404
             )
+        ensure_of_accepts_execution_write(session, ot.orden_operacion_id, action="agregar mangas")
+        ot = session.scalar(
+            select(RegistroDiarioProduccion)
+            .where(RegistroDiarioProduccion.public_id == public_id)
+            .with_for_update()
+        )
         if ot.trabajos_ot and action != "cerrar":
             raise ScmServiceError(
                 "USE_COLOR_WORK_ACTION",

@@ -57,6 +57,7 @@ from app.services.scm_service_support import (
     reject_unknown_fields,
     required_text,
 )
+from app.services.scm_execution_guards import ensure_of_accepts_execution_write
 
 
 QTY = Decimal("0.001")
@@ -4937,6 +4938,10 @@ def reserve_prepared_material_for_work(
                 "El TrabajoColor no existe.",
                 status_code=404,
             )
+        ensure_of_accepts_execution_write(
+            session, work_color.trabajo.orden_operacion_id,
+            action="reservar material preparado",
+        )
         locked_work = session.scalar(
             select(ScmTrabajoOt)
             .where(ScmTrabajoOt.id == work_color.trabajo_ot_id)
@@ -5207,6 +5212,10 @@ def prepare_prepared_material_delivery(
                 "La reserva no existe.",
                 status_code=404,
             )
+        ensure_of_accepts_execution_write(
+            session, preview.trabajo.orden_operacion_id,
+            action="preparar despacho de material preparado",
+        )
         session.scalar(
             select(ScmRequerimientoMaterialPreparado)
             .where(
@@ -5354,6 +5363,16 @@ def dispatch_prepared_material_delivery(
         )
         if replay is not None:
             return replay
+        preview_unlocked = session.get(ScmEmisionMaterialPreparado, delivery_id)
+        if preview_unlocked is None or preview_unlocked.reserva is None:
+            raise ScmServiceError(
+                "PREPARED_MATERIAL_DELIVERY_NOT_FOUND",
+                "La entrega no existe.", status_code=404,
+            )
+        ensure_of_accepts_execution_write(
+            session, preview_unlocked.reserva.trabajo.orden_operacion_id,
+            action="despachar material preparado",
+        )
         preview, requirement, _assignment = _delivery_lock_head(
             session, delivery_id
         )

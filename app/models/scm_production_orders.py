@@ -32,14 +32,18 @@ OPERATION_STATES = (
     "LIBERADA",
     "PROGRAMADA",
     "EN_EJECUCION",
+    "PAUSADA",
     "CERRADA",
+    "CANCELADA",
     "ANULADA",
 )
 RUN_STATES = (
     "BORRADOR",
     "LIBERADA",
     "EN_EJECUCION",
+    "PAUSADA",
     "COMPLETADA",
+    "CANCELADA",
     "ANULADA",
 )
 FABRICATION_PROCESSES = ("INYECCION", "SOPLADO")
@@ -337,7 +341,7 @@ class ScmOrdenOperacion(db.Model):
         db.CheckConstraint(
             "estado IN "
             "('BORRADOR', 'LIBERADA', 'PROGRAMADA', 'EN_EJECUCION', "
-            "'CERRADA', 'ANULADA')",
+            "'PAUSADA', 'CERRADA', 'CANCELADA', 'ANULADA')",
             name="ck_scm_orden_operacion_estado",
         ),
         db.CheckConstraint(
@@ -543,8 +547,8 @@ class ScmCorridaFabricacion(db.Model):
         ),
         db.CheckConstraint(
             "estado IN "
-            "('BORRADOR', 'LIBERADA', 'EN_EJECUCION', 'COMPLETADA', "
-            "'ANULADA')",
+            "('BORRADOR', 'LIBERADA', 'EN_EJECUCION', 'PAUSADA', "
+            "'COMPLETADA', 'CANCELADA', 'ANULADA')",
             name="ck_scm_corrida_estado",
         ),
         db.UniqueConstraint(
