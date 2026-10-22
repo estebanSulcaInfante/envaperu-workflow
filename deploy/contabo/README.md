@@ -7,8 +7,8 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to e013031ae8946793bb48ca14d67ece6f7d9318b0.
-check_ci.py accepts only GitHub Actions run 39819520184, repository
+Application source is fixed to e77f480154443af8aa737c233e97f8aa09d60d15.
+check_ci.py accepts only GitHub Actions run 39819894101, repository
 estebanSulcaInfante/envaperu-workflow, branch codex/of-execution-release-20261022,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
