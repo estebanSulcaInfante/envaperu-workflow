@@ -35,6 +35,10 @@ for i in $(seq 1 30); do
 done
 test "$ready" = yes
 docker exec "$test_container" pg_restore --list /backup/pre-migracion.dump >/dev/null
+# Policy role names are required even with --no-owner --no-acl. Mirror only
+# the two observed SCM policy roles, without login or production credentials.
+docker exec "$test_container" psql -U postgres -d postgres -X -v ON_ERROR_STOP=1 \
+  -c "CREATE ROLE scm_api NOLOGIN; CREATE ROLE scm_reader NOLOGIN;"
 docker exec "$test_container" pg_restore -U postgres -d scm_pilot --no-owner --no-acl --exit-on-error /backup/pre-migracion.dump
 facts() {
   for table in scm_manga scm_pesaje_manga scm_existencia_manga scm_existencia_manga_kg scm_movimiento_inventario scm_movimiento_inventario_kg scm_movimiento_material_inventario scm_movimiento_material_preparado; do
