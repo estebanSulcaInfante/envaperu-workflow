@@ -44,4 +44,3 @@ def test_cancelled_allocation_keeps_satisfied_history_but_releases_residual():
     assert covered == Decimal("40")
     assert committed == Decimal("0")
     assert operational is False
-

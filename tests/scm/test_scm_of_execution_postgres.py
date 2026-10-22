@@ -467,4 +467,3 @@ def test_cancel_vs_add_manga_endpoint_is_atomic(pg_app):
     with pg_app.app_context():
         order = db.session.get(ScmOrdenOperacion, UUID(fixture["order_id"]))
         assert order.estado in {"CANCELADA", "EN_EJECUCION"}
-
