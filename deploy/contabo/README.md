@@ -7,9 +7,9 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 98d835e11268e074fb2d124a1e604a187dec2580.
-check_ci.py accepts only GitHub Actions run 39837053357, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/of-execution-release-20261022,
+Application source is fixed to 66ccb5eac213839751959f94d4062675e5354be5.
+check_ci.py accepts only GitHub Actions run 40055636120, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/tv-excel-backend-20261023,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
