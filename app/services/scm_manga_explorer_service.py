@@ -9,6 +9,7 @@ OT and work context.
 from __future__ import annotations
 
 import base64
+from copy import copy
 import hashlib
 import json
 import re
@@ -1541,27 +1542,51 @@ def _style_export_columns(sheet, headers):
         "Estado receta": 28, "Estado molde": 28, "Estado salida": 28,
         "Cobertura maquinistas": 24,
     }
+    # Reuse the immutable style descriptors for every cell.  Constructing a
+    # Font/Alignment per cell makes openpyxl repeatedly hash and register
+    # equivalent style objects; on a complete export that cost dominates the
+    # SQL and projection work.  Number formats remain per-column below.
+    header_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    body_font = Font(name="Arial", size=10)
+    header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    body_alignment = Alignment(wrap_text=True, vertical="top")
     for index, header in enumerate(headers, start=1):
         width = widths.get(header, 22 if header.startswith("Material ") else 16)
         column = sheet.cell(row=1, column=index).column_letter
         sheet.column_dimensions[column].width = width
-        for cell in sheet[column]:
-            if cell.row == 1:
-                cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-                cell.fill = PatternFill(fill_type="solid", fgColor="1F4E78")
-            else:
-                cell.font = Font(name="Arial", size=10)
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-            if header == "Ciclos aproximados" and cell.row > 1:
-                cell.number_format = "0.0"
-            elif header in {"Peso real (kg)", "Peso bruto (kg)", "Tara (kg)", "Peso neto (kg)"} and cell.row > 1:
-                cell.number_format = "0.00"
-            elif header in {"Fracción virgen (receta)"} and cell.row > 1:
-                cell.number_format = "0.0%"
-            elif header in {"Fecha de OT", "Fecha del pesaje final"} and cell.row > 1:
-                cell.number_format = "dd/mm/yyyy"
-            elif header == "Hora del pesaje" and cell.row > 1:
-                cell.number_format = "dd/mm/yyyy hh:mm"
+        header_cell = sheet.cell(row=1, column=index)
+        header_cell.font = header_font
+        header_cell.fill = header_fill
+        header_cell.alignment = body_alignment
+        header_style = copy(header_cell._style)
+
+        number_format = "General"
+        if header == "Ciclos aproximados":
+            number_format = "0.0"
+        elif header in {"Peso real (kg)", "Peso bruto (kg)", "Tara (kg)", "Peso neto (kg)"}:
+            number_format = "0.00"
+        elif header in {"Fracción virgen (receta)"}:
+            number_format = "0.0%"
+        elif header in {"Fecha de OT", "Fecha del pesaje final"}:
+            number_format = "dd/mm/yyyy"
+        elif header == "Hora del pesaje":
+            number_format = "dd/mm/yyyy hh:mm"
+
+        # Configure one body cell so openpyxl resolves the style IDs once.
+        # Copy the completed StyleArray per cell: openpyxl's style descriptors
+        # are mutable containers, and sharing one would let a later
+        # cell-level number-format/style edit leak into its siblings.
+        body_style = None
+        if sheet.max_row > 1:
+            body_cell = sheet.cell(row=2, column=index)
+            body_cell.font = body_font
+            body_cell.alignment = body_alignment
+            body_cell.number_format = number_format
+            body_style = body_cell._style
+
+        for cell in sheet[column][1:]:
+            cell._style = copy(body_style) if body_style is not None else None
+        header_cell._style = header_style
     sheet.freeze_panes = "A2"
     sheet.sheet_view.showGridLines = False
     sheet.auto_filter.ref = f"A1:{sheet.cell(row=max(1, sheet.max_row), column=max(1, len(headers))).coordinate}"

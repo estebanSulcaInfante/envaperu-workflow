@@ -51,6 +51,7 @@ from app.services.scm_manga_explorer_service import (
     detail_fields,
     key_fields,
 )
+import app.services.scm_manga_explorer_service as manga_explorer_service
 from tests.scm.test_scm_production_observability import _manga, _seed_observability_graph
 from tests.scm.test_scm_kg_production import _auto_final_kg_fixture
 
@@ -1402,3 +1403,123 @@ def test_manga_explorer_keeps_formula_like_cells_as_text_and_hex_is_canonical():
     assert _canonical_color_hex(" #aBc123 ") == "#ABC123"
     assert _canonical_color_hex("transparent") is None
     assert _canonical_color_hex("#12345") is None
+
+
+def test_manga_explorer_export_reuses_openpyxl_style_descriptors(monkeypatch):
+    """Complete exports do not rebuild equivalent style objects per cell."""
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    headers = ["Manga", "Peso real (kg)", "Estado"]
+    sheet.append(headers)
+    for index in range(20):
+        sheet.append([f"M-{index}", index / 10, "PESADA"])
+
+    calls = {"font": 0, "fill": 0, "alignment": 0}
+    original_font = manga_explorer_service.Font
+    original_fill = manga_explorer_service.PatternFill
+    original_alignment = manga_explorer_service.Alignment
+
+    def font(*args, **kwargs):
+        calls["font"] += 1
+        return original_font(*args, **kwargs)
+
+    def fill(*args, **kwargs):
+        calls["fill"] += 1
+        return original_fill(*args, **kwargs)
+
+    def alignment(*args, **kwargs):
+        calls["alignment"] += 1
+        return original_alignment(*args, **kwargs)
+
+    monkeypatch.setattr(manga_explorer_service, "Font", font)
+    monkeypatch.setattr(manga_explorer_service, "PatternFill", fill)
+    monkeypatch.setattr(manga_explorer_service, "Alignment", alignment)
+
+    manga_explorer_service._style_export_columns(sheet, headers)
+
+    assert calls == {"font": 2, "fill": 1, "alignment": 1}
+
+
+def test_manga_explorer_export_body_styles_are_isolated_after_mutation_and_roundtrip():
+    """A cell-level style edit does not leak through shared StyleArray aliases."""
+    from copy import copy
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    headers = ["Manga", "Estado"]
+    sheet.append(headers)
+    sheet.append(["M-1", "PESADA"])
+    sheet.append(["M-2", "PESADA"])
+
+    manga_explorer_service._style_export_columns(sheet, headers)
+    first = sheet["A2"]
+    sibling = sheet["A3"]
+    sibling_style_before = copy(sibling._style)
+
+    first.number_format = "0.0%"
+    assert first.number_format == "0.0%"
+    assert sibling.number_format == "General"
+    assert sibling._style == sibling_style_before
+
+    payload = BytesIO()
+    workbook.save(payload)
+    payload.seek(0)
+    restored = load_workbook(payload, read_only=False, data_only=False)
+    restored_sheet = restored.active
+    assert restored_sheet["A2"].number_format == "0.0%"
+    assert restored_sheet["A3"].number_format == "General"
+    assert restored_sheet["A3"].font.bold is False
+
+
+def test_manga_explorer_export_preserves_values_and_layout_for_typed_columns(app, client, scm_config):
+    """The style refactor keeps typed cells and workbook navigation intact."""
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        response = client.get(
+            "/api/scm/v1/observabilidad/mangas-fabricacion/export.xlsx?vista=AMBOS",
+            headers=_headers(seeded["full"]),
+        )
+        assert response.status_code == 200
+        workbook = load_workbook(BytesIO(response.data), read_only=False, data_only=False)
+        assert workbook.sheetnames == ["Resumen", "Detalle", "Auditoría", "Criterios"]
+
+        detail = workbook["Detalle"]
+        headers = [cell.value for cell in detail[1]]
+        rows = list(detail.iter_rows(min_row=2, values_only=True))
+        manga_values = [row[headers.index("Manga")] for row in rows]
+        assert manga_values and len(manga_values) == len(set(manga_values))
+        kg_values = [row[headers.index("Peso real (kg)")] for row in rows]
+        assert any(value is not None for value in kg_values)
+        assert all(value is None or isinstance(value, (int, float, Decimal)) for value in kg_values)
+
+        header = detail[1][headers.index("Manga")]
+        assert header.font.name == "Arial"
+        assert header.font.bold is True
+        assert header.font.color.type == "rgb"
+        assert header.font.color.rgb.endswith("FFFFFF")
+        assert header.fill.fill_type == "solid"
+        assert header.fill.fgColor.rgb.endswith("1F4E78")
+        assert header.alignment.wrap_text is True
+        assert header.alignment.vertical == "top"
+        assert detail.freeze_panes == "A2"
+        assert detail.auto_filter.ref.startswith("A1:")
+
+        typed_expectations = {
+            "Peso real (kg)": "0.00",
+            "Ciclos aproximados": "0.0",
+            "Fracción virgen (receta)": "0.0%",
+            "Fecha de OT": "dd/mm/yyyy",
+        }
+        for column, number_format in typed_expectations.items():
+            cell = detail.cell(row=2, column=headers.index(column) + 1)
+            assert cell.number_format == number_format
+            assert cell.font.name == "Arial"
+            assert cell.alignment.wrap_text is True
+            assert cell.alignment.vertical == "top"
+
+        criteria = workbook["Criterios"]
+        assert criteria.freeze_panes == "A2"
+        assert criteria.auto_filter.ref == f"A1:B{criteria.max_row}"
