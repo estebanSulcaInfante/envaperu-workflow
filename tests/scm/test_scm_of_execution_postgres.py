@@ -8,13 +8,13 @@ other database identity.
 from datetime import date
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 import os
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 
 
@@ -30,9 +30,12 @@ from app import create_app, db  # noqa: E402
 from app.config import Config  # noqa: E402
 from app.models.maquina import Maquina, TipoMaquina  # noqa: E402
 from app.models.producto import Familia, Linea, LineaFamilia  # noqa: E402
+from app.models.receta_color import RecetaColorLinea, RecetaColorMaestra  # noqa: E402
 from app.models.registro import RegistroDiarioProduccion  # noqa: E402
 from app.models.scm_auditoria import ScmEvento  # noqa: E402
+from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial  # noqa: E402
 from app.models.scm_ot import ScmTrabajoColor, ScmTrabajoOt  # noqa: E402
+from app.models.scm_prepared_material import ScmRequerimientoMaterialPreparado  # noqa: E402
 from app.models.scm_production_orders import (  # noqa: E402
     ScmOrdenFabricacion,
     ScmOrdenOperacion,
@@ -228,6 +231,49 @@ def _active_order(
         }
 
 
+def _empty_released_order(app):
+    """Seed a released OF/corrida without an OT work child."""
+    from tests.scm.test_scm_fabrication_replacement import _seed_released_order
+
+    with app.app_context():
+        jp = Trabajador.query.filter_by(codigo="TRB-01").one()
+        jp.roles.clear()
+        db.session.commit()
+    order_id, jp_id, run_id, recipe_id = _seed_released_order(app)
+    with app.app_context():
+        category = ScmCategoriaRecepcion.query.filter_by(
+            codigo="LEGACY_POR_CONFIGURAR"
+        ).one()
+        material = ScmMaterial(
+            codigo=f"MP-OF-RACE-{uuid4().hex[:8].upper()}",
+            nombre="Materia prima carrera OF",
+            clase="MATERIA_PRIMA",
+            categoria_recepcion_id=category.id,
+        )
+        db.session.add(material)
+        db.session.flush()
+        recipe = db.session.get(RecetaColorMaestra, recipe_id)
+        recipe.lineas.append(RecetaColorLinea(
+            material_id=material.id,
+            tipo_componente="MATERIA_PRIMA",
+            cantidad=1,
+            unidad="FRACCION",
+            orden=1,
+        ))
+        db.session.commit()
+        order = db.session.get(ScmOrdenOperacion, UUID(order_id))
+        assert order.estado == "LIBERADA"
+        assert order.fabricacion.corridas[0].estado == "LIBERADA"
+        assert not ScmTrabajoOt.query.filter_by(orden_operacion_id=order.id).count()
+        db.session.commit()
+        return {
+            "order_id": order_id,
+            "run_id": run_id,
+            "jp_id": jp_id,
+            "gg_id": Trabajador.query.filter_by(codigo="W3-GG").one().id,
+        }
+
+
 def _impact(client, order_id, actor_id, action="PAUSAR"):
     response = client.get(
         f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion={action}",
@@ -380,6 +426,119 @@ def _concurrent_endpoint_calls(app, left, right):
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(invoke, left), pool.submit(invoke, right)]
         return [future.result(timeout=30) for future in futures]
+
+
+def test_cancel_empty_vs_generate_prepared_requirement_is_serialized(pg_app):
+    fixture = _empty_released_order(pg_app)
+    with pg_app.test_client() as client:
+        cancel_impact = _impact(
+            client, fixture["order_id"], fixture["gg_id"], "CANCELAR"
+        )
+        assert cancel_impact["can_execute"] is True
+
+    def cancel(client):
+        return _command(
+            client,
+            fixture["order_id"],
+            fixture["gg_id"],
+            "cancelar",
+            cancel_impact,
+            uuid4(),
+            "Carrera OF vacia contra requerimiento",
+        )
+
+    def generate(client):
+        return client.post(
+            "/api/scm/v1/requerimientos-preparacion/calcular",
+            headers={
+                "X-Actor-Id": str(fixture["jp_id"]),
+                "Idempotency-Key": str(uuid4()),
+            },
+            json={"corrida_fabricacion_id": fixture["run_id"]},
+        )
+
+    order_lock_acquired = Event()
+    second_order_lock_requested = Event()
+    cancel_waiting_for_run = Event()
+    release_generator = Event()
+    order_lock_statement = "FOR UPDATE OF scm_orden_operacion"
+    run_lock_statement = "FOR UPDATE OF scm_corrida_fabricacion"
+    order_lock_requests = 0
+    lock_acquisitions = []
+
+    def normalized(statement):
+        return statement.replace('"', "")
+
+    def before_cursor_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal order_lock_requests
+        normalized_statement = normalized(statement)
+        if not _connection.info.get("of_race_lock_timeout"):
+            _cursor.execute("SET LOCAL lock_timeout = '10s'")
+            _connection.info["of_race_lock_timeout"] = True
+        if order_lock_statement in normalized_statement:
+            order_lock_requests += 1
+            if order_lock_requests >= 2:
+                second_order_lock_requested.set()
+        if "UPDATE scm_corrida_fabricacion" in normalized_statement:
+            cancel_waiting_for_run.set()
+
+    def after_cursor_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+        normalized_statement = normalized(statement)
+        lock_kind = (
+            "OF" if order_lock_statement in normalized_statement
+            else "CORRIDA" if run_lock_statement in normalized_statement
+            else None
+        )
+        if lock_kind is not None:
+            lock_acquisitions.append(lock_kind)
+            if len(lock_acquisitions) == 1:
+                order_lock_acquired.set()
+                release_generator.wait(timeout=15)
+
+    with pg_app.app_context():
+        engine = db.engine
+    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    event.listen(engine, "after_cursor_execute", after_cursor_execute)
+    try:
+        def invoke(request):
+            with pg_app.test_client() as client:
+                return request(client)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            generated_future = executor.submit(invoke, generate)
+            assert order_lock_acquired.wait(timeout=15)
+            cancelled_future = executor.submit(invoke, cancel)
+            first_lock = lock_acquisitions[0]
+            if first_lock == "OF":
+                assert second_order_lock_requested.wait(timeout=15)
+            else:
+                assert cancel_waiting_for_run.wait(timeout=15)
+            release_generator.set()
+            generated = generated_future.result(timeout=30)
+            cancelled = cancelled_future.result(timeout=30)
+        results = [generated, cancelled]
+    finally:
+        release_generator.set()
+        event.remove(engine, "before_cursor_execute", before_cursor_execute)
+        event.remove(engine, "after_cursor_execute", after_cursor_execute)
+
+    statuses = sorted(response.status_code for response in results)
+    assert statuses == [200, 409], [response.get_json() for response in results]
+    assert all(response.status_code < 500 for response in results)
+
+    with pg_app.app_context():
+        order = db.session.get(ScmOrdenOperacion, UUID(fixture["order_id"]))
+        run = order.fabricacion.corridas[0]
+        requirements = ScmRequerimientoMaterialPreparado.query.filter_by(
+            corrida_fabricacion_id=run.id,
+        ).all()
+        if order.estado == "CANCELADA":
+            assert run.estado == "CANCELADA"
+            assert requirements == []
+        else:
+            assert order.estado == "LIBERADA"
+            assert run.estado == "LIBERADA"
+            assert len(requirements) == 1
 
 
 def test_pause_vs_real_ot_start_and_color_work_endpoints_is_atomic(pg_app):
