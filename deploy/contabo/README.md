@@ -7,20 +7,22 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 66ccb5eac213839751959f94d4062675e5354be5.
-check_ci.py accepts only GitHub Actions run 40055636120, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/tv-excel-backend-20261023,
+Application source is fixed to 2eaffb1f374cf471b730471ad3da204a1693cfca.
+check_ci.py accepts only GitHub Actions run 40110193753, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/of-duplicate-cancel-backend-source-20261024,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
 
-The approved source combines the already-operational global KG policy and migration
-with the reviewed TV total-color aggregation, warehouse QR identity changes, and
-the additive Fabricación manga explorer / summary and detailed Excel export, including
-compact rows, maquinistas, date criteria, recipe materials, mold and approximate cycles,
-plus the reviewed production-column order, separate audit, human-readable weighing states,
-catalog process for machine type and per-manga correlated OF search. The image must
-preserve revision b7f31e9c120a instead of reverting to the previous head.
+The source preserves the already-deployed KG, TV, warehouse QR, manga explorer,
+Excel export and OF execution lifecycle behavior, including schema head ff60718293a4.
+This release adds conservative cancellation for released/programmed/executing/paused
+OFs with no work or only annulled work, retaining production/history and residual
+fulfillment reconciliation. Prepared requirements and premix custody block the new
+path. Requirement generation uses the same OF-to-run lock order as cancellation.
+Only the two reviewed service files change in the runtime allowlist; no schema
+migration or local TV performance experiment is included. PostgreSQL 17 concurrency
+was verified with synthetic data and the current model schema, not a migration claim.
 
 The workflow checks out the deployment recipe at a literal commit SHA, separately
 from the source. Recipe files are committed first; a following workflow-only commit
