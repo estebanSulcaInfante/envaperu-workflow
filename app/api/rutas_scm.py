@@ -1279,6 +1279,11 @@ def ordenes_armado_listar():
     return jsonify(list_assembly_orders(
         db.session,
         actor_id=_actor_id(),
+        view=request.args.get("vista"),
+        q=request.args.get("q"),
+        estado=request.args.get("estado"),
+        pagina=request.args.get("pagina"),
+        tamano=request.args.get("tamano"),
     ))
 
 
@@ -1716,6 +1721,7 @@ def ots_listar():
         machine_id=request.args.get("maquina_id"),
         machine=request.args.get("maquina"),
         shift=request.args.get("turno"),
+        view=request.args.get("vista"),
     ))
 
 
@@ -1728,6 +1734,8 @@ def jornadas_planta_listar():
             request.args.get("fecha_operativa") or request.args.get("fecha")
         ),
         shift=request.args.get("turno"),
+        machine_id=request.args.get("maquina_id"),
+        view=request.args.get("vista"),
     ))
 
 

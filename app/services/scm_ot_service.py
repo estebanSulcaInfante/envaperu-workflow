@@ -8,16 +8,17 @@ import re
 import uuid
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 
-from sqlalchemy import String, and_, func, or_, select
+from sqlalchemy import String, and_, case, cast, func, literal, or_, select, union
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from app.models.lote import LoteSalidaPiezaColor
 from app.models.maquina import Maquina
 from app.models.orden import OrdenProduccion
 from app.models.registro import RegistroDiarioProduccion
-from app.models.producto import ColorProduccion
+from app.models.producto import ColorBase, ColorProduccion, FamiliaColor
 from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
 from app.models.scm_empaque import (
@@ -4357,6 +4358,664 @@ def create_fabrication_ot(
         raise
 
 
+def _empty_manga_summary():
+    return {
+        "total": 0,
+        "cerradas": 0,
+        "abiertas": 0,
+        "etiqueta_generada": 0,
+        "etiqueta_impresa": 0,
+        "preetiqueta_sin_estado": 0,
+        "pendientes": 0,
+        "anuladas": 0,
+        "por_estado": {},
+    }
+
+
+def _accumulate_manga_summary(summary, *, state, label_state, count):
+    """Apply the same manga buckets used by the daily machine board."""
+    amount = int(count or 0)
+    state = str(state or "").upper()
+    label_state = str(label_state or "").upper() or None
+    summary["por_estado"][state or "SIN_ESTADO"] = (
+        summary["por_estado"].get(state or "SIN_ESTADO", 0) + amount
+    )
+    if state == "BORRADA":
+        return
+    summary["total"] += amount
+    if state in {
+        "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN", "RECIBIDA",
+    }:
+        summary["cerradas"] += amount
+    elif state in {"ABIERTA", "INCOMPLETA", "PESAJE_PARCIAL", "CONTINUIDAD_PENDIENTE", "EN_LLENADO"}:
+        summary["abiertas"] += amount
+    elif state == "PREETIQUETADA":
+        if label_state in {"GENERADA", "PENDIENTE_IMPRESION"}:
+            summary["etiqueta_generada"] += amount
+        elif label_state == "IMPRESA":
+            summary["etiqueta_impresa"] += amount
+        else:
+            summary["preetiqueta_sin_estado"] += amount
+    elif state == "ANULADA":
+        summary["anuladas"] += amount
+    else:
+        summary["pendientes"] += amount
+
+
+def _summary_worker_name(worker):
+    if worker is None:
+        return None
+    return getattr(worker, "nombre_completo", worker)
+
+
+def _summary_article(article):
+    if article is None:
+        return None
+    if isinstance(article, dict):
+        return article
+    return _serialize_article_summary(article)
+
+
+def _serialize_ot_summary(
+    ot, *, works, manga_summaries, assembly_context=None,
+):
+    """Serialize the opt-in OT read model without touching ``_serialize_ot``."""
+    work_payloads = []
+    for work in works:
+        work_id = work.id
+        assignment = getattr(work, "asignacion_vigente", None)
+        work_payloads.append({
+            "id": str(work_id),
+            "codigo": work.codigo,
+            "secuencia": work.secuencia,
+            "estado": work.estado,
+            "version": work.version,
+            "orden_fabricacion_id": (
+                str(work.orden_fabricacion_id)
+                if getattr(work, "orden_fabricacion_id", None) is not None
+                else None
+            ),
+            "orden_fabricacion_codigo": getattr(work, "orden_fabricacion_codigo", None),
+            "corrida_fabricacion_id": (
+                str(work.corrida_fabricacion_id)
+                if getattr(work, "corrida_fabricacion_id", None) is not None
+                else None
+            ),
+            "corrida_codigo": getattr(work, "corrida_codigo", None),
+            "color": getattr(work, "color", None),
+            "color_hex": getattr(work, "color_hex", None),
+            "articulos_salida": [
+                _summary_article(article)
+                for article in (getattr(work, "articulos_salida", None) or [])
+            ],
+            "cantidades": {
+                "objetivo_un": _compact_number(getattr(work, "cantidad_objetivo_un", 0)),
+                "confirmado_un": _compact_number(getattr(work, "cantidad_confirmada_un", 0)),
+            },
+            "asignacion_vigente": assignment,
+            "mangas_resumen": manga_summaries.get(work_id, _empty_manga_summary()),
+        })
+
+    ot_summary = manga_summaries.get(ot.id, _empty_manga_summary())
+    center = getattr(ot, "centro_trabajo", None)
+    center_payload = None
+    if center is not None:
+        center_payload = {
+            "id": center.id,
+            "codigo": center.codigo,
+            "nombre": center.nombre,
+            "tipo": getattr(center, "tipo", None),
+        }
+    machine = getattr(ot, "maquina", None)
+    machine_name = getattr(ot, "maquina_nombre_snapshot", None) or (
+        getattr(machine, "nombre", None) if machine is not None else None
+    )
+    machine_code = getattr(ot, "maquina_codigo_snapshot", None) or (
+        getattr(machine, "codigo", None) if machine is not None else None
+    )
+    payload = {
+        "public_id": str(ot.public_id),
+        "codigo_ot": ot.codigo_ot,
+        "estado": ot.estado,
+        "tipo_ot": ot.tipo_ot,
+        "version": ot.version,
+        "fecha_operativa": ot.fecha.isoformat() if ot.fecha else None,
+        "turno": ot.turno,
+        "maquina_id": ot.maquina_id,
+        "maquina": machine_name,
+        "maquina_codigo": machine_code,
+        "centro_trabajo": center_payload,
+        "responsable_id": ot.responsable_id,
+        "responsable": _summary_worker_name(getattr(ot, "responsable", None)),
+        "maquinista_previsto_id": ot.maquinista_previsto_id,
+        "maquinista_previsto": _summary_worker_name(getattr(ot, "maquinista_previsto", None)),
+        "modo_ejecucion_ensamble": ot.modo_ejecucion_ensamble,
+        "orden_operacion_id": (
+            str(ot.orden_operacion_id) if ot.orden_operacion_id is not None else None
+        ),
+        "cantidad_objetivo": _compact_number(
+            sum((Decimal(getattr(work, "cantidad_objetivo_un", 0) or 0) for work in works), Decimal("0"))
+            if works else (ot.cantidad_objetivo or 0)
+        ),
+        "cantidad_confirmada": _compact_number(
+            sum((Decimal(getattr(work, "cantidad_confirmada_un", 0) or 0) for work in works), Decimal("0"))
+            if works else (ot.cantidad_confirmada or 0)
+        ),
+        "trabajos_color_resumen": work_payloads,
+        "mangas_resumen": ot_summary,
+    }
+    if assembly_context is not None:
+        payload.update(assembly_context)
+    return payload
+
+
+def _summary_view(value):
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized != "resumen":
+        raise ScmServiceError(
+            "OT_VIEW_INVALID", "vista debe ser resumen.", status_code=400
+        )
+    return normalized
+
+
+def _summary_machine_id(value):
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "INVALID_MACHINE", "maquina_id debe ser entero.", status_code=400
+        ) from error
+    if parsed <= 0:
+        raise ScmServiceError(
+            "INVALID_MACHINE", "maquina_id debe ser positivo.", status_code=400
+        )
+    return parsed
+
+
+def _summary_manga_aggregates(session, *, ot_ids, work_ids):
+    if not ot_ids:
+        return {}
+    latest_label = (
+        select(
+            ScmEtiquetaManga.manga_id.label("manga_id"),
+            func.max(ScmEtiquetaManga.version).label("version"),
+        )
+        .where(
+            ScmEtiquetaManga.tipo == "PREPESAJE",
+            ScmEtiquetaManga.estado != "INVALIDADA",
+        )
+        .group_by(ScmEtiquetaManga.manga_id)
+        .subquery()
+    )
+    label = aliased(ScmEtiquetaManga)
+    ot_ownership = select(
+        ScmManga.id.label("manga_id"),
+        ScmManga.ot_id.label("ot_id"),
+        ScmManga.ot_id.label("ot_key"),
+        cast(literal(None), ScmManga.trabajo_ot_id.type).label("work_key"),
+        literal("OT").label("scope"),
+    ).where(ScmManga.ot_id.in_(ot_ids))
+    work_ownership = select(
+        ScmManga.id.label("manga_id"),
+        ScmManga.ot_id.label("ot_id"),
+        cast(literal(None), ScmManga.ot_id.type).label("ot_key"),
+        ScmManga.trabajo_ot_id.label("work_key"),
+        literal("WORK").label("scope"),
+    ).where(
+        ScmManga.trabajo_ot_id.in_(work_ids),
+    ) if work_ids else None
+    segment_ownership = select(
+        ScmTramoMangaTrabajo.manga_id.label("manga_id"),
+        ScmManga.ot_id.label("ot_id"),
+        cast(literal(None), ScmManga.ot_id.type).label("ot_key"),
+        ScmTramoMangaTrabajo.trabajo_ot_id.label("work_key"),
+        literal("WORK").label("scope"),
+    ).select_from(ScmTramoMangaTrabajo).join(
+        ScmManga, ScmManga.id == ScmTramoMangaTrabajo.manga_id,
+    ).where(
+        ScmTramoMangaTrabajo.trabajo_ot_id.in_(work_ids),
+    ) if work_ids else None
+    ownership = ot_ownership
+    if work_ownership is not None:
+        ownership = union(ot_ownership, work_ownership, segment_ownership)
+    ownership = ownership.subquery()
+    statement = (
+        select(
+            ownership.c.ot_id,
+            ownership.c.ot_key,
+            ownership.c.work_key,
+            ownership.c.scope,
+            ScmManga.estado.label("manga_state"),
+            label.estado.label("label_state"),
+            func.count(ScmManga.id).label("amount"),
+        )
+        .select_from(ownership)
+        .join(ScmManga, ScmManga.id == ownership.c.manga_id)
+        .outerjoin(
+            latest_label,
+            latest_label.c.manga_id == ScmManga.id,
+        )
+        .outerjoin(
+            label,
+            and_(
+                label.manga_id == latest_label.c.manga_id,
+                label.version == latest_label.c.version,
+                label.tipo == "PREPESAJE",
+            ),
+        )
+        .where(ownership.c.scope.in_(("OT", "WORK")))
+        .group_by(
+            ownership.c.ot_id,
+            ownership.c.ot_key,
+            ownership.c.work_key,
+            ownership.c.scope,
+            ScmManga.estado,
+            label.estado,
+        )
+    )
+    summaries = {}
+    for row in session.execute(statement).all():
+        mapping = row._mapping
+        state = mapping["manga_state"]
+        label_state = mapping["label_state"]
+        amount = mapping["amount"]
+        key = mapping["ot_key"] if mapping["scope"] == "OT" else mapping["work_key"]
+        if key is not None:
+            summary = summaries.setdefault(key, _empty_manga_summary())
+            _accumulate_manga_summary(
+                summary, state=state, label_state=label_state, count=amount
+            )
+    return summaries
+
+
+def _summary_work_rows(session, ot_ids):
+    if not ot_ids:
+        return [], {}
+    assignment_id = (
+        select(ScmAsignacionPersonalTrabajoOt.id)
+        .where(
+            ScmAsignacionPersonalTrabajoOt.trabajo_ot_id == ScmTrabajoOt.id,
+            ScmAsignacionPersonalTrabajoOt.estado.in_(("ACTIVA", "PREVISTA")),
+        )
+        .order_by(
+            case((ScmAsignacionPersonalTrabajoOt.estado == "ACTIVA", 0), else_=1),
+            ScmAsignacionPersonalTrabajoOt.asignada_at.desc(),
+            ScmAsignacionPersonalTrabajoOt.id.desc(),
+        )
+        .limit(1)
+        .correlate(ScmTrabajoOt)
+        .scalar_subquery()
+    )
+    assignment_worker_id = (
+        select(ScmAsignacionPersonalTrabajoOt.trabajador_id)
+        .where(ScmAsignacionPersonalTrabajoOt.id == assignment_id)
+        .correlate(ScmTrabajoOt)
+        .scalar_subquery()
+    )
+    assignment_worker_name = (
+        select(func.trim(Trabajador.nombres + " " + Trabajador.apellidos))
+        .where(Trabajador.id == assignment_worker_id)
+        .correlate(ScmTrabajoOt)
+        .scalar_subquery()
+    )
+    assignment_state = (
+        select(ScmAsignacionPersonalTrabajoOt.estado)
+        .where(ScmAsignacionPersonalTrabajoOt.id == assignment_id)
+        .correlate(ScmTrabajoOt)
+        .scalar_subquery()
+    )
+    assignment_version = (
+        select(ScmAsignacionPersonalTrabajoOt.version)
+        .where(ScmAsignacionPersonalTrabajoOt.id == assignment_id)
+        .correlate(ScmTrabajoOt)
+        .scalar_subquery()
+    )
+    statement = (
+        select(
+            ScmTrabajoOt.id.label("work_id"),
+            ScmTrabajoOt.orden_trabajo_id.label("ot_id"),
+            ScmTrabajoOt.codigo.label("work_code"),
+            ScmTrabajoOt.secuencia,
+            ScmTrabajoOt.estado.label("work_state"),
+            ScmTrabajoOt.version.label("work_version"),
+            ScmTrabajoOt.orden_operacion_id.label("operation_id"),
+            ScmTrabajoOt.cantidad_objetivo_un,
+            ScmTrabajoOt.cantidad_confirmada_un,
+            ScmTrabajoColor.corrida_fabricacion_id.label("run_id"),
+            ScmTrabajoColor.color_nombre_snapshot.label("color_snapshot"),
+            ScmCorridaFabricacion.codigo.label("run_code"),
+            ColorProduccion.hex_referencia.label("color_hex"),
+            ColorBase.nombre.label("color_base"),
+            FamiliaColor.nombre.label("color_family"),
+            ScmOrdenOperacion.codigo.label("operation_code"),
+            assignment_id.label("assignment_id"),
+            assignment_worker_id.label("assignment_worker_id"),
+            assignment_worker_name.label("assignment_worker_name"),
+            assignment_state.label("assignment_state"),
+            assignment_version.label("assignment_version"),
+            ScmOrdenOperacionSalida.id.label("output_id"),
+            ScmOrdenOperacionSalida.corrida_fabricacion_id.label("output_run_id"),
+            ScmOrdenOperacionSalida.orden_operacion_id.label("output_operation_id"),
+            ScmArticulo.id.label("article_id"),
+            ScmArticulo.codigo.label("article_code"),
+            ScmArticulo.nombre.label("article_name"),
+            ScmArticulo.clase.label("article_class"),
+            ScmArticulo.unidad_base.label("article_unit"),
+        )
+        .select_from(ScmTrabajoOt)
+        .outerjoin(ScmTrabajoColor, ScmTrabajoColor.trabajo_ot_id == ScmTrabajoOt.id)
+        .outerjoin(ScmCorridaFabricacion, ScmCorridaFabricacion.id == ScmTrabajoColor.corrida_fabricacion_id)
+        .outerjoin(
+            ColorProduccion,
+            ColorProduccion.id == func.coalesce(
+                ScmTrabajoColor.color_id_snapshot,
+                ScmCorridaFabricacion.color_produccion_id,
+            ),
+        )
+        .outerjoin(ColorBase, ColorBase.id == ColorProduccion.color_base_id)
+        .outerjoin(FamiliaColor, FamiliaColor.id == ColorProduccion.familia_color_id)
+        .outerjoin(ScmOrdenOperacion, ScmOrdenOperacion.id == ScmTrabajoOt.orden_operacion_id)
+        .outerjoin(
+            ScmOrdenOperacionSalida,
+            or_(
+                ScmOrdenOperacionSalida.corrida_fabricacion_id == ScmTrabajoColor.corrida_fabricacion_id,
+                ScmOrdenOperacionSalida.orden_operacion_id == ScmTrabajoOt.orden_operacion_id,
+            ),
+        )
+        .outerjoin(ScmArticulo, ScmArticulo.id == ScmOrdenOperacionSalida.articulo_scm_id)
+        .where(ScmTrabajoOt.orden_trabajo_id.in_(ot_ids))
+        .order_by(ScmTrabajoOt.orden_trabajo_id, ScmTrabajoOt.secuencia, ScmOrdenOperacionSalida.id)
+    )
+    by_work = {}
+    for row in session.execute(statement).all():
+        mapping = row._mapping
+        work_id = mapping["work_id"]
+        work = by_work.setdefault(work_id, {
+            "ot_id": mapping["ot_id"],
+            "id": work_id,
+            "codigo": mapping["work_code"],
+            "secuencia": mapping["secuencia"],
+            "estado": mapping["work_state"],
+            "version": mapping["work_version"],
+            "orden_fabricacion_id": mapping["operation_id"],
+            "orden_fabricacion_codigo": mapping["operation_code"],
+            "corrida_fabricacion_id": mapping["run_id"],
+            "corrida_codigo": mapping["run_code"],
+            "color": mapping["color_snapshot"] or (
+                " ".join(item for item in (mapping["color_base"], mapping["color_family"]) if item)
+                or None
+            ),
+            "color_hex": mapping["color_hex"],
+            "cantidad_objetivo_un": mapping["cantidad_objetivo_un"],
+            "cantidad_confirmada_un": mapping["cantidad_confirmada_un"],
+            "asignacion_vigente": (
+                {
+                    "id": str(mapping["assignment_id"]),
+                    "trabajador_id": mapping["assignment_worker_id"],
+                    "trabajador": mapping["assignment_worker_name"],
+                    "estado": mapping["assignment_state"],
+                    "version": mapping["assignment_version"],
+                }
+                if mapping["assignment_id"] is not None else None
+            ),
+            "articulos_salida": [],
+            "output_ids": set(),
+            "run_outputs": [],
+            "operation_outputs": [],
+        })
+        output_id = mapping["output_id"]
+        if output_id is not None and output_id not in work["output_ids"] and mapping["article_id"] is not None:
+            work["output_ids"].add(output_id)
+            article = {
+                "id": mapping["article_id"],
+                "codigo": mapping["article_code"],
+                "nombre": mapping["article_name"],
+                "clase": mapping["article_class"],
+                "unidad": mapping["article_unit"],
+            }
+            # Keep the exact run as the preferred source.  The operation-level
+            # fallback intentionally retains every operation output, matching
+            # _batch_work_output_articles when a run has no own outputs.
+            work["operation_outputs"].append(article)
+            if (
+                mapping["output_run_id"] is not None
+                    and mapping["output_run_id"] == mapping["run_id"]
+            ):
+                work["run_outputs"].append(article)
+    for item in by_work.values():
+        item["articulos_salida"] = item["run_outputs"] or item["operation_outputs"]
+    projected = []
+    for item in by_work.values():
+        projected.append(SimpleNamespace(**{
+            key: value for key, value in item.items()
+            if key not in {"ot_id", "output_ids", "run_outputs", "operation_outputs"}
+        }))
+    return projected, by_work
+
+
+def _summary_assembly_contexts(session, ot_ids):
+    assembly_ids = list(ot_ids)
+    if not assembly_ids:
+        return {}
+    context_work = aliased(ScmTrabajoOt)
+    context_ot = aliased(RegistroDiarioProduccion)
+    context_color = aliased(ScmTrabajoColor)
+    context_run = aliased(ScmCorridaFabricacion)
+    context_catalog_color = aliased(ColorProduccion)
+    context_operation = aliased(ScmOrdenOperacion)
+    context_machine = aliased(Maquina)
+    statement = (
+        select(
+            RegistroDiarioProduccion.id.label("ot_id"),
+            ScmOrdenOperacion.id.label("order_id"),
+            ScmOrdenOperacion.codigo.label("order_code"),
+            ScmOrdenOperacionSalida.id.label("output_id"),
+            ScmOrdenOperacionSalida.cantidad_objetivo.label("output_quantity"),
+            ScmArticulo.id.label("article_id"),
+            ScmArticulo.codigo.label("article_code"),
+            ScmArticulo.nombre.label("article_name"),
+            ScmArticulo.clase.label("article_class"),
+            ScmArticulo.unidad_base.label("article_unit"),
+            ScmSolicitudAbastecimiento.codigo.label("supply_code"),
+            ScmSolicitudAbastecimiento.estado.label("supply_state"),
+            context_ot.public_id.label("context_ot_public_id"),
+            context_ot.codigo_ot.label("context_ot_code"),
+            context_ot.estado.label("context_ot_state"),
+            context_ot.fecha.label("context_ot_date"),
+            context_machine.nombre.label("context_machine"),
+            context_work.id.label("context_work_id"),
+            context_work.codigo.label("context_work_code"),
+            context_work.secuencia.label("context_work_sequence"),
+            context_work.estado.label("context_work_state"),
+            context_work.orden_operacion_id.label("context_operation_id"),
+            context_operation.codigo.label("context_operation_code"),
+            context_work.version.label("context_work_version"),
+            context_color.corrida_fabricacion_id.label("context_run_id"),
+            context_run.codigo.label("context_run_code"),
+            context_color.color_nombre_snapshot.label("context_color_snapshot"),
+            context_catalog_color.hex_referencia.label("context_color_hex"),
+        )
+        .select_from(RegistroDiarioProduccion)
+        .outerjoin(ScmOrdenOperacion, ScmOrdenOperacion.id == RegistroDiarioProduccion.orden_operacion_id)
+        .outerjoin(ScmSolicitudAbastecimiento, ScmSolicitudAbastecimiento.orden_trabajo_id == RegistroDiarioProduccion.id)
+        .outerjoin(ScmOrdenOperacionSalida, ScmOrdenOperacionSalida.orden_operacion_id == RegistroDiarioProduccion.orden_operacion_id)
+        .outerjoin(ScmArticulo, ScmArticulo.id == ScmOrdenOperacionSalida.articulo_scm_id)
+        .outerjoin(context_work, context_work.id == RegistroDiarioProduccion.trabajo_color_contexto_id)
+        .outerjoin(context_ot, context_ot.id == context_work.orden_trabajo_id)
+        .outerjoin(context_operation, context_operation.id == context_work.orden_operacion_id)
+        .outerjoin(context_color, context_color.trabajo_ot_id == context_work.id)
+        .outerjoin(context_run, context_run.id == context_color.corrida_fabricacion_id)
+        .outerjoin(
+            context_catalog_color,
+            context_catalog_color.id == func.coalesce(
+                context_color.color_id_snapshot,
+                context_run.color_produccion_id,
+            ),
+        )
+        .outerjoin(context_machine, context_machine.id == context_ot.maquina_id)
+        .where(RegistroDiarioProduccion.id.in_(assembly_ids))
+        .order_by(RegistroDiarioProduccion.id, ScmOrdenOperacionSalida.id)
+    )
+    contexts = {}
+    for row in session.execute(statement).all():
+        mapping = row._mapping
+        item = contexts.setdefault(mapping["ot_id"], {
+            "orden_armado": {
+                "id": str(mapping["order_id"]) if mapping["order_id"] else None,
+                "codigo": mapping["order_code"],
+                "salida": None,
+            },
+            "abastecimiento": (
+                {"codigo": mapping["supply_code"], "estado": mapping["supply_state"]}
+                if mapping["supply_code"] else None
+            ),
+            "ot_fabricacion_contexto": None,
+            "trabajo_color_contexto": None,
+        })
+        if item["orden_armado"]["salida"] is None and mapping["article_id"] is not None:
+            item["orden_armado"]["salida"] = {
+                "articulo": {
+                    "id": mapping["article_id"],
+                    "codigo": mapping["article_code"],
+                    "nombre": mapping["article_name"],
+                    "clase": mapping["article_class"],
+                    "unidad": mapping["article_unit"],
+                },
+                "cantidad_objetivo": _compact_number(mapping["output_quantity"] or 0),
+            }
+        if item["trabajo_color_contexto"] is None and mapping["context_work_id"] is not None:
+            context_color_name = mapping["context_color_snapshot"]
+            item["ot_fabricacion_contexto"] = {
+                "public_id": str(mapping["context_ot_public_id"]),
+                "codigo_ot": mapping["context_ot_code"],
+                "estado": mapping["context_ot_state"],
+                "fecha_operativa": mapping["context_ot_date"].isoformat() if mapping["context_ot_date"] else None,
+                "maquina": mapping["context_machine"],
+            }
+            item["trabajo_color_contexto"] = {
+                "id": str(mapping["context_work_id"]),
+                "codigo": mapping["context_work_code"],
+                "secuencia": mapping["context_work_sequence"],
+                "estado": mapping["context_work_state"],
+                "version": mapping["context_work_version"],
+                "orden_fabricacion_id": str(mapping["context_operation_id"]) if mapping["context_operation_id"] else None,
+                "orden_fabricacion_codigo": mapping["context_operation_code"],
+                "corrida_fabricacion_id": str(mapping["context_run_id"]) if mapping["context_run_id"] else None,
+                "corrida_codigo": mapping["context_run_code"],
+                "color": context_color_name,
+                "color_hex": mapping["context_color_hex"],
+            }
+    return contexts
+
+
+def _list_ots_summary(
+    session, *, actor_id, op_number=None, operation_order_id=None, tipo_ot=None,
+    operational_date=None, machine_id=None, machine=None, shift=None,
+):
+    normalized_type = str(tipo_ot or "").strip().upper()
+    if normalized_type and normalized_type not in ("FABRICACION", "ENSAMBLE"):
+        raise ScmServiceError(
+            "OT_TYPE_INVALID", "tipo_ot debe ser FABRICACION o ENSAMBLE.", status_code=400
+        )
+    if op_number and operation_order_id:
+        raise ScmServiceError(
+            "AMBIGUOUS_ORDER_FILTER",
+            "Filtre las OT por OP legacy o por OF, no por ambas.", status_code=400,
+        )
+    parsed_date = _parse_date(operational_date) if operational_date else None
+    parsed_machine = _summary_machine_id(machine_id)
+    normalized_shift = required_text(shift, field="turno", max_length=20).upper() if shift else None
+    if normalized_shift and normalized_shift not in {"DIA", "NOCHE", "EXTRA"}:
+        raise ScmServiceError(
+            "INVALID_SHIFT",
+            "turno debe ser DIA, NOCHE o EXTRA.",
+            status_code=400,
+        )
+    statement = select(
+        RegistroDiarioProduccion.id.label("ot_id"),
+        RegistroDiarioProduccion.public_id,
+        RegistroDiarioProduccion.codigo_ot,
+        RegistroDiarioProduccion.estado,
+        RegistroDiarioProduccion.tipo_ot,
+        RegistroDiarioProduccion.version,
+        RegistroDiarioProduccion.fecha,
+        RegistroDiarioProduccion.turno,
+        RegistroDiarioProduccion.maquina_id,
+        RegistroDiarioProduccion.maquina_nombre_snapshot,
+        RegistroDiarioProduccion.maquina_codigo_snapshot,
+        RegistroDiarioProduccion.centro_trabajo_id,
+        RegistroDiarioProduccion.responsable_id,
+        RegistroDiarioProduccion.maquinista_previsto_id,
+        RegistroDiarioProduccion.modo_ejecucion_ensamble,
+        RegistroDiarioProduccion.orden_operacion_id,
+        RegistroDiarioProduccion.cantidad_objetivo,
+        RegistroDiarioProduccion.cantidad_confirmada,
+        RegistroDiarioProduccion.trabajo_color_contexto_id,
+        RegistroDiarioProduccion.ot_fabricacion_contexto_id,
+        Maquina.id.label("machine_row_id"), Maquina.nombre.label("machine_name"), Maquina.codigo.label("machine_code"),
+        ScmCentroTrabajo.id.label("center_id"), ScmCentroTrabajo.codigo.label("center_code"), ScmCentroTrabajo.nombre.label("center_name"), ScmCentroTrabajo.tipo.label("center_type"),
+    ).select_from(RegistroDiarioProduccion)
+    # Use scalar worker lookups to retain one row per OT without ORM graph loading.
+    responsible = aliased(Trabajador)
+    planned = aliased(Trabajador)
+    statement = statement.add_columns(
+        func.trim(responsible.nombres + " " + responsible.apellidos).label("responsible_name"),
+        func.trim(planned.nombres + " " + planned.apellidos).label("planned_name"),
+    ).outerjoin(Maquina, Maquina.id == RegistroDiarioProduccion.maquina_id).outerjoin(
+        ScmCentroTrabajo, ScmCentroTrabajo.id == RegistroDiarioProduccion.centro_trabajo_id
+    ).outerjoin(responsible, responsible.id == RegistroDiarioProduccion.responsable_id).outerjoin(
+        planned, planned.id == RegistroDiarioProduccion.maquinista_previsto_id
+    )
+    filters = [RegistroDiarioProduccion.codigo_ot_sintetico.is_(False)]
+    if normalized_type:
+        filters.append(RegistroDiarioProduccion.tipo_ot == normalized_type)
+    if parsed_date:
+        filters.append(RegistroDiarioProduccion.fecha == parsed_date)
+    if parsed_machine is not None:
+        filters.append(RegistroDiarioProduccion.maquina_id == parsed_machine)
+    if machine:
+        normalized_machine = str(machine).strip().upper()
+        filters.append(or_(func.upper(RegistroDiarioProduccion.maquina_codigo_snapshot) == normalized_machine, func.upper(RegistroDiarioProduccion.maquina_nombre_snapshot) == normalized_machine))
+    if normalized_shift:
+        filters.append(RegistroDiarioProduccion.turno == normalized_shift)
+    if op_number:
+        filters.append(RegistroDiarioProduccion.orden_id == op_number)
+    if operation_order_id:
+        try:
+            canonical_id = uuid.UUID(str(operation_order_id))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ScmServiceError("INVALID_UUID", "orden_operacion_id debe ser un UUID valido.", status_code=400) from error
+        filters.append(or_(RegistroDiarioProduccion.orden_operacion_id == canonical_id, RegistroDiarioProduccion.trabajos_ot.any(ScmTrabajoOt.orden_operacion_id == canonical_id)))
+    rows = session.execute(statement.where(*filters).order_by(RegistroDiarioProduccion.fecha.desc(), RegistroDiarioProduccion.id.desc())).all()
+    if not rows:
+        return {"items": []}
+    headers = []
+    for row in rows:
+        data = row._mapping
+        headers.append(SimpleNamespace(
+            id=data["ot_id"], public_id=data["public_id"], codigo_ot=data["codigo_ot"], estado=data["estado"], tipo_ot=data["tipo_ot"], version=data["version"], fecha=data["fecha"], turno=data["turno"], maquina_id=data["maquina_id"], maquina_nombre_snapshot=data["maquina_nombre_snapshot"] or data["machine_name"], maquina_codigo_snapshot=data["maquina_codigo_snapshot"] or data["machine_code"], maquina=SimpleNamespace(id=data["machine_row_id"], nombre=data["machine_name"], codigo=data["machine_code"]) if data["machine_row_id"] else None, centro_trabajo=SimpleNamespace(id=data["center_id"], codigo=data["center_code"], nombre=data["center_name"], tipo=data["center_type"]) if data["center_id"] else None, responsable_id=data["responsable_id"], responsable=data["responsible_name"], maquinista_previsto_id=data["maquinista_previsto_id"], maquinista_previsto=data["planned_name"], modo_ejecucion_ensamble=data["modo_ejecucion_ensamble"], orden_operacion_id=data["orden_operacion_id"], cantidad_objetivo=data["cantidad_objetivo"], cantidad_confirmada=data["cantidad_confirmada"], trabajo_color_contexto_id=data["trabajo_color_contexto_id"], ot_fabricacion_contexto_id=data["ot_fabricacion_contexto_id"],
+        ))
+    ot_ids = [item.id for item in headers]
+    works, _work_rows = _summary_work_rows(session, ot_ids)
+    work_ids = [work.id for work in works]
+    # Keep the mapping from the SQL row list without a second query.
+    work_by_ot = {}
+    work_by_id = {work.id: work for work in works}
+    for work_id, raw in _work_rows.items():
+        work_by_ot.setdefault(raw["ot_id"], []).append(work_by_id[work_id])
+    summaries = _summary_manga_aggregates(session, ot_ids=ot_ids, work_ids=work_ids)
+    assembly_contexts = _summary_assembly_contexts(session, [item.id for item in headers if item.tipo_ot == "ENSAMBLE"])
+    items = []
+    for header in headers:
+        assembly = assembly_contexts.get(header.id)
+        items.append(_serialize_ot_summary(header, works=work_by_ot.get(header.id, []), manga_summaries=summaries, assembly_context=assembly))
+    return {"items": items}
+
+
 def get_ot(session, *, actor_id, public_id):
     load_actor(session, actor_id, capability="OT_VER")
     ot = session.scalar(select(RegistroDiarioProduccion).where(
@@ -4380,8 +5039,21 @@ def list_ots(
     machine_id=None,
     machine=None,
     shift=None,
+    view=None,
 ):
     load_actor(session, actor_id, capability="OT_VER")
+    if _summary_view(view) == "resumen":
+        return _list_ots_summary(
+            session,
+            actor_id=actor_id,
+            op_number=op_number,
+            operation_order_id=operation_order_id,
+            tipo_ot=tipo_ot,
+            operational_date=operational_date,
+            machine_id=machine_id,
+            machine=machine,
+            shift=shift,
+        )
     statement = (
         select(RegistroDiarioProduccion)
         .options(
@@ -4571,6 +5243,8 @@ def list_plant_journeys(
     actor_id,
     operational_date,
     shift,
+    machine_id=None,
+    view=None,
 ):
     """Aggregate both plant journey families in one authenticated request."""
     load_actor(session, actor_id, capability="OT_VER")
@@ -4592,7 +5266,9 @@ def list_plant_journeys(
         session,
         actor_id=actor_id,
         operational_date=parsed_date.isoformat(),
+        machine_id=machine_id,
         shift=normalized_shift,
+        view=view,
     )
     fabrication = []
     assembly = []

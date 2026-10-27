@@ -8,6 +8,7 @@ from app.services.scm_draft_order_annulment import (
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from uuid import UUID
 from sqlalchemy import cast, exists, func, or_, select, String
 from sqlalchemy.orm import noload, selectinload
 from sqlalchemy.exc import IntegrityError
@@ -746,7 +747,8 @@ def _load_fabrication(session, operation_id, *, lock=False):
 
 
 _SUMMARY_PAGE_SIZES = (25, 50, 100)
-_SUMMARY_STATES = {"SIN_ANULADAS", "TODOS"}
+_SUMMARY_STATES = {"SIN_ANULADAS", "TODOS", "ELEGIBLES"}
+_SUMMARY_ELIGIBLE_STATES = {"LIBERADA", "PROGRAMADA", "EN_EJECUCION"}
 
 
 def _fold_sql(expression):
@@ -859,10 +861,16 @@ def _summary_query(session, parsed):
     )
     if parsed["estado"] == "SIN_ANULADAS":
         statement = statement.where(ScmOrdenOperacion.estado != "ANULADA")
+    elif parsed["estado"] == "ELEGIBLES":
+        statement = statement.where(ScmOrdenOperacion.estado.in_(_SUMMARY_ELIGIBLE_STATES))
     elif parsed["estado"] != "TODOS":
         statement = statement.where(ScmOrdenOperacion.estado == parsed["estado"])
     query = parsed["q"]
     if query:
+        try:
+            uuid_query = UUID(query)
+        except (AttributeError, ValueError, TypeError):
+            uuid_query = None
         fabrication_match = exists(
             select(1)
             .select_from(ScmOrdenFabricacion)
@@ -917,7 +925,7 @@ def _summary_query(session, parsed):
                 ),
             )
         )
-        statement = statement.where(or_(
+        search_matches = [
             _summary_text_match(ScmOrdenOperacion.codigo, query),
             _summary_text_match(ScmOrdenOperacion.origen_demanda, query),
             _summary_text_match(ScmOrdenOperacion.motivo, query),
@@ -926,7 +934,10 @@ def _summary_query(session, parsed):
             run_match,
             output_match,
             origin_match,
-        ))
+        ]
+        if uuid_query:
+            search_matches.insert(1, ScmOrdenOperacion.id == uuid_query)
+        statement = statement.where(or_(*search_matches))
     if parsed["orden"] == "codigo":
         statement = statement.order_by(ScmOrdenOperacion.codigo.asc(), ScmOrdenOperacion.id.asc())
     else:
@@ -959,6 +970,7 @@ def _summary_item(operation, mold_by_code):
             {
                 "id": str(run.id),
                 "codigo": run.codigo,
+                "secuencia": run.secuencia,
                 "estado": run.estado,
                 "ciclos_objetivo": run.ciclos_objetivo,
                 "objetivo_neto_kg": _decimal_text(run.objetivo_neto_kg, 6),
@@ -968,8 +980,38 @@ def _summary_item(operation, mold_by_code):
                     "nombre": run.color_produccion.nombre,
                     "hex_referencia": run.color_produccion.hex_referencia,
                 } if run.color_produccion is not None else None),
+                # Keep the compact summary directly consumable by the OT
+                # selector, whose legacy-compatible labels read these flat
+                # aliases without expanding the OF detail graph.
+                "color": (
+                    run.color_produccion.nombre
+                    if run.color_produccion is not None else None
+                ),
+                "color_nombre": (
+                    run.color_produccion.nombre
+                    if run.color_produccion is not None else None
+                ),
+                "color_hex": (
+                    run.color_produccion.hex_referencia
+                    if run.color_produccion is not None else None
+                ),
                 "salidas": [
                     {
+                        "id": str(output.id) if getattr(output, "id", None) else None,
+                        "articulo_codigo": (
+                            output.articulo.codigo
+                            if output.articulo is not None else None
+                        ),
+                        "articulo_nombre": (
+                            output.articulo.nombre
+                            if output.articulo is not None else None
+                        ),
+                        # The OT selector uses the compact OF projection to
+                        # validate kg allocation. Preserve the frozen source
+                        # weight here; absent legacy values remain null.
+                        "peso_unitario_snapshot_g": _decimal_text(
+                            getattr(output, "peso_unitario_snapshot_g", None), 4,
+                        ),
                         "articulo": ({
                             "id": output.articulo.id,
                             "codigo": output.articulo.codigo,

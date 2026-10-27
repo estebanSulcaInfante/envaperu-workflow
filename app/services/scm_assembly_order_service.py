@@ -4,7 +4,7 @@ import copy
 from app.services.scm_draft_order_annulment import annulment_summary
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from app.models.scm_articulos import (
     CLASE_SUBENSAMBLE_WIP,
@@ -27,6 +27,7 @@ from app.models.scm_rutas import (
     ScmOperacionPrecedencia,
     ScmOperacionRuta,
     ScmRutaRevision,
+    ScmCentroTrabajo,
 )
 from app.models.registro import RegistroDiarioProduccion
 from app.services.catalog_code_generator import generar_codigo_catalogo
@@ -231,8 +232,246 @@ def _serialize(session, order, *, schedule_projection=None):
     }
 
 
-def list_assembly_orders(session, *, actor_id):
+_ASSEMBLY_ORDER_STATES = {
+    "BORRADOR", "LIBERADA", "PROGRAMADA", "EN_EJECUCION",
+    "PAUSADA", "CERRADA", "CANCELADA", "ANULADA",
+}
+
+
+def _assembly_summary_view(value):
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized != "resumen":
+        raise ScmServiceError(
+            "OA_VIEW_INVALID", "vista debe ser resumen.", status_code=400,
+        )
+    return normalized
+
+
+def _assembly_summary_page(value, *, field, default, allowed=None):
+    if value is None or not str(value).strip():
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "OA_PAGINATION_INVALID", f"{field} debe ser entero.", status_code=400,
+        ) from error
+    if parsed <= 0 or (allowed is not None and parsed not in allowed):
+        detail = f"{field} no es valido."
+        if allowed is not None:
+            detail = f"{field} debe ser uno de {sorted(allowed)}."
+        raise ScmServiceError("OA_PAGINATION_INVALID", detail, status_code=400)
+    return parsed
+
+
+def _assembly_summary_filters(*, q=None, estado=None):
+    normalized_q = str(q or "").strip()
+    if len(normalized_q) > 100:
+        raise ScmServiceError(
+            "OA_QUERY_INVALID", "q no puede superar 100 caracteres.", status_code=400,
+        )
+    normalized_state = str(estado or "").strip().upper()
+    if normalized_state and normalized_state != "NO_ANULADA" and normalized_state not in _ASSEMBLY_ORDER_STATES:
+        raise ScmServiceError(
+            "OA_STATE_INVALID", "estado de OA no es valido.", status_code=400,
+        )
+    return normalized_q, normalized_state
+
+
+def _assembly_summary_statement(*, q=None, estado=None):
+    output = ScmOrdenOperacionSalida
+    article = ScmArticulo
+    route = ScmOperacionRuta
+    center = ScmCentroTrabajo
+    statement = (
+        select(
+            ScmOrdenOperacion.id.label("order_id"),
+            ScmOrdenOperacion.codigo,
+            ScmOrdenOperacion.tipo,
+            ScmOrdenOperacion.estado,
+            ScmOrdenOperacion.version,
+            ScmOrdenOperacion.origen_demanda,
+            ScmOrdenOperacion.propuesta_clave,
+            ScmOrdenOperacion.created_at,
+            route.id.label("route_id"),
+            route.nombre.label("route_name"),
+            route.tipo.label("route_type"),
+            route.permite_concurrente,
+            route.centro_trabajo_id.label("route_center_id"),
+            center.codigo.label("center_code"),
+            center.nombre.label("center_name"),
+            output.id.label("output_id"),
+            output.articulo_scm_id,
+            output.cantidad_objetivo,
+            output.cantidad_real,
+            output.cantidad_rechazada,
+            article.codigo.label("article_code"),
+            article.nombre.label("article_name"),
+            article.clase.label("article_class"),
+            article.unidad_inventario.label("article_unit"),
+        )
+        .select_from(ScmOrdenOperacion)
+        .outerjoin(output, output.orden_operacion_id == ScmOrdenOperacion.id)
+        .outerjoin(article, article.id == output.articulo_scm_id)
+        .outerjoin(route, route.id == ScmOrdenOperacion.operacion_ruta_revision_id)
+        .outerjoin(center, center.id == route.centro_trabajo_id)
+        .where(ScmOrdenOperacion.tipo == "ENSAMBLE")
+    )
+    normalized_q, normalized_state = _assembly_summary_filters(q=q, estado=estado)
+    filters = []
+    if normalized_q:
+        escaped_q = normalized_q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_q}%"
+        filters.append(or_(
+            ScmOrdenOperacion.codigo.ilike(pattern, escape="\\"),
+            article.codigo.ilike(pattern, escape="\\"),
+            article.nombre.ilike(pattern, escape="\\"),
+        ))
+    if normalized_state == "NO_ANULADA":
+        filters.append(ScmOrdenOperacion.estado != "ANULADA")
+    elif normalized_state:
+        filters.append(ScmOrdenOperacion.estado == normalized_state)
+    return statement.where(*filters), filters
+
+
+def _assembly_summary_quantity(value):
+    return format(value, "f") if value is not None else None
+
+
+def _assembly_summary_item(mapping):
+    operation = None
+    if mapping["route_id"] is not None:
+        operation = {
+            "id": mapping["route_id"],
+            "nombre": mapping["route_name"],
+            "tipo": mapping["route_type"],
+            "permite_concurrente": bool(mapping["permite_concurrente"]),
+            "centro_trabajo_id": mapping["route_center_id"],
+            "centro_trabajo": mapping["center_name"],
+        }
+    output = None
+    if mapping["output_id"] is not None:
+        output = {
+            "id": str(mapping["output_id"]),
+            "articulo_scm_id": mapping["articulo_scm_id"],
+            "codigo": mapping["article_code"],
+            "nombre": mapping["article_name"],
+            "clase": mapping["article_class"],
+            "unidad_inventario": mapping["article_unit"],
+            "cantidad_objetivo": _assembly_summary_quantity(mapping["cantidad_objetivo"]),
+        }
+    return {
+        "id": str(mapping["order_id"]),
+        "codigo": mapping["codigo"],
+        "tipo": mapping["tipo"],
+        "estado": mapping["estado"],
+        "version": mapping["version"],
+        "origen_demanda": mapping["origen_demanda"],
+        "propuesta_clave": mapping["propuesta_clave"],
+        "operacion": operation,
+        "salida": output,
+    }
+
+
+def _list_assembly_orders_summary(
+    session, *, q=None, estado=None, pagina=None, tamano=None,
+):
+    page = _assembly_summary_page(pagina, field="pagina", default=1)
+    page_size = _assembly_summary_page(
+        tamano, field="tamano", default=25, allowed={25, 50, 100},
+    )
+    statement, filters = _assembly_summary_statement(q=q, estado=estado)
+    output = ScmOrdenOperacionSalida
+    article = ScmArticulo
+    output_count = (
+        select(func.count(ScmOrdenOperacionSalida.id))
+        .where(ScmOrdenOperacionSalida.orden_operacion_id == ScmOrdenOperacion.id)
+        .correlate(ScmOrdenOperacion)
+        .scalar_subquery()
+    )
+    identity_statement = (
+        select(
+            ScmOrdenOperacion.id.label("order_id"),
+            ScmOrdenOperacion.created_at,
+            output_count.label("output_count"),
+        )
+        .select_from(ScmOrdenOperacion)
+        .outerjoin(output, output.orden_operacion_id == ScmOrdenOperacion.id)
+        .outerjoin(article, article.id == output.articulo_scm_id)
+        .where(ScmOrdenOperacion.tipo == "ENSAMBLE", *filters)
+        .group_by(ScmOrdenOperacion.id, ScmOrdenOperacion.created_at)
+    )
+    identity_query = identity_statement.subquery()
+    identity_rows = session.execute(
+        select(
+            identity_query.c.order_id,
+            identity_query.c.created_at,
+            identity_query.c.output_count,
+            select(func.count()).select_from(identity_query).scalar_subquery().label("total"),
+        ).order_by(
+            identity_query.c.created_at.desc(),
+            identity_query.c.order_id.desc(),
+        ).offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    invalid_output_ids = [
+        row._mapping["order_id"]
+        for row in identity_rows
+        if row._mapping["output_count"] != 1
+    ]
+    if invalid_output_ids:
+        raise ScmServiceError(
+            "OA_OUTPUT_INVALID",
+            "La OA debe conservar exactamente una salida.",
+            status_code=409,
+            details={"order_id": str(invalid_output_ids[0])},
+        )
+    total = (
+        identity_rows[0]._mapping["total"]
+        if identity_rows else session.scalar(
+            select(func.count()).select_from(identity_query)
+        )
+    ) or 0
+    selected_ids = [row._mapping["order_id"] for row in identity_rows]
+    if not selected_ids:
+        return {
+            "items": [],
+            "page": {
+                "pagina": page,
+                "tamano": page_size,
+                "total": total,
+                "paginas": (total + page_size - 1) // page_size if total else 0,
+            },
+        }
+    rows = session.execute(
+        statement.where(ScmOrdenOperacion.id.in_(selected_ids))
+    ).all()
+    items_by_id = {}
+    for row in rows:
+        mapping = row._mapping
+        items_by_id[mapping["order_id"]] = _assembly_summary_item(mapping)
+    items = [items_by_id[order_id] for order_id in selected_ids if order_id in items_by_id]
+    pages = (total + page_size - 1) // page_size if total else 0
+    return {
+        "items": items,
+        "page": {
+            "pagina": page,
+            "tamano": page_size,
+            "total": total,
+            "paginas": pages,
+        },
+    }
+
+
+def list_assembly_orders(
+    session, *, actor_id, view=None, q=None, estado=None, pagina=None, tamano=None,
+):
     load_actor(session, actor_id, capability="OA_VER")
+    if _assembly_summary_view(view) == "resumen":
+        return _list_assembly_orders_summary(
+            session, q=q, estado=estado, pagina=pagina, tamano=tamano,
+        )
     orders = session.scalars(
         select(ScmOrdenOperacion)
         .where(ScmOrdenOperacion.tipo == "ENSAMBLE")

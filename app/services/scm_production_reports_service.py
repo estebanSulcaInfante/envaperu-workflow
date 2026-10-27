@@ -208,6 +208,53 @@ def _effective_weight(manga, weighings, corrections, annulments):
     return _d((projection or {}).get("peso_fisico_neto_kg", current.peso_fisico_neto_kg))
 
 
+def _associate_mangas_to_runs(runs, unique_mangas):
+    """Associate each loaded manga once, then union indexes per run.
+
+    Corrections can make a manga visible through either its origin or target
+    Trabajo.  Building that index once preserves the overlay semantics while
+    avoiding a full manga scan for every corrida.
+    """
+    mangas_by_work = defaultdict(dict)
+    mangas_by_ot = defaultdict(dict)
+    mangas_by_correction_work = defaultdict(dict)
+    correction_order = {}
+    for position, manga in enumerate(unique_mangas.values()):
+        if manga.trabajo_ot_id is not None:
+            mangas_by_work[manga.trabajo_ot_id][manga.id] = manga
+        if manga.ot_id is not None:
+            mangas_by_ot[manga.ot_id][manga.id] = manga
+        for segment in manga.tramos_trabajo:
+            if segment.trabajo_ot_id is not None:
+                mangas_by_work[segment.trabajo_ot_id][manga.id] = manga
+        correction = manga.correccion_asignacion
+        if correction is not None:
+            correction_order[manga.id] = position
+            for work_id in (
+                correction.origen_trabajo_ot_id,
+                correction.destino_trabajo_ot_id,
+            ):
+                if work_id is not None:
+                    mangas_by_correction_work[work_id][manga.id] = manga
+
+    for run in runs.values():
+        run_work_ids = {item[0].id for item in run["works"]}
+        run_ot_ids = {ot.id for ot in run["ots"]}
+        associated = {}
+        for work_id in run_work_ids:
+            associated.update(mangas_by_work.get(work_id, {}))
+        for ot_id in run_ot_ids:
+            associated.update(mangas_by_ot.get(ot_id, {}))
+        correction_candidates = {}
+        for work_id in run_work_ids:
+            correction_candidates.update(mangas_by_correction_work.get(work_id, {}))
+        for manga in sorted(
+            correction_candidates.values(), key=lambda item: correction_order[item.id]
+        ):
+            associated[manga.id] = manga
+        run["mangas"].update(associated)
+
+
 def _valid_kg_segments(manga, controls_by_tramo):
     segments = [
         segment for segment in manga.tramos_trabajo
@@ -430,32 +477,7 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
                 .order_by(ScmEvento.occurred_at, ScmEvento.id)
             ).all()
         }
-    mangas_by_work = defaultdict(dict)
-    mangas_by_ot = defaultdict(dict)
-    for manga in unique_mangas.values():
-        if manga.trabajo_ot_id is not None:
-            mangas_by_work[manga.trabajo_ot_id][manga.id] = manga
-        if manga.ot_id is not None:
-            mangas_by_ot[manga.ot_id][manga.id] = manga
-        for segment in manga.tramos_trabajo:
-            if segment.trabajo_ot_id is not None:
-                mangas_by_work[segment.trabajo_ot_id][manga.id] = manga
-    for run in runs.values():
-        run_work_ids = {item[0].id for item in run["works"]}
-        run_ot_ids = {ot.id for ot in run["ots"]}
-        associated = {}
-        for work_id in run_work_ids:
-            associated.update(mangas_by_work.get(work_id, {}))
-        for ot_id in run_ot_ids:
-            associated.update(mangas_by_ot.get(ot_id, {}))
-        for manga in unique_mangas.values():
-            correction = manga.correccion_asignacion
-            if correction is not None and (
-                correction.origen_trabajo_ot_id in run_work_ids
-                or correction.destino_trabajo_ot_id in run_work_ids
-            ):
-                associated[manga.id] = manga
-        run["mangas"].update(associated)
+    _associate_mangas_to_runs(runs, unique_mangas)
 
     weighing_rows = session.scalars(select(ScmPesajeManga).where(ScmPesajeManga.manga_id.in_(list(unique_mangas)))).all() if unique_mangas else []
     weighing_ids = [item.id for item in weighing_rows]

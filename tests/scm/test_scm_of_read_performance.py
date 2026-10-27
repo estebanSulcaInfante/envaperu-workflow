@@ -6,8 +6,10 @@ depending on historical production data.
 """
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import json
 import tracemalloc
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -138,6 +140,176 @@ def test_of_summary_search_matches_composite_color_identity(app, monkeypatch):
         )
 
         assert payload["pagination"]["total"] == 1
+
+
+def test_of_summary_search_matches_uuid_and_server_filters_elegible_states(app, monkeypatch):
+    with app.app_context():
+        operations = _seed_operations(3)
+        operations[0].estado = "LIBERADA"
+        operations[1].estado = "PROGRAMADA"
+        operations[2].estado = "BORRADOR"
+        db.session.commit()
+        monkeypatch.setattr(fabrication_service, "load_actor", lambda *args, **kwargs: None)
+
+        uuid_match = fabrication_service.list_fabrication_orders(
+            db.session,
+            actor_id=1,
+            filters={"vista": "resumen", "q": str(operations[1].id)},
+        )
+        uuid_match_without_hyphens = fabrication_service.list_fabrication_orders(
+            db.session,
+            actor_id=1,
+            filters={"vista": "resumen", "q": operations[1].id.hex},
+        )
+        eligible = fabrication_service.list_fabrication_orders(
+            db.session,
+            actor_id=1,
+            filters={"vista": "resumen", "estado": "LIBERADA"},
+        )
+        eligible_for_selector = fabrication_service.list_fabrication_orders(
+            db.session,
+            actor_id=1,
+            filters={"vista": "resumen", "estado": "ELEGIBLES"},
+        )
+
+        assert uuid_match["pagination"]["total"] == 1
+        assert uuid_match["items"][0]["id"] == str(operations[1].id)
+        assert uuid_match_without_hyphens["pagination"]["total"] == 1
+        assert uuid_match_without_hyphens["items"][0]["id"] == str(operations[1].id)
+        assert eligible["pagination"]["total"] == 1
+        assert eligible["items"][0]["estado"] == "LIBERADA"
+        assert eligible_for_selector["pagination"]["total"] == 2
+        assert {item["estado"] for item in eligible_for_selector["items"]} == {
+            "LIBERADA", "PROGRAMADA",
+        }
+
+
+def test_of_summary_search_does_not_turn_empty_uuid_fragment_into_match_all(app, monkeypatch):
+    with app.app_context():
+        _seed_operations(3)
+        monkeypatch.setattr(fabrication_service, "load_actor", lambda *args, **kwargs: None)
+
+        payload = fabrication_service.list_fabrication_orders(
+            db.session,
+            actor_id=1,
+            filters={"vista": "resumen", "q": "---"},
+        )
+
+        assert payload["pagination"]["total"] == 0
+
+
+def test_of_summary_selector_projection_keeps_mold_objectives_and_outputs():
+    run_id = UUID("00000000-0000-0000-0000-000000000101")
+    operation_id = UUID("00000000-0000-0000-0000-000000000102")
+    run = SimpleNamespace(
+        id=run_id,
+        codigo="C01",
+        secuencia=1,
+        estado="LIBERADA",
+        ciclos_objetivo=12,
+        objetivo_neto_kg=2.5,
+        color_produccion=SimpleNamespace(
+            id=7,
+            codigo_legacy=41,
+            nombre="AZUL SÓLIDO",
+            hex_referencia="#123456",
+        ),
+        salidas=[SimpleNamespace(
+            peso_unitario_snapshot_g=Decimal("125.0000"),
+            articulo=SimpleNamespace(
+                id=9,
+                codigo="PC-AZUL",
+                nombre="Pieza azul",
+                pieza_color=None,
+            ),
+        )],
+    )
+    operation = SimpleNamespace(
+        id=operation_id,
+        codigo="OF-000102",
+        estado="PROGRAMADA",
+        origen_demanda="PRUEBA",
+        motivo="selector",
+        created_at=datetime(2026, 10, 26, tzinfo=timezone.utc),
+        plan_produccion=None,
+        plan_produccion_id=None,
+        fabricacion=SimpleNamespace(molde_id="M-AZUL", corridas=[run]),
+    )
+
+    item = fabrication_service._summary_item(
+        operation,
+        {"M-AZUL": SimpleNamespace(nombre="Molde azul")},
+    )
+
+    assert item["molde"] == {"codigo": "M-AZUL", "nombre": "Molde azul"}
+    assert item["corridas"] == [{
+        "id": str(run_id),
+        "codigo": "C01",
+        "secuencia": 1,
+        "estado": "LIBERADA",
+        "ciclos_objetivo": 12,
+        "objetivo_neto_kg": "2.500000",
+        "color_produccion": {
+            "id": 7,
+            "codigo": 41,
+            "nombre": "AZUL SÓLIDO",
+            "hex_referencia": "#123456",
+        },
+        "color": "AZUL SÓLIDO",
+        "color_nombre": "AZUL SÓLIDO",
+        "color_hex": "#123456",
+        "salidas": [{
+            "id": None,
+            "articulo_codigo": "PC-AZUL",
+            "articulo_nombre": "Pieza azul",
+            "peso_unitario_snapshot_g": "125.0000",
+            "articulo": {
+                "id": 9,
+                "codigo": "PC-AZUL",
+                "nombre": "Pieza azul",
+                "pieza": None,
+            },
+        }],
+    }]
+
+
+def test_of_summary_selector_projection_preserves_null_frozen_weight():
+    run_id = UUID("00000000-0000-0000-0000-000000000111")
+    operation_id = UUID("00000000-0000-0000-0000-000000000112")
+    run = SimpleNamespace(
+        id=run_id,
+        codigo="C01",
+        secuencia=1,
+        estado="LIBERADA",
+        ciclos_objetivo=1,
+        objetivo_neto_kg=None,
+        color_produccion=None,
+        salidas=[SimpleNamespace(
+            peso_unitario_snapshot_g=None,
+            articulo=None,
+        )],
+    )
+    operation = SimpleNamespace(
+        id=operation_id,
+        codigo="OF-000112",
+        estado="PROGRAMADA",
+        origen_demanda="PRUEBA",
+        motivo="selector",
+        created_at=datetime(2026, 10, 26, tzinfo=timezone.utc),
+        plan_produccion=None,
+        plan_produccion_id=None,
+        fabricacion=SimpleNamespace(molde_id=None, corridas=[run]),
+    )
+
+    item = fabrication_service._summary_item(operation, {})
+
+    assert item["corridas"][0]["salidas"] == [{
+        "id": None,
+        "articulo_codigo": None,
+        "articulo_nombre": None,
+        "peso_unitario_snapshot_g": None,
+        "articulo": None,
+    }]
 
 
 def test_of_summary_metrics_are_measured_on_the_same_synthetic_dataset(app, monkeypatch, capsys):
