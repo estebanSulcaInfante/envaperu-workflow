@@ -7,8 +7,10 @@ and plain message data, then returns a small, sanitized provider result.
 
 import ipaddress
 import json
+import os
 import re
 import socket
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -16,6 +18,16 @@ from uuid import UUID
 from urllib.parse import urlsplit
 
 import requests
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows UAT only
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX only
+    msvcrt = None
 
 
 MAX_QUERY_CHARS = 4000
@@ -25,13 +37,18 @@ MAX_HISTORY_BYTES = 16000
 MAX_SERIALIZED_BYTES = 24000
 MAX_OUTPUT_BYTES = 128 * 1024
 MAX_ANSWER_CHARS = 32000
-DEADLINE_SECONDS = 45.0
+DEADLINE_SECONDS = 150.0
 CONNECT_TIMEOUT_SECONDS = 3.0
-READ_TIMEOUT_SECONDS = 42.0
+READ_TIMEOUT_SECONDS = 147.0
 MODEL = "openclaw/scm-personal"
 LIMITATION = "Las fuentes citadas forman parte de la respuesta del agente; esta interfaz no expone trazas de herramientas."
 
 _IN_FLIGHT = threading.BoundedSemaphore(1)
+_LEASE_PATH = (
+    Path("/tmp/scm-agent-chat.inflight.lock")
+    if os.name != "nt"
+    else Path(tempfile.gettempdir()) / "scm-agent-chat.inflight.lock"
+)
 _SAFE_MODEL = re.compile(r"[A-Za-z0-9_./:-]{1,160}\Z")
 
 
@@ -154,6 +171,76 @@ def readiness(config):
         "read_only": True,
         "attachments_supported": False,
     }
+
+
+def _open_process_lease():
+    flags = os.O_RDWR | os.O_CREAT
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    handle = None
+    try:
+        handle = os.fdopen(os.open(str(_LEASE_PATH), flags | no_follow, 0o600), "a+b")
+        try:
+            os.fchmod(handle.fileno(), 0o600)
+        except AttributeError:
+            try:
+                os.chmod(str(_LEASE_PATH), 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+        if msvcrt is not None and fcntl is None:
+            if os.path.getsize(str(_LEASE_PATH)) == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+        return handle
+    except OSError:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        return None
+
+
+def _acquire_process_lease():
+    """Take a nonblocking cross-worker lease without writing request metadata."""
+    handle = _open_process_lease()
+    if handle is None:
+        return None
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # pragma: no cover - an unsupported platform must fail closed
+            handle.close()
+            return None
+        return handle
+    except (BlockingIOError, OSError):
+        try:
+            handle.close()
+        except OSError:
+            pass
+        return None
+
+
+def _release_process_lease(handle):
+    if handle is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
 
 
 def _own_ip():
@@ -291,11 +378,20 @@ def complete_agent_chat(query, history, client_request_id, config):
     if not _IN_FLIGHT.acquire(blocking=False):
         _error("AGENT_BUSY", "El agente está atendiendo otra consulta; vuelve a intentar.", status_code=503)
     try:
+        lease = _acquire_process_lease()
+    except Exception:
+        _IN_FLIGHT.release()
+        _error("AGENT_UNAVAILABLE", "El agente no está disponible en este momento.", status_code=503)
+    if lease is None:
+        _IN_FLIGHT.release()
+        _error("AGENT_BUSY", "El agente está atendiendo otra consulta; vuelve a intentar.", status_code=503)
+    try:
         try:
             result = _complete(payload, config)
         except Exception:
             result = {"status": "UNAVAILABLE", "usage": None}
     finally:
+        _release_process_lease(lease)
         _IN_FLIGHT.release()
     if result.get("status") != "answered":
         raise _provider_error(result)

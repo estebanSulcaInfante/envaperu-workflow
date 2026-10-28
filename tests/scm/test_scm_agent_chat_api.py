@@ -224,7 +224,7 @@ def test_service_payload_and_transport_constraints(monkeypatch):
     assert payload["model"] == "openclaw/scm-personal"
     assert "tool_choice" not in payload and "tools" not in payload
     assert all(message["role"] != "system" for message in payload["messages"])
-    assert captured["kwargs"]["timeout"] == (3, 42)
+    assert captured["kwargs"]["timeout"] == (3, 147)
     assert captured["kwargs"]["allow_redirects"] is False
     assert captured["kwargs"]["verify"] is True
     assert captured["kwargs"]["headers"]["x-openclaw-model"] == "test/verified-model"
@@ -367,7 +367,8 @@ def test_service_rejects_malformed_tool_bad_finish_and_oversized_output(monkeypa
     assert raised.value.code == "AGENT_UNAVAILABLE"
 
 
-def test_service_busy_is_nonblocking_and_timeout_releases_slot(monkeypatch):
+def test_service_busy_is_nonblocking_and_timeout_releases_slot(monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway, "_LEASE_PATH", tmp_path / "scm-agent-chat.inflight.lock")
     assert gateway._IN_FLIGHT.acquire(blocking=False)
     try:
         with pytest.raises(gateway.AgentGatewayError) as raised:
@@ -380,6 +381,40 @@ def test_service_busy_is_nonblocking_and_timeout_releases_slot(monkeypatch):
     with pytest.raises(gateway.AgentGatewayError) as raised:
         gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())
     assert raised.value.code == "AGENT_TIMEOUT"
+    released = gateway._acquire_process_lease()
+    assert released is not None
+    gateway._release_process_lease(released)
+
+    monkeypatch.setattr(gateway, "_complete", lambda *_args: {"status": "answered", "answer": "ok", "usage": None})
+    assert gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())["answer"] == "ok"
+    released = gateway._acquire_process_lease()
+    assert released is not None
+    gateway._release_process_lease(released)
+
+
+def test_cross_worker_lease_busy_before_provider_and_releases(monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway, "_LEASE_PATH", tmp_path / "scm-agent-chat.inflight.lock")
+    held = gateway._acquire_process_lease()
+    assert held is not None
+    try:
+        monkeypatch.setattr(gateway, "_complete", lambda *_args: pytest.fail("provider must not run"))
+        with pytest.raises(gateway.AgentGatewayError) as raised:
+            gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())
+        assert raised.value.code == "AGENT_BUSY"
+    finally:
+        gateway._release_process_lease(held)
+    monkeypatch.setattr(gateway, "_complete", lambda *_args: {"status": "answered", "answer": "ok", "usage": None})
+    assert gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())["answer"] == "ok"
+
+
+def test_lease_open_permission_error_is_sanitized_and_slot_reusable(monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway, "_LEASE_PATH", tmp_path / "scm-agent-chat.inflight.lock")
+    with monkeypatch.context() as context:
+        context.setattr(gateway.os, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("private path")))
+        with pytest.raises(gateway.AgentGatewayError) as raised:
+            gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())
+        assert raised.value.code == "AGENT_BUSY"
+        assert "private path" not in str(raised.value)
 
     monkeypatch.setattr(gateway, "_complete", lambda *_args: {"status": "answered", "answer": "ok", "usage": None})
     assert gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())["answer"] == "ok"
