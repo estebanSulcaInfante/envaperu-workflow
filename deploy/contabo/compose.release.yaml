@@ -23,7 +23,8 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
     entrypoint: [python, /prep/start_guard.py]
-    command: [gunicorn, run:app, --bind, "0.0.0.0:5000", --workers, "2", --timeout, "60", --graceful-timeout, "30", --max-requests, "1000", --max-requests-jitter, "100", --error-logfile, "-"]
+    # Keep ordinary SCM reads available while the read-only agent waits on its provider.
+    command: [gunicorn, run:app, --bind, "0.0.0.0:5000", --workers, "2", --worker-class, gthread, --threads, "4", --timeout, "60", --graceful-timeout, "30", --max-requests, "1000", --max-requests-jitter, "100", --error-logfile, "-"]
     configs:
       - source: start_guard
         target: /prep/start_guard.py

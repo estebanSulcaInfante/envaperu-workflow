@@ -16,6 +16,8 @@ from app.services.scm_daily_query_service import (
     LocalProductionDailyAdapter, DailyQueryError,
 )
 from app.services.scm_assistant_gateway import narrate
+from app.services.scm_agent_chat_gateway import AgentGatewayError
+from app.services import scm_agent_chat_gateway
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from app.services.scm_service_support import ScmServiceError
@@ -30,6 +32,7 @@ def settings():
             'SCM_OPENCLAW_POLICY_CONFIRMED', 'SCM_OPENCLAW_PRIVATE_HOST',
             'SCM_OPENCLAW_TOKEN_FILE', 'SCM_OPENCLAW_CA_FILE',
             'SCM_ASSISTANT_V2_ENABLED', 'SCM_ASSISTANT_V2_MODEL_CALLS_ENABLED',
+            'SCM_AGENT_CHAT_ENABLED',
             'SCM_OPENCLAW_BACKEND_MODEL', 'SCM_OPENCLAW_MODEL_VERIFIED',
             'SCM_OPENCLAW_THINKING_LEVEL', 'SCM_OPENCLAW_THINKING_VERIFIED')
     return {k: current_app.config.get(k, os.environ.get(k, '')) for k in keys}
@@ -71,6 +74,11 @@ def no_store(response):
 @scm_assistant_bp.errorhandler(ScmServiceError)
 def service_error(error):
     return jsonify(error=error.to_dict()), error.status_code
+
+
+@scm_assistant_bp.errorhandler(AgentGatewayError)
+def agent_gateway_error(error):
+    return jsonify(error={"code": error.code, "message": error.message}), error.status_code
 
 
 @scm_assistant_bp.get('/asistente/estado')
@@ -237,6 +245,104 @@ def chat():
                            'status':result['status'], 'plan':result['plan'],
                            'latency_ms':round((perf_counter()-started)*1000,3), 'usage':provider.get('usage')})
     return jsonify(result)
+
+
+def _agent_owner(config):
+    actor_id = identity(config)
+    if not provider_linked(config, actor_id):
+        raise DailyQueryError(
+            'PROVIDER_OWNER_REQUIRED',
+            'El agente requiere la identidad del propietario del proveedor.',
+            status_code=403,
+        )
+    return actor_id
+
+
+@scm_assistant_bp.get('/asistente/agente/estado')
+def agent_status():
+    config = settings()
+    _agent_owner(config)
+    return jsonify(scm_agent_chat_gateway.readiness(config))
+
+
+@scm_assistant_bp.post('/asistente/agente/chat')
+def agent_chat():
+    config = settings()
+    _agent_owner(config)
+    if str(config.get('SCM_AGENT_CHAT_ENABLED') or '').lower() != 'true':
+        raise AgentGatewayError(
+            'AGENT_DISABLED',
+            'El chat del agente no está habilitado.',
+            status_code=503,
+        )
+    if request.content_length is not None and request.content_length > 24000:
+        raise DailyQueryError(
+            'AGENT_PAYLOAD_LIMIT',
+            'La solicitud supera el tamaño permitido.',
+            status_code=413,
+        )
+    raw = request.stream.read(24001)
+    if len(raw) > 24000:
+        raise DailyQueryError(
+            'AGENT_PAYLOAD_LIMIT',
+            'La solicitud supera el tamaño permitido.',
+            status_code=413,
+        )
+    request._cached_data = raw
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or set(body) != {'query', 'history', 'client_request_id'}:
+        raise DailyQueryError(
+            'AGENT_INVALID_REQUEST',
+            'La solicitud del agente no tiene la forma esperada.',
+            status_code=400,
+        )
+    if not isinstance(body['client_request_id'], str):
+        raise DailyQueryError(
+            'AGENT_INVALID_REQUEST',
+            'client_request_id debe ser UUID.',
+            status_code=400,
+        )
+    try:
+        client_request_id = UUID(body['client_request_id'])
+    except (ValueError, AttributeError, TypeError):
+        raise DailyQueryError(
+            'AGENT_INVALID_REQUEST',
+            'client_request_id debe ser UUID.',
+            status_code=400,
+        )
+    query, history = scm_agent_chat_gateway.validate_messages(
+        body['query'], body['history']
+    )
+    result = scm_agent_chat_gateway.complete_agent_chat(
+        query,
+        history,
+        client_request_id,
+        config,
+    )
+    if result.get('status') != 'answered':
+        if result.get('status') == 'TIMEOUT':
+            raise AgentGatewayError(
+                'AGENT_TIMEOUT',
+                'El proveedor no respondió dentro del tiempo permitido.',
+                status_code=504,
+            )
+        raise AgentGatewayError(
+            'AGENT_UNAVAILABLE',
+            'El proveedor no está disponible en este momento.',
+            status_code=503,
+        )
+    return jsonify(
+        status='answered',
+        answer=result['answer'],
+        trace_id=str(uuid4()),
+        client_request_id=body['client_request_id'],
+        read_only=True,
+        provider={'status': 'READY', 'usage': result.get('usage')},
+        sources=[],
+        limitations=[
+            'Las fuentes citadas forman parte de la respuesta del agente; esta interfaz no expone trazas de herramientas.'
+        ],
+    )
 
 
 def proposal_request(action, proposal_id=None):
