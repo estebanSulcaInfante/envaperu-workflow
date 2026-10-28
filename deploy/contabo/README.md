@@ -7,8 +7,8 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 078af6cf042f54170229e8896f63deb3ab172349.
-check_ci.py accepts only GitHub Actions run 40642112859, repository
+Application source is fixed to c401b082d7d324f552def60bb1c15cdbb9ab17d6.
+check_ci.py accepts only GitHub Actions run 40645261038, repository
 estebanSulcaInfante/envaperu-workflow, branch codex/agent-interface-v1-20261028,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
@@ -18,10 +18,10 @@ The source preserves the API currently deployed on 27 October (including its fiv
 performance patches and schema head ff60718293a4). This release adds an owner-bound,
 read-only agent chat bridge with a server kill switch. It does not expand the
 agent's tools or provider ownership and does not migrate data. The release runtime
-uses two Gunicorn gthread workers with four threads each and timeout 60 seconds so
+uses two Gunicorn gthread workers with four threads each and timeout 180 seconds so
 provider waits do not occupy all ordinary SCM request capacity. This concurrency
 configuration was exercised in an isolated Linux fixture with the restored DB;
-it does not substitute for authenticated production acceptance.
+it does not substitute for authenticated production acceptance. The bridge budget is 150 seconds, client HTTP/UI 155/160 seconds. Gunicorn timeout is not a per-request deadline; a separately tested transport wall-clock limit must release its cross-worker lease even on a slow-drip response. The spawn transport deadline and lease recovery passed focused code review and HTTP slow-header/body checks on Windows and Linux Gunicorn; CI must pass for the exact pinned source before publication.
 
 Only rutas_scm_assistant.py and the new scm_agent_chat_gateway.py differ from the
 currently deployed application runtime. The manifest also reconciles five

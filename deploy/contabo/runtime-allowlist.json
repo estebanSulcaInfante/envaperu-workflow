@@ -1,5 +1,5 @@
 {
-  "source_sha": "078af6cf042f54170229e8896f63deb3ab172349",
+  "source_sha": "c401b082d7d324f552def60bb1c15cdbb9ab17d6",
   "files": {
     "app/__init__.py": "7ec9b0d2139086b2ce808894982961c14c62bda682b8f220a0ba6f61b6dee814",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -262,7 +262,7 @@
     "migrations/versions/ff60718293a4_add_of_execution_lifecycle.py": "4d9515dd390df330410bd56789cac7da298db1eb5799e1bed86d357e81313815",
     "requirements.txt": "997b9b593b16f184d63b9499830655723ade0c3e312501a31652b1c81322ffd2",
     "run.py": "3c39bfce280061f10fc9f12bf9185ce33e73cd1546c5b125da5f17011bd8b59d",
-    "app/services/scm_agent_chat_gateway.py": "28b278569a0168a76b0249621c15acdad58d729944362f8aac5ecd27dad1d492"
+    "app/services/scm_agent_chat_gateway.py": "b104e25e38d28c91c8e9637996520690de3cc5526eae7ae0ddb141868c01b057"
   },
   "excluded_runtime_resources": [
     "app/templates/OCR/RegistroDiarioProduccion/image.png",
