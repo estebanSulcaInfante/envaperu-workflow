@@ -15,4 +15,4 @@ COPY run.py ./run.py
 RUN mkdir -p /app/logs /app/instance && chown -R 10001:10001 /app
 USER 10001:10001
 EXPOSE 5000
-CMD ["gunicorn", "run:app", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "60"]
+CMD ["gunicorn", "run:app", "--bind", "0.0.0.0:5000", "--workers", "2", "--worker-class", "gthread", "--threads", "4", "--timeout", "60"]

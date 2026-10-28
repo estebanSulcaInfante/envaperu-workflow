@@ -7,22 +7,27 @@ are part of this package.
 
 ## Source and trusted CI
 
-Application source is fixed to 2eaffb1f374cf471b730471ad3da204a1693cfca.
-check_ci.py accepts only GitHub Actions run 40110193753, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/of-duplicate-cancel-backend-source-20261024,
+Application source is fixed to 078af6cf042f54170229e8896f63deb3ab172349.
+check_ci.py accepts only GitHub Actions run 40642112859, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/agent-interface-v1-20261028,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
 
-The source preserves the already-deployed KG, TV, warehouse QR, manga explorer,
-Excel export and OF execution lifecycle behavior, including schema head ff60718293a4.
-This release adds conservative cancellation for released/programmed/executing/paused
-OFs with no work or only annulled work, retaining production/history and residual
-fulfillment reconciliation. Prepared requirements and premix custody block the new
-path. Requirement generation uses the same OF-to-run lock order as cancellation.
-Only the two reviewed service files change in the runtime allowlist; no schema
-migration or local TV performance experiment is included. PostgreSQL 17 concurrency
-was verified with synthetic data and the current model schema, not a migration claim.
+The source preserves the API currently deployed on 27 October (including its five
+performance patches and schema head ff60718293a4). This release adds an owner-bound,
+read-only agent chat bridge with a server kill switch. It does not expand the
+agent's tools or provider ownership and does not migrate data. The release runtime
+uses two Gunicorn gthread workers with four threads each and timeout 60 seconds so
+provider waits do not occupy all ordinary SCM request capacity. This concurrency
+configuration was exercised in an isolated Linux fixture with the restored DB;
+it does not substitute for authenticated production acceptance.
+
+Only rutas_scm_assistant.py and the new scm_agent_chat_gateway.py differ from the
+currently deployed application runtime. The manifest also reconciles five
+already-deployed performance files and removes two unshipped cancellation recipe
+pins by selecting the actual production-compatible source. No unrelated pending
+cancellation change is activated by this release.
 
 The workflow checks out the deployment recipe at a literal commit SHA, separately
 from the source. Recipe files are committed first; a following workflow-only commit
@@ -30,7 +35,7 @@ pins that reviewed recipe. Both commits require review. Actions are pinned to SH
 
 ## Runtime files and templates
 
-runtime-allowlist.json enumerates 258 approved files with SHA-256 hashes.
+runtime-allowlist.json enumerates 262 approved files with SHA-256 hashes.
 build_context.py creates a NEW context from these bytes; the source checkout is
 never sent to Docker. Unexpected files in the checkout do not enter the context.
 Every approved byte must match the fixed source; symlinks/escaping paths fail.
