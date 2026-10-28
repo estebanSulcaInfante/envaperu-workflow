@@ -125,7 +125,7 @@ def _validated_config(config):
     token = _read_token(config)
     destination = _destination(config)
     backend_model = config.get("SCM_OPENCLAW_BACKEND_MODEL")
-    if backend_model is not None and (
+    if backend_model and (
         str(config.get("SCM_OPENCLAW_MODEL_VERIFIED") or "").lower() != "true"
         or not _SAFE_MODEL.fullmatch(str(backend_model))
     ):

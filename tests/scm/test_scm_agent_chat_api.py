@@ -309,6 +309,37 @@ def test_service_accepts_token_file_and_ca_file(tmp_path, monkeypatch):
     assert captured["trust_env"] is False
 
 
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"SCM_OPENCLAW_BACKEND_MODEL": "", "SCM_OPENCLAW_MODEL_VERIFIED": ""},
+        {"SCM_OPENCLAW_BACKEND_MODEL": None, "SCM_OPENCLAW_MODEL_VERIFIED": None},
+    ],
+)
+def test_empty_or_absent_model_override_uses_fixed_agent_model(monkeypatch, model_config):
+    captured = _mock_session(monkeypatch, json.dumps(ready_response()).encode("utf-8"))
+    config = _service_config(**model_config)
+    if model_config["SCM_OPENCLAW_BACKEND_MODEL"] is None:
+        config.pop("SCM_OPENCLAW_BACKEND_MODEL")
+        config.pop("SCM_OPENCLAW_MODEL_VERIFIED")
+    result = gateway._complete(
+        {"model": "openclaw/scm-personal", "messages": []},
+        config,
+    )
+    assert result["status"] == "answered"
+    assert captured["kwargs"]["json"]["model"] == "openclaw/scm-personal"
+    assert "x-openclaw-model" not in captured["kwargs"]["headers"]
+
+
+def test_nonempty_unverified_model_override_remains_closed(monkeypatch):
+    monkeypatch.setattr(gateway.requests, "Session", lambda: pytest.fail("network must not run"))
+    result = gateway._complete(
+        {},
+        _service_config(SCM_OPENCLAW_BACKEND_MODEL="custom/model", SCM_OPENCLAW_MODEL_VERIFIED="false"),
+    )
+    assert result["status"] == "UNAVAILABLE"
+
+
 @pytest.mark.parametrize("change", [
     {"SCM_OPENCLAW_TOKEN_FILE": "missing-token-file", "SCM_OPENCLAW_TOKEN": ""},
     {"SCM_OPENCLAW_CA_FILE": "missing-ca-file"},
