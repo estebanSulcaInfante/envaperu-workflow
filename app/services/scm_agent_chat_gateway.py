@@ -7,6 +7,7 @@ and plain message data, then returns a small, sanitized provider result.
 
 import ipaddress
 import json
+import multiprocessing
 import os
 import re
 import socket
@@ -277,7 +278,7 @@ def _set_response_read_timeout(response, seconds):
                 continue
 
 
-def _complete(payload, config):
+def _complete_transport(payload, config):
     validated = _validated_config(config)
     if validated is None:
         return {"status": "UNAVAILABLE", "usage": None}
@@ -325,6 +326,8 @@ def _complete(payload, config):
                     if size > MAX_OUTPUT_BYTES:
                         return {"status": "OUTPUT_LIMIT", "usage": None}
                     chunks.append(chunk)
+                    if time.monotonic() - started >= DEADLINE_SECONDS:
+                        return {"status": "TIMEOUT", "usage": None}
                 if time.monotonic() - started > DEADLINE_SECONDS:
                     return {"status": "TIMEOUT", "usage": None}
                 result = json.loads(b"".join(chunks))
@@ -355,6 +358,80 @@ def _complete(payload, config):
         return {"status": "TIMEOUT", "usage": None}
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError, OSError):
         return {"status": "UNAVAILABLE", "usage": None}
+
+
+def _transport_child(payload, config, result_pipe):
+    try:
+        result_pipe.send(_complete_transport(payload, config))
+    except Exception:
+        try:
+            result_pipe.send({"status": "UNAVAILABLE", "usage": None})
+        except (BrokenPipeError, OSError):
+            pass
+    finally:
+        result_pipe.close()
+
+
+def _isolated_transport_config(config):
+    validated = _validated_config(config)
+    if validated is None:
+        return None
+    token, (base, verify), backend_model = validated
+    return {
+        "SCM_AGENT_CHAT_ENABLED": "true",
+        "SCM_ASSISTANT_PROVIDER": "openclaw",
+        "SCM_OPENCLAW_TOKEN": token,
+        "SCM_OPENCLAW_POLICY_CONFIRMED": "true",
+        "SCM_OPENCLAW_URL": base,
+        "SCM_OPENCLAW_PRIVATE_HOST": config.get("SCM_OPENCLAW_PRIVATE_HOST") or "",
+        "SCM_OPENCLAW_CA_FILE": verify if isinstance(verify, str) else "",
+        "SCM_OPENCLAW_BACKEND_MODEL": backend_model or "",
+        "SCM_OPENCLAW_MODEL_VERIFIED": "true" if backend_model else "",
+    }
+
+
+def _complete_isolated(payload, config):
+    transport_config = _isolated_transport_config(config)
+    if transport_config is None:
+        return {"status": "UNAVAILABLE", "usage": None}
+    context = multiprocessing.get_context("spawn")
+    parent_pipe, child_pipe = context.Pipe(duplex=False)
+    child = context.Process(target=_transport_child, args=(payload, transport_config, child_pipe))
+    started = time.monotonic()
+    child_started = False
+    try:
+        child.start()
+        child_started = True
+        child_pipe.close()
+        while True:
+            remaining = DEADLINE_SECONDS - (time.monotonic() - started)
+            if remaining <= 0:
+                return {"status": "TIMEOUT", "usage": None}
+            if parent_pipe.poll(min(remaining, 0.1)):
+                try:
+                    return parent_pipe.recv()
+                except (EOFError, OSError):
+                    return {"status": "UNAVAILABLE", "usage": None}
+    finally:
+        parent_pipe.close()
+        if child_started:
+            if child.is_alive():
+                child.terminate()
+                child.join(timeout=1)
+                if child.is_alive():
+                    child.kill()
+                    child.join()
+            else:
+                child.join()
+        else:
+            child_pipe.close()
+
+
+def _complete(payload, config):
+    # Every production request is isolated in an importable spawn child so
+    # slow headers/body reads cannot outlive the wall clock on either Linux or
+    # Windows. Unit tests may call _complete_transport explicitly.
+    return _complete_isolated(payload, config)
 
 
 def complete_agent_chat(query, history, client_request_id, config):

@@ -1,4 +1,8 @@
 import json
+import multiprocessing
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -206,10 +210,15 @@ def test_service_payload_and_transport_constraints(monkeypatch):
             return Response()
 
     monkeypatch.setattr(gateway.requests, "Session", Session)
-    result = gateway.complete_agent_chat(
-        "Consulta",
-        [{"role": "user", "content": "Anterior"}, {"role": "assistant", "content": "Respuesta"}],
-        str(uuid4()),
+    result = gateway._complete_transport(
+        {
+            "model": "openclaw/scm-personal",
+            "messages": [
+                {"role": "user", "content": "Anterior"},
+                {"role": "assistant", "content": "Respuesta"},
+                {"role": "user", "content": "Consulta"},
+            ],
+        },
         {
             "SCM_ASSISTANT_PROVIDER": "openclaw",
             "SCM_AGENT_CHAT_ENABLED": "true",
@@ -277,13 +286,21 @@ def _mock_session(monkeypatch, body, *, status_code=200):
     return captured
 
 
+def _use_in_process_transport(monkeypatch):
+    monkeypatch.setattr(
+        gateway,
+        "_complete_isolated",
+        lambda payload, config: gateway._complete_transport(payload, config),
+    )
+
+
 @pytest.mark.parametrize(
     "url",
     ["http://example.com:18789", "https://example.com:18789", "https://127.0.0.1:18789/path"],
 )
 def test_service_rejects_non_loopback_or_non_exact_destination(monkeypatch, url):
     monkeypatch.setattr(gateway.requests, "Session", lambda: pytest.fail("network must not run"))
-    result = gateway._complete({}, _service_config(SCM_OPENCLAW_URL=url))
+    result = gateway._complete_transport({}, _service_config(SCM_OPENCLAW_URL=url))
     assert result["status"] == "UNAVAILABLE"
 
 
@@ -293,7 +310,7 @@ def test_service_accepts_token_file_and_ca_file(tmp_path, monkeypatch):
     ca_file = tmp_path / "openclaw-ca.crt"
     ca_file.write_text("test-ca", encoding="utf-8")
     captured = _mock_session(monkeypatch, json.dumps(ready_response()).encode("utf-8"))
-    result = gateway._complete(
+    result = gateway._complete_transport(
         {"model": "openclaw/scm-personal", "messages": []},
         _service_config(
             SCM_OPENCLAW_TOKEN="",
@@ -322,7 +339,7 @@ def test_empty_or_absent_model_override_uses_fixed_agent_model(monkeypatch, mode
     if model_config["SCM_OPENCLAW_BACKEND_MODEL"] is None:
         config.pop("SCM_OPENCLAW_BACKEND_MODEL")
         config.pop("SCM_OPENCLAW_MODEL_VERIFIED")
-    result = gateway._complete(
+    result = gateway._complete_transport(
         {"model": "openclaw/scm-personal", "messages": []},
         config,
     )
@@ -333,7 +350,7 @@ def test_empty_or_absent_model_override_uses_fixed_agent_model(monkeypatch, mode
 
 def test_nonempty_unverified_model_override_remains_closed(monkeypatch):
     monkeypatch.setattr(gateway.requests, "Session", lambda: pytest.fail("network must not run"))
-    result = gateway._complete(
+    result = gateway._complete_transport(
         {},
         _service_config(SCM_OPENCLAW_BACKEND_MODEL="custom/model", SCM_OPENCLAW_MODEL_VERIFIED="false"),
     )
@@ -346,7 +363,7 @@ def test_nonempty_unverified_model_override_remains_closed(monkeypatch):
 ])
 def test_service_invalid_secret_or_ca_never_reaches_network(monkeypatch, change):
     monkeypatch.setattr(gateway.requests, "Session", lambda: pytest.fail("network must not run"))
-    result = gateway._complete({}, _service_config(**change))
+    result = gateway._complete_transport({}, _service_config(**change))
     assert result["status"] == "UNAVAILABLE"
 
 
@@ -361,6 +378,7 @@ def test_service_rejects_malformed_tool_bad_finish_and_oversized_output(monkeypa
         "oversized": json.dumps(ready_response()).encode("utf-8") + b"x" * (128 * 1024),
     }[response_kind]
     _mock_session(monkeypatch, response_body)
+    _use_in_process_transport(monkeypatch)
     with pytest.raises(gateway.AgentGatewayError) as raised:
         gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())
     assert raised.value.status_code == 503
@@ -434,11 +452,109 @@ def test_requests_timeout_maps_to_504_without_leaking_provider_error(monkeypatch
             raise gateway.requests.Timeout("provider detail must not escape")
 
     monkeypatch.setattr(gateway.requests, "Session", TimeoutSession)
+    _use_in_process_transport(monkeypatch)
     with pytest.raises(gateway.AgentGatewayError) as raised:
         gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())
     assert raised.value.status_code == 504
     assert raised.value.code == "AGENT_TIMEOUT"
     assert "provider detail" not in str(raised.value)
+
+
+def test_slow_drip_hits_injected_wall_clock_budget_and_releases_lease(monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway, "_LEASE_PATH", tmp_path / "scm-agent-chat.inflight.lock")
+    monkeypatch.setattr(gateway, "DEADLINE_SECONDS", 0.005)
+    monkeypatch.setattr(gateway, "READ_TIMEOUT_SECONDS", 0.004)
+
+    class SlowResponse:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_content(self, _size):
+            yield b'{"choices":'
+            time.sleep(0.02)
+            yield b"[]"
+
+    class SlowSession:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def post(self, *_args, **_kwargs):
+            return SlowResponse()
+
+    monkeypatch.setattr(gateway.requests, "Session", SlowSession)
+    _use_in_process_transport(monkeypatch)
+    with pytest.raises(gateway.AgentGatewayError) as raised:
+        gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())
+    assert raised.value.code == "AGENT_TIMEOUT"
+    lease = gateway._acquire_process_lease()
+    assert lease is not None
+    gateway._release_process_lease(lease)
+
+    monkeypatch.setattr(gateway, "_complete", lambda *_args: {"status": "answered", "answer": "ok", "usage": None})
+    assert gateway.complete_agent_chat("Consulta", [], str(uuid4()), _service_config())["answer"] == "ok"
+
+
+@pytest.mark.parametrize("slow_stage", ["headers", "body"])
+def test_isolated_transport_terminates_real_slow_http_at_budget(monkeypatch, tmp_path, slow_stage):
+    monkeypatch.setattr(gateway, "_LEASE_PATH", tmp_path / "scm-agent-chat.inflight.lock")
+    monkeypatch.setattr(gateway, "DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(gateway, "READ_TIMEOUT_SECONDS", 0.04)
+
+    class SlowHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            if slow_stage == "headers":
+                time.sleep(0.2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if slow_stage == "body":
+                self.wfile.write(b'{"choices":')
+                self.wfile.flush()
+                time.sleep(0.2)
+                self.wfile.write(b"[]")
+            else:
+                self.wfile.write(b"{}")
+
+        def log_message(self, *_args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        config = _service_config(SCM_OPENCLAW_URL=f"http://127.0.0.1:{server.server_port}")
+        with pytest.raises(gateway.AgentGatewayError) as raised:
+            gateway.complete_agent_chat("Consulta", [], str(uuid4()), config)
+        assert raised.value.code == "AGENT_TIMEOUT"
+        assert not any(child.is_alive() for child in multiprocessing.active_children())
+        lease = gateway._acquire_process_lease()
+        assert lease is not None
+        gateway._release_process_lease(lease)
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
+
+
+def test_isolated_transport_config_excludes_unrelated_settings():
+    config = _service_config(DATABASE_URL="postgresql://secret", SECRET_KEY="private")
+    isolated = gateway._isolated_transport_config(config)
+    assert isolated is not None
+    assert "DATABASE_URL" not in isolated
+    assert "SECRET_KEY" not in isolated
+    assert isolated["SCM_OPENCLAW_TOKEN"] == "test-token"
 
 
 @pytest.mark.parametrize("enabled", ["false", None])
