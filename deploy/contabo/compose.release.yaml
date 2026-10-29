@@ -1,24 +1,26 @@
-# RELEASE SOURCE: 66ccb5eac213839751959f94d4062675e5354be5
+# RELEASE SOURCE: 73f560aa190dc7565772a14e6cc5f4acc6412f10
 # PREPARATION ONLY: requires approved administrator handoff before any start.
 # Project name is controlled by Dokploy: envaperuscmpilot-scmpilot-cnxr9n
 services:
   api:
-    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:bdfcdc917b13f3aabdc26c2fc397f3e0228e02f936d2111d4b19ead7209d52f3
+    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:70a650995808f158e7d73c08db5edb3d359bf2c0bfdce1d934a261f19ada9ea1
     restart: unless-stopped
     init: true
     user: "10001:10001"
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    cpus: 2.0
+    cpus: 3.0
     mem_limit: 2g
     mem_reservation: 512m
     pids_limit: 128
     env_file:
       - ${SCM_API_ENV_FILE:?Administrator must securely supply API environment file}
+      - /etc/dokploy/scm-pilot-secrets/personal-agent-api.env
     environment:
       - SCM_AUTH_MODE=supabase
       - SCM_ASSISTANT_ENABLED=true
+      - SCM_AGENT_CHAT_ENABLED=true
       - SCM_ASSISTANT_PROVIDER=openclaw
       - SCM_ASSISTANT_ACTOR_ID=1
       - SCM_ASSISTANT_AUTH_USER_ID=28044442-3caf-4a92-97e4-212b50aa3c3b
@@ -26,7 +28,7 @@ services:
       - SCM_OPENCLAW_PRIVATE_HOST=openclaw-scm
       - SCM_OPENCLAW_TOKEN_FILE=/run/secrets/openclaw-token
       - SCM_OPENCLAW_CA_FILE=/run/openclaw/gateway-ca.crt
-      - SCM_OPENCLAW_POLICY_CONFIRMED=false
+      - SCM_OPENCLAW_POLICY_CONFIRMED=true
       - POSTPESAJE_REPRINT_ENABLED=true
       - KG_RECEIPT_WRITE_ENABLED=true
       - KG_CUSTODY_WRITE_ENABLED=true
@@ -41,7 +43,7 @@ services:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
     entrypoint: [python, /prep/start_guard.py]
-    command: [gunicorn, run:app, --bind, "0.0.0.0:5000", --workers, "2", --timeout, "60", --graceful-timeout, "30", --max-requests, "1000", --max-requests-jitter, "100", --error-logfile, "-"]
+    command: [gunicorn, run:app, --bind, "0.0.0.0:5000", --workers, "2", --timeout, "180", --graceful-timeout, "30", --max-requests, "1000", --max-requests-jitter, "100", --error-logfile, "-", --worker-class, gthread, --threads, "4"]
     volumes:
       - /opt/openclaw-pilot/secrets/backend-token:/run/secrets/openclaw-token:ro
       - /opt/openclaw-pilot/gateway-ca.crt:/run/openclaw/gateway-ca.crt:ro
@@ -60,7 +62,7 @@ services:
       - /tmp:size=67108864,mode=1777
       - /app/logs:size=83886080,uid=10001,gid=10001,mode=0700
       - /app/instance:size=16777216,uid=10001,gid=10001,mode=0700
-    networks: [database, egress, proxy, openclaw_private]
+    networks: [database, egress, proxy, openclaw_private, dokploy-network, default]
     labels:
       enva.scm.config-revision: "kg-cutoff-iso-v1"
       traefik.enable: "true"
@@ -77,6 +79,16 @@ services:
       traefik.http.routers.scm-pilot-api.tls.certresolver: letsencrypt
       traefik.http.routers.scm-pilot-api.service: scm-pilot-api
       traefik.http.services.scm-pilot-api.loadbalancer.server.port: "5000"
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-web.rule: Host(`api-scm.envaperu.pe`)
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-web.entrypoints: web
+      traefik.http.services.envaperuscmpilot-scmpilot-cnxr9n-1-web.loadbalancer.server.port: "5000"
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-web.service: envaperuscmpilot-scmpilot-cnxr9n-1-web
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-web.middlewares: redirect-to-https@file
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-websecure.rule: Host(`api-scm.envaperu.pe`)
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-websecure.entrypoints: websecure
+      traefik.http.services.envaperuscmpilot-scmpilot-cnxr9n-1-websecure.loadbalancer.server.port: "5000"
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-websecure.service: envaperuscmpilot-scmpilot-cnxr9n-1-websecure
+      traefik.http.routers.envaperuscmpilot-scmpilot-cnxr9n-1-websecure.tls.certresolver: letsencrypt
     depends_on:
       db:
         condition: service_healthy
@@ -129,6 +141,8 @@ networks:
   proxy:
     external: true
     name: dokploy-network
+  dokploy-network:
+    external: true
 volumes:
   pgdata: {}
 configs:

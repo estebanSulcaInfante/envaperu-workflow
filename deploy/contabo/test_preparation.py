@@ -77,4 +77,19 @@ class PreparationTests(unittest.TestCase):
         self.assertIn('${SCM_API_ENV_FILE',out);self.assertNotIn('${SCM_API_IMAGE',out)
         with self.assertRaises(ValueError):renderer.render(template,evidence,'postgres:18@sha256:'+'c'*64,sha)
 
+    def test_personal_agent_wrapper_pins_digest_and_runtime_limits_without_db_edit(self):
+        compose=(ROOT/'compose.release.yaml').read_text()
+        evidence=json.loads((ROOT/'release-image.json').read_text())
+        self.assertIn('image: '+evidence['api_image'],compose)
+        self.assertIn('cpus: 3.0',compose)
+        self.assertIn('mem_limit: 2g',compose)
+        self.assertIn('- /etc/dokploy/scm-pilot-secrets/personal-agent-api.env',compose)
+        self.assertIn('--timeout, "180"',compose)
+        self.assertIn('--worker-class, gthread',compose)
+        self.assertIn('--threads, "4"',compose)
+        self.assertIn('networks: [database, egress, proxy, openclaw_private, dokploy-network, default]',compose)
+        db=compose.split('  db:\n',1)[1].split('networks:\n',1)[0]
+        self.assertIn('image: postgres:17-bookworm@sha256:91eb910c44c7ed13f7f1a4ccadaa9ca72ef14cddc04cacb6e070e48eb44731a3',db)
+        self.assertIn('volumes:',db)
+
 if __name__=='__main__':unittest.main()
