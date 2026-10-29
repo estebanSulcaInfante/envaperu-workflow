@@ -1,4 +1,4 @@
-name: Prepare SCM Contabo image (manual)
+name: Prepare SCM Contabo images (manual)
 
 # No deploy, VPS access, repository writes or automatic push trigger.
 on:
@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       publish:
-        description: Publish the tested image after environment approval
+        description: Publish both tested images after one environment approval
         required: true
         default: false
         type: boolean
@@ -20,28 +20,34 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: c401b082d7d324f552def60bb1c15cdbb9ab17d6
-  RECIPE_SHA: 934a02fd5a2bb5b3eb40c6f314376fec0fec5d32
+  SOURCE_SHA: 73f560aa190dc7565772a14e6cc5f4acc6412f10
+  # The recipe checkout is tied to the immutable workflow commit that started this run.
+  # The coordinator must record that commit in the release receipt before dispatch.
+  RECIPE_SHA: ${{ github.sha }}
   PYTHON_BASE: ${{ inputs.python_base }}
-  IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
+  API_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
+  BRIDGE_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
+  BRIDGE_BASE: node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c
 
 jobs:
   build:
     if: github.repository == 'estebanSulcaInfante/envaperu-workflow' && github.ref == 'refs/heads/codex/scm-contabo-image'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: read
       actions: read
     outputs:
-      archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
-      image_id: ${{ steps.archive.outputs.image_id }}
+      api_archive_sha256: ${{ steps.archive.outputs.api_archive_sha256 }}
+      bridge_archive_sha256: ${{ steps.archive.outputs.bridge_archive_sha256 }}
+      api_image_id: ${{ steps.archive.outputs.api_image_id }}
+      bridge_image_id: ${{ steps.archive.outputs.bridge_image_id }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout immutable reviewed recipe
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 934a02fd5a2bb5b3eb40c6f314376fec0fec5d32
+          ref: ${{ env.RECIPE_SHA }}
           path: recipe
           persist-credentials: false
       - name: Verify recipe checkout and exact reviewed source CI
@@ -59,41 +65,70 @@ jobs:
       - name: Checkout exact application source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: c401b082d7d324f552def60bb1c15cdbb9ab17d6
+          ref: ${{ env.SOURCE_SHA }}
           path: source
           persist-credentials: false
-      - name: Build from newly generated hashed context
+      - name: Build API from newly generated hashed context
         shell: bash
         run: |
           set -euo pipefail
-          python3 recipe/deploy/contabo/build_context.py source context
+          python3 recipe/deploy/contabo/build_context.py source api-context
           docker build --platform linux/amd64 --build-arg PYTHON_BASE="$PYTHON_BASE" \
-            --build-arg SOURCE_SHA="$SOURCE_SHA" -f context/Dockerfile \
-            -t "$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" context
-      - name: Smoke-check dependencies and required template without network
+            --build-arg SOURCE_SHA="$SOURCE_SHA" -f api-context/Dockerfile \
+            -t "$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" api-context
+      - name: Build bridge from separately generated hashed context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 recipe/deploy/contabo/build_context.py source bridge-context --bridge
+          docker build --platform linux/amd64 \
+            -t "$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" bridge-context
+      - name: Smoke-check API dependencies and bridge without network
         shell: bash
         run: |
           set -euo pipefail
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --entrypoint python \
-            "$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            "$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             -c "import gunicorn, flask, psycopg2, openpyxl; from pathlib import Path; assert Path('/app/run.py').is_file(); assert Path('/app/migrations').is_dir(); w=openpyxl.load_workbook('/app/app/templates/excel/OrdenProduccion/Book2.xlsx'); assert 'IMPRIMIR OP' in w.sheetnames; w.close()"
-      - name: Save and inspect every layer of the tested image
+          test "$(docker run --rm --entrypoint id "$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" -u)" = "1000"
+          if docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            "$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            node -e "import('./src/config.js').then(({loadConfig}) => loadConfig())"; then
+            echo 'Bridge accepted invalid empty configuration' >&2
+            exit 1
+          fi
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -e SCM_PERSONAL_AGENT_SERVICE_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+            -e TESTING=true -e SCM_API_URL=http://127.0.0.1:5000/api \
+            -e SCM_ALLOWED_ORIGIN=https://bridge.example.test \
+            -e SCM_NATIVE_ADMIN_PASSWORD_FILE=/run/secrets/not-mounted \
+            -e SCM_BRIDGE_DB_PATH=/var/lib/scm-openclaw-bridge/bridge.sqlite \
+            "$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            sh -ec 'node src/server.js >/dev/null 2>&1 & pid=$!; trap "kill $pid 2>/dev/null || true" EXIT; for i in $(seq 1 30); do node -e "fetch(\"http://127.0.0.1:5182/healthz\").then(async r => { if (r.status !== 200) process.exit(1); const b=await r.json(); if (b.status !== \"ok\") process.exit(1); }).catch(() => process.exit(1))" && exit 0 || true; sleep 1; done; exit 1'
+      - name: Save and inspect every layer of both tested images
         id: archive
         shell: bash
         run: |
           set -euo pipefail
-          tag="$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          docker save --output image.tar "$tag"
-          python3 recipe/deploy/contabo/verify_image_layers.py image.tar
-          echo "archive_sha256=$(sha256sum image.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-          echo "image_id=$(docker image inspect "$tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
-      - name: Preserve exact tested image for separate publication job
+          api_tag="$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bridge_tag="$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker save --output api.tar "$api_tag"
+          docker save --output bridge.tar "$bridge_tag"
+          python3 recipe/deploy/contabo/verify_image_layers.py api.tar
+          python3 recipe/deploy/contabo/verify_bridge_layers.py bridge.tar
+          echo "api_archive_sha256=$(sha256sum api.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "bridge_archive_sha256=$(sha256sum bridge.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "api_image_id=$(docker image inspect "$api_tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+          echo "bridge_image_id=$(docker image inspect "$bridge_tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+      - name: Preserve exact tested images for separate publication job
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: scm-tested-image-${{ github.run_id }}-${{ github.run_attempt }}
-          path: image.tar
+          name: scm-tested-images-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            api.tar
+            bridge.tar
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -102,20 +137,22 @@ jobs:
     needs: build
     if: inputs.publish && github.repository == 'estebanSulcaInfante/envaperu-workflow' && github.ref == 'refs/heads/codex/scm-contabo-image'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     environment: scm-pilot-image-public
     permissions:
       contents: read
       actions: read
       packages: write
     env:
-      EXPECTED_ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
-      EXPECTED_IMAGE_ID: ${{ needs.build.outputs.image_id }}
+      EXPECTED_API_ARCHIVE_SHA256: ${{ needs.build.outputs.api_archive_sha256 }}
+      EXPECTED_BRIDGE_ARCHIVE_SHA256: ${{ needs.build.outputs.bridge_archive_sha256 }}
+      EXPECTED_API_IMAGE_ID: ${{ needs.build.outputs.api_image_id }}
+      EXPECTED_BRIDGE_IMAGE_ID: ${{ needs.build.outputs.bridge_image_id }}
     steps:
       - name: Checkout immutable reviewed publication checks
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: 934a02fd5a2bb5b3eb40c6f314376fec0fec5d32
+          ref: ${{ env.RECIPE_SHA }}
           path: recipe
           persist-credentials: false
       - name: Recheck recipe and actual environment policy
@@ -125,52 +162,90 @@ jobs:
           set -euo pipefail
           test "$(git -C recipe rev-parse HEAD)" = "$RECIPE_SHA"
           python3 recipe/deploy/contabo/check_publish_gate.py
-      - name: Download only the artifact from the successful build job
+      - name: Download only the artifacts from the successful build job
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
           path: tested
           merge-multiple: true
-      - name: Verify archive, layers and loaded image identity without executing it
+      - name: Verify archives, layers and loaded image identities without executing them
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$EXPECTED_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$EXPECTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
-          printf '%s  %s\n' "$EXPECTED_ARCHIVE_SHA256" tested/image.tar | sha256sum --check --strict
-          python3 recipe/deploy/contabo/verify_image_layers.py tested/image.tar
-          docker load --input tested/image.tar
-          tag="$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          test "$(docker image inspect "$tag" --format '{{.Id}}')" = "$EXPECTED_IMAGE_ID"
+          [[ "$EXPECTED_API_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_BRIDGE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_API_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_BRIDGE_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "$EXPECTED_API_ARCHIVE_SHA256" tested/api.tar | sha256sum --check --strict
+          printf '%s  %s\n' "$EXPECTED_BRIDGE_ARCHIVE_SHA256" tested/bridge.tar | sha256sum --check --strict
+          python3 recipe/deploy/contabo/verify_image_layers.py tested/api.tar
+          python3 recipe/deploy/contabo/verify_bridge_layers.py tested/bridge.tar
+          docker load --input tested/api.tar
+          docker load --input tested/bridge.tar
+          api_tag="$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bridge_tag="$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$(docker image inspect "$api_tag" --format '{{.Id}}')" = "$EXPECTED_API_IMAGE_ID"
+          test "$(docker image inspect "$bridge_tag" --format '{{.Id}}')" = "$EXPECTED_BRIDGE_IMAGE_ID"
       - name: Login using ephemeral publication token
         env:
           GH_TOKEN: ${{ github.token }}
           GH_ACTOR: ${{ github.actor }}
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GH_ACTOR" --password-stdin
-      - name: Publish exact tested image and record immutable reference
+      - name: Publish exact tested images and record immutable references
         shell: bash
         run: |
           set -euo pipefail
-          tag="$IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          docker push "$tag"
-          docker image inspect "$tag" --format '{{json .RepoDigests}}' > repo-digests.json
+          api_tag="$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bridge_tag="$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker push "$api_tag"
+          docker push "$bridge_tag"
+          docker image inspect "$api_tag" --format '{{json .RepoDigests}}' > api-repo-digests.json
+          docker image inspect "$bridge_tag" --format '{{json .RepoDigests}}' > bridge-repo-digests.json
+          export API_DIGEST="$(python3 -c "import json,os; x=json.load(open('api-repo-digests.json')); print(next(r for r in x if r.startswith(os.environ['API_IMAGE']+'@sha256:')))" )"
+          export BRIDGE_DIGEST="$(python3 -c "import json,os; x=json.load(open('bridge-repo-digests.json')); print(next(r for r in x if r.startswith(os.environ['BRIDGE_IMAGE']+'@sha256:')))" )"
+          test "$API_DIGEST" != "$BRIDGE_DIGEST"
+          anon_config="$RUNNER_TEMP/scm-anonymous-docker-config"
+          test ! -e "$anon_config"
+          mkdir "$anon_config"
+          test -z "$(find "$anon_config" -mindepth 1 -print -quit)"
+          env -u GH_TOKEN -u GH_ACTOR docker --config "$anon_config" pull "$API_DIGEST"
+          env -u GH_TOKEN -u GH_ACTOR docker --config "$anon_config" pull "$BRIDGE_DIGEST"
           python3 - <<'PY'
-          import json, os, re
-          refs=json.load(open('repo-digests.json'))
-          refs=[r for r in refs if r.startswith(os.environ['IMAGE']+'@sha256:')]
-          assert len(refs)==1 and re.fullmatch(r'.+@sha256:[0-9a-f]{64}', refs[0])
-          result={'source_sha':os.environ['SOURCE_SHA'], 'recipe_sha':os.environ['RECIPE_SHA'],
-                  'workflow_sha':os.environ['GITHUB_SHA'], 'python_base':os.environ['PYTHON_BASE'],
-                  'api_image':refs[0], 'archive_sha256':os.environ['EXPECTED_ARCHIVE_SHA256'],
-                  'image_id':os.environ['EXPECTED_IMAGE_ID'], 'run_id':os.environ['GITHUB_RUN_ID'],
-                  'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'], 'deployed':False}
+          import json, os, re, runpy
+          def digest(path, image):
+              refs=[r for r in json.load(open(path)) if r.startswith(image+'@sha256:')]
+              assert len(refs)==1 and re.fullmatch(r'.+@sha256:[0-9a-f]{64}', refs[0])
+              return refs[0]
+          api=digest('api-repo-digests.json',os.environ['API_IMAGE'])
+          bridge=digest('bridge-repo-digests.json',os.environ['BRIDGE_IMAGE'])
+          assert api == os.environ['API_DIGEST'] and bridge == os.environ['BRIDGE_DIGEST']
+          assert api != bridge
+          checks=runpy.run_path('recipe/deploy/contabo/check_ci.py',run_name='recipe_checks')
+          bridge_manifest=json.load(open('recipe/deploy/contabo/bridge-runtime-allowlist.json'))
+          assert checks['SOURCE_SHA'] == os.environ['SOURCE_SHA']
+          assert bridge_manifest['source_sha'] == os.environ['SOURCE_SHA']
+          assert bridge_manifest['base_image'] == os.environ['BRIDGE_BASE']
+          result={
+              'source_sha':os.environ['SOURCE_SHA'], 'recipe_sha':os.environ['RECIPE_SHA'],
+              'workflow_sha':os.environ['GITHUB_SHA'], 'python_base':os.environ['PYTHON_BASE'],
+              'bridge_base':os.environ['BRIDGE_BASE'], 'api_image':api, 'bridge_image':bridge,
+              'ci_run_id':checks['RUN_ID'], 'ci_run_url':checks['RUN_URL'],
+              'ci_branch':checks['BRANCH'], 'ci_workflow':'.github/workflows/tests.yml',
+              'api_archive_sha256':os.environ['EXPECTED_API_ARCHIVE_SHA256'],
+              'bridge_archive_sha256':os.environ['EXPECTED_BRIDGE_ARCHIVE_SHA256'],
+              'api_image_id':os.environ['EXPECTED_API_IMAGE_ID'],
+              'bridge_image_id':os.environ['EXPECTED_BRIDGE_IMAGE_ID'],
+              'run_id':os.environ['GITHUB_RUN_ID'], 'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'],
+              'deployed':False,
+          }
           with open('release-image.json','w') as f: json.dump(result,f,indent=2)
-          print('Candidate image:',refs[0])
+          print('Candidate API image:',api)
+          print('Candidate bridge image:',bridge)
           PY
       - name: Preserve release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: scm-release-image-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scm-release-images-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-image.json
           if-no-files-found: error
           retention-days: 30

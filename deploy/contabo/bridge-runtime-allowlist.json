@@ -1,0 +1,31 @@
+{
+  "source_sha": "73f560aa190dc7565772a14e6cc5f4acc6412f10",
+  "source_prefix": "services/openclaw_access_bridge",
+  "files": {
+    "package-lock.json": "ad8a81685f7229b0e03d3d691e835ede3f1f5553edf7fc5c907d1188da8ddacb",
+    "package.json": "c260b0e611b29968863ec54ea296459df9fc8153cf86fc97d3ad204741bd019e",
+    "src/config.js": "1ebc3096dd109836f4cbb44992210f0e48bb444a3e9b27e31cd3eb28f2441585",
+    "src/download_store.js": "0e958c01fbce89cd2459e395baf1ec7b8f8d7257273291d8542edd5e9a407268",
+    "src/manifest.js": "d9bc8584fb4f72e71ca3be0a7494df618aaa00bd6391d9c22e896c8c74b16370",
+    "src/native_admin.js": "eca12df7243574d8badcbf0eef75d8e13ef3b0a9725d2b0c4888c9d92cc83a02",
+    "src/native_artifacts.js": "e7497747baaaec706929d49582c583200221efbfcc359e679f15fc1c36bb82b5",
+    "src/scm_access_client.js": "3153d0f7533fe666f47e84f84862455e5dcf91564eb0c23e9b157e58a2956f56",
+    "src/server.js": "239cd3b23594b2dfef61a95292019d6d20e20df5a86bccdf34bb21e6a6449508",
+    "src/session_store.js": "b6b861fdeb0a6053ab469789596afd1c8b71db1e118fd8b3e6fc5f06f4c54df8"
+  },
+  "context_files": {
+    ".dockerignore": "4636ad9a40a05cd2017554fce75361355a007618b55a77b95503fa80d1cdf06c",
+    "Dockerfile": "43a1b3ca347d47c6ea5e5fd6a0d60595bd694100db36d6f9438baca75cdd933d"
+  },
+  "dependency_lockfile": "package-lock.json",
+  "dependency_packages": {
+    "ws": "8.22.0"
+  },
+  "excluded_patterns": [
+    ".env",
+    ".env.*",
+    "test",
+    "tests"
+  ],
+  "base_image": "node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c"
+}

@@ -1,15 +1,33 @@
-# SCM Contabo: reviewed image preparation
+# SCM Contabo: reviewed API + bridge image preparation
 
 Status: local preparation; independent review required before pushing or publishing.
-The user authorized a PUBLIC GHCR image containing code, dependencies and necessary
-runtime templates. No VPS deployment, credentials, Odoo changes or data migration
-are part of this package.
+The user authorized PUBLIC GHCR images containing the API and the personal-agent
+bridge, with code, dependencies and necessary runtime templates. No VPS deployment,
+credentials, Odoo changes or data migration are part of this package.
+
+The exact application source is `73f560aa190dc7565772a14e6cc5f4acc6412f10` and
+the reviewed CI gate is run `40953346956` on branch
+`codex/personal-agent-access-20261029`. The API context is independently hashed
+by `runtime-allowlist.json`; the bridge context is independently hashed by
+`bridge-runtime-allowlist.json` and includes only its pinned Dockerfile,
+package manifests and `src/**`. Tests, examples, `.env` files, fixtures and
+`node_modules` are never copied into either context.
+
+Both images use the existing public GHCR package
+`ghcr.io/estebansulcainfante/envaperu-scm-api`, with distinct immutable tags
+`sha-<source>-<run>-<attempt>` and
+`bridge-sha-<source>-<run>-<attempt>`. The manual workflow builds, smoke-checks
+and layer-verifies both images in the unprivileged job, uploads `api.tar` and
+`bridge.tar` together, then has one `scm-pilot-image-public` protected publish
+job re-check both archives, pushes both tags, and pulls both resulting digests
+with an empty anonymous Docker config before writing evidence. A private or
+unpullable package therefore cannot produce `release-image.json`.
 
 ## Source and trusted CI
 
-Application source is fixed to c401b082d7d324f552def60bb1c15cdbb9ab17d6.
-check_ci.py accepts only GitHub Actions run 40645261038, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/agent-interface-v1-20261028,
+Application source is fixed to 73f560aa190dc7565772a14e6cc5f4acc6412f10.
+check_ci.py accepts only GitHub Actions run 40953346956, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/personal-agent-access-20261029,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
@@ -23,22 +41,29 @@ provider waits do not occupy all ordinary SCM request capacity. This concurrency
 configuration was exercised in an isolated Linux fixture with the restored DB;
 it does not substitute for authenticated production acceptance. The bridge budget is 150 seconds, client HTTP/UI 155/160 seconds. Gunicorn timeout is not a per-request deadline; a separately tested transport wall-clock limit must release its cross-worker lease even on a slow-drip response. The spawn transport deadline and lease recovery passed focused code review and HTTP slow-header/body checks on Windows and Linux Gunicorn; CI must pass for the exact pinned source before publication.
 
-Only rutas_scm_assistant.py and the new scm_agent_chat_gateway.py differ from the
-currently deployed application runtime. The manifest also reconciles five
-already-deployed performance files and removes two unshipped cancellation recipe
-pins by selecting the actual production-compatible source. No unrelated pending
-cancellation change is activated by this release.
+The API manifest carries only the reviewed source/runtime changes, including the
+personal-agent route/service and their auth/config registration. The bridge is a
+separate image and is never added to the API allowlist. No unrelated source tree,
+tests, fixtures or secret material is activated by this release.
 
-The workflow checks out the deployment recipe at a literal commit SHA, separately
-from the source. Recipe files are committed first; a following workflow-only commit
-pins that reviewed recipe. Both commits require review. Actions are pinned to SHAs.
+The workflow checks out the deployment recipe at the immutable `github.sha` of the
+workflow commit, separately from the source. The coordinator must record that
+workflow/recipe commit in the release receipt before dispatch. Both source and
+recipe commits require review. Actions are pinned to SHAs.
 
 ## Runtime files and templates
 
-runtime-allowlist.json enumerates 262 approved files with SHA-256 hashes.
+runtime-allowlist.json enumerates 264 approved API files with SHA-256 hashes.
 build_context.py creates a NEW context from these bytes; the source checkout is
 never sent to Docker. Unexpected files in the checkout do not enter the context.
 Every approved byte must match the fixed source; symlinks/escaping paths fail.
+
+The bridge allowlist has 10 approved runtime files plus 2 context-only files.
+`verify_bridge_layers.py` reads every
+saved layer, rejects links, whiteouts, tests, secrets and unapproved `/app`
+files, and checks `package-lock.json` plus the exact `ws@8.22.0` dependency tree.
+The bridge base is fixed to
+`node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c`.
 
 Book2.xlsx is retained byte-for-byte: app/services/excel_service.py:TEMPLATE_PATH
 loads it when generating orders, using worksheet IMPRIMIR OP. The owner confirmed
@@ -78,11 +103,12 @@ It requires environment scm-pilot-image-public. check_publish_gate.py fails unle
 that environment has a required reviewer and exactly one allowed deployment branch,
 codex/scm-contabo-image. The build also checks this gate when publication is requested,
 before the privileged job. No script creates or weakens environment protections.
-The publish job downloads the artifact by its exact ID from this run, verifies the
-archive hash and all layers again, loads the tested image and checks its image ID.
-It never builds or executes application code. GHCR login uses the ephemeral workflow
-token. Tags include source SHA, run ID and attempt; release-image.json records the
-registry digest, source SHA, pinned recipe SHA, base and run. There is no deploy step.
+The publish job downloads the artifact by its exact ID from this run, verifies both
+archive hashes and all layers again, loads the tested images and checks both image
+IDs. It never builds or executes application code. GHCR login uses the ephemeral
+workflow token. Tags include source SHA, run ID and attempt; release-image.json
+records both registry digests, source SHA, pinned recipe SHA, both bases and run.
+There is no deploy step.
 
 Execution prerequisites still needing coordinator resolution:
 
@@ -94,9 +120,11 @@ Execution prerequisites still needing coordinator resolution:
    to enable dispatch. Coordinate a reviewed workflow-only bootstrap before execution.
 4. Supply a reviewed immutable python:3.12-slim@sha256 digest. No fabricated digest.
 5. A supported authenticated GitHub execution path. No PAT or credentials are created.
-6. GHCR visibility is separate from repository visibility. The new image is authorized
-   public, but setting/verifying package visibility and an anonymous digest pull remain
-   necessary after publication; this workflow does not silently change visibility.
+6. Both images use disjoint tags in the existing public GHCR package. The workflow
+   does not change visibility: it requires anonymous pulls of both distinct digests
+   before emitting release evidence. If either pull fails, the run fails and no
+   deployable candidate is emitted. Two pushes are not atomic; a partial publication
+   without release evidence must not be deployed and may be retried in a new run.
 
 ## Later deployment, outside current publication scope
 

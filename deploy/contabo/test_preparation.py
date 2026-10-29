@@ -40,7 +40,9 @@ class PreparationTests(unittest.TestCase):
             manifest={'source_sha':'a'*40,'files':{'run.py':hashlib.sha256(b'print(1)\n').hexdigest()}}
             (recipe/'runtime-allowlist.json').write_text(json.dumps(manifest))
             for f in ['Dockerfile','Dockerfile.dockerignore']:(recipe/f).write_text('test')
-            with patch.object(builder.subprocess,'check_output',return_value='a'*40):
+            def git_output(command, **_):
+                return 'a'*40 if 'rev-parse' in command else (source/'run.py').read_bytes()
+            with patch.object(builder.subprocess,'check_output',side_effect=git_output):
                 builder.create_context(source,root/'context',recipe)
                 self.assertFalse((root/'context/private.csv').exists())
                 (source/'run.py').write_bytes(b'changed')
@@ -79,6 +81,52 @@ class PreparationTests(unittest.TestCase):
         self.assertIn('app/templates/excel/OrdenProduccion/Book2.xlsx',manifest['files'])
         self.assertEqual(len(manifest['approved_templates']),1)
         self.assertEqual(len(manifest['excluded_runtime_resources']),8)
+
+    def test_bridge_allowlist_is_separate_and_dependency_pinned(self):
+        manifest=json.loads(
+            (ROOT/'bridge-runtime-allowlist.json').read_text(),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+        self.assertEqual(manifest['source_sha'],load('check_ci').SOURCE_SHA)
+        self.assertEqual(manifest['source_prefix'],'services/openclaw_access_bridge')
+        self.assertEqual(len(manifest['files']),10)
+        self.assertEqual(len(manifest['context_files']),2)
+        self.assertEqual(manifest['dependency_packages'],{'ws':'8.22.0'})
+        self.assertNotIn('node_modules',manifest['files'])
+        self.assertTrue(all(not path.startswith('test/') for path in manifest['files']))
+
+    def test_workflow_builds_and_publishes_two_images_under_one_gate(self):
+        workflow=(ROOT.parent.parent/'.github'/'workflows'/'contabo-image.yml').read_text()
+        self.assertIn('scm-pilot-image-public',workflow)
+        self.assertEqual(workflow.count('environment: scm-pilot-image-public'),1)
+        self.assertIn('verify_image_layers.py api.tar',workflow)
+        self.assertIn('verify_bridge_layers.py bridge.tar',workflow)
+        self.assertIn('docker push "$api_tag"',workflow)
+        self.assertIn('docker push "$bridge_tag"',workflow)
+        self.assertIn('BRIDGE_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api',workflow)
+        self.assertIn('bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT',workflow)
+        self.assertIn('docker --config "$anon_config" pull "$API_DIGEST"',workflow)
+        self.assertIn('docker --config "$anon_config" pull "$BRIDGE_DIGEST"',workflow)
+
+    def test_bridge_config_verifier_rejects_root_and_secret_env(self):
+        verifier=load('verify_bridge_layers')
+        def config(user='node',env=None):
+            return {'rootfs':{'type':'layers'},'config':{
+                'User':user,'WorkingDir':'/app','Cmd':['node','src/server.js'],
+                'Env':env or ['PATH=/usr/bin','NODE_ENV=production','SCM_BRIDGE_HOST=0.0.0.0','SCM_BRIDGE_PORT=5182'],
+            }}
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'image.tar'
+            with tarfile.open(p,'w') as archive:
+                for name,body in [('config.json',json.dumps(config()).encode())]:
+                    info=tarfile.TarInfo(name); info.size=len(body); archive.addfile(info,io.BytesIO(body))
+            with tarfile.open(p,'r') as archive:
+                verifier._load_lockfile(archive,'config.json')
+            for bad in [config(user='0'),config(env=['BRIDGE_SECRET=leak'])]:
+                with tarfile.open(p,'w') as archive:
+                    body=json.dumps(bad).encode(); info=tarfile.TarInfo('config.json'); info.size=len(body); archive.addfile(info,io.BytesIO(body))
+                with tarfile.open(p,'r') as archive:
+                    with self.assertRaises(ValueError): verifier._load_lockfile(archive,'config.json')
 
     def test_release_pins_images_and_preserves_secret_placeholders(self):
         renderer=load('render_release');sha='a'*40
