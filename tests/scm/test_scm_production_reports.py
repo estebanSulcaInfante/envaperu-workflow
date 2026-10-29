@@ -672,7 +672,9 @@ def test_tv_actual_ignores_known_foreign_mass_but_marks_own_plus_ownerless_incom
     from app.services.scm_production_reports_service import _progress_tv_actual
 
     assert _progress_tv_actual({"works": run["works"], "mangas": {1: foreign_only}}, 201, "KG") == (None, False)
-    assert _progress_tv_actual({"works": run["works"], "mangas": {2: own_plus_unknown}}, 201, "KG") == (None, True)
+    # The attributable 3 kg remains visible while the ownerless remainder
+    # keeps the result explicitly partial.
+    assert _progress_tv_actual({"works": run["works"], "mangas": {2: own_plus_unknown}}, 201, "KG") == (Decimal("3"), True)
 
 
 def test_tv_actual_marks_no_segments_ownerless_physical_mass_incomplete():
@@ -681,6 +683,97 @@ def test_tv_actual_marks_no_segments_ownerless_physical_mass_incomplete():
     from app.services.scm_production_reports_service import _progress_tv_actual
 
     assert _progress_tv_actual({"works": [(work, None, None)], "mangas": {1: ownerless}}, 201, "KG") == (None, True)
+
+
+def test_tv_actual_adds_latest_open_control_once_and_exposes_breakdown():
+    work = SimpleNamespace(id="work-open")
+    article = SimpleNamespace(id=201)
+    final = SimpleNamespace(
+        id=1, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[],
+        _report_final_kg=Decimal("90.6"), _report_open_kg=None,
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+    opened = SimpleNamespace(
+        id=2, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[],
+        _report_final_kg=None, _report_open_kg=Decimal("1.1"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+    run = {"works": [(work, None, None)], "mangas": {1: final, 2: opened}}
+
+    breakdown = production_reports_service._progress_tv_breakdown(run, 201, "KG")
+
+    assert breakdown == {
+        "finalizados": Decimal("90.6"),
+        "en_proceso": Decimal("1.1"),
+        "medido": Decimal("91.7"),
+        "incomplete": False,
+    }
+
+
+def test_tv_actual_keeps_open_control_with_active_unclosed_runtime_segment(monkeypatch):
+    """Runtime shape: open manga has active _report_all_segments only."""
+    work = SimpleNamespace(id="work-of122")
+    article = SimpleNamespace(id=201)
+    final = SimpleNamespace(
+        id=1, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[],
+        _report_all_segments=[], _report_final_kg=Decimal("90.6"),
+        _report_open_kg=None, _report_quantity_un=None, _report_weight_corrected=False,
+    )
+    active = _segment(1, "0", "0", "0")
+    active.estado = "ACTIVO"
+    active.cantidad_fin_kg = None
+    active.cantidad_atribuida_kg = Decimal("0")
+    active.trabajo = work
+    opened = SimpleNamespace(
+        id=2, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article), _report_segments=[],
+        _report_all_segments=[active], _report_final_kg=None,
+        _report_open_kg=Decimal("1.1"), _report_quantity_un=None,
+        _report_weight_corrected=False,
+    )
+    run = _tv_aggregate_run(works=[work], mangas={1: final, 2: opened}, output_meta="250")
+
+    assert production_reports_service._progress_tv_actual(run, 201, "KG") == (Decimal("91.7"), False)
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+    output = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+    assert output["avance"] == pytest.approx(91.7)
+    assert output["porcentaje"] == pytest.approx(36.68)
+    assert output["avance_medido_kg"] == pytest.approx(91.7)
+    assert output["finalizados_kg"] == pytest.approx(90.6)
+    assert output["en_proceso_kg"] == pytest.approx(1.1)
+
+
+def test_standard_progress_keeps_partial_measured_and_percentage_separate_from_coverage(monkeypatch):
+    work = SimpleNamespace(id="work-partial")
+    known = SimpleNamespace(
+        id=1, estado="PESADA", trabajo=work, _report_final_kg=Decimal("90.6"),
+        _report_open_kg=Decimal("1.1"), _report_segments=[], _report_weight_corrected=False,
+    )
+    pending = SimpleNamespace(
+        id=2, estado="EN_LLENADO", trabajo=work, _report_final_kg=None,
+        _report_open_kg=None, _report_segments=[], _report_weight_corrected=False,
+    )
+    run = {
+        "corrida": SimpleNamespace(id="run-partial", codigo="C-PARTIAL", objetivo_neto_kg=Decimal("250"), color_produccion=None, salidas=[]),
+        "orden": SimpleNamespace(id="of-partial", codigo="OF-122", estado="EN_EJECUCION"),
+        "ot": None, "color_name": "Melón", "color_hex": None, "molde": None,
+        "mangas": {1: known, 2: pending}, "contexts": [{"work": work}],
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+
+    assert item["kg_finalizados_efectivos"] == 90.6
+    assert item["kg_medidos_en_abiertas"] == 1.1
+    assert item["kg_medidos_efectivos"] == 91.7
+    assert item["avance_medido_kg"] == 91.7
+    assert item["porcentaje"] == pytest.approx(36.68)
+    assert item["coverage"]["estado"] == "INCOMPLETA"
+    assert "SUBTOTAL_PARCIAL" in item["coverage"]["motivos"]
 
 
 def test_tv_group_id_and_ot_order_do_not_depend_on_context_order(monkeypatch):

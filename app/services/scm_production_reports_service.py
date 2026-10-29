@@ -694,9 +694,11 @@ def _run_manga_values(run):
             total += 1
             if attributed_evidence:
                 known += 1
-    complete = total > 0 and total == known
     objective = _d(run["corrida"].objetivo_neto_kg)
-    measured = final + opened if complete else None
+    # Coverage describes completeness, not whether known evidence exists.
+    # Keep the attributable final/open subtotal visible when another manga is
+    # still pending evidence.
+    measured = final + opened if known > 0 else None
     return final, opened, measured, total, known, objective
 
 
@@ -745,8 +747,8 @@ def list_production_progress(session, *, actor_id, filters=None):
             final = opened = measured = None
             known = 0
         coverage = "COMPLETA" if total > 0 and total == known and visible else "INCOMPLETA"
-        percent = ((final / objective) * 100) if objective and coverage == "COMPLETA" else None
-        remaining = (objective - final) if objective is not None and coverage == "COMPLETA" else None
+        percent = ((measured / objective) * 100) if objective and measured is not None else None
+        remaining = (objective - measured) if objective is not None and measured is not None else None
         outputs = []
         for output in getattr(run["corrida"], "salidas", ()) or ():
             article = getattr(output, "articulo", None)
@@ -781,11 +783,12 @@ def list_production_progress(session, *, actor_id, filters=None):
             "kg_finalizados_efectivos": _n(final),
             "kg_medidos_en_abiertas": _n(opened),
             "kg_medidos_efectivos": _n(measured),
+            "avance_medido_kg": _n(measured),
             "restante_kg": _n(remaining),
             "porcentaje": _n(percent),
             "mangas": {"total": total, "conocidas": known},
             "subtotal_conocido_kg": _n(final + opened) if visible else None,
-            "coverage": {"estado": coverage, "mangas_total": total, "mangas_conocidas": known, "motivos": ([] if coverage == "COMPLETA" else ["MANGA_PESAJE_VER_REQUERIDO" if not visible else "PESO_MANGA_SIN_EVIDENCIA"])},
+            "coverage": {"estado": coverage, "mangas_total": total, "mangas_conocidas": known, "motivos": ([] if coverage == "COMPLETA" else (["MANGA_PESAJE_VER_REQUERIDO"] if not visible else (["SUBTOTAL_PARCIAL", "PESO_MANGA_SIN_EVIDENCIA"] if measured is not None else ["PESO_MANGA_SIN_EVIDENCIA"])))},
             "criterio_uniformidad": "Criterio de uniformidad no definido",
         })
     return {"items": items, "as_of": date.today().isoformat(), "visibilidad": {"pesaje": visible, "restriccion": None if visible else "MANGA_PESAJE_VER requerido para ver pesos"}}
@@ -810,10 +813,11 @@ def _progress_tv_un_ledger_is_valid(manga, segments):
     return previous == quantity
 
 
-def _progress_tv_actual(run, article_id, unit):
-    """Return effective evidence for one output, attributed to this run once."""
+def _progress_tv_breakdown(run, article_id, unit):
+    """Project final/open measured evidence for one output without duplication."""
     work_ids = {item[0].id for item in run.get("works", ())}
-    total = Decimal("0")
+    final_total = Decimal("0")
+    open_total = Decimal("0")
     evidence = False
     incomplete = False
     for manga in run.get("mangas", {}).values():
@@ -856,20 +860,28 @@ def _progress_tv_actual(run, article_id, unit):
                     if (segment_owner := effective_work_for_segment(manga, segment)) is not None
                     and segment_owner.id in work_ids
                 ), Decimal("0"))
-                if net is not None and attributed > 0 and not has_ownerless_segment:
-                    total += attributed
+                if attributed > 0:
+                    if net is not None:
+                        final_total += attributed
+                    elif unit == "KG" and open_net is not None:
+                        open_total += attributed
                     evidence = True
-                elif net is not None and (has_ownerless_segment or has_own_segment):
+                if has_ownerless_segment and (net is not None or open_net is not None):
                     # A known foreign owner is safely ignored.  An absent
-                    # owner, even alongside attributable mass, makes the
-                    # objective incomplete because the physical net cannot be
-                    # fully assigned.
+                    # owner preserves the attributable subtotal but keeps the
+                    # objective explicitly partial.
                     incomplete = True
             elif unit == "KG":
                 valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
                 segment_owner_ids = {owner.id for owner in segment_owners if owner is not None}
-                if not has_kg_ledger and valid_un and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment and net is not None:
-                    total += net
+                if open_net is not None and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment:
+                    # An open control is a single current observation.  When
+                    # every effective segment owner is this corrida, retain it
+                    # even if the active segment has no closing endpoint.
+                    open_total += open_net
+                    evidence = True
+                elif not has_kg_ledger and valid_un and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment and net is not None:
+                    final_total += net
                     evidence = True
                 elif has_ownerless_segment or has_own_segment:
                     incomplete = True
@@ -883,7 +895,7 @@ def _progress_tv_actual(run, article_id, unit):
                     and str(getattr(segment, "estado", "")).upper() != "ANULADO"
                 ), Decimal("0"))
                 if valid_un and attributed_un > 0 and not has_ownerless_segment:
-                    total += attributed_un
+                    final_total += attributed_un
                     evidence = True
                 elif has_ownerless_segment or has_own_segment:
                     incomplete = True
@@ -900,18 +912,32 @@ def _progress_tv_actual(run, article_id, unit):
             continue
         if unit == "KG":
             if net is not None:
-                total += net
+                final_total += net
+                evidence = True
+            elif open_net is not None:
+                open_total += open_net
                 evidence = True
             elif _d(getattr(manga, "_report_quantity_un", None)):
                 incomplete = True
         else:
             quantity = _d(getattr(manga, "_report_quantity_un", None))
             if quantity is not None:
-                total += quantity
+                final_total += quantity
                 evidence = True
             elif net is not None:
                 incomplete = True
-    return (total if evidence else None), incomplete
+    return {
+        "finalizados": final_total if evidence else None,
+        "en_proceso": open_total if evidence and unit == "KG" else None,
+        "medido": (final_total + open_total) if evidence else None,
+        "incomplete": incomplete,
+    }
+
+
+def _progress_tv_actual(run, article_id, unit):
+    """Compatibility projection: measured evidence and attribution warning."""
+    breakdown = _progress_tv_breakdown(run, article_id, unit)
+    return breakdown["medido"], breakdown["incomplete"]
 
 
 def _tv_identity_value(value):
@@ -1320,15 +1346,17 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     unit, meta_kind, raw_meta = "UN", "OBJETIVO", output.cantidad_objetivo
                 else:
                     unit, meta_kind, raw_meta = None, None, None
-                actual, attribution_incomplete = (
-                    _progress_tv_actual(scoped_run, article.id, unit)
-                    if visible and unit else (None, False)
+                actual_breakdown = (
+                    _progress_tv_breakdown(scoped_run, article.id, unit)
+                    if visible and unit else {"finalizados": None, "en_proceso": None, "medido": None, "incomplete": False}
                 )
-                physical_kg, kg_incomplete = (
-                    _progress_tv_actual(scoped_run, article.id, "KG")
-                    if visible else (None, False)
+                kg_breakdown = (
+                    _progress_tv_breakdown(scoped_run, article.id, "KG")
+                    if visible else {"finalizados": None, "en_proceso": None, "medido": None, "incomplete": False}
                 )
-                physical_kg = None if kg_incomplete else physical_kg
+                actual = actual_breakdown["medido"]
+                attribution_incomplete = actual_breakdown["incomplete"]
+                physical_kg = kg_breakdown["medido"]
                 meta = _d(raw_meta)
                 if meta is not None and meta <= 0:
                     meta = None
@@ -1354,7 +1382,6 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     status = "INCOMPLETO"
                 elif attribution_incomplete:
                     status = "INCOMPLETO"
-                    progress = remaining = percent = None
                 elif actual is None:
                     status = "SIN_PESAJES"
                     progress = remaining = percent = None
@@ -1379,6 +1406,9 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     "pendiente": _n(remaining),
                     "porcentaje": _n(percent),
                     "peso_fisico_kg": _n(physical_kg),
+                    "finalizados_kg": _n(kg_breakdown["finalizados"]),
+                    "en_proceso_kg": _n(kg_breakdown["en_proceso"]),
+                    "avance_medido_kg": _n(kg_breakdown["medido"]),
                     "estado_avance": status,
                 })
         item["salidas"] = sorted(outputs, key=lambda row: (row["corrida"], row["sku"] or ""))
