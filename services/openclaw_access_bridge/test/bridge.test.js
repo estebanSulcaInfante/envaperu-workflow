@@ -216,8 +216,10 @@ test('HTTP proxy allowlist limits SPA/assets/media to the bound agent', async ()
   assert.equal((await get('/new?agent=scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&openclaw_mount_recovery=1793313894362')).status, 404);
   assert.equal((await get(`/new?agent=${agentId}&sessionKey=agent:scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:s&openclaw_mount_recovery=1793313894362`)).status, 404);
   assert.equal((await get(`/chat?agent=scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&openclaw_mount_recovery=1793313894362`)).status, 404);
+  assert.equal((await get(`/chat/scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb?agent=${agentId}&openclaw_mount_recovery=1793313894362`)).status, 404);
   assert.equal((await get(`/assets/main.js?openclaw_mount_recovery=1793313894362`)).status, 404);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&sessionKey=agent:${agentId}:s&openclaw_mount_recovery=1793313894362`)).status, 404);
+  assert.equal((await get('/control-ui-config.json?openclaw_mount_recovery=1793313894362')).status, 404);
   assert.equal((await get('/assets/main.js')).status, 200);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&sessionKey=agent:${agentId}:s&meta=1`)).status, 200);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&agentId=${agentId}&sessionKey=agent:${agentId}:s`)).status, 404);
