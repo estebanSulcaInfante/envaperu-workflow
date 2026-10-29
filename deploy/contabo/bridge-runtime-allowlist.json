@@ -1,5 +1,5 @@
 {
-  "source_sha": "73f560aa190dc7565772a14e6cc5f4acc6412f10",
+  "source_sha": "267039f82f3b94dadd6fc3b8e3a2f1f214922a52",
   "source_prefix": "services/openclaw_access_bridge",
   "files": {
     "package-lock.json": "ad8a81685f7229b0e03d3d691e835ede3f1f5553edf7fc5c907d1188da8ddacb",
@@ -10,7 +10,7 @@
     "src/native_admin.js": "eca12df7243574d8badcbf0eef75d8e13ef3b0a9725d2b0c4888c9d92cc83a02",
     "src/native_artifacts.js": "e7497747baaaec706929d49582c583200221efbfcc359e679f15fc1c36bb82b5",
     "src/scm_access_client.js": "3153d0f7533fe666f47e84f84862455e5dcf91564eb0c23e9b157e58a2956f56",
-    "src/server.js": "239cd3b23594b2dfef61a95292019d6d20e20df5a86bccdf34bb21e6a6449508",
+    "src/server.js": "4b6ce490e190e6cd596db0df6d8964b05de73b80efa6ead350b0940b76424f62",
     "src/session_store.js": "b6b861fdeb0a6053ab469789596afd1c8b71db1e118fd8b3e6fc5f06f4c54df8"
   },
   "context_files": {

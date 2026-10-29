@@ -5,9 +5,9 @@ The user authorized PUBLIC GHCR images containing the API and the personal-agent
 bridge, with code, dependencies and necessary runtime templates. No VPS deployment,
 credentials, Odoo changes or data migration are part of this package.
 
-The exact application source is `73f560aa190dc7565772a14e6cc5f4acc6412f10` and
-the reviewed CI gate is run `40953346956` on branch
-`codex/personal-agent-access-20261029`. The API context is independently hashed
+The exact application source is `267039f82f3b94dadd6fc3b8e3a2f1f214922a52` and
+the candidate CI gate is run `40968850223` on branch
+`codex/personal-agent-route-20261029`. The API context is independently hashed
 by `runtime-allowlist.json`; the bridge context is independently hashed by
 `bridge-runtime-allowlist.json` and includes only its pinned Dockerfile,
 package manifests and `src/**`. Tests, examples, `.env` files, fixtures and
@@ -25,10 +25,12 @@ unpullable package therefore cannot produce `release-image.json`.
 
 ## Source and trusted CI
 
-Application source is fixed to 73f560aa190dc7565772a14e6cc5f4acc6412f10.
-check_ci.py accepts only GitHub Actions run 40953346956, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/personal-agent-access-20261029,
+Application source is fixed to 267039f82f3b94dadd6fc3b8e3a2f1f214922a52.
+check_ci.py accepts only GitHub Actions run 40968850223, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/personal-agent-route-20261029,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
+At recipe preparation time that run was in progress; publication remains blocked
+until this exact run is observed completed with success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
 
