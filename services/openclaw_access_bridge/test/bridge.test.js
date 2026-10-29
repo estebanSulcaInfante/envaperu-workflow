@@ -58,6 +58,7 @@ test('exchange is same-origin form-only, opaque-cookie and replay-safe across re
   });
   const first = await exchange();
   assert.equal(first.status, 303);
+  assert.equal(first.headers.get('clear-site-data'), '"storage"');
   assert.equal(first.headers.get('location'), `/new?agent=${encodeURIComponent(agentId)}`);
   assert.match(first.headers.get('set-cookie'), /HttpOnly/);
   assert.match(first.headers.get('set-cookie'), /Secure/);
@@ -143,8 +144,12 @@ test('filters native agent metadata and denies explicit foreign agent targets', 
   nativeWs.on('connection', (socket) => socket.on('message', (raw) => {
     forwarded += 1;
     const request = JSON.parse(raw.toString());
+    if (request.method === 'connect') socket.send(JSON.stringify({ type: 'res', ok: true, id: request.id, payload: {
+      snapshot: { sessionDefaults: { defaultAgentId: 'scm-personal', mainKey: 'main', mainSessionKey: 'agent:scm-personal:main', ownership: 'explicit', selectionRequired: false } },
+      auth: { scopes: ['operator.sessions.read', 'operator.sessions.write'] },
+    } }));
     if (request.method === 'agents.list') socket.send(JSON.stringify({ type: 'res', id: request.id, payload: {
-      agents: [{ id: agentId }, { id: 'scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }], defaultId: 'scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      agents: [{ id: agentId }, { id: 'scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }],
     } }));
   }));
   const scm = { authorize: async () => fixture.auth('filter-jti') };
@@ -160,10 +165,18 @@ test('filters native agent metadata and denies explicit foreign agent targets', 
   const response = await metadata;
   assert.deepEqual(response.payload.agents, [{ id: agentId }]);
   assert.equal(response.payload.defaultId, agentId);
+  assert.equal(response.payload.selectionRequired, false);
+  const hello = new Promise((resolve) => client.once('message', (message) => resolve(JSON.parse(message.toString()))));
+  client.send(JSON.stringify({ type: 'req', id: 'hello', method: 'connect', params: {} }));
+  const snapshot = await hello;
+  assert.equal(snapshot.payload.snapshot.sessionDefaults.defaultAgentId, agentId);
+  assert.equal(snapshot.payload.snapshot.sessionDefaults.mainSessionKey, `agent:${agentId}:main`);
+  assert.equal(snapshot.payload.snapshot.sessionDefaults.ownership, 'explicit');
+  assert.deepEqual(snapshot.payload.auth.scopes, ['operator.sessions.read', 'operator.sessions.write']);
   const closed = new Promise((resolve) => client.once('close', (code) => resolve(code)));
   client.send(JSON.stringify({ type: 'req', id: '2', method: 'sessions.list', params: { agentId: 'scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' } }));
   assert.equal(await closed, 4403);
-  assert.equal(forwarded, 1);
+  assert.equal(forwarded, 2);
   await bridge.close();
   await new Promise((resolve) => nativeWs.close(resolve));
   await new Promise((resolve) => fixture.native.close(resolve));

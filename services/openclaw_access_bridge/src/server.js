@@ -10,6 +10,8 @@ import { loadManifest, manifestAllows } from './manifest.js';
 import { ScmAccessClient, ScmAccessError } from './scm_access_client.js';
 import { SessionStore } from './session_store.js';
 import { provisionNativeIdentity } from './native_admin.js';
+import { DownloadStore } from './download_store.js';
+import { DownloadError, NativeArtifactBroker } from './native_artifacts.js';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const now = () => Math.floor(Date.now() / 1000);
@@ -144,10 +146,17 @@ const frameTargetsOtherAgent = (data, ownAgentId) => {
 const filterNativeFrame = (data, ownAgentId) => {
   let frame;
   try { frame = JSON.parse(Buffer.isBuffer(data) ? data.toString('utf8') : String(data)); } catch { return data; }
+  const defaults = frame?.type === 'res' && frame?.ok && frame?.payload?.snapshot?.sessionDefaults;
+  if (defaults) {
+    defaults.defaultAgentId = ownAgentId;
+    defaults.mainSessionKey = `agent:${ownAgentId}:${defaults.mainKey || 'main'}`;
+    return JSON.stringify(frame);
+  }
   if (frame?.method !== 'agents.list' && !(frame?.type === 'res' && frame?.payload?.agents)) return data;
   if (Array.isArray(frame?.payload?.agents)) {
     frame.payload.agents = frame.payload.agents.filter((agent) => agent?.id === ownAgentId);
-    if (Object.prototype.hasOwnProperty.call(frame.payload, 'defaultId')) frame.payload.defaultId = ownAgentId;
+    frame.payload.defaultId = ownAgentId;
+    frame.payload.selectionRequired = false;
   }
   return JSON.stringify(frame);
 };
@@ -161,6 +170,8 @@ export const createBridgeServer = (config, dependencies = {}) => {
   const provisioning = new Map();
   const purgeTimer = setInterval(() => store.purgeExpired?.(), 60_000);
   purgeTimer.unref?.();
+  const downloadStore = dependencies.downloadStore || new DownloadStore();
+  const artifactBroker = dependencies.artifactBroker || new NativeArtifactBroker({ config, store: downloadStore, fetchImpl: dependencies.fetchImpl || fetch });
   const wsServer = new WebSocketServer({ noServer: true, maxPayload: config.maxWsPayload });
 
   const getAuthorizedSession = async (req) => {
@@ -265,6 +276,7 @@ export const createBridgeServer = (config, dependencies = {}) => {
     const cookie = `${config.cookieName}=${encodeURIComponent(sid)}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
     return send(res, 303, '', {
       Location: `/new?agent=${encodeURIComponent(authorization.agent_id)}`,
+      'Clear-Site-Data': '"storage"',
       'Set-Cookie': cookie,
     });
   };
@@ -295,6 +307,38 @@ export const createBridgeServer = (config, dependencies = {}) => {
     }
   };
 
+  const handleDownloadRoute = async (req, res, session, requestUrl) => {
+    const match = /^\/api\/artifacts\/download\/scm\/([A-Za-z0-9_-]{32,128})$/.exec(requestUrl.pathname);
+    if (!match || requestUrl.search) { sendJson(res, 404, { error: 'download_not_found' }); return true; }
+    if (!['GET', 'HEAD'].includes(req.method)) { sendJson(res, 405, { error: 'download_method_not_allowed' }); return true; }
+    const allowedHeaders = new Set(['range', 'if-range', 'if-none-match']);
+    const seenHeaders = new Set();
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const key = req.rawHeaders[i].toLowerCase();
+      if (allowedHeaders.has(key)) {
+        if (seenHeaders.has(key)) { sendJson(res, 400, { error: 'duplicate_download_header' }); return true; }
+        seenHeaders.add(key);
+      }
+    }
+    const entry = downloadStore.get(match[1]);
+    if (!entry || entry.sidHash !== session.row.sid_hash || entry.agentId !== session.authorization.agent_id) {
+      return sendJson(res, 404, { error: 'download_not_found' });
+    }
+    try {
+      await artifactBroker.serveHandle({
+        entry, req, res, authorization: session.authorization, sidHash: session.row.sid_hash, clientAddress: req.socket?.remoteAddress,
+        reauthorize: async () => {
+          const fresh = await getAuthorizedSession(req);
+          return fresh && fresh.row.sid_hash === session.row.sid_hash ? fresh : null;
+        },
+      });
+    } catch (error) {
+      if (!res.headersSent) sendJson(res, error instanceof DownloadError ? error.status : 502, { error: error instanceof DownloadError ? error.message : 'download_unavailable' });
+      else res.destroy();
+    }
+    return true;
+  };
+
   const onRequest = async (req, res) => {
     res.setHeader('Referrer-Policy', 'no-referrer');
     if (req.url === '/healthz' && req.method === 'GET') return sendJson(res, 200, { status: 'ok' });
@@ -315,6 +359,9 @@ export const createBridgeServer = (config, dependencies = {}) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.headers.origin !== config.allowedOrigin) {
       return sendJson(res, 403, { error: 'origin_not_allowed' });
     }
+    let requestUrl;
+    try { requestUrl = new URL(req.url, config.allowedOrigin); } catch { return sendJson(res, 400, { error: 'request_invalid' }); }
+    if (requestUrl.pathname.startsWith('/api/artifacts/download/scm/')) return handleDownloadRoute(req, res, session, requestUrl);
     return proxyHttp(req, res, session);
   };
 
@@ -345,6 +392,23 @@ export const createBridgeServer = (config, dependencies = {}) => {
         try { fresh = await getAuthorizedSession(req); } catch { fresh = null; }
         if (!fresh || fresh.row.sid_hash !== session.row.sid_hash) { deny(); return; }
         if (frameTargetsOtherAgent(data, fresh.authorization.agent_id)) { deny(); return; }
+        let frame;
+        try { frame = JSON.parse(Buffer.isBuffer(data) ? data.toString('utf8') : String(data)); } catch { frame = null; }
+        if (frame?.type === 'req' && frame.method === 'artifacts.download') {
+          try {
+            const result = await artifactBroker.downloadRpc({
+              frame, authorization: fresh.authorization, sidHash: fresh.row.sid_hash, clientAddress: req.socket?.remoteAddress,
+              reauthorize: async () => {
+                const latest = await getAuthorizedSession(req);
+                return latest && latest.row.sid_hash === session.row.sid_hash ? latest : null;
+              },
+            });
+            if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(result));
+          } catch (error) {
+            if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: { code: error instanceof DownloadError ? error.message : 'artifact_download_denied' } }));
+          }
+          return;
+        }
         if (!opened) {
           if (pending.length >= 1) { client.close(1009, 'Demasiados frames pendientes'); upstream.close(); return; }
           pending.push(data); return;
@@ -388,6 +452,7 @@ export const createBridgeServer = (config, dependencies = {}) => {
       for (const client of wsServer.clients) client.close(1001, 'Bridge shutting down');
       wsServer.close();
       clearInterval(purgeTimer);
+      downloadStore.clear?.();
       await new Promise((resolve) => server.close(resolve));
       store.close();
     },

@@ -85,6 +85,8 @@ export const loadConfig = (env = process.env) => {
   const stateRoot = String(env.SCM_NATIVE_STATE_ROOT || '/state').trim().replace(/\/$/, '');
   if (!stateRoot || stateRoot.includes('..') || !stateRoot.startsWith('/')) throw new Error('SCM_NATIVE_STATE_ROOT must be an absolute path');
   const maxBodyBytes = boundedInt(env.SCM_BRIDGE_MAX_BODY_BYTES, 'SCM_BRIDGE_MAX_BODY_BYTES', 1024, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  const maxDownloadBytes = boundedInt(env.SCM_BRIDGE_MAX_DOWNLOAD_BYTES, 'SCM_BRIDGE_MAX_DOWNLOAD_BYTES', 1024, 16 * 1024 * 1024, 16 * 1024 * 1024);
+  const maxInlineBytes = boundedInt(env.SCM_BRIDGE_MAX_INLINE_BYTES, 'SCM_BRIDGE_MAX_INLINE_BYTES', 1024, 8 * 1024 * 1024, 8 * 1024 * 1024);
   const apiTimeoutMs = boundedInt(env.SCM_BRIDGE_API_TIMEOUT_MS, 'SCM_BRIDGE_API_TIMEOUT_MS', 100, 30000, 5000);
   const maxIdleSeconds = boundedInt(env.SCM_PERSONAL_AGENT_MAX_IDLE_SECONDS, 'SCM_PERSONAL_AGENT_MAX_IDLE_SECONDS', 30, 86400, 900);
   return {
@@ -106,6 +108,8 @@ export const loadConfig = (env = process.env) => {
     stateRoot,
     dbPath: path.resolve(env.SCM_BRIDGE_DB_PATH || '/var/lib/scm-openclaw-bridge/bridge.sqlite'),
     maxBodyBytes,
+    maxDownloadBytes,
+    maxInlineBytes,
     apiTimeoutMs,
     maxIdleSeconds,
     maxSessionSeconds: boundedInt(env.SCM_PERSONAL_AGENT_MAX_SESSION_SECONDS, 'SCM_PERSONAL_AGENT_MAX_SESSION_SECONDS', 30, 86400, 3600),

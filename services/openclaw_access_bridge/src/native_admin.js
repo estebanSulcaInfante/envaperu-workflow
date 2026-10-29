@@ -58,7 +58,14 @@ const connect = async ({ url, headers, client, auth, scopes }) => {
   return {
     socket,
     rpc: (method, params) => rpc(socket, method, params, pending, sequence),
-    close: () => { for (const request of pending.values()) request.reject(new Error('native socket closed')); socket.close(); },
+    close: () => new Promise((resolve) => {
+      for (const request of pending.values()) request.reject(new Error('native socket closed'));
+      pending.clear();
+      if (socket.readyState === WebSocket.CLOSED) return resolve();
+      const timer = setTimeout(() => { socket.terminate(); resolve(); }, 250);
+      socket.once('close', () => { clearTimeout(timer); resolve(); });
+      socket.close();
+    }),
   };
 };
 
@@ -155,6 +162,23 @@ const adminConnect = (config) => {
   return connect({ url: config.nativeWsUrl, headers: {}, client: {
     id: 'gateway-client', version: 'bridge', platform: 'linux', mode: 'backend',
   }, auth: { password }, scopes: ['operator.admin'] });
+};
+
+export const verifyNativeOwnSession = async ({ config, canonical, sessionKey, clientAddress }) => {
+  const user = await trustedConnect(config, canonical, clientAddress);
+  try {
+    const result = await user.rpc('chat.history', { sessionKey, agentId: canonical.agentId, limit: 1, maxBytes: 1024, maxChars: 1 });
+    return Boolean(result.ok);
+  } finally { await user.close(); }
+};
+
+export const withNativeArtifactDownload = async ({ config, params, consume }) => {
+  const admin = await adminConnect(config);
+  try {
+    const result = await admin.rpc('artifacts.download', params);
+    return await consume(result);
+  }
+  finally { await admin.close(); }
 };
 
 const patchRole = async (admin, identity, agentId, roleName, baseHash) => {

@@ -27,7 +27,15 @@ attachments use the authenticated WebSocket `chat.send` path.
 
 Known native 2026.9.8 limitation: the personal role intentionally grants only
 session scopes. Secondary UI may report `missing scope: operator.read`; HTTP
-media previews return 403 even for the owner's file. Outgoing HTTP downloads
-remain blocked. Do not add global `operator.read` to hide this warning: native
-administrative/file surfaces are broader than personal chat. Office/ZIP
-analysis and file preview/download support require a separate reviewed slice.
+legacy HTTP media previews and outgoing/plugin file routes remain blocked;
+managed assistant artifacts use the reviewed, SID-bound download bridge. Do
+not add global `operator.read` to hide this warning: native administrative/file
+surfaces are broader than personal chat. Office/ZIP analysis and arbitrary
+file generation require a separate reviewed slice.
+
+
+Successful handoffs clear same-origin browser storage (not cookies) and normalize
+hello/agent defaults to the bound personal agent. A browser profile/origin has
+one active account: switching accounts in the same tab removes the previous
+native UI cache. Use separate browser profiles for simultaneous accounts; this
+is not a promise to revoke another already-open tab or profile.
