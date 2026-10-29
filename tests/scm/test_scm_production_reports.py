@@ -530,6 +530,31 @@ def _tv_manga(manga_id, work, kg, *, segments=None):
     )
 
 
+def _continuity_manga(work, *, segment=None, final=None, open_kg="4", ledger_valid=True):
+    segments = [segment] if segment is not None else []
+    control_frontier = None if open_kg is None else Decimal(str(open_kg))
+    control = SimpleNamespace(tipo="CORTE_TURNO", peso_neto_kg=control_frontier)
+    manga = SimpleNamespace(
+        id=501, estado="CONTINUIDAD_PENDIENTE", trabajo=work,
+        correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=SimpleNamespace(id=201)),
+        _report_segments=segments if ledger_valid else [],
+        _report_all_segments=segments,
+        _report_final_kg=None if final is None else Decimal(str(final)),
+        _report_open_kg=None if open_kg is None else Decimal(str(open_kg)),
+        _report_quantity_un=None, _report_weight_corrected=False,
+        _report_controls=[control],
+    )
+    manga._report_continuity_ledger_valid = (
+        ledger_valid
+        and production_reports_service._continuity_control_ledger_is_valid(
+            manga, segments, control,
+            frontier=None if final is None else Decimal(str(final)),
+        )
+    )
+    return manga
+
+
 def test_tv_progress_excludes_released_without_work_but_keeps_legacy_active(monkeypatch):
     runs = []
     for state in ("LIBERADA", "EN_EJECUCION", "PAUSADA", "CANCELADA"):
@@ -1088,7 +1113,7 @@ def test_standard_and_tv_do_not_fallback_incompatible_closed_ledger_to_whole_man
 
 
 @pytest.mark.parametrize("state", [
-    "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN", "RECIBIDA", "CONTINUIDAD_PENDIENTE",
+    "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN", "RECIBIDA",
 ])
 def test_tv_does_not_reuse_open_control_from_terminal_manga_states(state):
     work = SimpleNamespace(id="work-terminal")
@@ -1104,6 +1129,103 @@ def test_tv_does_not_reuse_open_control_from_terminal_manga_states(state):
     assert breakdown["medido"] is None
     assert breakdown["en_proceso"] is None
     assert breakdown["fisico_observado"] is None
+
+
+def _continuity_endpoint_run(manga):
+    run = _tv_aggregate_run(works=[manga.trabajo], mangas={manga.id: manga}, output_meta="10")
+    run["corrida"].objetivo_neto_kg = Decimal("10")
+    run["ot"] = None
+    return run
+
+
+def _serialized_continuity_pair(monkeypatch, manga):
+    run = _continuity_endpoint_run(manga)
+    monkeypatch.setattr(
+        production_reports_service, "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _capability: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+    standard = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+    tv = list_production_progress_tv(object(), actor_id=1, filters={})["items"][0]["salidas"][0]
+    return standard, tv
+
+
+def test_continuity_pending_valid_closed_ledger_serializes_control_as_open_progress(monkeypatch):
+    work = SimpleNamespace(id="work-continuity-valid")
+    segment = _segment(1, "0", "4", "4")
+    segment.trabajo = work
+    manga = _continuity_manga(work, segment=segment, open_kg="4", ledger_valid=True)
+
+    standard, tv = _serialized_continuity_pair(monkeypatch, manga)
+
+    assert (
+        standard["kg_finalizados_efectivos"],
+        standard["kg_medidos_en_abiertas"],
+        standard["kg_medidos_efectivos"],
+    ) == (0.0, 4.0, 4.0)
+    assert standard["coverage"] == {
+        "estado": "COMPLETA", "mangas_total": 1, "mangas_conocidas": 1, "motivos": [],
+    }
+    assert (tv["finalizados_kg"], tv["en_proceso_kg"], tv["avance_medido_kg"]) == (0.0, 4.0, 4.0)
+    assert tv["avance"] == 4.0
+    assert tv["estado_avance"] == "EN_AVANCE"
+
+
+def test_continuity_pending_incompatible_ledger_keeps_physical_without_attribution(monkeypatch):
+    work = SimpleNamespace(id="work-continuity-invalid")
+    segment = _segment(1, "0", "4", "4", quality="PENDIENTE")
+    segment.cantidad_inicio_kg = None
+    segment.trabajo = work
+    manga = _continuity_manga(work, segment=segment, open_kg="4", ledger_valid=False)
+
+    standard, tv = _serialized_continuity_pair(monkeypatch, manga)
+
+    assert standard["kg_finalizados_efectivos"] is None
+    assert standard["kg_medidos_en_abiertas"] is None
+    assert standard["kg_medidos_efectivos"] is None
+    assert standard["peso_fisico_kg"] == 4.0
+    assert standard["coverage"]["estado"] == "INCOMPLETA"
+    assert standard["coverage"]["motivos"] == ["ATRIBUCION_INCOMPLETA"]
+    assert tv["finalizados_kg"] is None
+    assert tv["en_proceso_kg"] is None
+    assert tv["avance_medido_kg"] is None
+    assert tv["peso_fisico_kg"] == 4.0
+    assert tv["estado_avance"] == "INCOMPLETO"
+    assert tv["motivos_atribucion"] == ["ATRIBUCION_INCOMPLETA"]
+
+
+def test_continuity_pending_without_ledger_does_not_fallback_to_whole_manga(monkeypatch):
+    work = SimpleNamespace(id="work-continuity-no-ledger")
+    manga = _continuity_manga(work, segment=None, open_kg="4", ledger_valid=True)
+
+    standard, tv = _serialized_continuity_pair(monkeypatch, manga)
+
+    assert standard["kg_medidos_efectivos"] is None
+    assert standard["peso_fisico_kg"] == 4.0
+    assert standard["coverage"]["estado"] == "INCOMPLETA"
+    assert tv["avance_medido_kg"] is None
+    assert tv["peso_fisico_kg"] == 4.0
+    assert tv["estado_avance"] == "INCOMPLETO"
+
+
+def test_continuity_pending_later_final_replaces_control_without_duplication(monkeypatch):
+    work = SimpleNamespace(id="work-continuity-final")
+    segment = _segment(1, "0", "5", "5")
+    segment.trabajo = work
+    manga = _continuity_manga(
+        work, segment=segment, final="5", open_kg="4", ledger_valid=True,
+    )
+
+    standard, tv = _serialized_continuity_pair(monkeypatch, manga)
+
+    assert (
+        standard["kg_finalizados_efectivos"],
+        standard["kg_medidos_en_abiertas"],
+        standard["kg_medidos_efectivos"],
+    ) == (5.0, 0.0, 5.0)
+    assert tv["finalizados_kg"] == 5.0
+    assert tv["en_proceso_kg"] == 0.0
+    assert tv["avance_medido_kg"] == 5.0
 
 
 def test_tv_un_keeps_kg_control_as_physical_observation_without_converting_to_units():

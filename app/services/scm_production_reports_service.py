@@ -54,7 +54,10 @@ from app.services.scm_manga_assignment_projection import effective_work, effecti
 
 
 KG = Decimal("0.001")
-CANONICAL_OPEN_MANGA_STATES = frozenset({"EN_LLENADO"})
+# A turno cut closes the current ledger span but leaves the manga physically
+# open until it is linked to its next OT.  Its latest control is eligible for
+# projection only when the closed span proves the same frontier.
+CANONICAL_OPEN_MANGA_STATES = frozenset({"EN_LLENADO", "CONTINUIDAD_PENDIENTE"})
 ATTRIBUTION_INCOMPLETE_REASON = "ATRIBUCION_INCOMPLETA"
 KG_WITHOUT_UN_SEGMENTS_REASON = "KG_SIN_TRAMOS_UN"
 GROUP_OPTIONS = (
@@ -92,8 +95,10 @@ def _manga_allows_open_control(manga):
     Persisted rows always carry a state.  Small report fixtures from older
     callers may omit it, so those remain compatible with the projection
     helpers; the loader itself never omits the state.  A control from a
-    closed/received/continuity-pending manga is physical history, not current
-    progress, and must not be revived by the report.
+    closed/received manga is physical history, not current progress, and must
+    not be revived by the report.  Continuity-pending is different:
+    CORTE_TURNO has closed a valid frontier while the manga remains physically
+    open.  The loader applies the additional ledger gate for that state.
     """
     state = getattr(manga, "estado", None)
     if state is None:
@@ -302,6 +307,35 @@ def _segment_conciliates(segments, net):
         previous = end
         total += attributed
     return previous == net.quantize(KG) and total == net.quantize(KG)
+
+
+def _continuity_control_ledger_is_valid(
+    manga, segments, latest_control, *, frontier=None
+):
+    """Validate a CONTINUIDAD_PENDIENTE control before attributing its KG.
+
+    ``CORTE_TURNO`` closes the current segment and stores the control as the
+    frontier.  A missing/incompatible ledger or a stale ACTIVE segment must
+    remain a physical observation only; the report must not turn the whole
+    manga mass into attributable progress.
+    """
+    if str(getattr(manga, "estado", "")).upper() != "CONTINUIDAD_PENDIENTE":
+        return True
+    final_frontier = frontier is not None
+    if not final_frontier and latest_control is None:
+        return False
+    if (
+        not final_frontier
+        and str(getattr(latest_control, "tipo", "")).upper() != "CORTE_TURNO"
+    ):
+        return False
+    if not segments or any(
+        str(getattr(segment, "estado", "")).upper() != "CERRADO"
+        for segment in segments
+    ):
+        return False
+    observed = frontier if final_frontier else getattr(latest_control, "peso_neto_kg", None)
+    return _segment_conciliates(segments, _d(observed))
 
 
 def _progress_segments(manga):
@@ -613,6 +647,9 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
                     final = _d(direct_close_segment.cantidad_fin_kg)
                 else:
                     final = _d(latest_control.peso_neto_kg)
+            continuity_ledger_valid = _continuity_control_ledger_is_valid(
+                manga, segments, latest_control, frontier=final
+            )
             control_allowed = (
                 manga.estado != "ANULADA"
                 and _manga_allows_open_control(manga)
@@ -626,6 +663,7 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
                 else (_d(latest_control.peso_neto_kg) if latest_control is not None and control_allowed else None)
             )
             manga._report_open_control_allowed = control_allowed
+            manga._report_continuity_ledger_valid = continuity_ledger_valid
             quantity_projection = (
                 correction_by_weight.get(current_weighing.id).result_projection_json
                 if current_weighing is not None and current_weighing.id in correction_by_weight
@@ -741,6 +779,15 @@ def _run_manga_values(run):
             continue
         segments = _progress_segments(manga)
         net, open_net = _effective_report_kg(manga)
+        continuity_state = str(getattr(manga, "estado", "")).upper()
+        continuity_ledger_valid = continuity_state != "CONTINUIDAD_PENDIENTE" or (
+            bool(getattr(manga, "_report_continuity_ledger_valid", False))
+            and bool(segments)
+            and all(
+                str(getattr(segment, "estado", "")).upper() == "CERRADO"
+                for segment in segments
+            )
+        )
         assigned = False
         # A vigente final replaces its prior control for advancement; the
         # same manga can never contribute both projections.
@@ -769,7 +816,12 @@ def _run_manga_values(run):
             # immutable ledger against that projection, just as TV does,
             # before deciding whether the manga supplies attributable KG.
             segments = _project_corrected_kg_segments(segments, observed)
-        if segments and observed is not None and _segment_conciliates(segments, observed):
+        if (
+            segments
+            and observed is not None
+            and continuity_ledger_valid
+            and _segment_conciliates(segments, observed)
+        ):
             attributed = sum(
                 (
                     _d(segment.cantidad_atribuida_kg) or Decimal("0")
@@ -806,6 +858,7 @@ def _run_manga_values(run):
                 and owner is not None
                 and str(owner.id) in work_ids
                 and open_net is not None
+                and continuity_ledger_valid
                 and _has_active_open_segment(segments)
             ):
                 segment_owners = [
@@ -819,16 +872,21 @@ def _run_manga_values(run):
                     opened += open_net
                     attributed_evidence = True
                     measured_evidence = True
-            if observed is not None and (has_ownerless_segment or not _has_active_open_segment(segments)):
+            if observed is not None and (
+                not continuity_ledger_valid
+                or has_ownerless_segment
+                or not _has_active_open_segment(segments)
+            ):
                 attribution_reasons.add(ATTRIBUTION_INCOMPLETE_REASON)
         if not assigned and not segments:
             assigned = owner_is_own or ownerless_ot
             if assigned:
                 if owner is not None:
-                    final += net or Decimal("0")
-                    opened += open_net or Decimal("0")
-                    attributed_evidence = net is not None or open_net is not None
-                    measured_evidence = measured_evidence or attributed_evidence
+                    if continuity_ledger_valid:
+                        final += net or Decimal("0")
+                        opened += open_net or Decimal("0")
+                        attributed_evidence = net is not None or open_net is not None
+                        measured_evidence = measured_evidence or attributed_evidence
                     if observed is not None and not attributed_evidence:
                         attribution_reasons.add(ATTRIBUTION_INCOMPLETE_REASON)
                 elif observed is not None:
@@ -1045,6 +1103,15 @@ def _progress_tv_breakdown(run, article_id, unit):
         net, open_net = _effective_report_kg(manga)
         physical = _effective_physical_kg(manga)
         quantity = _d(getattr(manga, "_report_quantity_un", None))
+        continuity_state = str(getattr(manga, "estado", "")).upper()
+        continuity_ledger_valid = continuity_state != "CONTINUIDAD_PENDIENTE" or (
+            bool(getattr(manga, "_report_continuity_ledger_valid", False))
+            and bool(segments)
+            and all(
+                str(getattr(segment, "estado", "")).upper() == "CERRADO"
+                for segment in segments
+            )
+        )
         # A final weighing is the vigente projection and replaces any older
         # control for advancement; expose the control only while still open.
         observed = net if net is not None else open_net
@@ -1108,7 +1175,12 @@ def _progress_tv_breakdown(run, article_id, unit):
             ]
             has_ownerless_segment = any(owner is None for owner in segment_owners)
             has_own_segment = any(getattr(owner, "id", None) in work_ids for owner in segment_owners if owner is not None)
-            if unit == "KG" and observed is not None and _segment_conciliates(corrected_segments, observed):
+            if (
+                unit == "KG"
+                and observed is not None
+                and continuity_ledger_valid
+                and _segment_conciliates(corrected_segments, observed)
+            ):
                 attributed = sum((
                     _d(segment.cantidad_atribuida_kg) or Decimal("0")
                     for segment in corrected_segments
@@ -1132,6 +1204,7 @@ def _progress_tv_breakdown(run, article_id, unit):
                 segment_owner_ids = {owner.id for owner in segment_owners if owner is not None}
                 if (
                     open_net is not None
+                    and continuity_ledger_valid
                     and _has_active_open_segment(corrected_segments)
                     and segment_owner_ids
                     and segment_owner_ids <= work_ids
@@ -1188,8 +1261,12 @@ def _progress_tv_breakdown(run, article_id, unit):
                 final_total += net
                 evidence = True
             elif open_net is not None:
-                open_total += open_net
-                evidence = True
+                if continuity_ledger_valid:
+                    open_total += open_net
+                    evidence = True
+                else:
+                    incomplete = True
+                    attribution_reasons.add(ATTRIBUTION_INCOMPLETE_REASON)
             elif quantity:
                 incomplete = True
         else:
