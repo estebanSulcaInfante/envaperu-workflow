@@ -21,7 +21,6 @@ from app.models.scm_ot import (
     ScmManga,
     ScmLoteArticulo,
     ScmPesajeManga,
-    ScmReaperturaManga,
     ScmTramoMangaTrabajo,
     ScmTrabajoColor,
     ScmTrabajoOt,
@@ -688,6 +687,7 @@ def test_tv_actual_ignores_known_foreign_mass_but_marks_own_plus_ownerless_incom
 def test_tv_actual_marks_no_segments_ownerless_physical_mass_incomplete():
     work = SimpleNamespace(id="work-owned")
     ownerless = _tv_manga(1, None, "2")
+    ownerless.estado = "EN_LLENADO"
     ownerless._report_final_kg = None
     ownerless._report_open_kg = Decimal("2")
     from app.services.scm_production_reports_service import _progress_tv_actual
@@ -734,7 +734,9 @@ def test_tv_actual_adds_latest_open_control_once_and_exposes_breakdown():
         "mangas_total": 3,
         "mangas_conocidas": 2,
         "pendientes_sin_peso": 1,
-        "incomplete": False,
+        "pendientes_sin_cantidad_un": 0,
+        "incomplete": True,
+        "motivos_atribucion": [],
     }
 
 
@@ -831,7 +833,213 @@ def test_standard_and_tv_share_incompatible_mixed_ledger_projection(monkeypatch)
     assert tv["incomplete"] is True
 
 
-def test_standard_and_tv_do_not_fallback_incompatible_closed_ledger_to_whole_manga():
+@pytest.mark.parametrize("shape, expected_physical", [("incompatible", 9.0), ("active", 5.0)])
+def test_standard_and_tv_keep_own_span_scope_when_effective_owner_moves_foreign(
+    monkeypatch, shape, expected_physical,
+):
+    """A prior own span keeps the manga visible after a foreign handoff.
+
+    The current foreign owner must not turn the current final/control into
+    attributable KG.  Both serializers retain the physical diagnostic and
+    incomplete coverage, while a foreign-only ledger remains out of scope.
+    """
+    work = SimpleNamespace(id="work-handoff-own")
+    foreign = SimpleNamespace(id="work-handoff-foreign")
+    own = _segment(1, "0", "4", "4")
+    own.trabajo = work
+    if shape == "incompatible":
+        foreign_segment = _segment(2, "4", "9", "4", quality="PENDIENTE")
+        manga_state = "PESADA"
+        final_kg, open_kg = Decimal("9"), None
+    else:
+        foreign_segment = _segment(2, "4", "4", "0")
+        foreign_segment.estado = "ACTIVO"
+        foreign_segment.cantidad_fin_kg = None
+        foreign_segment.cantidad_atribuida_kg = None
+        manga_state = "EN_LLENADO"
+        final_kg, open_kg = None, Decimal("5")
+    foreign_segment.trabajo = foreign
+    manga = SimpleNamespace(
+        id=91, estado=manga_state, trabajo=foreign, correccion_asignacion=None,
+        _report_final_kg=final_kg, _report_open_kg=open_kg,
+        _report_segments=[], _report_all_segments=[own, foreign_segment],
+        _report_weight_corrected=False, _report_quantity_un=None,
+        lote_articulo=SimpleNamespace(articulo=SimpleNamespace(id=201)),
+    )
+    run = _tv_aggregate_run(works=[work], mangas={91: manga}, output_meta="10")
+    run["corrida"].objetivo_neto_kg = Decimal("10")
+    run["ot"] = None
+    run["ots"] = []
+
+    monkeypatch.setattr(
+        production_reports_service, "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    standard = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+    assert standard["kg_finalizados_efectivos"] is None
+    assert standard["kg_medidos_en_abiertas"] is None
+    assert standard["kg_medidos_efectivos"] is None
+    assert standard["avance_medido_kg"] is None
+    assert standard["peso_fisico_kg"] == expected_physical
+    assert standard["mangas"] == {"total": 1, "conocidas": 0}
+    assert standard["coverage"]["estado"] == "INCOMPLETA"
+    assert standard["motivos_atribucion"] == ["ATRIBUCION_INCOMPLETA"]
+
+    tv = list_production_progress_tv(object(), actor_id=1, filters={})["items"][0]["salidas"][0]
+    assert tv["avance"] is None
+    assert tv["finalizados_kg"] is None
+    assert tv["en_proceso_kg"] is None
+    assert tv["avance_medido_kg"] is None
+    assert tv["peso_fisico_kg"] == expected_physical
+    assert tv["mangas_total"] == 1
+    assert tv["estado_avance"] == "INCOMPLETO"
+    assert "ATRIBUCION_INCOMPLETA" in tv["motivos_atribucion"]
+
+
+def test_standard_and_tv_keep_ownerless_ot_with_segments_in_scope(monkeypatch):
+    work = SimpleNamespace(id="work-ownerless-segments")
+    ot = SimpleNamespace(id="ot-ownerless-segments", public_id="ot-ownerless-segments", codigo_ot="OT-OWNERLESS")
+    ownerless_segment = _segment(1, "0", "5", "5")
+    ownerless_segment.trabajo = None
+    manga = SimpleNamespace(
+        id=92, estado="PESADA", trabajo=None, ot_id=ot.id,
+        correccion_asignacion=None, _report_final_kg=Decimal("5"), _report_open_kg=None,
+        _report_segments=[], _report_all_segments=[ownerless_segment],
+        _report_weight_corrected=False, _report_quantity_un=None,
+        lote_articulo=SimpleNamespace(articulo=SimpleNamespace(id=201)),
+    )
+    run = _tv_aggregate_run(
+        works=[work],
+        contexts=[{"work": work, "color_work": None, "ot": ot}],
+        mangas={92: manga}, output_meta="10",
+    )
+    run["corrida"].objetivo_neto_kg = Decimal("10")
+    run["ot"] = ot
+    run["ots"] = [ot]
+    monkeypatch.setattr(
+        production_reports_service, "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    standard = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+    assert standard["mangas"] == {"total": 1, "conocidas": 0}
+    assert standard["peso_fisico_kg"] == 5.0
+    assert standard["kg_medidos_efectivos"] is None
+    assert standard["coverage"]["estado"] == "INCOMPLETA"
+    assert standard["motivos_atribucion"] == ["ATRIBUCION_INCOMPLETA"]
+
+    tv = list_production_progress_tv(object(), actor_id=1, filters={})["items"][0]["salidas"][0]
+    assert tv["mangas_total"] == 1
+    assert tv["peso_fisico_kg"] == 5.0
+    assert tv["avance"] is None
+    assert tv["estado_avance"] == "INCOMPLETO"
+    assert "ATRIBUCION_INCOMPLETA" in tv["motivos_atribucion"]
+
+
+def test_standard_valid_own_foreign_split_has_physical_without_false_attribution_reason(monkeypatch):
+    work = SimpleNamespace(id="work-split-own")
+    foreign = SimpleNamespace(id="work-split-foreign")
+    own = _segment(1, "0", "4", "4")
+    own.trabajo = work
+    foreign_segment = _segment(2, "4", "9", "5")
+    foreign_segment.trabajo = foreign
+    manga = SimpleNamespace(
+        id=87, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        _report_final_kg=Decimal("9"), _report_open_kg=None,
+        _report_segments=[own, foreign_segment], _report_all_segments=[own, foreign_segment],
+        _report_weight_corrected=False, _report_quantity_un=None,
+    )
+    run = {
+        "corrida": SimpleNamespace(
+            id="run-split", codigo="C-SPLIT", objetivo_neto_kg=Decimal("10"),
+            color_produccion=None, salidas=[],
+        ),
+        "orden": SimpleNamespace(id="of-split", codigo="OF-SPLIT", estado="EN_EJECUCION"),
+        "ot": None, "color_name": "Melón", "color_hex": None, "molde": None,
+        "mangas": {87: manga}, "contexts": [{"work": work}],
+    }
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+
+    assert item["kg_medidos_efectivos"] == 4.0
+    assert item["peso_fisico_kg"] == 9.0
+    assert item["mangas"] == {"total": 1, "conocidas": 1}
+    assert item["coverage"]["estado"] == "COMPLETA"
+    assert item["motivos_atribucion"] == []
+
+
+def test_standard_foreign_only_has_no_physical_or_attribution_reason(monkeypatch):
+    work = SimpleNamespace(id="work-foreign-only")
+    foreign = SimpleNamespace(id="work-foreign-source")
+    foreign_segment = _segment(1, "0", "9", "9")
+    # A current foreign owner plus an ownerless segment is still outside this
+    # corrida; unknown ownership must not leak the OT's physical fact here.
+    foreign_segment.trabajo = None
+    manga = SimpleNamespace(
+        id=86, estado="PESADA", trabajo=foreign, correccion_asignacion=None,
+        _report_final_kg=Decimal("9"), _report_open_kg=None,
+        _report_segments=[foreign_segment], _report_all_segments=[foreign_segment],
+        _report_weight_corrected=False, _report_quantity_un=None,
+    )
+    run = {
+        "corrida": SimpleNamespace(
+            id="run-foreign-only", codigo="C-FOREIGN-ONLY", objetivo_neto_kg=Decimal("10"),
+            color_produccion=None, salidas=[],
+        ),
+        "orden": SimpleNamespace(id="of-foreign-only", codigo="OF-FOREIGN-ONLY", estado="EN_EJECUCION"),
+        "ot": None, "color_name": "Rojo", "color_hex": None, "molde": None,
+        "mangas": {86: manga}, "contexts": [{"work": work}],
+    }
+    result = _run_manga_values(run)
+
+    assert result[:5] == (Decimal("0"), Decimal("0"), None, 0, 0)
+    assert run["_report_physical_kg"] is None
+    assert run["_report_attribution_reasons"] == []
+
+
+def test_tv_serializer_uses_un_quantity_counters_and_keeps_kg_diagnostic_separate(monkeypatch):
+    work = SimpleNamespace(id="work-un-serializer")
+    foreign = SimpleNamespace(id="work-un-serializer-foreign")
+    ot = SimpleNamespace(id="ot-un-serializer", public_id="ot-un-serializer", codigo_ot="OT-UN-SERIALIZER")
+    own = _tv_manga(1, work, "0")
+    own._report_final_kg = None
+    own._report_quantity_un = Decimal("4")
+    foreign_manga = _tv_manga(2, foreign, "0")
+    foreign_manga._report_final_kg = None
+    foreign_manga._report_quantity_un = Decimal("9")
+    ownerless = _tv_manga(3, None, "0")
+    ownerless._report_final_kg = None
+    ownerless._report_quantity_un = Decimal("7")
+    ownerless.ot_id = ot.id
+    run = _tv_aggregate_run(
+        works=[work],
+        contexts=[{"work": work, "color_work": SimpleNamespace(molde_codigo_snapshot="ML-1", color_id_snapshot=7), "ot": ot}],
+        mangas={1: own, 2: foreign_manga, 3: ownerless}, output_meta="0",
+    )
+    output = run["corrida"].salidas[0]
+    output.kg_estandar_objetivo = None
+    output.cantidad_objetivo = Decimal("10")
+    run["corrida"].objetivo_neto_kg = None
+    monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    serialized = list_production_progress_tv(object(), actor_id=1, filters={})["items"][0]["salidas"][0]
+
+    assert serialized["unidad"] == "UN"
+    assert serialized["avance"] == 4.0
+    assert serialized["mangas_total"] == 2
+    assert serialized["mangas_conocidas"] == 2
+    assert serialized["pendientes_sin_peso"] == 0
+    assert serialized["pendientes_sin_cantidad_un"] == 0
+    assert serialized["estado_avance"] == "INCOMPLETO"
+
+
+def test_standard_and_tv_do_not_fallback_incompatible_closed_ledger_to_whole_manga(monkeypatch):
     work = SimpleNamespace(id="work-invalid")
     invalid = _segment(1, "0", "5", "4", quality="PENDIENTE")
     invalid.trabajo = work
@@ -854,6 +1062,94 @@ def test_standard_and_tv_do_not_fallback_incompatible_closed_ledger_to_whole_man
     assert standard[:5] == (Decimal("0"), Decimal("0"), None, 1, 0)
     assert tv["medido"] is None
     assert tv["incomplete"] is True
+
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _capability: True),
+    )
+    standard_run = {
+        "corrida": SimpleNamespace(
+            id="run-invalid", codigo="C-INVALID", objetivo_neto_kg=Decimal("5"),
+            color_produccion=None, salidas=[],
+        ),
+        "orden": SimpleNamespace(id="of-invalid", codigo="OF-INVALID", estado="EN_EJECUCION"),
+        "ot": None, "color_name": "Azul", "color_hex": None, "molde": None,
+        "mangas": {89: manga}, "contexts": [{"work": work}],
+    }
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [standard_run])
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+    assert item["kg_finalizados_efectivos"] is None
+    assert item["kg_medidos_en_abiertas"] is None
+    assert item["kg_medidos_efectivos"] is None
+    assert item["subtotal_conocido_kg"] is None
+    assert item["peso_fisico_kg"] == 5.0
+    assert item["coverage"]["motivos"] == ["ATRIBUCION_INCOMPLETA"]
+
+
+@pytest.mark.parametrize("state", [
+    "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN", "RECIBIDA", "CONTINUIDAD_PENDIENTE",
+])
+def test_tv_does_not_reuse_open_control_from_terminal_manga_states(state):
+    work = SimpleNamespace(id="work-terminal")
+    manga = _tv_manga(1, work, "2")
+    manga.estado = state
+    manga._report_final_kg = None
+    manga._report_open_kg = Decimal("2")
+
+    breakdown = production_reports_service._progress_tv_breakdown(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, 201, "KG"
+    )
+
+    assert breakdown["medido"] is None
+    assert breakdown["en_proceso"] is None
+    assert breakdown["fisico_observado"] is None
+
+
+def test_tv_un_keeps_kg_control_as_physical_observation_without_converting_to_units():
+    work = SimpleNamespace(id="work-un-control")
+    manga = _tv_manga(1, work, "2")
+    manga.estado = "EN_LLENADO"
+    manga._report_final_kg = None
+    manga._report_open_kg = Decimal("2")
+    manga._report_quantity_un = None
+
+    breakdown = production_reports_service._progress_tv_breakdown(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, 201, "UN"
+    )
+
+    assert breakdown["medido"] is None
+    assert breakdown["fisico_observado"] == Decimal("2")
+    assert breakdown["incomplete"] is True
+    assert "KG_SIN_TRAMOS_UN" in breakdown["motivos_atribucion"]
+
+
+def test_tv_un_counters_use_quantity_and_exclude_foreign_without_weight_conversion():
+    work = SimpleNamespace(id="work-un-own")
+    foreign = SimpleNamespace(id="work-un-foreign")
+    ot = SimpleNamespace(id="ot-un", public_id="ot-un", codigo_ot="OT-UN")
+
+    own = _tv_manga(1, work, "0")
+    own._report_final_kg = None
+    own._report_quantity_un = Decimal("4")
+    foreign_manga = _tv_manga(2, foreign, "0")
+    foreign_manga._report_final_kg = None
+    foreign_manga._report_quantity_un = Decimal("9")
+    ownerless = _tv_manga(3, None, "0")
+    ownerless._report_final_kg = None
+    ownerless._report_quantity_un = Decimal("7")
+    ownerless.ot_id = ot.id
+    run = {"works": [(work, None, ot)], "mangas": {1: own, 2: foreign_manga, 3: ownerless}}
+
+    breakdown = production_reports_service._progress_tv_breakdown(run, 201, "UN")
+
+    assert breakdown["medido"] == Decimal("4")
+    assert breakdown["mangas_total"] == 2
+    assert breakdown["mangas_conocidas"] == 2
+    assert breakdown["pendientes_sin_peso"] == 0
+    assert breakdown["pendientes_sin_cantidad_un"] == 0
+    assert breakdown["incomplete"] is True
+    assert breakdown["motivos_atribucion"] == ["ATRIBUCION_INCOMPLETA"]
 
 
 def test_tv_actual_keeps_open_control_with_active_unclosed_runtime_segment(monkeypatch):
@@ -886,7 +1182,7 @@ def test_tv_actual_keeps_open_control_with_active_unclosed_runtime_segment(monke
     )
     run = _tv_aggregate_run(works=[work], mangas={1: final, 2: opened, 3: pending}, output_meta="250")
 
-    assert production_reports_service._progress_tv_actual(run, 201, "KG") == (Decimal("91.7"), False)
+    assert production_reports_service._progress_tv_actual(run, 201, "KG") == (Decimal("91.7"), True)
     monkeypatch.setattr(production_reports_service, "load_actor", lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True))
     monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
     output = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
@@ -898,6 +1194,45 @@ def test_tv_actual_keeps_open_control_with_active_unclosed_runtime_segment(monke
     assert output["mangas_total"] == 3
     assert output["mangas_conocidas"] == 2
     assert output["pendientes_sin_peso"] == 1
+
+
+def test_ownerless_ot_manga_without_evidence_is_pending_in_both_serializers(app, client, monkeypatch):
+    work = SimpleNamespace(id="work-owner")
+    known = _tv_manga(1, work, "3")
+    pending = _tv_manga(2, None, "3")
+    pending._report_final_kg = None
+    pending._report_open_kg = None
+    run = _tv_aggregate_run(works=[work], mangas={1: known, 2: pending}, output_meta="5")
+    ot = run["contexts"][0]["ot"]
+    run["ots"] = [ot]
+    run["ot"] = ot
+    pending.ot_id = ot.id
+    run["corrida"].objetivo_neto_kg = Decimal("5")
+
+    monkeypatch.setattr(
+        production_reports_service, "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+    with app.app_context():
+        app.config["SECRET_KEY"] = "ownerless-pending-test-secret"
+        standard = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": "7"},
+        ).get_json()["items"][0]
+        tv = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": "7"},
+        ).get_json()["items"][0]["salidas"][0]
+
+    assert standard["kg_medidos_efectivos"] == 3.0
+    assert standard["mangas"] == {"total": 2, "conocidas": 1}
+    assert standard["coverage"]["estado"] == "INCOMPLETA"
+    assert tv["avance"] == 3.0
+    assert tv["estado_avance"] == "INCOMPLETO"
+    assert tv["mangas_total"] == 2
+    assert tv["mangas_conocidas"] == 1
+    assert tv["pendientes_sin_peso"] == 1
 
 
 def test_standard_progress_keeps_partial_measured_and_percentage_separate_from_coverage(monkeypatch):
@@ -931,6 +1266,35 @@ def test_standard_progress_keeps_partial_measured_and_percentage_separate_from_c
     assert item["porcentaje"] == pytest.approx(36.68)
     assert item["coverage"]["estado"] == "INCOMPLETA"
     assert "SUBTOTAL_PARCIAL" in item["coverage"]["motivos"]
+
+
+def test_standard_pending_only_does_not_turn_missing_measurement_into_zero(monkeypatch):
+    work = SimpleNamespace(id="work-pending-only")
+    pending = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work, _report_final_kg=None,
+        _report_open_kg=None, _report_segments=[], _report_weight_corrected=False,
+    )
+    run = {
+        "corrida": SimpleNamespace(
+            id="run-pending-only", codigo="C-PENDING-ONLY", objetivo_neto_kg=Decimal("10"),
+            color_produccion=None, salidas=[],
+        ),
+        "orden": SimpleNamespace(id="of-pending-only", codigo="OF-PENDING-ONLY", estado="EN_EJECUCION"),
+        "ot": None, "color_name": "Azul", "color_hex": None, "molde": None,
+        "mangas": {1: pending}, "contexts": [{"work": work}],
+    }
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _capability: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+
+    assert item["kg_medidos_efectivos"] is None
+    assert item["subtotal_conocido_kg"] is None
+    assert item["coverage"]["motivos"] == ["PESO_MANGA_SIN_EVIDENCIA"]
 
 
 def test_final_vigente_replaces_control_on_same_manga():
@@ -1303,7 +1667,7 @@ def test_open_control_is_attributed_only_when_kg_segments_conciliate():
     assert _run_manga_values(run_b)[:5] == (Decimal("0"), Decimal("2"), Decimal("2"), 1, 1)
 
     manga._report_open_kg = Decimal("5")
-    assert _run_manga_values(run_a)[:5] == (Decimal("0"), Decimal("0"), None, 0, 0)
+    assert _run_manga_values(run_a)[:5] == (Decimal("0"), Decimal("0"), None, 1, 0)
     assert _run_manga_values(run_b)[:5] == (Decimal("0"), Decimal("0"), None, 1, 0)
 
 
@@ -1933,14 +2297,31 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         )
         db.session.add(assignment)
         db.session.flush()
+        plan_assignment = ScmAsignacionPlanMangaOt.query.filter_by(
+            plan_linea_id=weighed_manga.plan_linea_id,
+            trabajo_ot_id=blue.id,
+        ).first()
+        if plan_assignment is None:
+            plan_assignment = ScmAsignacionPlanMangaOt(
+                plan_linea_id=weighed_manga.plan_linea_id,
+                ot_id=weighed_manga.ot_id,
+                trabajo_ot_id=blue.id,
+                cantidad_asignada_un=95,
+                mangas_asignadas=1,
+                asignada_por_id=seeded["full"].id,
+            )
+            db.session.add(plan_assignment)
+            db.session.flush()
         segment = ScmTramoMangaTrabajo(
             manga_id=weighed_manga.id, trabajo_ot_id=blue.id,
+            asignacion_plan_id=plan_assignment.id,
             asignacion_personal_trabajo_id=assignment.id, secuencia=1,
             estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=95,
             cantidad_atribuida_un=95, cantidad_inicio_kg=0,
             cantidad_fin_kg=Decimal("11.500"), cantidad_atribuida_kg=Decimal("11.500"),
             calidad_evidencia_kg="MEDIDA_DIRECTA_CIERRE_CONTROL",
             cerrada_at=event_time,
+            motivo_cierre="PESAJE_FINAL",
             created_by_id=seeded["full"].id,
         )
         db.session.add(segment)
@@ -1960,14 +2341,19 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
             ))
         db.session.add_all(controls)
         db.session.flush()
-        weighing.estado = "REABIERTO"
-        weighed_manga.estado = "EN_LLENADO"
-        db.session.add(ScmReaperturaManga(
-            manga_id=weighed_manga.id, pesaje_id=weighing.id,
-            motivo="Continuar llenado con evidencia", tipo_reapertura="CONTINUAR_LLENADO",
-            peso_base_neto_kg=Decimal("11.500"), reabierta_por_id=seeded["full"].id,
-            reabierta_at=event_time + timedelta(minutes=3), operation_id=uuid4(),
-        ))
+        from app.models.scm_catalogos import ScmCapacidad
+        from app.models.trabajador import RolOperativo
+        from app.services.scm_weighing_service import reopen_manga_after_accidental_close
+        reopen_role = RolOperativo(
+            codigo=f"R-REOPEN-{uuid4().hex[:8]}", nombre="Reapertura de prueba",
+            capacidades=[ScmCapacidad.query.filter_by(codigo="MANGA_REABRIR").one()],
+        )
+        db.session.add(reopen_role)
+        seeded["full"].roles.append(reopen_role)
+        # A canonical close can finish in the terminal receiving state.  The
+        # direct-close segment and append-only event must project the final
+        # even though no open control is allowed in that state.
+        weighed_manga.estado = "PENDIENTE_RECEPCION_ALMACEN"
         db.session.add(ScmEvento(
             aggregate_type="MANGA", aggregate_id=str(weighed_manga.id),
             tipo="KG_MANGA_CLOSED_FROM_LAST_CONTROL", actor_id=seeded["full"].id,
@@ -1976,6 +2362,34 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
             occurred_at=event_time + timedelta(minutes=2),
         ))
         db.session.commit()
+
+        terminal_rows = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        terminal_manga = next(
+            row["mangas"][weighed_manga.id]
+            for row in terminal_rows
+            if row["corrida"].id == corrida.id
+        )
+        assert terminal_manga._report_final_kg == Decimal("11.500")
+        assert terminal_manga._report_open_kg is None
+        assert terminal_manga._report_closure_event is not None
+
+        # Reopen through the production service: it marks the persisted
+        # segment ACTIVO but leaves its historical KG endpoint intact.
+        reopened_response = reopen_manga_after_accidental_close(
+            db.session,
+            actor_id=seeded["full"].id,
+            manga_id=weighed_manga.public_id,
+            operation_id=uuid4(),
+            data={
+                "version": weighed_manga.version,
+                "tipo_reapertura": "CONTINUAR_LLENADO",
+                "motivo": "Continuar llenado con evidencia",
+            },
+        )
+        assert reopened_response["manga"]["estado"] == "EN_LLENADO"
 
         reopened_rows = production_reports_service._load_rows(
             db.session, production_reports_service._filters({}, require_dates=False),
@@ -1990,6 +2404,33 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         assert reopened_manga._report_open_kg == Decimal("11.000")
         assert len(reopened_manga._report_controls) == 2
         assert reopened_manga._report_closure_event is None
+        assert reopened_manga._report_all_segments[0].estado == "ACTIVO"
+        assert reopened_manga._report_all_segments[0].cantidad_fin_kg == Decimal("11.500")
+
+        reopened_tv_payload = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        reopened_tv_order = next(item for item in reopened_tv_payload["items"] if item["of"] == "OF-OBS-001")
+        reopened_tv_row = next(
+            item for item in reopened_tv_order["salidas"]
+            if item["corrida_id"] == str(corrida.id)
+        )
+        assert reopened_tv_row["finalizados_kg"] == 0
+        assert reopened_tv_row["en_proceso_kg"] == pytest.approx(11.0)
+        assert reopened_tv_row["avance"] == pytest.approx(11.0)
+
+        reopened_standard_payload = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        reopened_standard_item = next(
+            item for item in reopened_standard_payload["items"]
+            if item["corrida_id"] == str(corrida.id)
+        )
+        assert reopened_standard_item["kg_finalizados_efectivos"] == pytest.approx(8.0)
+        assert reopened_standard_item["kg_medidos_en_abiertas"] == pytest.approx(11.0)
+        assert reopened_standard_item["kg_medidos_efectivos"] == pytest.approx(19.0)
 
         new_final = ScmPesajeManga(
             manga_id=weighed_manga.id, operation_id=uuid4(), source_system="TEST",
@@ -2029,6 +2470,8 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         assert standard_item["kg_finalizados_efectivos"] == pytest.approx(19.5)
         assert standard_item["kg_medidos_en_abiertas"] == 0
         assert standard_item["kg_medidos_efectivos"] == pytest.approx(19.5)
+        assert standard_item["peso_fisico_kg"] == pytest.approx(19.5)
+        assert standard_item["motivos_atribucion"] == []
         loaded = production_reports_service._load_rows(
             db.session, production_reports_service._filters({}, require_dates=False),
             order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
@@ -2044,6 +2487,315 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         assert loaded_manga._report_closure_event is None
         assert len(loaded_manga.reaperturas) == 1
         assert db.session.get(ScmManga, weighed_manga.id).estado == "PENDIENTE_RECEPCION_ALMACEN"
+
+        annulled_final = ScmAnulacionPesajeManga(
+            pesaje_id=new_final.id,
+            motivo="Anulación real de prueba",
+            anulada_por_id=seeded["full"].id,
+            anulada_at=event_time + timedelta(minutes=5),
+            operation_id=uuid4(),
+            cantidad_devuelta_plan_un=95,
+            ot_reabierta=False,
+        )
+        db.session.add(annulled_final)
+        db.session.commit()
+        annulled_rows = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        annulled_manga = next(
+            row["mangas"][weighed_manga.id]
+            for row in annulled_rows
+            if row["corrida"].id == corrida.id
+        )
+        assert annulled_manga._report_final_kg is None
+        assert annulled_manga._report_open_kg is None
+
+
+def test_progress_http_serializes_corrected_kg_before_ledger_reconciliation(app, client, scm_config):
+    """ORM regression: corrected 11.9 reconciles a persisted 12.0 ledger."""
+    from test_scm_production_observability import _seed_observability_graph
+    from app.models.scm_articulos import ScmArticulo
+    from app.models.molde import Pieza
+    from app.models.producto import PiezaColor
+    from uuid import uuid4
+
+    with app.app_context():
+        app.config["SECRET_KEY"] = "standard-corrected-ledger-secret"
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabrication = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabrication)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=order.id, codigo="C-STD-CORRECTED", secuencia=14,
+            objetivo_neto_kg=Decimal("10"), estado="EN_EJECUCION",
+        )
+        piece = Pieza(codigo="PZ-STD-CORRECTED", nombre="Pieza corregida", peso_nominal_gr=100)
+        db.session.add_all([corrida, piece])
+        db.session.flush()
+        variant = PiezaColor(
+            sku=f"PC-STD-CORRECTED-{uuid4().hex[:10]}".upper(),
+            pieza_id=piece.id, piezas=piece.nombre,
+        )
+        db.session.add(variant)
+        db.session.flush()
+        from app.services.scm_article_service import _ensure_piece_article
+        _ensure_piece_article(db.session, variant)
+        article = ScmArticulo.query.filter_by(codigo=variant.sku).one()
+        output = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=corrida.id,
+            articulo_scm_id=article.id, cantidad_objetivo=100,
+            kg_estandar_objetivo=10, excedente_objetivo=0,
+        )
+        db.session.add(output)
+        db.session.flush()
+        lot = ScmLoteArticulo(
+            codigo="LOTE-STD-CORRECTED", articulo_id=article.id,
+            clase="SALIDA_ORDEN_OPERACION", orden_operacion_salida_id=output.id,
+            cantidad_acreditada=1,
+        )
+        db.session.add(lot)
+        blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
+        color_work = ScmTrabajoColor.query.filter_by(trabajo_ot_id=blue.id).one()
+        color_work.corrida_fabricacion_id = corrida.id
+        color_work.molde_codigo_snapshot = "ML-OBS"
+        color_work.color_id_snapshot = 1
+        weighed_manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
+        weighed_manga.lote_articulo = lot
+        weighing = ScmPesajeManga.query.filter_by(manga_id=weighed_manga.id).one()
+        from app.models.scm_ot import ScmCorreccionPesajeManga
+        correction = ScmCorreccionPesajeManga.query.filter_by(pesaje_id=weighing.id).one()
+        correction.result_projection_json = {
+            **(correction.result_projection_json or {}),
+            "peso_fisico_neto_kg": "11.900",
+            "kg_produccion_ot": "11.900",
+        }
+        event_time = datetime(2026, 8, 10, 6, 0, tzinfo=timezone.utc)
+        assignment = ScmAsignacionPersonalTrabajoOt(
+            trabajo_ot_id=blue.id, trabajador_id=seeded["full"].id,
+            estado="CERRADA", finalizada_at=event_time,
+            asignada_por_id=seeded["full"].id, finalizada_por_id=seeded["full"].id,
+        )
+        db.session.add(assignment)
+        db.session.flush()
+        plan_assignment = ScmAsignacionPlanMangaOt.query.filter_by(
+            plan_linea_id=weighed_manga.plan_linea_id,
+            trabajo_ot_id=blue.id,
+        ).first()
+        if plan_assignment is None:
+            plan_assignment = ScmAsignacionPlanMangaOt(
+                plan_linea_id=weighed_manga.plan_linea_id,
+                ot_id=weighed_manga.ot_id, trabajo_ot_id=blue.id,
+                cantidad_asignada_un=95, mangas_asignadas=1,
+                asignada_por_id=seeded["full"].id,
+            )
+            db.session.add(plan_assignment)
+            db.session.flush()
+        segment = ScmTramoMangaTrabajo(
+            manga_id=weighed_manga.id, trabajo_ot_id=blue.id,
+            asignacion_plan_id=plan_assignment.id,
+            asignacion_personal_trabajo_id=assignment.id, secuencia=1,
+            estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=95,
+            cantidad_atribuida_un=95, cantidad_inicio_kg=0,
+            cantidad_fin_kg=Decimal("12.000"), cantidad_atribuida_kg=Decimal("12.000"),
+            calidad_evidencia_kg="MEDIDA_DIRECTA", cerrada_at=event_time,
+            created_by_id=seeded["full"].id,
+        )
+        db.session.add(segment)
+        db.session.flush()
+        control = ScmControlPesoManga(
+            manga_id=weighed_manga.id, tramo_id=segment.id,
+            operation_id=uuid4(), source_system="TEST", station_id="ST-OBS",
+            capture_id=uuid4(), tipo="AVANCE_KG", peso_bruto_kg=Decimal("11.100"),
+            tara_kg=Decimal("0.100"), peso_neto_kg=Decimal("11.000"),
+            aporte_desde_control_anterior_kg=0, tara_fuente="TIPO_MANGA",
+            unidad_evidencia="KG", calidad_evidencia="MEDIDA_DIRECTA",
+            motivo="control corregido", pesado_at=event_time,
+            fecha_local_pesaje=date(2026, 8, 10), pesado_por_id=seeded["full"].id,
+        )
+        db.session.add(control)
+        db.session.commit()
+
+        rows = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        run = next(row for row in rows if row["corrida"].id == corrida.id)
+        loaded_manga = run["mangas"][weighed_manga.id]
+        assert loaded_manga._report_final_kg == Decimal("11.900")
+        assert loaded_manga._report_segments[-1].cantidad_fin_kg == Decimal("12.000")
+        isolated = {**run, "mangas": {weighed_manga.id: loaded_manga}}
+        standard_values = _run_manga_values(isolated)
+        assert standard_values[:3] == (Decimal("11.900"), Decimal("0"), Decimal("11.900"))
+        tv_values = production_reports_service._progress_tv_breakdown(isolated, article.id, "KG")
+        assert tv_values["finalizados"] == Decimal("11.900")
+        assert tv_values["medido"] == Decimal("11.900")
+
+        standard_payload = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        standard = next(item for item in standard_payload["items"] if item["corrida_id"] == str(corrida.id))
+        # The seeded OT has one separate 8 kg manga in the standard OT scope;
+        # the isolated assertion proves the corrected manga contributes 11.9.
+        assert standard["kg_medidos_efectivos"] == pytest.approx(19.9)
+        assert standard["peso_fisico_kg"] == pytest.approx(19.9)
+        assert standard["kg_medidos_efectivos"] != pytest.approx(20.0)
+
+        tv_payload = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        tv_order = next(item for item in tv_payload["items"] if item["of"] == "OF-OBS-001")
+        tv = next(item for item in tv_order["salidas"] if item["corrida_id"] == str(corrida.id))
+        assert tv["avance"] == pytest.approx(11.9)
+        assert tv["finalizados_kg"] == pytest.approx(11.9)
+        assert tv["peso_fisico_kg"] == pytest.approx(11.9)
+        assert tv["avance"] != pytest.approx(12.0)
+
+        # A canonical close event remains sufficient without the optional
+        # direct-close marker, including after the manga enters terminal
+        # receiving state.  There is no reopening in this branch.
+        weighing.estado = "REABIERTO"
+        weighed_manga.estado = "PENDIENTE_RECEPCION_ALMACEN"
+        db.session.add(ScmEvento(
+            aggregate_type="MANGA", aggregate_id=str(weighed_manga.id),
+            tipo="KG_MANGA_CLOSED_FROM_LAST_CONTROL", actor_id=seeded["full"].id,
+            actor_snapshot={"codigo": "OBS-FULL"}, motivo="cierre de control sin marcador",
+            before_json={}, after_json={"control_fuente": {"id": str(control.public_id)}},
+            occurred_at=datetime(2026, 8, 10, 7, 0, tzinfo=timezone.utc),
+        ))
+        db.session.commit()
+        no_marker_rows = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        no_marker_manga = next(
+            row["mangas"][weighed_manga.id]
+            for row in no_marker_rows
+            if row["corrida"].id == corrida.id
+        )
+        assert no_marker_manga._report_final_kg == Decimal("11.000")
+        assert no_marker_manga._report_open_kg is None
+
+
+def test_progress_http_serializes_physical_separately_for_real_invalid_ledger(app, client, scm_config):
+    from test_scm_production_observability import _manga, _seed_observability_graph, _weighing
+    from app.models.molde import Pieza
+    from app.models.producto import PiezaColor
+    from app.models.registro import RegistroDiarioProduccion
+    from app.models.scm_articulos import ScmArticulo
+    from app.services.scm_article_service import _ensure_piece_article
+
+    with app.app_context():
+        app.config["SECRET_KEY"] = "standard-physical-invalid-ledger-secret"
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabrication = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabrication)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=fabrication.orden_operacion_id, codigo="C-STD-PHYSICAL", secuencia=13,
+            objetivo_neto_kg=Decimal("10"), estado="EN_EJECUCION",
+        )
+        piece = Pieza(codigo="PZ-STD-PHYSICAL", nombre="Pieza física", peso_nominal_gr=100)
+        db.session.add_all([corrida, piece])
+        db.session.flush()
+        variant = PiezaColor(
+            sku=f"PC-STD-PHYSICAL-{uuid4().hex[:10]}".upper(),
+            pieza_id=piece.id, piezas=piece.nombre,
+        )
+        db.session.add(variant)
+        db.session.flush()
+        _ensure_piece_article(db.session, variant)
+        article = ScmArticulo.query.filter_by(codigo=variant.sku).one()
+        output = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=corrida.id,
+            articulo_scm_id=article.id, cantidad_objetivo=100,
+            kg_estandar_objetivo=10, excedente_objetivo=0,
+        )
+        db.session.add(output)
+        db.session.flush()
+        lot = ScmLoteArticulo(
+            codigo="LOTE-STD-PHYSICAL", articulo_id=article.id,
+            clase="SALIDA_ORDEN_OPERACION", orden_operacion_salida_id=output.id,
+            cantidad_acreditada=1,
+        )
+        db.session.add(lot)
+        new_ot = RegistroDiarioProduccion(
+            codigo_ot="OT-STD-PHYSICAL", codigo_ot_sintetico=False,
+            estado="EN_EJECUCION", tipo_ot="FABRICACION", fecha=date(2026, 8, 10),
+            turno="DIA", maquina_id=1, responsable_id=seeded["full"].id,
+            maquinista_previsto_id=seeded["full"].id, created_by_id=seeded["full"].id,
+            orden_operacion_id=order.id,
+        )
+        db.session.add(new_ot)
+        db.session.flush()
+        work = ScmTrabajoOt(
+            orden_trabajo_id=new_ot.id, codigo="TC-STD-PHYSICAL", secuencia=1,
+            estado="EN_EJECUCION", orden_operacion_id=order.id,
+            cantidad_objetivo_un=100, cantidad_confirmada_un=0,
+            created_by_id=seeded["full"].id,
+        )
+        db.session.add(work)
+        db.session.flush()
+        db.session.add(ScmTrabajoColor(
+            trabajo_ot_id=work.id, corrida_fabricacion_id=corrida.id,
+            color_nombre_snapshot="AZUL", molde_codigo_snapshot="ML-STD",
+        ))
+        weighed_manga = _manga(
+            ot=new_ot, work=work, sequence=1, state="PESADA",
+            worker=seeded["full"], confirmed=95,
+        )
+        db.session.add(weighed_manga)
+        db.session.flush()
+        weighed_manga.lote_articulo = lot
+        _weighing(
+            manga=weighed_manga, worker=seeded["full"], net="11.500",
+            standard="11.500", weighed_at=datetime(2026, 8, 10, 6, 0, tzinfo=timezone.utc),
+        )
+        event_time = datetime(2026, 8, 10, 6, 0, tzinfo=timezone.utc)
+        assignment = ScmAsignacionPersonalTrabajoOt(
+            trabajo_ot_id=work.id, trabajador_id=seeded["full"].id,
+            estado="CERRADA", finalizada_at=event_time,
+            asignada_por_id=seeded["full"].id, finalizada_por_id=seeded["full"].id,
+        )
+        db.session.add(assignment)
+        db.session.flush()
+        db.session.add(ScmTramoMangaTrabajo(
+            manga_id=weighed_manga.id, trabajo_ot_id=work.id,
+            asignacion_personal_trabajo_id=assignment.id, secuencia=1,
+            estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=95,
+            cantidad_atribuida_un=95, cantidad_inicio_kg=0,
+            cantidad_fin_kg=Decimal("10.000"), cantidad_atribuida_kg=Decimal("10.000"),
+            calidad_evidencia_kg="PENDIENTE", cerrada_at=event_time,
+            created_by_id=seeded["full"].id,
+        ))
+        db.session.commit()
+
+        standard = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        item = next(item for item in standard["items"] if item["corrida_id"] == str(corrida.id))
+        assert item["kg_finalizados_efectivos"] is None
+        assert item["kg_medidos_en_abiertas"] is None
+        assert item["kg_medidos_efectivos"] is None
+        assert item["avance_medido_kg"] is None
+        assert item["subtotal_conocido_kg"] is None
+        assert item["peso_fisico_kg"] == pytest.approx(11.5)
+        assert item["motivos_atribucion"] == ["ATRIBUCION_INCOMPLETA"]
+        assert "ATRIBUCION_INCOMPLETA" in item["coverage"]["motivos"]
+
+        tv = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        tv_item = next(item for item in tv["items"] if item["corrida_id"] == str(corrida.id))
+        assert tv_item["salidas"][0]["avance"] is None
+        assert tv_item["salidas"][0]["peso_fisico_kg"] == pytest.approx(11.5)
+        assert tv_item["salidas"][0]["motivos_atribucion"] == ["ATRIBUCION_INCOMPLETA"]
 
 
 def test_tv_progress_http_consolidates_real_multi_ot_contexts(app, client, scm_config):
