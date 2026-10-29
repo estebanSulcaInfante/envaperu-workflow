@@ -819,7 +819,7 @@ def _run_manga_values(run):
         if (
             segments
             and observed is not None
-            and continuity_ledger_valid
+            and (net is not None or continuity_ledger_valid)
             and _segment_conciliates(segments, observed)
         ):
             attributed = sum(
@@ -882,7 +882,7 @@ def _run_manga_values(run):
             assigned = owner_is_own or ownerless_ot
             if assigned:
                 if owner is not None:
-                    if continuity_ledger_valid:
+                    if net is not None or continuity_ledger_valid:
                         final += net or Decimal("0")
                         opened += open_net or Decimal("0")
                         attributed_evidence = net is not None or open_net is not None
@@ -1178,7 +1178,7 @@ def _progress_tv_breakdown(run, article_id, unit):
             if (
                 unit == "KG"
                 and observed is not None
-                and continuity_ledger_valid
+                and (net is not None or continuity_ledger_valid)
                 and _segment_conciliates(corrected_segments, observed)
             ):
                 attributed = sum((

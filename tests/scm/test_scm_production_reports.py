@@ -1208,6 +1208,41 @@ def test_continuity_pending_without_ledger_does_not_fallback_to_whole_manga(monk
     assert tv["estado_avance"] == "INCOMPLETO"
 
 
+def test_continuity_pending_final_without_ledger_keeps_standard_tv_parity(monkeypatch):
+    work = SimpleNamespace(id="work-continuity-final-no-ledger")
+    manga = _continuity_manga(
+        work, segment=None, final="5", open_kg="4", ledger_valid=True,
+    )
+
+    standard, tv = _serialized_continuity_pair(monkeypatch, manga)
+
+    assert (
+        standard["kg_finalizados_efectivos"],
+        standard["kg_medidos_en_abiertas"],
+        standard["kg_medidos_efectivos"],
+    ) == (5.0, 0.0, 5.0)
+    assert (tv["finalizados_kg"], tv["en_proceso_kg"], tv["avance_medido_kg"]) == (5.0, 0.0, 5.0)
+
+
+def test_continuity_pending_corrected_final_projects_before_standard_tv_gate(monkeypatch):
+    work = SimpleNamespace(id="work-continuity-final-corrected")
+    segment = _segment(1, "0", "4", "4")
+    segment.trabajo = work
+    manga = _continuity_manga(
+        work, segment=segment, final="5", open_kg="4", ledger_valid=False,
+    )
+    manga._report_weight_corrected = True
+
+    standard, tv = _serialized_continuity_pair(monkeypatch, manga)
+
+    assert standard["kg_finalizados_efectivos"] == 5.0
+    assert standard["kg_medidos_en_abiertas"] == 0.0
+    assert standard["kg_medidos_efectivos"] == 5.0
+    assert tv["finalizados_kg"] == 5.0
+    assert tv["en_proceso_kg"] == 0.0
+    assert tv["avance_medido_kg"] == 5.0
+
+
 def test_continuity_pending_later_final_replaces_control_without_duplication(monkeypatch):
     work = SimpleNamespace(id="work-continuity-final")
     segment = _segment(1, "0", "5", "5")
@@ -2918,6 +2953,108 @@ def test_progress_http_serializes_physical_separately_for_real_invalid_ledger(ap
         assert tv_item["salidas"][0]["avance"] is None
         assert tv_item["salidas"][0]["peso_fisico_kg"] == pytest.approx(11.5)
         assert tv_item["salidas"][0]["motivos_atribucion"] == ["ATRIBUCION_INCOMPLETA"]
+
+
+def test_progress_http_uses_real_corte_turno_continuity_ledger(app, client, scm_config):
+    """ORM/service path: CORTE_TURNO closes a valid KG frontier but stays open."""
+    from uuid import UUID
+
+    from test_scm_ot_service import _print_color_manga, _seed_aggregate_color_work
+    from app.services.scm_ot_service import transition_color_work
+    from app.services.scm_weighing_service import register_manga_weighing_control
+
+    with app.app_context():
+        app.config["SECRET_KEY"] = "reports-continuity-real-test-secret"
+        creator, _approver, _order, run, output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=50, operational_date="2026-09-03")
+        )
+        # The shared OT fixture is intentionally legacy-UN.  This scenario
+        # exercises the real KG CORTE_TURNO branch without converting units.
+        output.articulo.unidad_inventario = "KG"
+        manga_model = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+        # Use an exact SQLite decimal subtraction while retaining the service's
+        # TIPO_MANGA tare validation.
+        manga_model.tara_nominal_g_snapshot = 200
+        db.session.commit()
+        manga_payload = created["mangas"][0]
+        work_payload = created["trabajo_color"]
+        station, prelabel = _print_color_manga(
+            actor=creator,
+            manga_id=manga_payload["public_id"],
+            station_code="PESAJE-REPORTS-CONT",
+        )
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(work_payload["id"]),
+            operation_id=uuid4(),
+            data={"version": work_payload["version"]},
+            action="iniciar",
+        )
+        controlled = register_manga_weighing_control(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": prelabel["public_id"],
+                "capture_id": str(uuid4()),
+                "control_type": "CORTE_TURNO",
+                "peso_bruto_kg": "4.200",
+                "tara_kg": "0.200",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-03T14:00:00-05:00",
+                "pesado_por_id": creator.id,
+                "reading_stable": True,
+                "motivo": "CAMBIO_TURNO",
+            },
+        )
+
+        manga_model = ScmManga.query.filter_by(
+            public_id=UUID(manga_payload["public_id"])
+        ).one()
+        control = ScmControlPesoManga.query.filter_by(manga_id=manga_model.id).one()
+        segment = ScmTramoMangaTrabajo.query.filter_by(
+            manga_id=manga_model.id
+        ).one()
+        assert controlled["manga"]["estado"] == "CONTINUIDAD_PENDIENTE"
+        assert manga_model.estado == "CONTINUIDAD_PENDIENTE"
+        assert control.tipo == "CORTE_TURNO"
+        assert control.peso_neto_kg == Decimal("4.000")
+        assert segment.estado == "CERRADO"
+        assert segment.cantidad_inicio_kg == Decimal("0.000")
+        assert segment.cantidad_fin_kg == Decimal("4.000")
+        assert segment.cantidad_atribuida_kg == Decimal("4.000")
+
+        standard = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(creator.id)},
+        ).get_json()
+        standard_item = next(
+            item for item in standard["items"] if item["corrida_id"] == str(run.id)
+        )
+        assert standard_item["kg_finalizados_efectivos"] == 0
+        assert standard_item["kg_medidos_en_abiertas"] == pytest.approx(4.0)
+        assert standard_item["kg_medidos_efectivos"] == pytest.approx(4.0)
+        assert standard_item["peso_fisico_kg"] == pytest.approx(4.0)
+        assert standard_item["coverage"] == {
+            "estado": "COMPLETA", "mangas_total": 1, "mangas_conocidas": 1,
+            "motivos": [],
+        }
+
+        tv = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(creator.id)},
+        ).get_json()
+        tv_item = next(item for item in tv["items"] if item["corrida_id"] == str(run.id))
+        tv_output = tv_item["salidas"][0]
+        assert tv_output["finalizados_kg"] == 0
+        assert tv_output["en_proceso_kg"] == pytest.approx(4.0)
+        assert tv_output["avance_medido_kg"] == pytest.approx(4.0)
+        assert tv_output["peso_fisico_kg"] == pytest.approx(4.0)
+        assert tv_output["estado_avance"] == "EN_AVANCE"
 
 
 def test_tv_progress_http_consolidates_real_multi_ot_contexts(app, client, scm_config):
