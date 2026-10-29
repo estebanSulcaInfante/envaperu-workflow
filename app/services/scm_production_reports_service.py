@@ -654,9 +654,10 @@ def _run_manga_values(run):
         if str(getattr(manga, "estado", "")).upper() == "ANULADA":
             continue
         segments = list(getattr(manga, "_report_segments", ()) or ())
-        net = _d(getattr(manga, "_report_final_kg", None))
+        net, open_net = _effective_report_kg(manga)
         assigned = False
-        open_net = _d(getattr(manga, "_report_open_kg", None))
+        # A vigente final replaces its prior control for advancement; the
+        # same manga can never contribute both projections.
         observed = net if net is not None else open_net
         attributed_evidence = False
         if segments and observed is not None and _segment_conciliates(segments, observed):
@@ -688,7 +689,7 @@ def _run_manga_values(run):
             assigned = owner is not None and str(owner.id) in work_ids
             if assigned:
                 final += net or Decimal("0")
-                opened += _d(getattr(manga, "_report_open_kg", None)) or Decimal("0")
+                opened += open_net or Decimal("0")
                 attributed_evidence = net is not None or open_net is not None
         if assigned:
             total += 1
@@ -700,6 +701,13 @@ def _run_manga_values(run):
     # still pending evidence.
     measured = final + opened if known > 0 else None
     return final, opened, measured, total, known, objective
+
+
+def _effective_report_kg(manga):
+    """Project one manga's vigente final or, when absent, its open control."""
+    net = _d(getattr(manga, "_report_final_kg", None))
+    open_net = None if net is not None else _d(getattr(manga, "_report_open_kg", None))
+    return net, open_net
 
 
 def _canonical_article_identity(article):
@@ -818,6 +826,10 @@ def _progress_tv_breakdown(run, article_id, unit):
     work_ids = {item[0].id for item in run.get("works", ())}
     final_total = Decimal("0")
     open_total = Decimal("0")
+    observed_total = Decimal("0")
+    mangas_total = 0
+    mangas_known = 0
+    mangas_pending = 0
     evidence = False
     incomplete = False
     for manga in run.get("mangas", {}).values():
@@ -828,9 +840,16 @@ def _progress_tv_breakdown(run, article_id, unit):
             continue
         owner = effective_work(manga)
         segments = list(getattr(manga, "_report_all_segments", None) or getattr(manga, "_report_segments", ()) or ())
-        net = _d(getattr(manga, "_report_final_kg", None))
-        open_net = _d(getattr(manga, "_report_open_kg", None))
+        net, open_net = _effective_report_kg(manga)
+        # A final weighing is the vigente projection and replaces any older
+        # control for advancement; expose the control only while still open.
         observed = net if net is not None else open_net
+        mangas_total += 1
+        if observed is not None:
+            observed_total += observed
+            mangas_known += 1
+        else:
+            mangas_pending += 1
         if segments:
             corrected_segments = (
                 _project_corrected_kg_segments(segments, observed)
@@ -903,7 +922,7 @@ def _progress_tv_breakdown(run, article_id, unit):
         if owner is None:
             # A manga with physical evidence but no current owner is not a
             # foreign contribution: it is an attribution failure.
-            if net is not None or _d(getattr(manga, "_report_quantity_un", None)) is not None:
+            if net is not None or open_net is not None or _d(getattr(manga, "_report_quantity_un", None)) is not None:
                 incomplete = True
             continue
         if owner.id not in work_ids:
@@ -930,6 +949,10 @@ def _progress_tv_breakdown(run, article_id, unit):
         "finalizados": final_total if evidence else None,
         "en_proceso": open_total if evidence and unit == "KG" else None,
         "medido": (final_total + open_total) if evidence else None,
+        "fisico_observado": observed_total if mangas_known else None,
+        "mangas_total": mangas_total,
+        "mangas_conocidas": mangas_known,
+        "pendientes_sin_peso": mangas_pending,
         "incomplete": incomplete,
     }
 
@@ -1348,15 +1371,15 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     unit, meta_kind, raw_meta = None, None, None
                 actual_breakdown = (
                     _progress_tv_breakdown(scoped_run, article.id, unit)
-                    if visible and unit else {"finalizados": None, "en_proceso": None, "medido": None, "incomplete": False}
+                    if visible and unit else {"finalizados": None, "en_proceso": None, "medido": None, "fisico_observado": None, "mangas_total": 0, "mangas_conocidas": 0, "pendientes_sin_peso": 0, "incomplete": False}
                 )
                 kg_breakdown = (
                     _progress_tv_breakdown(scoped_run, article.id, "KG")
-                    if visible else {"finalizados": None, "en_proceso": None, "medido": None, "incomplete": False}
+                    if visible else {"finalizados": None, "en_proceso": None, "medido": None, "fisico_observado": None, "mangas_total": 0, "mangas_conocidas": 0, "pendientes_sin_peso": 0, "incomplete": False}
                 )
                 actual = actual_breakdown["medido"]
                 attribution_incomplete = actual_breakdown["incomplete"]
-                physical_kg = kg_breakdown["medido"]
+                physical_kg = kg_breakdown["fisico_observado"]
                 meta = _d(raw_meta)
                 if meta is not None and meta <= 0:
                     meta = None
@@ -1409,6 +1432,9 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
                     "finalizados_kg": _n(kg_breakdown["finalizados"]),
                     "en_proceso_kg": _n(kg_breakdown["en_proceso"]),
                     "avance_medido_kg": _n(kg_breakdown["medido"]),
+                    "mangas_total": kg_breakdown["mangas_total"],
+                    "mangas_conocidas": kg_breakdown["mangas_conocidas"],
+                    "pendientes_sin_peso": kg_breakdown["pendientes_sin_peso"],
                     "estado_avance": status,
                 })
         item["salidas"] = sorted(outputs, key=lambda row: (row["corrida"], row["sku"] or ""))
