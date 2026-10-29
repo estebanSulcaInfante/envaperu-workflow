@@ -194,7 +194,14 @@ test('HTTP proxy allowlist limits SPA/assets/media to the bound agent', async ()
   const get = (path) => fetch(`http://127.0.0.1:${port}${path}`, { headers: { Cookie: cookie, Origin: fixture.config.allowedOrigin } });
   assert.equal((await get('/')).status, 200);
   assert.equal((await get(`/new?agent=${agentId}`)).status, 200);
+  assert.equal((await get(`/new?agent=${agentId}&openclaw_mount_recovery=1793313894362`)).status, 200);
   assert.equal((await get(`/new?agent=${agentId}&agent=${agentId}`)).status, 404);
+  assert.equal((await get(`/new?agent=${agentId}&openclaw_mount_recovery=1793313894362&openclaw_mount_recovery=1793313894363`)).status, 404);
+  assert.equal((await get(`/new?agent=${agentId}&openclaw_mount_recovery=%00`)).status, 404);
+  assert.equal((await get(`/new?agent=${agentId}&openclaw_mount_recovery=17933138943620`)).status, 404);
+  assert.equal((await get(`/new?agent=${agentId}&unknown=1`)).status, 404);
+  assert.equal((await get('/new?agent=scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&openclaw_mount_recovery=1793313894362')).status, 404);
+  assert.equal((await get(`/new?agent=${agentId}&sessionKey=agent:scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:s&openclaw_mount_recovery=1793313894362`)).status, 404);
   assert.equal((await get('/assets/main.js')).status, 200);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&sessionKey=agent:${agentId}:s&meta=1`)).status, 200);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&agentId=${agentId}&sessionKey=agent:${agentId}:s`)).status, 404);

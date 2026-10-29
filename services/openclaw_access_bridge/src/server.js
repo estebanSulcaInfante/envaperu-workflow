@@ -62,22 +62,32 @@ const CLIENT_PROXY_HEADERS = new Set([
 const STATIC_PREFIXES = ['/assets/', '/themes/', '/fonts/', '/app-art/', '/community-art/', '/file-icons/', '/provider-icons/', '/cloud-provider-icons/'];
 const STATIC_EXTENSIONS = new Set(['.js', '.mjs', '.css', '.map', '.json', '.webmanifest', '.wasm', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.woff', '.woff2', '.ttf', '.otf']);
 const MEDIA_PARAMS = new Set(['meta', 'source', 'sessionKey', 'agentId', 'mediaTicket', 'filename', 'playback']);
+const NEW_PARAMS = new Set(['agent', 'sessionKey', 'openclaw_mount_recovery']);
 const MAX_QUERY_BYTES = 8192;
 const MAX_QUERY_VALUE = 2048;
 
 const hasPathTraversal = (rawUrl) => /(?:^|[\\/])\.\.?(?:[\\/]|$)|%2e|%2f|%5c/i.test(String(rawUrl || '').split('?')[0]);
 const ownSessionKey = (value, agentId) => typeof value === 'string' && value.startsWith(`agent:${agentId}:`);
+const validQueryValue = (value) => typeof value === 'string'
+  && value.length <= MAX_QUERY_VALUE
+  && !/[\u0000-\u001f\u007f]/.test(value);
 const singletonQuery = (url, agentId, allowed) => {
   if (Buffer.byteLength(url.search, 'utf8') > MAX_QUERY_BYTES) return false;
   for (const key of url.searchParams.keys()) if (!allowed.has(key)) return false;
   for (const key of allowed) {
     const values = url.searchParams.getAll(key);
-    if (values.length > 1 || values.some((value) => value.length > MAX_QUERY_VALUE)) return false;
+    if (values.length > 1 || values.some((value) => !validQueryValue(value))) return false;
   }
   if (url.searchParams.has('agent') && url.searchParams.get('agent') !== agentId) return false;
   if (url.searchParams.has('agentId') && url.searchParams.get('agentId') !== agentId) return false;
   if (url.searchParams.has('sessionKey') && !ownSessionKey(url.searchParams.get('sessionKey'), agentId)) return false;
   return true;
+};
+
+const validNewRouteQuery = (url, ownAgentId) => {
+  if (!singletonQuery(url, ownAgentId, NEW_PARAMS)) return false;
+  if (!url.searchParams.has('openclaw_mount_recovery')) return true;
+  return /^\d{13}$/.test(url.searchParams.get('openclaw_mount_recovery'));
 };
 
 const allowedNativeRoute = (method, target, ownAgentId, rawUrl) => {
@@ -89,7 +99,8 @@ const allowedNativeRoute = (method, target, ownAgentId, rawUrl) => {
       || !ownSessionKey(target.searchParams.get('sessionKey'), ownAgentId)) return false;
     return true;
   }
-  if (pathname === '/' || pathname === '/new' || pathname === '/chat' || pathname.startsWith('/chat/')) {
+  if (pathname === '/new') return validNewRouteQuery(target, ownAgentId);
+  if (pathname === '/' || pathname === '/chat' || pathname.startsWith('/chat/')) {
     if (!singletonQuery(target, ownAgentId, new Set(['agent', 'sessionKey']))) return false;
     const chatId = pathname.startsWith('/chat/') ? pathname.slice('/chat/'.length).split('/')[0] : '';
     return !chatId || !chatId.startsWith('scm-') || chatId === ownAgentId;
