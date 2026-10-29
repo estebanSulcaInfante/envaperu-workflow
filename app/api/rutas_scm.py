@@ -92,6 +92,7 @@ from app.services.scm_packaging_service import (
     update_packable_profile,
     update_packaging_rule,
 )
+from app.services.scm_engineering_reads import list_engineering_approvals
 from app.services.scm_commercial_presentation_service import (
     create_commercial_presentation,
     list_commercial_presentations,
@@ -362,6 +363,18 @@ def _optional_active_filter():
         "El filtro activo debe ser true o false.",
         status_code=400,
     )
+
+
+@scm_bp.get("/ingenieria/aprobaciones")
+def ingenieria_aprobaciones_listar():
+    return jsonify(list_engineering_approvals(
+        db.session,
+        actor_id=_actor_id(),
+        domain=request.args.get("dominio"),
+        query=request.args.get("q"),
+        limit=request.args.get("limite", 25),
+        cursor=request.args.get("cursor"),
+    ))
 
 
 @scm_bp.get("/altas-producto")
