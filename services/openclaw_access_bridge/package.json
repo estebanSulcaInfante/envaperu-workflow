@@ -1,0 +1,13 @@
+{
+  "name": "scm-openclaw-access-bridge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  }
+}

@@ -11,6 +11,13 @@ def _csv_env(name, default=""):
         if item.strip()
     ]
 
+
+def _int_env(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return None
+
 class Config:
     # Heroku usa postgres:// pero SQLAlchemy requiere postgresql://
     _db_url = os.getenv('DATABASE_URL', 'postgresql://postgres:1234@localhost:5432/enva_test')
@@ -91,3 +98,30 @@ class Config:
         'authenticated',
     ).strip()
     SUPABASE_JWT_ISSUER = os.getenv('SUPABASE_JWT_ISSUER', '').strip().rstrip('/')
+
+    # Personal native OpenClaw handoff.  All values are intentionally empty or
+    # disabled by default; the access route fails closed until an operator
+    # supplies an HTTPS bridge origin and two independent credentials.
+    SCM_PERSONAL_AGENT_ACCESS_ENABLED = (
+        os.getenv(
+            'SCM_PERSONAL_AGENT_ACCESS_ENABLED',
+            os.getenv('SCM_PERSONAL_AGENT_ENABLED', 'false'),
+        ).strip().lower()
+        == 'true'
+    )
+    SCM_PERSONAL_AGENT_ENABLED = SCM_PERSONAL_AGENT_ACCESS_ENABLED
+    SCM_PERSONAL_AGENT_BRIDGE_ORIGIN = os.getenv(
+        'SCM_PERSONAL_AGENT_BRIDGE_ORIGIN', ''
+    ).strip().rstrip('/')
+    SCM_PERSONAL_AGENT_ASSERTION_SECRET = os.getenv(
+        'SCM_PERSONAL_AGENT_ASSERTION_SECRET', ''
+    ).strip()
+    SCM_PERSONAL_AGENT_BRIDGE_CREDENTIAL = os.getenv(
+        'SCM_PERSONAL_AGENT_BRIDGE_CREDENTIAL', ''
+    ).strip()
+    SCM_PERSONAL_AGENT_SERVICE_SECRET = os.getenv(
+        'SCM_PERSONAL_AGENT_SERVICE_SECRET', ''
+    ).strip()
+    SCM_PERSONAL_AGENT_MAX_SESSION_SECONDS = _int_env(
+        'SCM_PERSONAL_AGENT_MAX_SESSION_SECONDS', 3600
+    )

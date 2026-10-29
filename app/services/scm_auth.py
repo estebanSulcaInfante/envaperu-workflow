@@ -70,6 +70,13 @@ def _is_public_request():
         return True
     if request.method == "GET" and request.path.endswith("/qr"):
         return True
+    # The bridge calls this one internal POST with its own constant-time
+    # credential.  No other personal-agent path bypasses SCM auth middleware.
+    if (
+        request.method == "POST"
+        and request.path == "/api/scm/v1/agente/autorizacion"
+    ):
+        return True
     return False
 
 

@@ -13,6 +13,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  personal-agent-bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: services/openclaw_access_bridge
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: services/openclaw_access_bridge/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Build non-root bridge image
+        run: docker build -t scm-personal-access-ci .
+
   fast-suite:
     runs-on: ubuntu-latest
     timeout-minutes: 20
