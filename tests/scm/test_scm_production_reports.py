@@ -1,6 +1,6 @@
 from decimal import Decimal
 from io import BytesIO
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from types import SimpleNamespace
@@ -10,11 +10,16 @@ import pytest
 from openpyxl import load_workbook
 
 from app.extensions import db
+from app.models.scm_auditoria import ScmEvento
 from app.models.scm_ot import (
+    ScmAsignacionPersonalTrabajoOt,
     ScmAnulacionPesajeManga,
+    ScmControlPesoManga,
     ScmManga,
     ScmLoteArticulo,
     ScmPesajeManga,
+    ScmReaperturaManga,
+    ScmTramoMangaTrabajo,
     ScmTrabajoColor,
     ScmTrabajoOt,
 )
@@ -749,6 +754,87 @@ def test_tv_final_replaces_open_control_even_with_multiple_control_records():
     assert breakdown["finalizados"] == Decimal("90.6")
     assert breakdown["en_proceso"] == Decimal("0")
     assert breakdown["medido"] == Decimal("90.6")
+
+
+def test_tv_breakdown_excludes_foreign_known_and_pending_mangas_from_scope_counts():
+    work = SimpleNamespace(id="work-owned")
+    foreign = SimpleNamespace(id="work-foreign")
+    owned = _tv_manga(1, work, "2")
+    foreign_known = _tv_manga(2, foreign, "9")
+    foreign_pending = _tv_manga(3, foreign, "2")
+    foreign_pending._report_final_kg = None
+    foreign_pending._report_open_kg = None
+
+    breakdown = production_reports_service._progress_tv_breakdown(
+        {"works": [(work, None, None)], "mangas": {
+            1: owned, 2: foreign_known, 3: foreign_pending,
+        }},
+        201,
+        "KG",
+    )
+
+    assert breakdown["medido"] == Decimal("2")
+    assert breakdown["fisico_observado"] == Decimal("2")
+    assert breakdown["mangas_total"] == 1
+    assert breakdown["mangas_conocidas"] == 1
+    assert breakdown["pendientes_sin_peso"] == 0
+
+
+def test_standard_and_tv_share_incompatible_mixed_ledger_projection():
+    work = SimpleNamespace(id="work-owned")
+    foreign = SimpleNamespace(id="work-foreign")
+    own = _segment(1, "0", "4", "4")
+    own.trabajo = work
+    foreign_segment = _segment(2, "4", "9", "5")
+    foreign_segment.trabajo = foreign
+    ownerless = _segment(3, "9", "10", "1")
+    ownerless.trabajo = None
+    manga = SimpleNamespace(
+        id=88, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        _report_final_kg=Decimal("10"), _report_open_kg=None,
+        _report_segments=[own, foreign_segment, ownerless],
+        _report_all_segments=[own, foreign_segment, ownerless],
+        _report_weight_corrected=False, _report_quantity_un=None,
+        lote_articulo=SimpleNamespace(articulo=SimpleNamespace(id=201)),
+    )
+    standard_run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("10")),
+        "mangas": {88: manga}, "contexts": [{"work": work}],
+    }
+    standard = _run_manga_values(standard_run)
+    tv = production_reports_service._progress_tv_breakdown(
+        {"works": [(work, None, None)], "mangas": {88: manga}}, 201, "KG"
+    )
+
+    assert standard[:5] == (Decimal("4"), Decimal("0"), Decimal("4"), 1, 1)
+    assert tv["finalizados"] == Decimal("4")
+    assert tv["medido"] == Decimal("4")
+    assert tv["incomplete"] is True
+
+
+def test_standard_and_tv_do_not_fallback_incompatible_closed_ledger_to_whole_manga():
+    work = SimpleNamespace(id="work-invalid")
+    invalid = _segment(1, "0", "5", "4", quality="PENDIENTE")
+    invalid.trabajo = work
+    manga = SimpleNamespace(
+        id=89, estado="PESADA", trabajo=work, correccion_asignacion=None,
+        _report_final_kg=Decimal("5"), _report_open_kg=None,
+        _report_segments=[], _report_all_segments=[invalid],
+        _report_weight_corrected=False, _report_quantity_un=None,
+        lote_articulo=SimpleNamespace(articulo=SimpleNamespace(id=201)),
+    )
+
+    standard = _run_manga_values({
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("5")),
+        "mangas": {89: manga}, "contexts": [{"work": work}],
+    })
+    tv = production_reports_service._progress_tv_breakdown(
+        {"works": [(work, None, None)], "mangas": {89: manga}}, 201, "KG"
+    )
+
+    assert standard[:5] == (Decimal("0"), Decimal("0"), None, 1, 0)
+    assert tv["medido"] is None
+    assert tv["incomplete"] is True
 
 
 def test_tv_actual_keeps_open_control_with_active_unclosed_runtime_segment(monkeypatch):
@@ -1818,6 +1904,56 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         color_work.color_id_snapshot = 1
         weighed_manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-02").one()
         weighed_manga.lote_articulo = lot
+        weighing = ScmPesajeManga.query.filter_by(manga_id=weighed_manga.id).one()
+        event_time = datetime(2026, 8, 10, 6, 0, tzinfo=timezone.utc)
+        assignment = ScmAsignacionPersonalTrabajoOt(
+            trabajo_ot_id=blue.id, trabajador_id=seeded["full"].id,
+            estado="CERRADA", finalizada_at=event_time,
+            asignada_por_id=seeded["full"].id,
+            finalizada_por_id=seeded["full"].id,
+        )
+        db.session.add(assignment)
+        db.session.flush()
+        segment = ScmTramoMangaTrabajo(
+            manga_id=weighed_manga.id, trabajo_ot_id=blue.id,
+            asignacion_personal_trabajo_id=assignment.id, secuencia=1,
+            estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=95,
+            cantidad_atribuida_un=95, cantidad_inicio_kg=0,
+            cantidad_fin_kg=Decimal("11.500"), cantidad_atribuida_kg=Decimal("11.500"),
+            calidad_evidencia_kg="MEDIDA_DIRECTA_CIERRE_CONTROL",
+            cerrada_at=event_time,
+            created_by_id=seeded["full"].id,
+        )
+        db.session.add(segment)
+        db.session.flush()
+        controls = []
+        for index, net in enumerate((Decimal("10.000"), Decimal("11.000")), start=1):
+            controls.append(ScmControlPesoManga(
+                manga_id=weighed_manga.id, tramo_id=segment.id,
+                operation_id=uuid4(), source_system="TEST",
+                station_id="ST-OBS", capture_id=uuid4(), tipo="AVANCE_KG",
+                peso_bruto_kg=net + Decimal("0.100"), tara_kg=Decimal("0.100"),
+                peso_neto_kg=net, aporte_desde_control_anterior_kg=0,
+                tara_fuente="TIPO_MANGA", unidad_evidencia="KG",
+                calidad_evidencia="MEDIDA_DIRECTA", motivo=f"control {index}",
+                pesado_at=event_time + timedelta(minutes=index),
+                fecha_local_pesaje=date(2026, 8, 10), pesado_por_id=seeded["full"].id,
+            ))
+        db.session.add_all(controls)
+        db.session.flush()
+        db.session.add(ScmReaperturaManga(
+            manga_id=weighed_manga.id, pesaje_id=weighing.id,
+            motivo="Continuar llenado con evidencia", tipo_reapertura="CONTINUAR_LLENADO",
+            peso_base_neto_kg=Decimal("11.500"), reabierta_por_id=seeded["full"].id,
+            reabierta_at=event_time + timedelta(minutes=3), operation_id=uuid4(),
+        ))
+        db.session.add(ScmEvento(
+            aggregate_type="MANGA", aggregate_id=str(weighed_manga.id),
+            tipo="KG_MANGA_CLOSED_FROM_LAST_CONTROL", actor_id=seeded["full"].id,
+            actor_snapshot={"codigo": "OBS-FULL"}, motivo="cierre de control",
+            before_json={}, after_json={"control_fuente": {"id": str(controls[-1].public_id)}},
+            occurred_at=event_time + timedelta(minutes=2),
+        ))
         db.session.commit()
 
         response = client.get(
@@ -1833,6 +1969,20 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         assert row["pieza_id"] == piece.id
         assert row["avance"] == pytest.approx(11.5)
         assert row["estado_avance"] == "SOBREPRODUCCION"
+        loaded = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        loaded_manga = next(
+            row["mangas"][weighed_manga.id]
+            for row in loaded
+            if row["corrida"].id == corrida.id
+        )
+        assert loaded_manga._report_final_kg == Decimal("11.500")
+        assert loaded_manga._report_open_kg is None
+        assert len(loaded_manga._report_controls) == 2
+        assert loaded_manga._report_closure_event is None
+        assert len(loaded_manga.reaperturas) == 1
         assert db.session.get(ScmManga, weighed_manga.id).estado == "PENDIENTE_RECEPCION_ALMACEN"
 
 

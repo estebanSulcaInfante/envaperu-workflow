@@ -286,6 +286,41 @@ def _segment_conciliates(segments, net):
     return previous == net.quantize(KG) and total == net.quantize(KG)
 
 
+def _progress_segments(manga):
+    """Use one ledger projection for standard and TV reports.
+
+    The valid closed projection is preferred.  When it is empty, retain the
+    non-annulled all-segment view so an incompatible/active ledger cannot be
+    mistaken for a manga without ledger evidence.
+    """
+    valid = list(getattr(manga, "_report_segments", ()) or ())
+    all_segments = list(getattr(manga, "_report_all_segments", ()) or ())
+    valid_refs = {id(item) for item in valid}
+    if any(
+        str(getattr(segment, "estado", "")).upper() == "ACTIVO"
+        and _d(getattr(segment, "cantidad_fin_kg", None)) is None
+        for segment in all_segments
+    ) or any(id(segment) not in valid_refs for segment in all_segments):
+        return [
+            segment for segment in all_segments
+            if str(getattr(segment, "estado", "")).upper() != "ANULADO"
+        ]
+    if valid:
+        return valid
+    return [
+        segment for segment in all_segments
+        if str(getattr(segment, "estado", "")).upper() != "ANULADO"
+    ]
+
+
+def _has_active_open_segment(segments):
+    return any(
+        str(getattr(segment, "estado", "")).upper() == "ACTIVO"
+        and _d(getattr(segment, "cantidad_fin_kg", None)) is None
+        for segment in segments
+    )
+
+
 def _project_corrected_kg_segments(segments, net):
     """Project a corrected final NET onto the final closed segment only."""
     if not segments or net is None:
@@ -653,7 +688,7 @@ def _run_manga_values(run):
     for manga in run["mangas"].values():
         if str(getattr(manga, "estado", "")).upper() == "ANULADA":
             continue
-        segments = list(getattr(manga, "_report_segments", ()) or ())
+        segments = _progress_segments(manga)
         net, open_net = _effective_report_kg(manga)
         assigned = False
         # A vigente final replaces its prior control for advancement; the
@@ -684,6 +719,17 @@ def _run_manga_values(run):
             # effective owner without inventing or duplicating a kg amount.
             owner = effective_work(manga)
             assigned = owner is not None and str(owner.id) in work_ids
+            if assigned and open_net is not None and _has_active_open_segment(segments):
+                segment_owners = [
+                    effective_work_for_segment(manga, segment)
+                    for segment in segments
+                ]
+                if segment_owners and all(
+                    segment_owner is not None and str(segment_owner.id) in work_ids
+                    for segment_owner in segment_owners
+                ):
+                    opened += open_net
+                    attributed_evidence = True
         if not assigned and not segments:
             owner = effective_work(manga)
             assigned = owner is not None and str(owner.id) in work_ids
@@ -839,11 +885,25 @@ def _progress_tv_breakdown(run, article_id, unit):
         if article is None or getattr(article, "id", None) != article_id:
             continue
         owner = effective_work(manga)
-        segments = list(getattr(manga, "_report_all_segments", None) or getattr(manga, "_report_segments", ()) or ())
+        segments = _progress_segments(manga)
         net, open_net = _effective_report_kg(manga)
         # A final weighing is the vigente projection and replaces any older
         # control for advancement; expose the control only while still open.
         observed = net if net is not None else open_net
+        # A run can see a manga through an origin/destination correction or
+        # OT association.  Foreign ownership is diagnostic context, not
+        # physical evidence belonging to this output.
+        segment_owners_for_scope = [
+            effective_work_for_segment(manga, segment)
+            for segment in segments
+            if str(getattr(segment, "estado", "")).upper() != "ANULADO"
+        ]
+        has_scope_segment = any(
+            segment_owner is not None and segment_owner.id in work_ids
+            for segment_owner in segment_owners_for_scope
+        )
+        if owner is not None and owner.id not in work_ids and not has_scope_segment:
+            continue
         mangas_total += 1
         if observed is not None:
             observed_total += observed
@@ -893,7 +953,13 @@ def _progress_tv_breakdown(run, article_id, unit):
             elif unit == "KG":
                 valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
                 segment_owner_ids = {owner.id for owner in segment_owners if owner is not None}
-                if open_net is not None and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment:
+                if (
+                    open_net is not None
+                    and _has_active_open_segment(corrected_segments)
+                    and segment_owner_ids
+                    and segment_owner_ids <= work_ids
+                    and not has_ownerless_segment
+                ):
                     # An open control is a single current observation.  When
                     # every effective segment owner is this corrida, retain it
                     # even if the active segment has no closing endpoint.
@@ -924,10 +990,6 @@ def _progress_tv_breakdown(run, article_id, unit):
             # foreign contribution: it is an attribution failure.
             if net is not None or open_net is not None or _d(getattr(manga, "_report_quantity_un", None)) is not None:
                 incomplete = True
-            continue
-        if owner.id not in work_ids:
-            # Known foreign ownership is outside this objective and is ignored
-            # without making the current objective incomplete.
             continue
         if unit == "KG":
             if net is not None:
