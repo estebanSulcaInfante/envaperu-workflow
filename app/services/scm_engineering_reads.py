@@ -639,7 +639,9 @@ def _article_search_filters(query):
         ScmArticuloPiezaColor.pieza_color_sku,
         ScmDefinicionWip.descripcion,
         ScmArticuloProducto.producto_terminado_id,
-        func.replace(_sql_fold(ScmArticulo.clase), "_", ""),
+        # _like_literal folds every expression once. Folding here as well
+        # needlessly doubles nesting and overflows older SQLite parsers.
+        func.replace(ScmArticulo.clase, "_", ""),
     ]
     return [
         or_(*(_like_literal(column, term) for column in columns))

@@ -319,6 +319,20 @@ def test_c1_article_page_filters_aliases_terms_and_literal_search(app, client):
     payload = response.get_json()
     assert payload["total"] == 30
     assert all(item["clase"] == "SUBENSAMBLE_WIP" for item in payload["items"])
+    for alias, expected_class in (
+        ("piezacolor", "PIEZA_COLOR"),
+        ("subensamblewip", "SUBENSAMBLE_WIP"),
+    ):
+        alias_page = _get(
+            client, actor_id,
+            f"/api/scm/v1/articulos/pagina?q={alias}&limite=100",
+        )
+        assert alias_page.status_code == 200, alias_page.get_json()
+        assert alias_page.get_json()["total"] == 30
+        assert all(
+            item["clase"] == expected_class
+            for item in alias_page.get_json()["items"]
+        )
     literal = _get(
         client,
         actor_id,
