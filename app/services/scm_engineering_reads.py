@@ -3,9 +3,18 @@ import binascii
 import json
 import unicodedata
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import joinedload, selectinload
 
-from app.models.scm_articulos import ScmArticulo
+from app.models.scm_articulos import (
+    CLASE_PIEZA_COLOR,
+    CLASE_PRODUCTO_TERMINADO,
+    CLASE_SUBENSAMBLE_WIP,
+    ScmArticulo,
+    ScmArticuloPiezaColor,
+    ScmArticuloProducto,
+    ScmDefinicionWip,
+)
 from app.models.scm_empaque import (
     ScmPerfilEmpacable,
     ScmReglaEmpaque,
@@ -13,11 +22,14 @@ from app.models.scm_empaque import (
     ScmTipoContenedor,
 )
 from app.models.scm_estructuras import (
+    ESTADO_ESTRUCTURA_APROBADA,
     ESTADO_ESTRUCTURA_PENDIENTE,
+    ScmEstructuraComponente,
     ScmEstructuraRevision,
 )
 from app.models.scm_rutas import ESTADO_RUTA_BORRADOR, ScmRutaRevision
 from app.services.scm_service_support import ScmServiceError, load_actor
+from app.services.scm_structure_service import serialize_structure
 
 
 ENDPOINT = "ingenieria/aprobaciones"
@@ -95,18 +107,18 @@ def _like_literal(column, query):
     return _sql_fold(column).like(f"%{escaped}%", escape="\\")
 
 
-def _parse_limit(limit):
+def _parse_limit(limit, *, code="INVALID_ENGINEERING_APPROVAL_PAGE"):
     try:
         parsed = int(limit)
     except (TypeError, ValueError) as error:
         raise ScmServiceError(
-            "INVALID_ENGINEERING_APPROVAL_PAGE",
+            code,
             "limite debe ser un entero entre 1 y 100.",
             status_code=400,
         ) from error
     if parsed < 1 or parsed > MAX_LIMIT:
         raise ScmServiceError(
-            "INVALID_ENGINEERING_APPROVAL_PAGE",
+            code,
             "limite debe ser un entero entre 1 y 100.",
             status_code=400,
         )
@@ -477,6 +489,540 @@ def list_engineering_approvals(
             "estado": state,
             "capacidad": capability,
         },
+        "items": items,
+        "total": total,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
+
+
+# ---------------------------------------------------------------------------
+# B1H/C1/C2 additive readers
+# ---------------------------------------------------------------------------
+
+ARTICLE_PAGE_ENDPOINT = "articulos/pagina"
+ARTICLE_RESOLUTION_ENDPOINT = "articulos/resolver"
+STRUCTURE_HYDRATION_ENDPOINT = "estructuras/hidratacion"
+PACKAGING_PAGE_ENDPOINT = "reglas-empaque/pagina"
+ARTICLE_CLASSES = (
+    CLASE_PIEZA_COLOR,
+    CLASE_SUBENSAMBLE_WIP,
+    CLASE_PRODUCTO_TERMINADO,
+)
+
+
+def _invalid_read(code, message, *, details=None):
+    raise ScmServiceError(code, message, status_code=400, details=details)
+
+
+def _page_cursor_encode(*, endpoint, actor_id, capability, filters, order, last, code):
+    payload = {
+        "v": CURSOR_VERSION,
+        "actor_id": actor_id,
+        "capability": capability,
+        "endpoint": endpoint,
+        "filters": filters,
+        "order": order,
+        "last": last,
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    ).decode().rstrip("=")
+    if len(encoded) > MAX_CURSOR_LENGTH:
+        _invalid_read(code, "El cursor excede el limite permitido.")
+    return encoded
+
+
+def _page_cursor_decode(
+    cursor,
+    *,
+    endpoint,
+    actor_id,
+    capability,
+    filters,
+    order,
+    code,
+    last_shape,
+):
+    if cursor is None:
+        return None
+    if not isinstance(cursor, str) or not cursor or len(cursor) > MAX_CURSOR_LENGTH:
+        _invalid_read(code, "El cursor no es valido.")
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = json.loads(
+            base64.b64decode(
+                (cursor + padding).encode(),
+                altchars=b"-_",
+                validate=True,
+            ).decode()
+        )
+    except (ValueError, UnicodeError, json.JSONDecodeError, binascii.Error) as error:
+        raise ScmServiceError(code, "El cursor no es valido.", status_code=400) from error
+    if not isinstance(payload, dict):
+        _invalid_read(code, "El cursor no es valido.")
+    if (
+        type(payload.get("v")) is not int
+        or payload.get("v") != CURSOR_VERSION
+        or type(payload.get("actor_id")) is not int
+        or payload.get("actor_id") != actor_id
+        or payload.get("capability") != capability
+        or payload.get("endpoint") != endpoint
+        or payload.get("filters") != filters
+        or payload.get("order") != order
+        or not isinstance(payload.get("last"), list)
+        or len(payload.get("last")) != len(last_shape)
+        or any(
+            type(value) is not expected_type
+            for value, expected_type in zip(payload.get("last"), last_shape)
+        )
+    ):
+        _invalid_read(code, "El cursor no corresponde a los filtros actuales.")
+    return payload["last"]
+
+
+def _parse_query(value, *, code):
+    try:
+        normalized = _normalize(value, field="q")
+    except ScmServiceError as error:
+        raise ScmServiceError(code, error.message, status_code=error.status_code) from error
+    return _fold(normalized) if normalized is not None else None
+
+
+def _parse_id_csv(value, *, field, code, required=True, max_items=100):
+    if value is None:
+        if required:
+            _invalid_read(code, f"{field} es obligatorio.")
+        return []
+    if not isinstance(value, str) or not value.strip():
+        _invalid_read(code, f"{field} debe contener IDs positivos.")
+    parsed = []
+    seen = set()
+    for raw in value.split(","):
+        token = raw.strip()
+        if not token or not token.isdigit() or int(token) <= 0:
+            _invalid_read(code, f"{field} debe contener IDs positivos.")
+        item = int(token)
+        if item not in seen:
+            seen.add(item)
+            parsed.append(item)
+    if len(parsed) > max_items:
+        _invalid_read(code, f"{field} supera el limite de {max_items} IDs.")
+    return parsed
+
+
+def _article_page_classes(raw):
+    if raw is None:
+        return tuple(sorted(ARTICLE_CLASSES))
+    if not isinstance(raw, str) or not raw.strip():
+        _invalid_read("INVALID_ARTICLE_PAGE", "clases debe ser un CSV no vacio.")
+    values = tuple(sorted({token.strip().upper() for token in raw.split(",")}))
+    if not values or any(value not in ARTICLE_CLASSES for value in values):
+        _invalid_read("INVALID_ARTICLE_PAGE", "clases contiene una clase invalida.")
+    return values
+
+
+def _article_page_active(raw):
+    value = "all" if raw is None else raw.strip().lower()
+    if value not in {"all", "true", "false"}:
+        _invalid_read("INVALID_ARTICLE_PAGE", "activo debe ser all, true o false.")
+    return value
+
+
+def _article_search_filters(query):
+    if query is None:
+        return []
+    columns = [
+        ScmArticulo.codigo,
+        ScmArticulo.nombre,
+        ScmArticulo.clase,
+        ScmArticuloPiezaColor.pieza_color_sku,
+        ScmDefinicionWip.descripcion,
+        ScmArticuloProducto.producto_terminado_id,
+        func.replace(_sql_fold(ScmArticulo.clase), "_", ""),
+    ]
+    return [
+        or_(*(_like_literal(column, term) for column in columns))
+        for term in query.split(" ")
+    ]
+
+
+def _article_base(filters):
+    return (
+        select(ScmArticulo.id)
+        .select_from(ScmArticulo)
+        .outerjoin(ScmArticuloPiezaColor, ScmArticuloPiezaColor.articulo_id == ScmArticulo.id)
+        .outerjoin(ScmDefinicionWip, ScmDefinicionWip.articulo_id == ScmArticulo.id)
+        .outerjoin(ScmArticuloProducto, ScmArticuloProducto.articulo_id == ScmArticulo.id)
+        .where(*filters)
+    )
+
+
+def _article_projection(article):
+    return article.to_dict()
+
+
+def list_article_page(
+    session,
+    *,
+    actor_id,
+    query=None,
+    classes=None,
+    active="all",
+    limit=DEFAULT_LIMIT,
+    cursor=None,
+):
+    capability = "ARTICULO_VER"
+    load_actor(session, actor_id, capability=capability)
+    limit = _parse_limit(limit, code="INVALID_ARTICLE_PAGE")
+    classes = _article_page_classes(classes)
+    active = _article_page_active(active)
+    query = _parse_query(query, code="INVALID_ARTICLE_PAGE")
+    filters = [ScmArticulo.clase.in_(classes)]
+    if active != "all":
+        filters.append(ScmArticulo.activo.is_(active == "true"))
+    filters.extend(_article_search_filters(query))
+    base_filters = list(filters)
+    cursor_filters = {
+        "q": query,
+        "clases": list(classes),
+        "activo": active,
+        "limit": limit,
+    }
+    last = _page_cursor_decode(
+        cursor,
+        endpoint=ARTICLE_PAGE_ENDPOINT,
+        actor_id=actor_id,
+        capability=capability,
+        filters=cursor_filters,
+        order="codigo_asc_id_asc",
+        code="INVALID_ARTICLE_PAGE",
+        last_shape=(str, int),
+    )
+    page_filters = list(base_filters)
+    if last is not None:
+        page_filters.append(
+            or_(
+                ScmArticulo.codigo > last[0],
+                and_(ScmArticulo.codigo == last[0], ScmArticulo.id > last[1]),
+            )
+        )
+    base = _article_base(base_filters)
+    total = session.scalar(select(func.count()).select_from(base.subquery()))
+    statement = (
+        select(ScmArticulo)
+        .select_from(ScmArticulo)
+        .outerjoin(ScmArticuloPiezaColor, ScmArticuloPiezaColor.articulo_id == ScmArticulo.id)
+        .outerjoin(ScmDefinicionWip, ScmDefinicionWip.articulo_id == ScmArticulo.id)
+        .outerjoin(ScmArticuloProducto, ScmArticuloProducto.articulo_id == ScmArticulo.id)
+        .where(*page_filters)
+        .options(
+            selectinload(ScmArticulo.pieza_color),
+            selectinload(ScmArticulo.definicion_wip),
+            selectinload(ScmArticulo.producto),
+        )
+        .order_by(ScmArticulo.codigo, ScmArticulo.id)
+        .limit(limit + 1)
+    )
+    articles = session.scalars(statement).unique().all()
+    has_more = len(articles) > limit
+    articles = articles[:limit]
+    items = [_article_projection(article) for article in articles]
+    next_cursor = (
+        _page_cursor_encode(
+            endpoint=ARTICLE_PAGE_ENDPOINT,
+            code="INVALID_ARTICLE_PAGE",
+            actor_id=actor_id,
+            capability=capability,
+            filters=cursor_filters,
+            order="codigo_asc_id_asc",
+            last=[items[-1]["codigo"], items[-1]["id"]],
+        )
+        if has_more
+        else None
+    )
+    return {
+        "items": items,
+        "total": total,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
+
+
+def resolve_articles(session, *, actor_id, ids):
+    capability = "ARTICULO_VER"
+    load_actor(session, actor_id, capability=capability)
+    article_ids = _parse_id_csv(
+        ids,
+        field="ids",
+        code="INVALID_ARTICLE_RESOLUTION",
+    )
+    articles = session.scalars(
+        select(ScmArticulo)
+        .where(ScmArticulo.id.in_(article_ids))
+        .options(
+            selectinload(ScmArticulo.pieza_color),
+            selectinload(ScmArticulo.definicion_wip),
+            selectinload(ScmArticulo.producto),
+        )
+        .order_by(ScmArticulo.id)
+    ).unique().all()
+    found = {article.id for article in articles}
+    return {
+        "items": [_article_projection(article) for article in articles],
+        "missing_ids": [article_id for article_id in article_ids if article_id not in found],
+    }
+
+
+def hydrate_structures(session, *, actor_id, article_ids=None, revision_ids=None):
+    capability = "ESTRUCTURA_VER"
+    load_actor(session, actor_id, capability=capability)
+    article_ids = _parse_id_csv(
+        article_ids,
+        field="articulo_ids",
+        code="INVALID_STRUCTURE_HYDRATION",
+        required=False,
+    )
+    revision_ids = _parse_id_csv(
+        revision_ids,
+        field="revision_ids",
+        code="INVALID_STRUCTURE_HYDRATION",
+        required=False,
+    )
+    if not article_ids and not revision_ids:
+        _invalid_read(
+            "INVALID_STRUCTURE_HYDRATION",
+            "Se requiere articulo_ids o revision_ids.",
+        )
+    if len(article_ids) + len(revision_ids) > 100:
+        _invalid_read(
+            "INVALID_STRUCTURE_HYDRATION",
+            "La hidratacion supera el limite combinado de 100 IDs.",
+        )
+    options = (
+        joinedload(ScmEstructuraRevision.articulo_resultado),
+        selectinload(ScmEstructuraRevision.componentes).joinedload(
+            ScmEstructuraComponente.articulo_componente
+        ),
+    )
+    approved = session.scalars(
+        select(ScmEstructuraRevision)
+        .where(
+            ScmEstructuraRevision.articulo_resultado_id.in_(article_ids),
+            ScmEstructuraRevision.estado == ESTADO_ESTRUCTURA_APROBADA,
+        )
+        .options(*options)
+        .order_by(ScmEstructuraRevision.articulo_resultado_id)
+    ).unique().all() if article_ids else []
+    referenced = session.scalars(
+        select(ScmEstructuraRevision)
+        .where(ScmEstructuraRevision.id.in_(revision_ids))
+        .options(*options)
+        .order_by(ScmEstructuraRevision.id)
+    ).unique().all() if revision_ids else []
+    approved_found = {revision.articulo_resultado_id for revision in approved}
+    referenced_found = {revision.id for revision in referenced}
+    return {
+        "approved": [serialize_structure(revision) for revision in approved],
+        "referenced": [serialize_structure(revision) for revision in referenced],
+        "missing_article_ids": [article_id for article_id in article_ids if article_id not in approved_found],
+        "missing_revision_ids": [revision_id for revision_id in revision_ids if revision_id not in referenced_found],
+    }
+
+
+def _packaging_search_filters(query):
+    if query is None:
+        return []
+    columns = (
+        ScmPerfilEmpacable.codigo,
+        ScmPerfilEmpacable.nombre,
+        ScmPerfilEmpacable.descripcion_fisica,
+        ScmTipoContenedor.codigo,
+        ScmTipoContenedor.nombre,
+        ScmTipoContenedor.clase,
+    )
+    return [
+        or_(*(_like_literal(column, term) for column in columns))
+        for term in query.split(" ")
+    ]
+
+
+def _packaging_page_item(row):
+    return {
+        "revision_id": row.revision_id,
+        "regla_id": row.rule_id,
+        "numero_revision": row.numero_revision,
+        "estado": row.estado,
+        "version": row.version,
+        "medicion_fisica_probada": row.measured,
+        "cantidad_objetivo_un": row.target,
+        "cantidad_maxima_probada_un": row.tested,
+        "peso_neto_operativo_max_kg": _decimal(row.net_max),
+        "creada_por_id": row.created_by,
+        "created_at": _iso(row.created_at),
+        "updated_at": _iso(row.updated_at),
+        "perfil_empacable": {
+            "id": row.profile_id,
+            "codigo": row.profile_code,
+            "nombre": row.profile_name,
+            "descripcion_fisica": row.profile_description,
+            "activo": row.profile_active,
+        },
+        "tipo_contenedor": {
+            "id": row.container_id,
+            "codigo": row.container_code,
+            "clase": row.container_class,
+            "nombre": row.container_name,
+            "material": row.container_material,
+            "activo": row.container_active,
+        },
+    }
+
+
+def list_packaging_rule_page(
+    session,
+    *,
+    actor_id,
+    view="actual",
+    query=None,
+    profile_id=None,
+    container_id=None,
+    limit=DEFAULT_LIMIT,
+    cursor=None,
+):
+    capability = "EMPAQUE_VER"
+    load_actor(session, actor_id, capability=capability)
+    limit = _parse_limit(limit, code="INVALID_PACKAGING_RULE_PAGE")
+    view = "actual" if view is None else view.strip().lower()
+    if view not in {"actual", "historial"}:
+        _invalid_read("INVALID_PACKAGING_RULE_PAGE", "vista debe ser actual o historial.")
+    query = _parse_query(query, code="INVALID_PACKAGING_RULE_PAGE")
+    try:
+        profile_id = int(profile_id) if profile_id is not None else None
+        container_id = int(container_id) if container_id is not None else None
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError(
+            "INVALID_PACKAGING_RULE_PAGE",
+            "Los IDs de perfil y contenedor deben ser positivos.",
+            status_code=400,
+        ) from error
+    if profile_id is not None and profile_id <= 0:
+        _invalid_read("INVALID_PACKAGING_RULE_PAGE", "perfil_empacable_id debe ser positivo.")
+    if container_id is not None and container_id <= 0:
+        _invalid_read("INVALID_PACKAGING_RULE_PAGE", "tipo_contenedor_id debe ser positivo.")
+    states = ("BORRADOR", "APROBADA") if view == "actual" else ("RETIRADA",)
+    filters = [ScmReglaEmpaqueRevision.estado.in_(states)]
+    if profile_id is not None:
+        filters.append(ScmReglaEmpaque.perfil_empacable_id == profile_id)
+    if container_id is not None:
+        filters.append(ScmReglaEmpaque.tipo_contenedor_id == container_id)
+    filters.extend(_packaging_search_filters(query))
+    cursor_filters = {
+        "vista": view,
+        "q": query,
+        "perfil_empacable_id": profile_id,
+        "tipo_contenedor_id": container_id,
+        "limit": limit,
+    }
+    last = _page_cursor_decode(
+        cursor,
+        endpoint=PACKAGING_PAGE_ENDPOINT,
+        actor_id=actor_id,
+        capability=capability,
+        filters=cursor_filters,
+        order="perfil_codigo_asc_contenedor_codigo_asc_numero_revision_desc_revision_id_desc",
+        code="INVALID_PACKAGING_RULE_PAGE",
+        last_shape=(str, str, int, int),
+    )
+    joins = (
+        select(ScmReglaEmpaqueRevision.id)
+        .join(ScmReglaEmpaque, ScmReglaEmpaque.id == ScmReglaEmpaqueRevision.regla_id)
+        .join(ScmPerfilEmpacable, ScmPerfilEmpacable.id == ScmReglaEmpaque.perfil_empacable_id)
+        .join(ScmTipoContenedor, ScmTipoContenedor.id == ScmReglaEmpaque.tipo_contenedor_id)
+        .where(*filters)
+    )
+    total = session.scalar(select(func.count()).select_from(joins.subquery()))
+    if last is not None:
+        filters.append(
+            or_(
+                ScmPerfilEmpacable.codigo > last[0],
+                and_(
+                    ScmPerfilEmpacable.codigo == last[0],
+                    ScmTipoContenedor.codigo > last[1],
+                ),
+                and_(
+                    ScmPerfilEmpacable.codigo == last[0],
+                    ScmTipoContenedor.codigo == last[1],
+                    ScmReglaEmpaqueRevision.numero_revision < last[2],
+                ),
+                and_(
+                    ScmPerfilEmpacable.codigo == last[0],
+                    ScmTipoContenedor.codigo == last[1],
+                    ScmReglaEmpaqueRevision.numero_revision == last[2],
+                    ScmReglaEmpaqueRevision.id < last[3],
+                ),
+            )
+        )
+    rows = session.execute(
+        select(
+            ScmReglaEmpaqueRevision.id.label("revision_id"),
+            ScmReglaEmpaqueRevision.regla_id.label("rule_id"),
+            ScmReglaEmpaqueRevision.numero_revision,
+            ScmReglaEmpaqueRevision.estado,
+            ScmReglaEmpaqueRevision.version,
+            ScmReglaEmpaqueRevision.medicion_fisica_probada.label("measured"),
+            ScmReglaEmpaqueRevision.cantidad_objetivo_un.label("target"),
+            ScmReglaEmpaqueRevision.cantidad_maxima_probada_un.label("tested"),
+            ScmReglaEmpaqueRevision.peso_neto_operativo_max_kg.label("net_max"),
+            ScmReglaEmpaqueRevision.creada_por_id.label("created_by"),
+            ScmReglaEmpaqueRevision.created_at,
+            ScmReglaEmpaqueRevision.updated_at,
+            ScmPerfilEmpacable.id.label("profile_id"),
+            ScmPerfilEmpacable.codigo.label("profile_code"),
+            ScmPerfilEmpacable.nombre.label("profile_name"),
+            ScmPerfilEmpacable.descripcion_fisica.label("profile_description"),
+            ScmPerfilEmpacable.activo.label("profile_active"),
+            ScmTipoContenedor.id.label("container_id"),
+            ScmTipoContenedor.codigo.label("container_code"),
+            ScmTipoContenedor.clase.label("container_class"),
+            ScmTipoContenedor.nombre.label("container_name"),
+            ScmTipoContenedor.material.label("container_material"),
+            ScmTipoContenedor.activo.label("container_active"),
+        )
+        .join(ScmReglaEmpaque, ScmReglaEmpaque.id == ScmReglaEmpaqueRevision.regla_id)
+        .join(ScmPerfilEmpacable, ScmPerfilEmpacable.id == ScmReglaEmpaque.perfil_empacable_id)
+        .join(ScmTipoContenedor, ScmTipoContenedor.id == ScmReglaEmpaque.tipo_contenedor_id)
+        .where(*filters)
+        .order_by(
+            ScmPerfilEmpacable.codigo,
+            ScmTipoContenedor.codigo,
+            ScmReglaEmpaqueRevision.numero_revision.desc(),
+            ScmReglaEmpaqueRevision.id.desc(),
+        )
+        .limit(limit + 1)
+    ).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = [_packaging_page_item(row) for row in rows]
+    next_cursor = (
+        _page_cursor_encode(
+            endpoint=PACKAGING_PAGE_ENDPOINT,
+            code="INVALID_PACKAGING_RULE_PAGE",
+            actor_id=actor_id,
+            capability=capability,
+            filters=cursor_filters,
+            order="perfil_codigo_asc_contenedor_codigo_asc_numero_revision_desc_revision_id_desc",
+            last=[
+                items[-1]["perfil_empacable"]["codigo"],
+                items[-1]["tipo_contenedor"]["codigo"],
+                items[-1]["numero_revision"],
+                items[-1]["revision_id"],
+            ],
+        )
+        if has_more
+        else None
+    )
+    return {
         "items": items,
         "total": total,
         "has_more": has_more,

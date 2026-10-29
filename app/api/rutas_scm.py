@@ -92,7 +92,13 @@ from app.services.scm_packaging_service import (
     update_packable_profile,
     update_packaging_rule,
 )
-from app.services.scm_engineering_reads import list_engineering_approvals
+from app.services.scm_engineering_reads import (
+    hydrate_structures,
+    list_article_page,
+    list_engineering_approvals,
+    list_packaging_rule_page,
+    resolve_articles,
+)
 from app.services.scm_commercial_presentation_service import (
     create_commercial_presentation,
     list_commercial_presentations,
@@ -2014,6 +2020,28 @@ def articulos_listar():
     ))
 
 
+@scm_bp.get("/articulos/pagina")
+def articulos_pagina_listar():
+    return jsonify(list_article_page(
+        db.session,
+        actor_id=_actor_id(),
+        query=request.args.get("q"),
+        classes=request.args.get("clases"),
+        active=request.args.get("activo"),
+        limit=request.args.get("limite", 25),
+        cursor=request.args.get("cursor"),
+    ))
+
+
+@scm_bp.get("/articulos/resolver")
+def articulos_resolver():
+    return jsonify(resolve_articles(
+        db.session,
+        actor_id=_actor_id(),
+        ids=request.args.get("ids"),
+    ))
+
+
 @scm_bp.get("/mangas/<uuid:manga_id>/pesaje")
 def mangas_pesaje_detalle(manga_id):
     return jsonify(get_manga_weighing(
@@ -2145,6 +2173,16 @@ def estructuras_listar(article_id):
         db.session,
         actor_id=_actor_id(),
         article_id=article_id,
+    ))
+
+
+@scm_bp.get("/estructuras/hidratacion")
+def estructuras_hidratacion():
+    return jsonify(hydrate_structures(
+        db.session,
+        actor_id=_actor_id(),
+        article_ids=request.args.get("articulo_ids"),
+        revision_ids=request.args.get("revision_ids"),
     ))
 
 
@@ -2548,6 +2586,20 @@ def reglas_empaque_listar():
         actor_id=_actor_id(),
         profile_id=profile_id,
         container_id=container_id,
+    ))
+
+
+@scm_bp.get("/reglas-empaque/pagina")
+def reglas_empaque_pagina_listar():
+    return jsonify(list_packaging_rule_page(
+        db.session,
+        actor_id=_actor_id(),
+        view=request.args.get("vista"),
+        query=request.args.get("q"),
+        profile_id=request.args.get("perfil_empacable_id"),
+        container_id=request.args.get("tipo_contenedor_id"),
+        limit=request.args.get("limite", 25),
+        cursor=request.args.get("cursor"),
     ))
 
 
