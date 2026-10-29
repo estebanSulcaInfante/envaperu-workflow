@@ -685,6 +685,7 @@ def _run_manga_values(run):
     opened = Decimal("0")
     known = 0
     total = 0
+    measured_evidence = False
     for manga in run["mangas"].values():
         if str(getattr(manga, "estado", "")).upper() == "ANULADA":
             continue
@@ -710,6 +711,7 @@ def _run_manga_values(run):
             assigned = attributed > 0
             if assigned:
                 attributed_evidence = True
+                measured_evidence = True
                 if net is not None:
                     final += attributed
                 else:
@@ -730,6 +732,7 @@ def _run_manga_values(run):
                 ):
                     opened += open_net
                     attributed_evidence = True
+                    measured_evidence = True
         if not assigned and not segments:
             owner = effective_work(manga)
             assigned = owner is not None and str(owner.id) in work_ids
@@ -737,15 +740,20 @@ def _run_manga_values(run):
                 final += net or Decimal("0")
                 opened += open_net or Decimal("0")
                 attributed_evidence = net is not None or open_net is not None
+                measured_evidence = measured_evidence or attributed_evidence
         if assigned:
             total += 1
-            if attributed_evidence:
+            segment_ownerless = any(
+                effective_work_for_segment(manga, segment) is None
+                for segment in segments
+            )
+            if attributed_evidence and not segment_ownerless:
                 known += 1
     objective = _d(run["corrida"].objetivo_neto_kg)
     # Coverage describes completeness, not whether known evidence exists.
     # Keep the attributable final/open subtotal visible when another manga is
     # still pending evidence.
-    measured = final + opened if known > 0 else None
+    measured = final + opened if measured_evidence else None
     return final, opened, measured, total, known, objective
 
 
@@ -965,9 +973,16 @@ def _progress_tv_breakdown(run, article_id, unit):
                     # even if the active segment has no closing endpoint.
                     open_total += open_net
                     evidence = True
-                elif not has_kg_ledger and valid_un and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment and net is not None:
-                    final_total += net
-                    evidence = True
+                elif not has_kg_ledger and valid_un and net is not None:
+                    if not getattr(manga, "_report_all_segments", None):
+                        # Legacy in-memory callers without the all-segment
+                        # projection may prove one corrida owns the UN span.
+                        final_total += net
+                        evidence = True
+                    else:
+                        # Loaded multi-run ledgers never license attributing
+                        # the whole physical KG fact to one corrida.
+                        incomplete = True
                 elif has_ownerless_segment or has_own_segment:
                     incomplete = True
             elif unit == "UN":

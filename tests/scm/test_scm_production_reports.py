@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -15,6 +16,8 @@ from app.models.scm_ot import (
     ScmAsignacionPersonalTrabajoOt,
     ScmAnulacionPesajeManga,
     ScmControlPesoManga,
+    ScmCorreccionAsignacionManga,
+    ScmAsignacionPlanMangaOt,
     ScmManga,
     ScmLoteArticulo,
     ScmPesajeManga,
@@ -780,7 +783,7 @@ def test_tv_breakdown_excludes_foreign_known_and_pending_mangas_from_scope_count
     assert breakdown["pendientes_sin_peso"] == 0
 
 
-def test_standard_and_tv_share_incompatible_mixed_ledger_projection():
+def test_standard_and_tv_share_incompatible_mixed_ledger_projection(monkeypatch):
     work = SimpleNamespace(id="work-owned")
     foreign = SimpleNamespace(id="work-foreign")
     own = _segment(1, "0", "4", "4")
@@ -806,7 +809,23 @@ def test_standard_and_tv_share_incompatible_mixed_ledger_projection():
         {"works": [(work, None, None)], "mangas": {88: manga}}, 201, "KG"
     )
 
-    assert standard[:5] == (Decimal("4"), Decimal("0"), Decimal("4"), 1, 1)
+    assert standard[:5] == (Decimal("4"), Decimal("0"), Decimal("4"), 1, 0)
+    standard_run["corrida"] = SimpleNamespace(
+        id="run-mixed", codigo="C-MIXED", objetivo_neto_kg=Decimal("10"),
+        color_produccion=None, salidas=[],
+    )
+    standard_run.update({
+        "orden": SimpleNamespace(id="of-mixed", codigo="OF-MIXED", estado="EN_EJECUCION"),
+        "ot": None, "color_name": "Azul", "color_hex": None, "molde": None,
+    })
+    monkeypatch.setattr(
+        production_reports_service, "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [standard_run])
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+    assert item["kg_medidos_efectivos"] == 4.0
+    assert item["coverage"]["estado"] == "INCOMPLETA"
     assert tv["finalizados"] == Decimal("4")
     assert tv["medido"] == Decimal("4")
     assert tv["incomplete"] is True
@@ -1941,6 +1960,8 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
             ))
         db.session.add_all(controls)
         db.session.flush()
+        weighing.estado = "REABIERTO"
+        weighed_manga.estado = "EN_LLENADO"
         db.session.add(ScmReaperturaManga(
             manga_id=weighed_manga.id, pesaje_id=weighing.id,
             motivo="Continuar llenado con evidencia", tipo_reapertura="CONTINUAR_LLENADO",
@@ -1956,6 +1977,34 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         ))
         db.session.commit()
 
+        reopened_rows = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        reopened_manga = next(
+            row["mangas"][weighed_manga.id]
+            for row in reopened_rows
+            if row["corrida"].id == corrida.id
+        )
+        assert reopened_manga._report_final_kg is None
+        assert reopened_manga._report_open_kg == Decimal("11.000")
+        assert len(reopened_manga._report_controls) == 2
+        assert reopened_manga._report_closure_event is None
+
+        new_final = ScmPesajeManga(
+            manga_id=weighed_manga.id, operation_id=uuid4(), source_system="TEST",
+            station_id="ST-OBS", capture_id=uuid4(), peso_bruto_kg=Decimal("11.600"),
+            tara_kg=Decimal("0.100"), peso_fisico_neto_kg=Decimal("11.500"),
+            tara_fuente="TIPO_MANGA", cantidad_confirmada=Decimal("95"),
+            fuente_cantidad="PLAN_CONFIRMADO_POR_PESAJE", estado="VIGENTE",
+            kg_produccion_ot=Decimal("11.500"), pesada_at=event_time + timedelta(minutes=4),
+            fecha_local_pesaje=date(2026, 8, 10), dias_desfase_operativo=0,
+            pesado_por_id=seeded["full"].id, snapshots_json={}, created_at=event_time + timedelta(minutes=4),
+        )
+        db.session.add(new_final)
+        weighed_manga.estado = "PENDIENTE_RECEPCION_ALMACEN"
+        db.session.commit()
+
         response = client.get(
             "/api/scm/v1/observabilidad/avance-of-tv",
             headers={"X-Actor-Id": str(seeded["full"].id)},
@@ -1969,6 +2018,17 @@ def test_tv_progress_http_uses_real_corrected_weighing_and_output_relation(app, 
         assert row["pieza_id"] == piece.id
         assert row["avance"] == pytest.approx(11.5)
         assert row["estado_avance"] == "SOBREPRODUCCION"
+        standard_payload = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        standard_item = next(
+            item for item in standard_payload["items"]
+            if item["corrida_id"] == str(corrida.id)
+        )
+        assert standard_item["kg_finalizados_efectivos"] == pytest.approx(19.5)
+        assert standard_item["kg_medidos_en_abiertas"] == 0
+        assert standard_item["kg_medidos_efectivos"] == pytest.approx(19.5)
         loaded = production_reports_service._load_rows(
             db.session, production_reports_service._filters({}, require_dates=False),
             order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
@@ -2074,12 +2134,13 @@ def test_tv_progress_http_consolidates_real_multi_ot_contexts(app, client, scm_c
         assert len(cards[0]["salidas"]) == 1
 
 
-def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, scm_config):
+def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, client, scm_config):
     from test_scm_production_observability import _seed_observability_graph
     from app.models.scm_articulos import ScmArticulo
     from app.models.scm_ot import ScmAsignacionPersonalTrabajoOt, ScmTramoMangaTrabajo
 
     with app.app_context():
+        app.config["SECRET_KEY"] = "tv-02-server-secret-for-tests"
         seeded = _seed_observability_graph()
         order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
         db.session.add(ScmOrdenFabricacion(orden_operacion_id=order.id))
@@ -2128,18 +2189,34 @@ def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, sc
             assignments.append(assignment)
         db.session.add_all(assignments)
         db.session.flush()
-        db.session.add_all([
-            ScmTramoMangaTrabajo(
-                manga_id=manga.id, trabajo_ot_id=red.id, asignacion_personal_trabajo_id=assignments[0].id,
-                secuencia=1, estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=4,
-                cantidad_atribuida_un=4, created_by_id=seeded["full"].id,
-            ),
-            ScmTramoMangaTrabajo(
-                manga_id=manga.id, trabajo_ot_id=blue.id, asignacion_personal_trabajo_id=assignments[1].id,
-                secuencia=2, estado="CERRADO", cantidad_inicio_un=4, cantidad_fin_un=9,
-                cantidad_atribuida_un=5, created_by_id=seeded["full"].id,
-            ),
-        ])
+        first_segment = ScmTramoMangaTrabajo(
+            manga_id=manga.id, trabajo_ot_id=red.id, asignacion_personal_trabajo_id=assignments[0].id,
+            secuencia=1, estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=4,
+            cantidad_atribuida_un=4, created_by_id=seeded["full"].id,
+        )
+        second_segment = ScmTramoMangaTrabajo(
+            manga_id=manga.id, trabajo_ot_id=blue.id, asignacion_personal_trabajo_id=assignments[1].id,
+            secuencia=2, estado="CERRADO", cantidad_inicio_un=4, cantidad_fin_un=9,
+            cantidad_atribuida_un=5, created_by_id=seeded["full"].id,
+        )
+        db.session.add_all([first_segment, second_segment])
+        db.session.flush()
+        target_plan = ScmAsignacionPlanMangaOt(
+            plan_linea_id=manga.plan_linea_id, ot_id=red.orden_trabajo_id, trabajo_ot_id=blue.id,
+            cantidad_asignada_un=100, mangas_asignadas=1,
+            asignada_por_id=seeded["full"].id,
+        )
+        db.session.add(target_plan)
+        db.session.flush()
+        db.session.add(ScmCorreccionAsignacionManga(
+            manga_id=manga.id, origen_ot_id=red.orden_trabajo_id, origen_trabajo_ot_id=red.id,
+            destino_ot_id=blue.orden_trabajo_id, destino_trabajo_ot_id=blue.id,
+            origen_asignacion_id=assignments[0].id, destino_asignacion_id=assignments[1].id,
+            destino_asignacion_plan_id=target_plan.id, tramo_objetivo_id=first_segment.id,
+            manga_version_antes=manga.version, manga_version_despues=manga.version + 1,
+            motivo="Corrección de continuidad hacia trabajo destino", evidencia_json={"source": "test"},
+            actor_id=seeded["full"].id, operation_id=uuid4(),
+        ))
         db.session.commit()
 
         # Exercise the actual SQLAlchemy loader: the legacy KG-only segment
@@ -2153,10 +2230,40 @@ def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, sc
         manga_b = rows["C-TV-UN-B"]["mangas"][manga.id]
         assert manga_a._report_segments == manga_b._report_segments == []
         assert len(manga_a._report_all_segments) == len(manga_b._report_all_segments) == 2
-        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-A"], article.id, "UN") == (Decimal("4"), False)
-        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-B"], article.id, "UN") == (Decimal("5"), False)
-        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-A"], article.id, "KG") == (None, True)
+        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-A"], article.id, "UN") == (None, False)
+        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-B"], article.id, "UN") == (Decimal("9"), False)
+        assert production_reports_service._progress_tv_actual(rows["C-TV-UN-A"], article.id, "KG") == (None, False)
         assert production_reports_service._progress_tv_actual(rows["C-TV-UN-B"], article.id, "KG") == (None, True)
+        origin_kg = production_reports_service._progress_tv_breakdown(rows["C-TV-UN-A"], article.id, "KG")
+        destination_kg = production_reports_service._progress_tv_breakdown(rows["C-TV-UN-B"], article.id, "KG")
+        assert origin_kg["mangas_total"] == 0
+        assert destination_kg["mangas_total"] == 1
+
+        standard_payload = client.get(
+            "/api/scm/v1/observabilidad/avance-of",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        standard_rows = {
+            item["corrida_id"]: item for item in standard_payload["items"]
+            if item["corrida_id"] in {str(run_a.id), str(run_b.id)}
+        }
+        assert standard_rows[str(run_a.id)]["kg_medidos_efectivos"] is None
+        assert standard_rows[str(run_b.id)]["kg_medidos_efectivos"] == pytest.approx(8.0)
+
+        tv_payload = client.get(
+            "/api/scm/v1/observabilidad/avance-of-tv",
+            headers={"X-Actor-Id": str(seeded["full"].id)},
+        ).get_json()
+        tv_outputs = {
+            output["corrida_id"]: output
+            for item in tv_payload["items"]
+            for output in item["salidas"]
+            if output["corrida_id"] in {str(run_a.id), str(run_b.id)}
+        }
+        assert tv_outputs[str(run_a.id)]["avance"] is None
+        assert tv_outputs[str(run_b.id)]["avance"] is None
+        assert tv_outputs[str(run_a.id)]["mangas_total"] == 0
+        assert tv_outputs[str(run_b.id)]["mangas_total"] == 1
 
 
 def test_progress_http_hides_weights_without_manga_visibility(app, client, scm_config):
