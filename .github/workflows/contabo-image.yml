@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 267039f82f3b94dadd6fc3b8e3a2f1f214922a52
+  SOURCE_SHA: d9662d5581e780b0b9f64ae40208884f2add6403
   # The recipe checkout is tied to the immutable workflow commit that started this run.
   # The coordinator must record that commit in the release receipt before dispatch.
   RECIPE_SHA: ${{ github.sha }}

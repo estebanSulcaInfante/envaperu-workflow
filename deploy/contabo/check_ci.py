@@ -3,9 +3,9 @@ import json
 import os
 import re
 import urllib.request
-SOURCE_SHA='267039f82f3b94dadd6fc3b8e3a2f1f214922a52'
-RUN_ID=40968850223
-BRANCH='codex/personal-agent-route-20261029'
+SOURCE_SHA='d9662d5581e780b0b9f64ae40208884f2add6403'
+RUN_ID=41098144080
+BRANCH='codex/personal-agent-assets-20261030'
 REPOSITORY='estebanSulcaInfante/envaperu-workflow'
 RUN_URL=f'https://github.com/{REPOSITORY}/actions/runs/{RUN_ID}'
 def validate_inputs(source_sha, python_base):
