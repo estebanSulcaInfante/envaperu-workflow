@@ -225,6 +225,12 @@ test('HTTP proxy allowlist limits SPA/assets/media to the bound agent', async ()
   assert.equal((await head(`/fonts/instrument-sans.css?v=${nativeBuild}`)).status, 200);
   assert.equal((await get(`/fonts/jetbrains-mono.css?v=${nativeBuild}`)).status, 200);
   assert.equal((await get(`/provider-icons/codex.png?v=${nativeBuild}`)).status, 200);
+  assert.equal((await get(`/assets/main.js?v=${nativeBuild}`)).status, 200);
+  assert.equal((await get(`/assets/main.js?v=${'x'.repeat(160)}`)).status, 200);
+  assert.equal((await get(`/assets/main.js?v=a%2Fb`)).status, 404);
+  assert.equal((await get(`/assets/main.js?v=%C3%A9`)).status, 404);
+  assert.equal((await get(`/new?agent=${agentId}&v=${nativeBuild}`)).status, 404);
+  assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&sessionKey=agent:${agentId}:s&v=${nativeBuild}`)).status, 404);
   assert.equal((await get(`/fonts/instrument-sans.css?v=one&v=two`)).status, 404);
   assert.equal((await get(`/fonts/instrument-sans.css?%76=one&v=two`)).status, 404);
   assert.equal((await get(`/fonts/instrument-sans.css?v=%00`)).status, 404);
