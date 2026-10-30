@@ -220,6 +220,22 @@ test('HTTP proxy allowlist limits SPA/assets/media to the bound agent', async ()
   assert.equal((await get(`/assets/main.js?openclaw_mount_recovery=1793313894362`)).status, 404);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&sessionKey=agent:${agentId}:s&openclaw_mount_recovery=1793313894362`)).status, 404);
   assert.equal((await get('/control-ui-config.json?openclaw_mount_recovery=1793313894362')).status, 404);
+  const nativeBuild = '2026.9.8-fc23bc864e45-2026-10-02T18-21-06.010Z-987738c52d34b655508e269302eef45d770c63ff77a096e6ee6ee2016233811d';
+  assert.equal((await get(`/fonts/instrument-sans.css?v=${nativeBuild}`)).status, 200);
+  assert.equal((await head(`/fonts/instrument-sans.css?v=${nativeBuild}`)).status, 200);
+  assert.equal((await get(`/fonts/jetbrains-mono.css?v=${nativeBuild}`)).status, 200);
+  assert.equal((await get(`/provider-icons/codex.png?v=${nativeBuild}`)).status, 200);
+  assert.equal((await get(`/fonts/instrument-sans.css?v=one&v=two`)).status, 404);
+  assert.equal((await get(`/fonts/instrument-sans.css?%76=one&v=two`)).status, 404);
+  assert.equal((await get(`/fonts/instrument-sans.css?v=%00`)).status, 404);
+  assert.equal((await get(`/fonts/instrument-sans.css?v=`)).status, 404);
+  assert.equal((await get(`/fonts/instrument-sans.css?v=${'x'.repeat(161)}`)).status, 404);
+  assert.equal((await get(`/fonts/instrument-sans.css?v=${nativeBuild}&unknown=1`)).status, 404);
+  assert.equal((await get(`/fonts/instrument-sans.css?v=${nativeBuild}&agent=${agentId}`)).status, 404);
+  assert.equal((await get(`/fonts/instrument-sans.css?v=${nativeBuild}&agent=scm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`)).status, 404);
+  assert.equal((await get(`/api/${nativeBuild}.css?v=${nativeBuild}`)).status, 404);
+  assert.equal((await get(`/sw.js?v=${nativeBuild}`)).status, 404);
+  assert.equal((await get(`/fonts/%2e%2e/instrument-sans.css?v=${nativeBuild}`)).status, 404);
   assert.equal((await get('/assets/main.js')).status, 200);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&sessionKey=agent:${agentId}:s&meta=1`)).status, 200);
   assert.equal((await get(`/__openclaw__/assistant-media?agentId=${agentId}&agentId=${agentId}&sessionKey=agent:${agentId}:s`)).status, 404);
@@ -232,6 +248,8 @@ test('HTTP proxy allowlist limits SPA/assets/media to the bound agent', async ()
   assert.equal(post.status, 404);
   const postNew = await fetch(`http://127.0.0.1:${port}/new?agent=${agentId}&openclaw_mount_recovery=1793313894362`, { method: 'POST', headers: { Cookie: cookie, Origin: fixture.config.allowedOrigin }, body: 'x' });
   assert.equal(postNew.status, 404);
+  const postStatic = await fetch(`http://127.0.0.1:${port}/fonts/instrument-sans.css?v=${nativeBuild}`, { method: 'POST', headers: { Cookie: cookie, Origin: fixture.config.allowedOrigin }, body: 'x' });
+  assert.equal(postStatic.status, 404);
   await stop(fixture, bridge);
 });
 

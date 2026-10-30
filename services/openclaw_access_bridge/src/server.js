@@ -90,6 +90,14 @@ const validSpaRouteQuery = (url, ownAgentId) => {
   return /^\d{13}$/.test(url.searchParams.get('openclaw_mount_recovery'));
 };
 
+const validStaticQuery = (url) => {
+  if (!url.search) return true;
+  const values = url.searchParams.getAll('v');
+  return url.searchParams.size === 1
+    && values.length === 1
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(values[0]);
+};
+
 const allowedNativeRoute = (method, target, ownAgentId, rawUrl) => {
   if (!['GET', 'HEAD'].includes(method) || hasPathTraversal(rawUrl)) return false;
   const pathname = target.pathname;
@@ -110,7 +118,7 @@ const allowedNativeRoute = (method, target, ownAgentId, rawUrl) => {
     || pathname === '/manifest.webmanifest' || pathname === '/sw.js' || pathname === '/asset-manifest.json') return target.search === '';
   if (STATIC_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
     const extension = pathname.slice(pathname.lastIndexOf('/')).match(/\.[^.]+$/)?.[0]?.toLowerCase();
-    return Boolean(extension && STATIC_EXTENSIONS.has(extension) && target.search === '');
+    return Boolean(extension && STATIC_EXTENSIONS.has(extension) && validStaticQuery(target));
   }
   return false;
 };
