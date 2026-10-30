@@ -1,0 +1,1085 @@
+diff --git a/ui/src/app/browser-auth-recovery.test.ts b/ui/src/app/browser-auth-recovery.test.ts
+index e98cc82c..5694dd3c 100644
+--- a/ui/src/app/browser-auth-recovery.test.ts
++++ b/ui/src/app/browser-auth-recovery.test.ts
+@@ -5,6 +5,9 @@ import { registerSettingsEnglish } from "../i18n/locales/en-settings.ts";
+ import { getRenderedModalDialog, installDialogPolyfill } from "../test-helpers/modal-dialog.ts";
+ import { startBrowserAuthRecovery } from "./browser-auth-recovery.ts";
+ import { fetchControlUiResource, subscribeBrowserAuthRestored } from "./browser-http.ts";
++import { registerControlUiReloadGuard } from "./document-reload-guard.ts";
++
++const scmPersonalAccessEnabled = process.env.VITE_SCM_PERSONAL_ACCESS === "true";
+ 
+ function redirectResponse() {
+   return Object.defineProperty(new Response(null, { status: 302 }), "type", {
+@@ -53,7 +56,7 @@ describe("browser sign-in recovery", () => {
+     vi.useRealTimers();
+   });
+ 
+-  it.each(["browser", "native"])(
++  it.skipIf(scmPersonalAccessEnabled).each(["browser", "native"])(
+     "recovers failed reads through %s sign-in without navigating the chat",
+     async (host) => {
+       const reconnect = vi.fn();
+@@ -134,6 +137,71 @@ describe("browser sign-in recovery", () => {
+     },
+   );
+ 
++  it.runIf(scmPersonalAccessEnabled)(
++    "uses same-tab SCM recovery without iframe, credentials, or external prompts",
++    async () => {
++      stop();
++      stop = startBrowserAuthRecovery("/nested");
++      const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
++        if (init?.method === "HEAD") {
++          return redirectResponse();
++        }
++        throw new TypeError("Failed to fetch");
++      });
++      const opened = vi.spyOn(window, "open").mockReturnValue(null);
++      vi.stubGlobal("fetch", fetchMock);
++      await expect(
++        fetchControlUiResource("/nested/__openclaw__/assistant-media"),
++      ).rejects.toThrow();
++      await expect.poll(() => document.querySelector("openclaw-modal-dialog")).not.toBeNull();
++      const { dialog } = await getRenderedModalDialog(document.body);
++      expect(dialog.getAttribute("aria-label")).toBe("Tu sesión venció");
++      expect(document.querySelector("iframe")).toBeNull();
++      expect(document.body.textContent).toContain("Vuelve a SCM para continuar con tu agente.");
++      expect(document.body.textContent).not.toMatch(/sign in|new tab|password|token|not now/iu);
++      expect(document.querySelectorAll("button")).toHaveLength(1);
++      const cancel = new Event("modal-cancel", { bubbles: true, cancelable: true });
++      expect(document.querySelector("openclaw-modal-dialog")?.dispatchEvent(cancel)).toBe(false);
++      expect(cancel.defaultPrevented).toBe(true);
++      expect(document.querySelector("openclaw-modal-dialog")).not.toBeNull();
++      expect(button("Continuar con SCM")).not.toBeNull();
++
++      const assign = vi.fn();
++      const reload = vi.fn();
++      const currentLocation = new URL(window.location.href);
++      vi.stubGlobal("location", Object.assign(currentLocation, { assign, reload }));
++      button("Continuar con SCM").click();
++      expect(assign).toHaveBeenCalledWith(new URL("/nested/", currentLocation.origin).href);
++      expect(reload).not.toHaveBeenCalled();
++      expect(opened).not.toHaveBeenCalled();
++
++      assign.mockClear();
++      vi.stubGlobal(
++        "location",
++        Object.assign(new URL(new URL("/nested/", currentLocation.origin).href), {
++          assign,
++          reload,
++        }),
++      );
++      button("Continuar con SCM").click();
++      expect(assign).not.toHaveBeenCalled();
++      expect(reload).toHaveBeenCalledOnce();
++
++      const explain = vi.fn();
++      const release = registerControlUiReloadGuard(() => false, explain);
++      try {
++        assign.mockClear();
++        reload.mockClear();
++        button("Continuar con SCM").click();
++        expect(explain).toHaveBeenCalledOnce();
++        expect(assign).not.toHaveBeenCalled();
++        expect(reload).not.toHaveBeenCalled();
++      } finally {
++        release();
++      }
++    },
++  );
++
+   it.each(["offline", "missing", "server-error", "gateway-auth", "html"])(
+     "does not turn %s into a sign-in dialog",
+     async (failure) => {
+@@ -164,7 +232,7 @@ describe("browser sign-in recovery", () => {
+     },
+   );
+ 
+-  it.each(["stored-token", "stored-password"])(
++  it.skipIf(scmPersonalAccessEnabled).each(["stored-token", "stored-password"])(
+     "verifies renewed website access using the current %s credential",
+     async (acceptedCredential) => {
+       stop();
+@@ -212,69 +280,81 @@ describe("browser sign-in recovery", () => {
+     },
+   );
+ 
+-  it("discards recovery from a credential replaced while the probe was pending", async () => {
+-    stop();
+-    let token = "original-token";
+-    vi.spyOn(window, "open").mockReturnValue(null);
+-    stop = startBrowserAuthRecovery("/nested", () => ({ settings: { token } }));
+-    const probe = createDeferred<Response>();
+-    const success = () => new Response(null, { headers: { "content-type": "application/json" } });
+-    let probes = 0;
+-    vi.stubGlobal(
+-      "fetch",
+-      vi.fn(async (_url: string, init?: RequestInit) => {
+-        if (init?.method !== "HEAD") {
+-          throw new TypeError("Failed to fetch");
+-        }
+-        probes += 1;
+-        if (probes <= 2) {
+-          return redirectResponse();
+-        }
+-        if (probes === 3) {
+-          return probe.promise;
+-        }
+-        expect(new Headers(init.headers).get("Authorization")).toBe("Bearer replacement-token");
+-        return success();
+-      }),
+-    );
+-    const restored = vi.fn();
+-    onTestFinished(subscribeBrowserAuthRestored(restored));
+-    await expect(fetchControlUiResource("/nested/__openclaw__/assistant-media")).rejects.toThrow();
+-    await finishRenewal();
+-    await expect.poll(() => document.querySelector("openclaw-modal-dialog")).not.toBeNull();
+-    await getRenderedModalDialog(document.body);
+-    button("Sign in").click();
+-    window.dispatchEvent(new Event("focus"));
+-    token = "replacement-token";
+-    probe.resolve(success());
+-    await expect.poll(() => button("Check again").disabled).toBe(false);
+-    expect(restored).not.toHaveBeenCalled();
+-    expect(document.querySelector("openclaw-modal-dialog")).not.toBeNull();
+-    button("Check again").click();
+-    await expect.poll(() => restored.mock.calls.length).toBe(1);
+-  });
++  it.skipIf(scmPersonalAccessEnabled)(
++    "discards recovery from a credential replaced while the probe was pending",
++    async () => {
++      stop();
++      let token = "original-token";
++      vi.spyOn(window, "open").mockReturnValue(null);
++      stop = startBrowserAuthRecovery("/nested", () => ({ settings: { token } }));
++      const probe = createDeferred<Response>();
++      const success = () => new Response(null, { headers: { "content-type": "application/json" } });
++      let probes = 0;
++      vi.stubGlobal(
++        "fetch",
++        vi.fn(async (_url: string, init?: RequestInit) => {
++          if (init?.method !== "HEAD") {
++            throw new TypeError("Failed to fetch");
++          }
++          probes += 1;
++          if (probes <= 2) {
++            return redirectResponse();
++          }
++          if (probes === 3) {
++            return probe.promise;
++          }
++          expect(new Headers(init.headers).get("Authorization")).toBe("Bearer replacement-token");
++          return success();
++        }),
++      );
++      const restored = vi.fn();
++      onTestFinished(subscribeBrowserAuthRestored(restored));
++      await expect(
++        fetchControlUiResource("/nested/__openclaw__/assistant-media"),
++      ).rejects.toThrow();
++      await finishRenewal();
++      await expect.poll(() => document.querySelector("openclaw-modal-dialog")).not.toBeNull();
++      await getRenderedModalDialog(document.body);
++      button("Sign in").click();
++      window.dispatchEvent(new Event("focus"));
++      token = "replacement-token";
++      probe.resolve(success());
++      await expect.poll(() => button("Check again").disabled).toBe(false);
++      expect(restored).not.toHaveBeenCalled();
++      expect(document.querySelector("openclaw-modal-dialog")).not.toBeNull();
++      button("Check again").click();
++      await expect.poll(() => restored.mock.calls.length).toBe(1);
++    },
++  );
+ 
+-  it("keeps dismissal quiet across later automatic attachment retries", async () => {
+-    vi.stubGlobal(
+-      "fetch",
+-      vi.fn(async (_url: string, init?: RequestInit) => {
+-        if (init?.method === "HEAD") {
+-          return redirectResponse();
+-        }
+-        throw new TypeError("Failed to fetch");
+-      }),
+-    );
+-    await expect(fetchControlUiResource("/nested/__openclaw__/assistant-media")).rejects.toThrow();
+-    await finishRenewal();
+-    await expect.poll(() => document.querySelector("openclaw-modal-dialog")).not.toBeNull();
+-    await getRenderedModalDialog(document.body);
+-    button("Not now").click();
+-    now += 30_001;
+-    await expect(fetchControlUiResource("/nested/__openclaw__/assistant-media")).rejects.toThrow();
+-    await Promise.resolve();
+-    expect(document.querySelector("openclaw-modal-dialog")).toBeNull();
+-    expect(document.querySelector("iframe")).toBeNull();
+-  });
++  it.skipIf(scmPersonalAccessEnabled)(
++    "keeps dismissal quiet across later automatic attachment retries",
++    async () => {
++      vi.stubGlobal(
++        "fetch",
++        vi.fn(async (_url: string, init?: RequestInit) => {
++          if (init?.method === "HEAD") {
++            return redirectResponse();
++          }
++          throw new TypeError("Failed to fetch");
++        }),
++      );
++      await expect(
++        fetchControlUiResource("/nested/__openclaw__/assistant-media"),
++      ).rejects.toThrow();
++      await finishRenewal();
++      await expect.poll(() => document.querySelector("openclaw-modal-dialog")).not.toBeNull();
++      await getRenderedModalDialog(document.body);
++      button("Not now").click();
++      now += 30_001;
++      await expect(
++        fetchControlUiResource("/nested/__openclaw__/assistant-media"),
++      ).rejects.toThrow();
++      await Promise.resolve();
++      expect(document.querySelector("openclaw-modal-dialog")).toBeNull();
++      expect(document.querySelector("iframe")).toBeNull();
++    },
++  );
+ 
+   it("ignores external requests, sibling roots, and aborted callers", async () => {
+     const fetchMock = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+@@ -288,56 +368,66 @@ describe("browser sign-in recovery", () => {
+     expect(document.querySelector("openclaw-modal-dialog")).toBeNull();
+   });
+ 
+-  it.each(["timeout", "stop"])("cleans up a pending renewal on %s", async (outcome) => {
+-    vi.useFakeTimers();
+-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+-      if (init?.method === "HEAD") {
+-        return redirectResponse();
++  it.skipIf(scmPersonalAccessEnabled).each(["timeout", "stop"])(
++    "cleans up a pending renewal on %s",
++    async (outcome) => {
++      vi.useFakeTimers();
++      const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
++        if (init?.method === "HEAD") {
++          return redirectResponse();
++        }
++        throw new TypeError("Failed to fetch");
++      });
++      vi.stubGlobal("fetch", fetchMock);
++      const restored = vi.fn();
++      onTestFinished(subscribeBrowserAuthRestored(restored));
++      await expect(
++        fetchControlUiResource("/nested/__openclaw__/assistant-media"),
++      ).rejects.toThrow();
++      await vi.advanceTimersByTimeAsync(0);
++      expect(document.querySelector("iframe")).not.toBeNull();
++      if (outcome === "stop") {
++        stop();
+       }
+-      throw new TypeError("Failed to fetch");
+-    });
+-    vi.stubGlobal("fetch", fetchMock);
+-    const restored = vi.fn();
+-    onTestFinished(subscribeBrowserAuthRestored(restored));
+-    await expect(fetchControlUiResource("/nested/__openclaw__/assistant-media")).rejects.toThrow();
+-    await vi.advanceTimersByTimeAsync(0);
+-    expect(document.querySelector("iframe")).not.toBeNull();
+-    if (outcome === "stop") {
+-      stop();
+-    }
+-    await vi.advanceTimersByTimeAsync(10_000);
+-    expect(document.querySelector("iframe")).toBeNull();
+-    expect(restored).not.toHaveBeenCalled();
+-    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "HEAD")).toHaveLength(
+-      outcome === "stop" ? 1 : 2,
+-    );
+-    expect(document.querySelectorAll("openclaw-modal-dialog")).toHaveLength(
+-      outcome === "stop" ? 0 : 1,
+-    );
+-  });
++      await vi.advanceTimersByTimeAsync(10_000);
++      expect(document.querySelector("iframe")).toBeNull();
++      expect(restored).not.toHaveBeenCalled();
++      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "HEAD")).toHaveLength(
++        outcome === "stop" ? 1 : 2,
++      );
++      expect(document.querySelectorAll("openclaw-modal-dialog")).toHaveLength(
++        outcome === "stop" ? 0 : 1,
++      );
++    },
++  );
+ 
+-  it("discards a renewal when Gateway credentials change during navigation", async () => {
+-    stop();
+-    let token = "original-token";
+-    stop = startBrowserAuthRecovery("/nested", () => ({ settings: { token } }));
+-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+-      if (init?.method === "HEAD") {
+-        return redirectResponse();
+-      }
+-      throw new TypeError("Failed to fetch");
+-    });
+-    vi.stubGlobal("fetch", fetchMock);
+-    const restored = vi.fn();
+-    onTestFinished(subscribeBrowserAuthRestored(restored));
+-    await expect(fetchControlUiResource("/nested/__openclaw__/assistant-media")).rejects.toThrow();
+-    await expect.poll(() => document.querySelector("iframe")).not.toBeNull();
+-    token = "replacement-token";
+-    await finishRenewal();
+-    expect(document.querySelector("iframe")).toBeNull();
+-    expect(document.querySelector("openclaw-modal-dialog")).toBeNull();
+-    expect(restored).not.toHaveBeenCalled();
+-    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "HEAD")).toHaveLength(1);
+-  });
++  it.skipIf(scmPersonalAccessEnabled)(
++    "discards a renewal when Gateway credentials change during navigation",
++    async () => {
++      stop();
++      let token = "original-token";
++      stop = startBrowserAuthRecovery("/nested", () => ({ settings: { token } }));
++      const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
++        if (init?.method === "HEAD") {
++          return redirectResponse();
++        }
++        throw new TypeError("Failed to fetch");
++      });
++      vi.stubGlobal("fetch", fetchMock);
++      const restored = vi.fn();
++      onTestFinished(subscribeBrowserAuthRestored(restored));
++      await expect(
++        fetchControlUiResource("/nested/__openclaw__/assistant-media"),
++      ).rejects.toThrow();
++      await expect.poll(() => document.querySelector("iframe")).not.toBeNull();
++      token = "replacement-token";
++      await finishRenewal();
++      expect(document.querySelector("iframe")).toBeNull();
++      expect(document.querySelector("openclaw-modal-dialog")).toBeNull();
++      expect(restored).not.toHaveBeenCalled();
++      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "HEAD")).toHaveLength(1);
++    },
++  );
+ 
+   it("discards an in-flight probe when its document owner stops", async () => {
+     const probe = createDeferred<Response>();
+diff --git a/ui/src/app/browser-auth-recovery.ts b/ui/src/app/browser-auth-recovery.ts
+index 3a26ad6e..edf59992 100644
+--- a/ui/src/app/browser-auth-recovery.ts
++++ b/ui/src/app/browser-auth-recovery.ts
+@@ -10,8 +10,25 @@ import {
+   resolveControlUiAuthCandidates,
+   type ControlUiAuthSource,
+ } from "./control-ui-auth.ts";
++import { canReloadControlUiDocument } from "./document-reload-guard.ts";
+ import { webKitHostWindow } from "./native-webkit-bridge.ts";
+ 
++type ViteImportMeta = ImportMeta & {
++  readonly env?: {
++    readonly VITE_SCM_PERSONAL_ACCESS?: string;
++  };
++};
++
++function isScmPersonalAccessEnabled(): boolean {
++  return (import.meta as ViteImportMeta).env?.VITE_SCM_PERSONAL_ACCESS === "true";
++}
++
++const SCM_RECOVERY_COPY = {
++  title: "Tu sesión venció",
++  summary: "Vuelve a SCM para continuar con tu agente.",
++  action: "Continuar con SCM",
++} as const;
++
+ function renewBrowserSession(url: URL, signal: AbortSignal): Promise<void> {
+   if (signal.aborted) {
+     return Promise.resolve();
+@@ -44,6 +61,7 @@ export function startBrowserAuthRecovery(
+   getAuth: () => ControlUiAuthSource = () => ({}),
+ ): () => void {
+   const root = new URL(`${normalizeBasePath(resourceBasePath)}/`, window.location.origin);
++  const scmNativeRecovery = isScmPersonalAccessEnabled() && root.origin === window.location.origin;
+   const probeUrl = new URL(CONTROL_UI_BOOTSTRAP_CONFIG_PATH.slice(1), root);
+   const lifetime = new AbortController();
+   let pending: Promise<void> | undefined;
+@@ -59,41 +77,69 @@ export function startBrowserAuthRecovery(
+       return;
+     }
+     void withPromiseModalHost({ signal: lifetime.signal, value: undefined }, (modal) => {
+-      const dismiss = () => {
++      const dismiss = (event?: Event) => {
++        if (scmNativeRecovery) {
++          event?.preventDefault();
++          return;
++        }
+         dismissed = true;
+         modal.finish(undefined);
+       };
+       const content = () => html`
+         <openclaw-modal-dialog
+-          label=${t("connection.browserSignIn.title")}
+-          description=${t("connection.browserSignIn.description")}
++          label=${scmNativeRecovery ? SCM_RECOVERY_COPY.title : t("connection.browserSignIn.title")}
++          description=${scmNativeRecovery ? SCM_RECOVERY_COPY.summary : t("connection.browserSignIn.description")}
+           @modal-cancel=${dismiss}
+         >
+           <div class="exec-approval-card">
+             <div class="exec-approval-header">
+               <div style="min-width: 0">
+-                <div class="exec-approval-title">${t("connection.browserSignIn.title")}</div>
++                <div class="exec-approval-title">
++                  ${scmNativeRecovery ? SCM_RECOVERY_COPY.title : t("connection.browserSignIn.title")}
++                </div>
+                 <div class="exec-approval-sub" style="white-space: normal">
+-                  ${t("connection.browserSignIn.description")}
++                  ${scmNativeRecovery ? SCM_RECOVERY_COPY.summary : t("connection.browserSignIn.description")}
+                 </div>
+               </div>
+             </div>
+-            ${openedSignIn ? html`<p>${t("connection.browserSignIn.returnHint")}</p>` : nothing}
+-            <p role="status" aria-live="polite">
+-              ${
+-                pending
+-                  ? t("connection.browserSignIn.checking")
+-                  : probeResult === "unavailable"
+-                    ? t("connection.browserSignIn.unavailable")
+-                    : probeResult === "sign-in"
+-                      ? t("connection.browserSignIn.stillRequired")
+-                      : nothing
+-              }
+-            </p>
++            ${
++              scmNativeRecovery
++                ? nothing
++                : openedSignIn
++                  ? html`<p>${t("connection.browserSignIn.returnHint")}</p>`
++                  : nothing
++            }
++            ${
++              scmNativeRecovery
++                ? nothing
++                : html`<p role="status" aria-live="polite">
++                    ${
++                      pending
++                        ? t("connection.browserSignIn.checking")
++                        : probeResult === "unavailable"
++                          ? t("connection.browserSignIn.unavailable")
++                          : probeResult === "sign-in"
++                            ? t("connection.browserSignIn.stillRequired")
++                            : nothing
++                    }
++                  </p>`
++            }
+             <div class="exec-approval-actions">
+               <button
+                 class="btn primary"
+                 @click=${async () => {
++                  if (scmNativeRecovery) {
++                    if (lifetime.signal.aborted || dismissed || !canReloadControlUiDocument(true)) {
++                      return;
++                    }
++                    const current = new URL(globalThis.location.href);
++                    if (current.href === root.href) {
++                      globalThis.location.reload();
++                    } else {
++                      globalThis.location.assign(root.href);
++                    }
++                    return;
++                  }
+                   if (webKitHostWindow()?.webkit?.messageHandlers?.openclawGateways) {
+                     const { nativeGatewaysCapability } =
+                       await import("./native-gateways.runtime.ts");
+@@ -114,12 +160,22 @@ export function startBrowserAuthRecovery(
+                   modal.render(content);
+                 }}
+               >
+-                ${t("connection.browserSignIn.action")}
+-              </button>
+-              ${openedSignIn ? html`<button class="btn" ?disabled=${Boolean(pending)} @click=${() => void check(true)}>${t("connection.browserSignIn.checkAgain")}</button>` : nothing}
+-              <button class="btn" @click=${dismiss}>
+-                ${t("connection.browserSignIn.dismiss")}
++                ${scmNativeRecovery ? SCM_RECOVERY_COPY.action : t("connection.browserSignIn.action")}
+               </button>
++              ${
++                scmNativeRecovery
++                  ? nothing
++                  : openedSignIn
++                    ? html`<button
++                        class="btn"
++                        ?disabled=${Boolean(pending)}
++                        @click=${() => void check(true)}
++                      >
++                        ${t("connection.browserSignIn.checkAgain")}
++                      </button>`
++                    : nothing
++              }
++              ${scmNativeRecovery ? nothing : html`<button class="btn" @click=${dismiss}>${t("connection.browserSignIn.dismiss")}</button>`}
+             </div>
+           </div>
+         </openclaw-modal-dialog>
+@@ -168,13 +224,15 @@ export function startBrowserAuthRecovery(
+         }
+         if (response.type === "opaqueredirect" && !signInRequired) {
+           signInRequired = true;
+-          await renewBrowserSession(probeUrl, lifetime.signal);
+-          if (!isCurrent()) {
+-            return;
++          if (!scmNativeRecovery) {
++            await renewBrowserSession(probeUrl, lifetime.signal);
++            if (!isCurrent()) {
++              return;
++            }
++            // Login/error pages can also finish loading (or refuse framing).
++            // Only a fresh authenticated probe establishes renewed HTTP access.
++            response = await probe();
+           }
+-          // Login/error pages can also finish loading (or refuse framing).
+-          // Only a fresh authenticated probe establishes renewed HTTP access.
+-          response = await probe();
+         }
+         if (!isCurrent()) {
+           return;
+diff --git a/ui/src/components/app-sidebar-session-catalog-live.test.ts b/ui/src/components/app-sidebar-session-catalog-live.test.ts
+index 142cc406..972bc875 100644
+--- a/ui/src/components/app-sidebar-session-catalog-live.test.ts
++++ b/ui/src/components/app-sidebar-session-catalog-live.test.ts
+@@ -5,7 +5,11 @@ import type {
+   SessionCatalogHost,
+ } from "../../../packages/gateway-protocol/src/index.ts";
+ import type { GatewayBrowserClient } from "../api/gateway.ts";
+-import { SessionCatalogLiveState } from "./app-sidebar-session-catalog-live.ts";
++import type { ApplicationGatewaySnapshot } from "../app/gateway.ts";
++import {
++  SessionCatalogLiveState,
++  sessionCatalogListClient,
++} from "./app-sidebar-session-catalog-live.ts";
+ import { refetchExpandedSessionCatalogPages } from "./app-sidebar-session-catalog-state.ts";
+ import { sessionCatalogHostKey } from "./app-sidebar-session-types.ts";
+ 
+@@ -34,6 +38,41 @@ function catalog(id: string, hostCount: number): SessionCatalog {
+ }
+ 
+ describe("SessionCatalogLiveState", () => {
++  it.each([
++    { name: "missing auth", auth: undefined },
++    { name: "session-only auth", auth: { role: "operator", scopes: ["operator.sessions.read"] } },
++    { name: "unrelated auth", auth: { role: "operator", scopes: ["operator.talk"] } },
++  ])("does not activate native catalog for $name", ({ auth }) => {
++    const client = {} as GatewayBrowserClient;
++    const snapshot = {
++      client,
++      phase: "connected",
++      hello: {
++        auth,
++        features: { methods: ["sessions.catalog.list"] },
++      },
++    } as ApplicationGatewaySnapshot;
++
++    expect(sessionCatalogListClient(snapshot, true)).toBeNull();
++  });
++
++  it.each([
++    { name: "read", scopes: ["operator.read"] },
++    { name: "admin", scopes: ["operator.admin"] },
++  ])("activates native catalog for $name scope", ({ scopes }) => {
++    const client = {} as GatewayBrowserClient;
++    const snapshot = {
++      client,
++      phase: "connected",
++      hello: {
++        auth: { role: "operator", scopes },
++        features: { methods: ["sessions.catalog.list"] },
++      },
++    } as ApplicationGatewaySnapshot;
++
++    expect(sessionCatalogListClient(snapshot, true)).toBe(client);
++  });
++
+   it.each(["final", "incremental"] as const)(
+     "retains rows and cursors for a pending host in %s publications",
+     async (publication) => {
+diff --git a/ui/src/components/app-sidebar-session-catalog-live.ts b/ui/src/components/app-sidebar-session-catalog-live.ts
+index 83b53720..ebd85fa0 100644
+--- a/ui/src/components/app-sidebar-session-catalog-live.ts
++++ b/ui/src/components/app-sidebar-session-catalog-live.ts
+@@ -8,7 +8,7 @@ import { GatewayRequestError, type GatewayBrowserClient } from "../api/gateway.t
+ import type { ApplicationGatewaySnapshot } from "../app/gateway.ts";
+ import { formatUiError } from "../lib/format-error.ts";
+ import { isAwaitingGatewayFailure } from "../lib/gateway-availability.ts";
+-import { isGatewayMethodAdvertised } from "../lib/gateway-methods.ts";
++import { canCallGatewayMethod } from "../lib/gateway-methods.ts";
+ import { createSessionEventRefreshCoordinator } from "../lib/sessions/event-refresh-coordinator.ts";
+ import { normalizeAgentId } from "../lib/sessions/session-key.ts";
+ import { generateUUID } from "../lib/uuid.ts";
+@@ -30,7 +30,7 @@ export function sessionCatalogListClient(
+     !connected ||
+     snapshot?.phase !== "connected" ||
+     !snapshot.client ||
+-    isGatewayMethodAdvertised(snapshot, "sessions.catalog.list") !== true
++    !canCallGatewayMethod(snapshot, "sessions.catalog.list", "operator.read")
+   ) {
+     return null;
+   }
+diff --git a/ui/src/components/login-gate.test.ts b/ui/src/components/login-gate.test.ts
+index 307bbb3d..f1240c71 100644
+--- a/ui/src/components/login-gate.test.ts
++++ b/ui/src/components/login-gate.test.ts
+@@ -6,6 +6,8 @@ import { registerControlUiReloadGuard } from "../app/document-reload-guard.ts";
+ import { showToast } from "../lib/toast.ts";
+ import "./login-gate.ts";
+ 
++const scmPersonalAccessEnabled = process.env.VITE_SCM_PERSONAL_ACCESS === "true";
++
+ type LoginGateElement = HTMLElement & {
+   props: Record<string, unknown>;
+   updateComplete: Promise<boolean>;
+@@ -36,6 +38,7 @@ async function mountFailure(lastError: string, lastErrorCode: string | null, sec
+ afterEach(() => {
+   document.body.replaceChildren();
+   vi.unstubAllGlobals();
++  vi.unstubAllEnvs();
+   vi.restoreAllMocks();
+   Reflect.deleteProperty(document, "execCommand");
+ });
+@@ -150,6 +153,98 @@ describe("login gate failure recovery", () => {
+     );
+   });
+ 
++  it("gates same-origin verified identity recovery behind the SCM build flag", async () => {
++    const assign = vi.fn();
++    vi.stubGlobal("location", Object.assign(new URL("https://scm.example/chat/main"), { assign }));
++    const element = await mountFailure(
++      "operator role policies require a verified user identity",
++      ConnectErrorDetailCodes.AUTH_VERIFIED_USER_REQUIRED,
++    );
++    element.props = {
++      ...element.props,
++      gatewayUrl: "wss://scm.example",
++      resourceBasePath: "/mi-agente",
++      secret: "expired-secret",
++    };
++    await element.updateComplete;
++
++    const failure = element.querySelector(".login-gate__failure")!;
++    if (!scmPersonalAccessEnabled) {
++      expect(failure.querySelector(".login-gate__failure-title")?.textContent).toBe(
++        "Verified identity required",
++      );
++      expect(failure.querySelector(".login-gate__native-session-recovery")).toBeNull();
++      expect(failure.querySelector(".login-gate__connect")).not.toBeNull();
++      expect(failure.querySelector(".login-gate__failure-steps")).not.toBeNull();
++      expect(failure.querySelector(".login-gate__connection")).not.toBeNull();
++      return;
++    }
++    expect(failure.querySelector(".login-gate__failure-title")?.textContent).toBe(
++      "Tu sesión venció",
++    );
++    expect(failure.querySelector(".login-gate__failure-summary")?.textContent).toBe(
++      "Vuelve a SCM para continuar con tu agente.",
++    );
++    expect(failure.querySelector(".login-gate__native-session-recovery")?.textContent).toContain(
++      "Continuar con SCM",
++    );
++    expect(failure.querySelectorAll(".login-gate__actions button")).toHaveLength(1);
++    expect(failure.textContent).not.toMatch(/trusted proxy|Tailscale|Gateway token|password/iu);
++    expect(element.querySelector(".login-gate__logo--neutral svg")).not.toBeNull();
++    expect(element.querySelector("img.login-gate__logo")).toBeNull();
++    expect(failure.querySelector(".login-gate__failure-steps")).toBeNull();
++    expect(failure.querySelector(".login-gate__connection")).toBeNull();
++    expect(failure.querySelector("#login-gate-credential")).toBeNull();
++    expect(failure.querySelector(".login-gate__failure-raw")).toBeNull();
++    failure.querySelector<HTMLButtonElement>(".login-gate__native-session-recovery")!.click();
++    expect(assign).toHaveBeenCalledOnce();
++    expect(assign).toHaveBeenCalledWith("https://scm.example/mi-agente");
++    expect(element.props.onConnect).not.toHaveBeenCalled();
++  });
++
++  it.runIf(scmPersonalAccessEnabled)(
++    "reloads once at the SCM root and honors draft guards",
++    async () => {
++      const assign = vi.fn();
++      const reload = vi.fn();
++      vi.stubGlobal(
++        "location",
++        Object.assign(new URL("https://scm.example/mi-agente"), { assign, reload }),
++      );
++      const element = await mountFailure(
++        "operator role policies require a verified user identity",
++        ConnectErrorDetailCodes.AUTH_VERIFIED_USER_REQUIRED,
++      );
++      element.props = {
++        ...element.props,
++        gatewayUrl: "wss://scm.example",
++        resourceBasePath: "/mi-agente",
++      };
++      await element.updateComplete;
++      const action = () =>
++        element.querySelector<HTMLButtonElement>(".login-gate__native-session-recovery")!.click();
++
++      action();
++      expect(assign).not.toHaveBeenCalled();
++      expect(reload).toHaveBeenCalledOnce();
++
++      const explain = vi.fn();
++      const release = registerControlUiReloadGuard(() => false, explain);
++      try {
++        vi.stubGlobal(
++          "location",
++          Object.assign(new URL("https://scm.example/chat"), { assign, reload }),
++        );
++        action();
++        expect(explain).toHaveBeenCalledOnce();
++        expect(assign).not.toHaveBeenCalled();
++        expect(reload).toHaveBeenCalledOnce();
++      } finally {
++        release();
++      }
++    },
++  );
++
+   it("explains missing identity headers even with credentials entered", async () => {
+     const element = await mountFailure(
+       "unauthorized",
+diff --git a/ui/src/components/login-gate.ts b/ui/src/components/login-gate.ts
+index 5f07a7b3..d9d6cb35 100644
+--- a/ui/src/components/login-gate.ts
++++ b/ui/src/components/login-gate.ts
+@@ -4,6 +4,7 @@ import { property, state } from "lit/decorators.js";
+ import type { ThemeMascot } from "../../../packages/gateway-protocol/src/theme.ts";
+ import { normalizeBasePath } from "../app-route-paths.ts";
+ import { canReloadControlUiDocument } from "../app/document-reload-guard.ts";
++import { isSameOriginGateway } from "../app/gateway-control-ui-reload.ts";
+ import { beginNativeWindowDrag } from "../app/native-window-drag.ts";
+ import { controlUiPublicAssetPath } from "../app/public-assets.ts";
+ import { retryStaleChunkReloadWhenReachable } from "../app/stale-chunk-reload.ts";
+@@ -27,6 +28,17 @@ import {
+ 
+ registerLoginEnglish();
+ 
++type ViteImportMeta = ImportMeta & {
++  readonly env?: {
++    readonly VITE_SCM_PERSONAL_ACCESS?: string;
++  };
++};
++
++function isScmPersonalAccessEnabled(): boolean {
++  // SCM personal-agent handoff is opt-in per build: `VITE_SCM_PERSONAL_ACCESS=true pnpm --dir ui build`.
++  return (import.meta as ViteImportMeta).env?.VITE_SCM_PERSONAL_ACCESS === "true";
++}
++
+ type LoginGateProps = LoginFailureFeedbackParams & {
+   mascot?: ThemeMascot;
+   resourceBasePath: string;
+@@ -245,8 +257,19 @@ function renderStatusBody(params: {
+   props: LoginGateProps;
+   feedback: LoginFailureFeedback;
+   refreshAction: RefreshAction;
++  onNativeSessionRecovery: () => void;
+ }) {
+   const { props, feedback } = params;
++  const nativeSessionRecovery =
++    isScmPersonalAccessEnabled() &&
++    feedback.kind === "verified-user-required" &&
++    isSameOriginGateway(props.gatewayUrl);
++  const failureTitle = nativeSessionRecovery
++    ? t("login.failure.verifiedUserRequired.nativeTitle")
++    : feedback.title;
++  const failureSummary = nativeSessionRecovery
++    ? t("login.failure.verifiedUserRequired.nativeSummary")
++    : feedback.summary;
+   const waitingForPairing = feedback.kind === "pairing-required" && props.reconnectPending;
+   const retrySeconds = Math.max(0, Math.ceil(((props.reconnectAt ?? 0) - Date.now()) / 1_000));
+   return html`
+@@ -260,8 +283,8 @@ function renderStatusBody(params: {
+       <div class="login-gate__status-head">
+         <span class="login-gate__status-icon" aria-hidden="true">${TONE_ICONS[feedback.tone]}</span>
+         <div class="login-gate__status-text">
+-          <h1 class="login-gate__failure-title">${feedback.title}</h1>
+-          <p class="login-gate__failure-summary">${feedback.summary}</p>
++          <h1 class="login-gate__failure-title">${failureTitle}</h1>
++          <p class="login-gate__failure-summary">${failureSummary}</p>
+         </div>
+       </div>
+       ${
+@@ -274,7 +297,7 @@ function renderStatusBody(params: {
+             `
+           : nothing
+       }
+-      ${renderSteps(feedback)}
++      ${nativeSessionRecovery ? nothing : renderSteps(feedback)}
+       ${
+         feedback.kind === "busy"
+           ? html`
+@@ -297,15 +320,34 @@ function renderStatusBody(params: {
+           : nothing
+       }
+       <div class="login-gate__actions">
+-        ${renderRefreshAction(feedback, params.refreshAction)}
+-        <button class="btn login-gate__connect" @click=${props.onConnect}>
+-          ${waitingForPairing ? t("login.failure.pairing.checkNow") : t("common.connect")}
+-        </button>
++        ${
++          nativeSessionRecovery
++            ? html`
++                <button
++                  class="btn primary login-gate__native-session-recovery"
++                  @click=${params.onNativeSessionRecovery}
++                >
++                  ${t("login.failure.verifiedUserRequired.nativeAction")}
++                </button>
++              `
++            : html`
++                ${renderRefreshAction(feedback, params.refreshAction)}
++                <button class="btn login-gate__connect" @click=${props.onConnect}>
++                  ${waitingForPairing ? t("login.failure.pairing.checkNow") : t("common.connect")}
++                </button>
++              `
++        }
+       </div>
+-      <details class="login-gate__connection">
+-        ${renderConnectionSummary(props)} ${renderForm({ ...params, withSubmit: false })}
+-      </details>
+-      ${renderFailureFooter(feedback)}
++      ${
++        nativeSessionRecovery
++          ? nothing
++          : html`
++              <details class="login-gate__connection">
++                ${renderConnectionSummary(props)} ${renderForm({ ...params, withSubmit: false })}
++              </details>
++              ${renderFailureFooter(feedback)}
++            `
++      }
+     </section>
+   `;
+ }
+@@ -360,13 +402,22 @@ function renderFormBody(params: { props: LoginGateProps; feedback: LoginFailureF
+   `;
+ }
+ 
+-function renderLoginGate(props: LoginGateProps, refreshAction: RefreshAction) {
++function renderLoginGate(
++  props: LoginGateProps,
++  refreshAction: RefreshAction,
++  onNativeSessionRecovery: () => void,
++) {
+   const resourceBasePath = normalizeBasePath(props.resourceBasePath);
+   const faviconSrc = controlUiPublicAssetPath("favicon.svg", resourceBasePath);
+   const feedback = resolveLoginFailureFeedback(props);
++  const scmNativeRecovery =
++    feedback?.placement === "status" &&
++    feedback.kind === "verified-user-required" &&
++    isScmPersonalAccessEnabled() &&
++    isSameOriginGateway(props.gatewayUrl);
+   const body =
+     feedback?.placement === "status"
+-      ? renderStatusBody({ props, feedback, refreshAction })
++      ? renderStatusBody({ props, feedback, refreshAction, onNativeSessionRecovery })
+       : renderFormBody({ props, feedback });
+ 
+   return html`
+@@ -382,7 +433,7 @@ function renderLoginGate(props: LoginGateProps, refreshAction: RefreshAction) {
+       <div class="login-gate__card" data-mode=${feedback?.placement ?? "form"}>
+         <header class="login-gate__brand">
+           ${
+-            props.mascot === "none"
++            props.mascot === "none" || scmNativeRecovery
+               ? html`<span class="login-gate__logo login-gate__logo--neutral" aria-hidden="true"
+                   >${icons.mark}</span
+                 >`
+@@ -503,6 +554,60 @@ class LoginGate extends OpenClawLightDomContentsElement {
+     }
+   }
+ 
++  private redirectExpiredNativeSession() {
++    const props = this.props;
++    const feedback = props ? resolveLoginFailureFeedback(props) : null;
++    if (
++      !props ||
++      !this.isConnected ||
++      props.connected ||
++      props.reconnectPending ||
++      feedback?.kind !== "verified-user-required" ||
++      !isSameOriginGateway(props.gatewayUrl) ||
++      !canReloadControlUiDocument(true)
++    ) {
++      return;
++    }
++
++    let current: URL;
++    let target: URL;
++    try {
++      current = new URL(globalThis.location.href);
++      target = new URL(normalizeBasePath(props.resourceBasePath) || "/", current.origin);
++      target.search = "";
++      target.hash = "";
++    } catch {
++      return;
++    }
++
++    // The bridge may publish a replacement snapshot between render and the click.
++    // Do not redirect a newer error or a connection that has already recovered.
++    const currentProps = this.props;
++    const stillCurrent =
++      currentProps === props ||
++      (currentProps !== undefined &&
++        !currentProps.connected &&
++        !currentProps.reconnectPending &&
++        (
++          [
++            "lastError",
++            "lastErrorCode",
++            "lastErrorAuthReason",
++            "gatewayUrl",
++            "resourceBasePath",
++            "secret",
++          ] as const
++        ).every((key) => currentProps[key] === props[key]));
++    if (!stillCurrent) {
++      return;
++    }
++    if (target.href === current.href) {
++      globalThis.location.reload();
++      return;
++    }
++    globalThis.location.assign(target.href);
++  }
++
+   override render() {
+     const props = this.props;
+     if (!props) {
+@@ -525,7 +630,11 @@ class LoginGate extends OpenClawLightDomContentsElement {
+           props.onSecretChange(value);
+         },
+       },
+-      { state: this.refreshState, onRefresh: () => void this.refreshPage() },
++      {
++        state: this.refreshState,
++        onRefresh: () => void this.refreshPage(),
++      },
++      () => this.redirectExpiredNativeSession(),
+     );
+   }
+ }
+diff --git a/ui/src/i18n/locales/en-login.ts b/ui/src/i18n/locales/en-login.ts
+index 51e2b77c..aa102ba6 100644
+--- a/ui/src/i18n/locales/en-login.ts
++++ b/ui/src/i18n/locales/en-login.ts
+@@ -41,6 +41,9 @@ const enLogin = {
+         title: "Verified identity required",
+         summary:
+           "This Gateway has named roles enabled. Device and setup tokens cannot identify a person.",
++        nativeTitle: "Tu sesión venció",
++        nativeSummary: "Vuelve a SCM para continuar con tu agente.",
++        nativeAction: "Continuar con SCM",
+         stepIdentity:
+           "Reconnect through the trusted proxy or Tailscale so the Gateway can verify your identity.",
+         stepSharedSecret:
+diff --git a/ui/src/pages/chat/chat-pane-pull-requests.test.ts b/ui/src/pages/chat/chat-pane-pull-requests.test.ts
+index 332b2c00..aa2ed0ea 100644
+--- a/ui/src/pages/chat/chat-pane-pull-requests.test.ts
++++ b/ui/src/pages/chat/chat-pane-pull-requests.test.ts
+@@ -81,7 +81,11 @@ function emitSnapshot(
+   });
+ }
+ 
+-function createPublicationPane(scope?: "global" | "per-sender") {
++function createPublicationPane(
++  scope?: "global" | "per-sender",
++  scopes: readonly string[] = ["operator.read", "operator.write"],
++  publishAdvertised = true,
++) {
+   const agentId = scope ? "research" : "main";
+   const sessionKey = scope ? "global" : "agent:main:publication";
+   const shared = { source: "system-configured", accountId: 1, login: "system-bot" };
+@@ -112,8 +116,15 @@ function createPublicationPane(scope?: "global" | "per-sender") {
+   const initial = createInitializationContext();
+   const eventListeners = new Set<GatewayEventListener>();
+   const hello = gatewayHelloForMethods(
+-    ["sessions.github.publish", SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD, "projects.list"],
+-    ["operator.read", "operator.write"],
++    [
++      ...(publishAdvertised ? ["sessions.github.publish"] : []),
++      "sessions.github.options",
++      "sessions.github.status",
++      "sessions.github.confirm",
++      SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
++      "projects.list",
++    ],
++    scopes,
+   );
+   if (scope) {
+     hello.snapshot = {
+@@ -211,6 +222,52 @@ function createPublicationPane(scope?: "global" | "per-sender") {
+ }
+ 
+ describe("chat pane pushed pull request state", () => {
++  it.each([
++    { name: "missing operator.read", scopes: [], expected: false },
++    { name: "operator.read", scopes: ["operator.read"], expected: true },
++    { name: "operator.admin", scopes: ["operator.admin"], expected: true },
++  ])("gates GitHub publication capability by $name", async ({ scopes, expected }) => {
++    const harness = createPublicationPane(undefined, scopes);
++    harness.pane.render();
++    if (expected) {
++      await harness.settled();
++      expect(
++        harness.request.mock.calls.filter(([method]) => method === "sessions.github.options"),
++      ).toHaveLength(1);
++      expect(harness.pane.chatProps?.githubPublication).toBeDefined();
++    } else {
++      await Promise.resolve();
++      expect(
++        harness.request.mock.calls.filter(([method]) => method === "sessions.github.options"),
++      ).toHaveLength(0);
++      expect(harness.pane.chatProps?.githubPublication).toBeUndefined();
++    }
++  });
++
++  it("requires the publication method advertisement as well as read capability", async () => {
++    const harness = createPublicationPane(undefined, ["operator.read"], false);
++    harness.pane.render();
++    await Promise.resolve();
++    expect(
++      harness.request.mock.calls.filter(([method]) => method === "sessions.github.options"),
++    ).toHaveLength(0);
++    expect(harness.pane.chatProps?.githubPublication).toBeUndefined();
++  });
++
++  it("retires a retained publication immediately when the connection loses operator.read", async () => {
++    const harness = createPublicationPane();
++    await harness.settled();
++    expect(harness.pane.chatProps?.githubPublication).toBeDefined();
++    const callsBeforeRevocation = harness.request.mock.calls.length;
++    harness.pane.context.gateway.snapshot.hello!.auth = {
++      role: "operator",
++      scopes: [],
++    };
++    harness.pane.render();
++    expect(harness.pane.chatProps?.githubPublication).toBeUndefined();
++    expect(harness.request.mock.calls.length).toBe(callsBeforeRevocation);
++  });
++
+   it("keeps the pane quiet for unrelated PR snapshots while publishing its own changes", () => {
+     const { pane, state, emitGatewayEvent } = createPullRequestPane({
+       capturePullRequestEpoch: vi.fn(() => ({})),
+diff --git a/ui/src/pages/chat/chat-pane-render.ts b/ui/src/pages/chat/chat-pane-render.ts
+index e1463abd..342bdf92 100644
+--- a/ui/src/pages/chat/chat-pane-render.ts
++++ b/ui/src/pages/chat/chat-pane-render.ts
+@@ -12,7 +12,7 @@ import { personActivityRouting } from "../../components/person-activity-link.ts"
+ import { isCloudWorkerPlacementState } from "../../components/session-row-badges.ts";
+ import { t } from "../../i18n/index.ts";
+ import { isModelIndependentChatCommand } from "../../lib/chat/commands.ts";
+-import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
++import { canCallGatewayMethod, isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
+ import {
+   pickFreshestObserverDigest,
+   projectSessionObserverDigest,
+@@ -283,7 +283,8 @@ export class ChatPane extends ChatPaneLayoutRender {
+     if (
+       !publicationScope ||
+       !publicationRow ||
+-      !isGatewayMethodAdvertised(gatewaySnapshot, "sessions.github.publish")
++      !isGatewayMethodAdvertised(gatewaySnapshot, "sessions.github.publish") ||
++      !canCallGatewayMethod(gatewaySnapshot, "sessions.github.options", "operator.read")
+     ) {
+       this.githubPublication?.detach();
+       this.githubPublication = null;

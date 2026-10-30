@@ -5,6 +5,7 @@ import { authorizationIdentity } from './manifest.js';
 
 const SESSION_SCOPES = ['operator.sessions.read', 'operator.sessions.write'];
 const SAFE_TOOLS = ['enva_corpus_read', 'enva_scm_sql_read'];
+const PERSONAL_AGENT_NAME = 'Mi agente';
 const normalizeClientAddress = (value) => {
   const address = String(value || '').trim();
   const normalized = address.toLowerCase().startsWith('::ffff:') ? address.slice(7) : address;
@@ -121,7 +122,7 @@ const templateEntry = (config, templateId) => {
 
 const expectedAgentEntry = ({ agentId, workspace, template, stateRoot }) => {
   const entry = {
-    name: agentId,
+    name: PERSONAL_AGENT_NAME,
     workspace,
     agentDir: `${stateRoot}/agents/${agentId}/agent`,
   };
@@ -134,12 +135,40 @@ const verifyAgent = (config, agentId, expected, template) => {
   const actual = config?.agents?.entries?.[agentId];
   if (!actual) return false;
   if (actual.workspace !== expected.workspace || actual.agentDir !== expected.agentDir) throw new Error('native personal agent workspace diverges');
-  if (actual.name !== undefined && actual.name !== agentId) throw new Error('native personal agent name diverges');
+  if (actual.name !== undefined && actual.name !== null && actual.name !== agentId && actual.name !== PERSONAL_AGENT_NAME) throw new Error('native personal agent name diverges');
   if (actual.tools?.allow !== undefined && !same(actual.tools.allow, SAFE_TOOLS)) throw new Error('native personal agent tools diverge');
   if (actual.tools?.elevated?.enabled !== undefined && actual.tools.elevated.enabled !== false) throw new Error('native personal agent elevation diverges');
   if (template.model !== undefined && actual.model !== undefined && !same(actual.model, expected.model)) throw new Error('native personal model diverges');
   if (template.agentRuntime !== undefined && actual.agentRuntime !== undefined && !same(actual.agentRuntime, expected.agentRuntime)) throw new Error('native personal runtime diverges');
-  return actual.name === agentId;
+  return true;
+};
+
+const convergeAgentName = async (admin, nativeConfig, configResult, agentId) => {
+  const actual = nativeConfig?.agents?.entries?.[agentId];
+  if (!actual) throw new Error('native personal agent is missing');
+  if (actual.name !== undefined && actual.name !== null && actual.name !== agentId && actual.name !== PERSONAL_AGENT_NAME) throw new Error('native personal agent name diverges');
+  if (actual.name === PERSONAL_AGENT_NAME) return { nativeConfig, configResult };
+  const updated = await admin.rpc('agents.update', { agentId, name: PERSONAL_AGENT_NAME });
+  if (!updated.ok) throw new Error('native agents.update denied');
+  const refreshed = await admin.rpc('config.get', {});
+  if (!refreshed.ok) throw new Error('native config.get denied');
+  const refreshedConfig = validateNativeBase(refreshed.payload);
+  const refreshedAgent = refreshedConfig?.agents?.entries?.[agentId];
+  if (!refreshedAgent || refreshedAgent.name !== PERSONAL_AGENT_NAME) throw new Error('native personal agent name did not converge');
+  return { nativeConfig: refreshedConfig, configResult: refreshed };
+};
+
+const convergeProfileDisplayName = async (admin, profile, displayName) => {
+  if (!profile?.id) throw new Error('native identity profile id is missing');
+  const current = profile.displayName ?? profile.display_name;
+  if (current === displayName) return;
+  const updated = await admin.rpc('users.setDisplayName', { profileId: profile.id, displayName });
+  if (!updated.ok) throw new Error('native users.setDisplayName denied');
+  const returned = updated.payload?.profile?.displayName
+    ?? updated.payload?.profile?.display_name
+    ?? updated.payload?.displayName
+    ?? updated.payload?.display_name;
+  if (returned !== undefined && returned !== displayName) throw new Error('native profile display name did not converge');
 };
 
 const trustedConnect = (config, canonical, clientAddress) => connect({
@@ -205,12 +234,14 @@ const provisionManifestIdentity = async ({ config, authorization, manifest, clie
     const listed = await admin.rpc('users.list', {});
     const configResult = await admin.rpc('config.get', {});
     if (!configResult.ok) throw new Error('native config.get denied');
-    const nativeConfig = validateNativeBase(configResult.payload);
+    let nativeConfig = validateNativeBase(configResult.payload);
     const agent = nativeConfig.agents?.entries?.[canonical.agentId];
     if (!agent) throw new Error('native manifest agent is not provisioned');
     exactRole(nativeConfig, canonical.email, canonical.agentId, entry.role);
+    ({ nativeConfig } = await convergeAgentName(admin, nativeConfig, configResult, canonical.agentId));
     if (!listed.ok || !Array.isArray(listed.payload?.profiles)) throw new Error('native users.list denied');
     const profile = exactProfile(listed.payload.profiles, canonical.email);
+    await convergeProfileDisplayName(admin, profile, canonical.displayName);
     const currentRole = profile.role || profile.assignedRole || profile.roleName || 'deny_all';
     if (currentRole !== 'deny_all' && currentRole !== entry.role) throw new Error('native profile role diverges');
     if (currentRole !== entry.role) {
@@ -249,6 +280,8 @@ const provisionAutoIdentity = async ({ config, authorization, clientAddress }) =
       nativeConfig = validateNativeBase(configResult.payload);
       verifyAgent(nativeConfig, canonical.agentId, expected, template);
     }
+    ({ nativeConfig, configResult } = await convergeAgentName(admin, nativeConfig, configResult, canonical.agentId));
+    await convergeProfileDisplayName(admin, profile, canonical.displayName);
     let converged = false;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const currentRoleEntry = nativeConfig.gateway.roles.definitions?.[roleName];
@@ -278,6 +311,7 @@ const provisionAutoIdentity = async ({ config, authorization, clientAddress }) =
     configResult = await admin.rpc('config.get', {});
     if (!configResult.ok) throw new Error('native config.get denied');
     nativeConfig = validateNativeBase(configResult.payload);
+    ({ nativeConfig, configResult } = await convergeAgentName(admin, nativeConfig, configResult, canonical.agentId));
     verifyAgent(nativeConfig, canonical.agentId, expected, template);
     exactRole(nativeConfig, canonical.email, canonical.agentId, roleName);
     if (currentRole !== roleName) {

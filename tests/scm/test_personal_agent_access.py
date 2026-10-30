@@ -86,6 +86,66 @@ def test_access_issues_short_handoff_without_raw_supabase_token(app, client):
     assert assertion["handoff_exp"] <= assertion["iat"] + 30
 
 
+def test_bridge_authorization_uses_verified_actor_display_name_and_safe_fallback(app, client):
+    with app.app_context():
+        actor, auth_user_id = actor_with_access()
+        actor_id = actor.id
+        actor.nombre_corto = "  Ana <b>\n Operadora\t"
+        claims = {
+            "sub": str(auth_user_id),
+            "exp": int((datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp()),
+            "iat": int(datetime.now(timezone.utc).timestamp()),
+            "aud": "authenticated",
+            "display_name": "Nombre no confiable de claims",
+        }
+        db.session.commit()
+    configure(app, claims)
+
+    issued = client.post(
+        "/api/scm/v1/agente/acceso",
+        headers={"Authorization": "Bearer supabase"},
+    ).get_json()["assertion"]
+    response = client.post(
+        "/api/scm/v1/agente/autorizacion",
+        headers={"Authorization": f"Bearer {BRIDGE_CREDENTIAL}"},
+        json={"assertion": issued, "phase": "exchange"},
+    )
+    assert response.status_code == 200, response.get_json()
+    body = response.get_json()
+    display_name = body["identity"]["display_name"]
+    assert display_name == "Ana <b> Operadora"
+    assert len(display_name) <= 120
+    assert not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in display_name)
+    assert "claims" not in display_name
+    assert response.content_type.startswith("application/json")
+
+    with app.app_context():
+        actor = db.session.get(Trabajador, actor_id)
+        actor.nombre_corto = "N" * 200
+        db.session.commit()
+    limited = client.post(
+        "/api/scm/v1/agente/autorizacion",
+        headers={"Authorization": f"Bearer {BRIDGE_CREDENTIAL}"},
+        json={"assertion": issued, "phase": "session"},
+    )
+    assert limited.status_code == 200, limited.get_json()
+    assert limited.get_json()["identity"]["display_name"] == "N" * 120
+
+    with app.app_context():
+        actor = db.session.get(Trabajador, actor_id)
+        actor.nombre_corto = "   "
+        actor.nombres = ""
+        actor.apellidos = ""
+        db.session.commit()
+    fallback = client.post(
+        "/api/scm/v1/agente/autorizacion",
+        headers={"Authorization": f"Bearer {BRIDGE_CREDENTIAL}"},
+        json={"assertion": issued, "phase": "session"},
+    )
+    assert fallback.status_code == 200, fallback.get_json()
+    assert fallback.get_json()["identity"]["display_name"] == "Usuario SCM"
+
+
 def test_internal_authorization_reloads_capability_and_rejects_revocation(
     app, client
 ):

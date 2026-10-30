@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import hmac
 import secrets
 import time
+import unicodedata
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -27,6 +28,8 @@ AUDIENCE = "scm-agent-bridge"
 AGENT_ID_PREFIX = "scm-"
 IDENTITY_EMAIL_DOMAIN = "internal.envaperu.invalid"
 HANDOFF_SECONDS = 30
+DISPLAY_NAME_FALLBACK = "Usuario SCM"
+DISPLAY_NAME_MAX_LENGTH = 120
 ALLOWED_ASSERTION_CLAIMS = {
     "iss",
     "aud",
@@ -199,6 +202,27 @@ def _agent_id(auth_user_id):
 
 def _identity_email(auth_user_id):
     return f"scm+{auth_user_id}@{IDENTITY_EMAIL_DOMAIN}"
+
+
+def _safe_display_name(value):
+    if not isinstance(value, str):
+        return ""
+    without_controls = "".join(
+        " " if unicodedata.category(char) in {"Cc", "Cf"} else char
+        for char in value
+    )
+    return " ".join(without_controls.split())[:DISPLAY_NAME_MAX_LENGTH].strip()
+
+
+def _actor_display_name(actor):
+    for candidate in (
+        getattr(actor, "nombre_corto", None),
+        getattr(actor, "nombre_completo", None),
+    ):
+        display_name = _safe_display_name(candidate)
+        if display_name:
+            return display_name
+    return DISPLAY_NAME_FALLBACK
 
 
 def _has_capability(actor_id):
@@ -427,6 +451,7 @@ def authorize_bridge(config, *, assertion, phase):
             "auth_user_id": str(auth_user_id),
             "actor_id": actor.id,
             "email": _identity_email(auth_user_id),
+            "display_name": _actor_display_name(actor),
         },
         "agent_id": _agent_id(auth_user_id),
         "jti": claims_jti,

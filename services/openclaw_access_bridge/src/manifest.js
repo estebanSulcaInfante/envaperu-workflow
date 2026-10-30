@@ -1,6 +1,18 @@
 import { readFileSync } from 'node:fs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DISPLAY_NAME_FALLBACK = 'Usuario SCM';
+const DISPLAY_NAME_MAX_LENGTH = 120;
+
+const normalizeDisplayName = (value) => {
+  if (typeof value !== 'string') return DISPLAY_NAME_FALLBACK;
+  const normalized = value
+    .replace(/[\p{Cc}\p{Cf}]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const limited = Array.from(normalized).slice(0, DISPLAY_NAME_MAX_LENGTH).join('').trim();
+  return limited || DISPLAY_NAME_FALLBACK;
+};
 
 export const authorizationIdentity = (authorization) => {
   const identity = authorization?.identity;
@@ -13,7 +25,13 @@ export const authorizationIdentity = (authorization) => {
   const email = `scm+${authUserId}@internal.envaperu.invalid`;
   if (identity.email !== undefined && identity.email !== email) return null;
   if (authorization.agent_id !== agentId) return null;
-  return { authUserId, actorId: Number(actorId), email, agentId };
+  return {
+    authUserId,
+    actorId: Number(actorId),
+    email,
+    agentId,
+    displayName: normalizeDisplayName(identity.display_name),
+  };
 };
 
 export const loadManifest = (filePath) => {

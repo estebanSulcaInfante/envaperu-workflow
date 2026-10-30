@@ -60,6 +60,15 @@ const nativeUrl = (value, config, expected) => {
 };
 
 const rpcFailure = (result) => !result?.ok && fail('native_download_denied', 404);
+const reauthorizeForDownload = async (reauthorize) => {
+  let fresh;
+  try { fresh = await reauthorize(); } catch (error) {
+    if (error?.status === 503) fail('scm_unavailable', 503);
+    throw error;
+  }
+  if (fresh?.kind === 'temporary' || fresh?.status === 503) fail('scm_unavailable', 503);
+  return fresh;
+};
 
 export class NativeArtifactBroker {
   constructor({ config, store, fetchImpl = fetch, verifyOwnSession = verifyNativeOwnSession, downloadExact = withNativeArtifactDownload }) {
@@ -118,7 +127,7 @@ export class NativeArtifactBroker {
       const authExpiry = Date.parse(authorization.expires_at);
       if (!Number.isFinite(authExpiry)) fail('download_expiry_invalid', 502);
       const expiresAt = Math.min(nativeExpiry, authExpiry, Date.now() + 5 * 60 * 1000);
-      const fresh = await reauthorize();
+      const fresh = await reauthorizeForDownload(reauthorize);
       if (!fresh || fresh.row.agent_id !== authorization.agent_id) fail('download_revoked', 404);
       const handle = this.store.issue({ sidHash: fresh.row.sid_hash, agentId: authorization.agent_id, sessionKey: params.sessionKey, artifactId: params.artifactId, summary, expiresAt });
       delete payload.data;
@@ -130,7 +139,7 @@ export class NativeArtifactBroker {
         try { bytes = decodeBase64(payload.data); } catch (error) { if (error instanceof DownloadError) throw error; fail('inline_download_invalid', 502); }
         if (bytes.length > this.config.maxInlineBytes) fail('inline_download_too_large', 413);
         if (summary.sizeBytes !== undefined && bytes.length !== summary.sizeBytes) fail('inline_download_size_invalid', 502);
-        const fresh = await reauthorize();
+        const fresh = await reauthorizeForDownload(reauthorize);
         if (!fresh || fresh.row.agent_id !== authorization.agent_id) fail('download_revoked', 404);
       } else fail('inline_download_invalid', 502);
       return { type: 'res', id: frame.id, ok: true, payload };
@@ -153,7 +162,7 @@ export class NativeArtifactBroker {
     rpcFailure(native);
     const summary = validateSummary(summaryOf(native), { ...entry.summary, ...entry });
     if (summary.mimeType !== entry.summary.mimeType || summary.sizeBytes !== entry.summary.sizeBytes) fail('artifact_changed', 404);
-    const fresh = await reauthorize();
+    const fresh = await reauthorizeForDownload(reauthorize);
     if (!fresh || fresh.row.sid_hash !== entry.sidHash) fail('download_revoked', 404);
     if (req.method === 'GET' || req.method === 'HEAD') {
       const allowed = new Set(['range', 'if-range', 'if-none-match']);

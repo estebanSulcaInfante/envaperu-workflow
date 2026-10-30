@@ -11,9 +11,14 @@ import { NativeArtifactBroker } from '../src/native_artifacts.js';
 const identity = 'scm+aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa@internal.envaperu.invalid';
 const agentId = 'scm-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
+const setCookieValue = (headers, name) => {
+  const match = (headers.get('set-cookie') || '').match(new RegExp(`(?:^|,\\s*)(${name}=[^;,]*)`));
+  return match ? match[1] : null;
+};
 
 const configFor = (root) => ({
   host: '127.0.0.1', port: 0, dbPath: path.join(root, 'bridge.sqlite'), nativeManifestPath: path.join(root, 'manifest.json'),
+  serviceSecret: 's'.repeat(32),
   provisionMode: 'auto', allowedOrigin: 'https://bridge.example.test', scmFormOrigin: 'https://scm.example.test',
   nativeHttpOrigin: 'http://127.0.0.1:18789', nativeWsUrl: 'ws://127.0.0.1:18789', maxBodyBytes: 16 * 1024 * 1024,
   maxDownloadBytes: 16 * 1024 * 1024, maxInlineBytes: 8 * 1024 * 1024, apiTimeoutMs: 1000, maxIdleSeconds: 900,
@@ -33,7 +38,10 @@ test('download handles are opaque, SID-bound and revocable without storing bytes
   const port = bridge.server.address().port;
   const handoff = await fetch(`http://127.0.0.1:${port}/_scm/exchange`, { method: 'POST', redirect: 'manual', headers: { Origin: config.scmFormOrigin, 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ assertion: 'opaque' }) });
   assert.equal(handoff.status, 303, await handoff.text());
-  const cookie = handoff.headers.get('set-cookie').split(';')[0];
+  const pendingCookie = setCookieValue(handoff.headers, '__Host-scm_personal_pending');
+  const continuation = await fetch(`http://127.0.0.1:${port}/_scm/continue`, { redirect: 'manual', headers: { Cookie: pendingCookie } });
+  assert.equal(continuation.status, 303, await continuation.text());
+  const cookie = setCookieValue(continuation.headers, 'scm_personal_sid');
   const sid = decodeURIComponent(cookie.split('=')[1]);
   const handle = store.issue({ sidHash: hash(sid), agentId, sessionKey: `agent:${agentId}:s`, artifactId: 'artifact-pdf', summary: { id: 'artifact-pdf', sessionKey: `agent:${agentId}:s`, mimeType: 'application/pdf', sizeBytes: 3 }, expiresAt: Date.now() + 60_000 });
   assert.match(handle, /^[A-Za-z0-9_-]{43}$/);
@@ -112,6 +120,24 @@ test('native UI two-field request returns bound URL; hidden session never reache
   assert.equal(h.counts().closed, 1); assert.equal(h.broker.active, 0);
   const hidden = harness({ own: false }); await assert.rejects(() => consume(hidden), /not_owned/);
   assert.deepEqual(hidden.counts(), { opened: 0, closed: 0 });
+});
+
+test('temporary final reauthorization is retryable for HTTP and RPC without delivering bytes', async () => {
+  const h = harness({ payload: { artifact: summary, url: '/api/artifacts/download/c/t' } });
+  const temporary = async () => ({ kind: 'temporary', status: 503 });
+  await assert.rejects(
+    () => h.broker.downloadRpc({ frame, authorization, clientAddress: '192.0.2.1', reauthorize: temporary }),
+    (error) => error instanceof Error && error.status === 503 && error.message === 'scm_unavailable',
+  );
+  const pair = io();
+  await assert.rejects(
+    () => h.broker.serveHandle({ entry, ...pair, authorization, clientAddress: '192.0.2.1', reauthorize: temporary }),
+    (error) => error instanceof Error && error.status === 503 && error.message === 'scm_unavailable',
+  );
+  assert.equal(pair.res.status, undefined);
+  assert.equal(pair.res.ended, false);
+  assert.equal(pair.res.chunks.length, 0);
+  assert.equal(h.broker.active, 0);
 });
 
 test('backpressure disconnect releases admin and concurrency slot', async () => {
