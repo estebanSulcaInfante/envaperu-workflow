@@ -1,5 +1,5 @@
 {
-  "source_sha": "d9662d5581e780b0b9f64ae40208884f2add6403",
+  "source_sha": "831d6deb940dcefc5f7837129f1741662642f516",
   "files": {
     "app/__init__.py": "3bffb676bbb41f4f8e14779c31bfb3ed13813224afa80df7f61b77222967efb8",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -96,7 +96,7 @@
     "app/services/scm_assistant_gateway.py": "7569bcfc6a932c816fb5900dabca963782e472abc80176b617c621b218f597d9",
     "app/services/scm_assistant_proposals.py": "c3de1ae15385c4a75e4c75ce0f25bddc5fe6575f3fdc4b8d7d6dbf85428f2a1d",
     "app/services/scm_auth.py": "448f727913e6a45d3e7d6d65af1b95be40f71d972ee923f081ded5b8d9311fa5",
-    "app/services/scm_personal_agent_access.py": "7decb1f0974bf8cdb12082cdaab92deaee847f283d4e7c47e8b808a7a011f245",
+    "app/services/scm_personal_agent_access.py": "0d65523d1a5f0991a120d10ea78a483ccdfe162205ee558ccdcd8e6179f61164",
     "app/services/scm_color_identity.py": "b779858af327279836aa9204576c0eb7bca80868d268b5bf46c1cd9dbdd0a4ff",
     "app/services/scm_commercial_presentation_service.py": "3d163529d21286a87843ebdbc3635d8f125f2aac5eea34a3791eb4ac80d8c8f3",
     "app/services/scm_configuration.py": "fafb32252c12293a831ae4ca0c798f4a07b7f9ae891d3738e8fa3893ae073d78",

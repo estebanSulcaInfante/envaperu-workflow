@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       publish:
-        description: Publish both tested images after one environment approval
+        description: Publish all three tested images after one environment approval
         required: true
         default: false
         type: boolean
@@ -20,14 +20,17 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: d9662d5581e780b0b9f64ae40208884f2add6403
+  SOURCE_SHA: 831d6deb940dcefc5f7837129f1741662642f516
   # The recipe checkout is tied to the immutable workflow commit that started this run.
   # The coordinator must record that commit in the release receipt before dispatch.
   RECIPE_SHA: ${{ github.sha }}
   PYTHON_BASE: ${{ inputs.python_base }}
   API_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
   BRIDGE_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
+  NATIVE_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
   BRIDGE_BASE: node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c
+  OPENCLAW_UPSTREAM_REVISION: fc23bc864e4553c2d215e479eeec47b67a0bf943
+  OPENCLAW_BASE_IMAGE: ghcr.io/openclaw/openclaw@sha256:5139eb3ca71ba20d3cd3aa933338e63dbff857d384e482fbdb7dd557849e5529
 
 jobs:
   build:
@@ -42,6 +45,9 @@ jobs:
       bridge_archive_sha256: ${{ steps.archive.outputs.bridge_archive_sha256 }}
       api_image_id: ${{ steps.archive.outputs.api_image_id }}
       bridge_image_id: ${{ steps.archive.outputs.bridge_image_id }}
+      native_archive_sha256: ${{ steps.archive.outputs.native_archive_sha256 }}
+      native_image_id: ${{ steps.archive.outputs.native_image_id }}
+      base_archive_sha256: ${{ steps.archive.outputs.base_archive_sha256 }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout immutable reviewed recipe
@@ -83,7 +89,52 @@ jobs:
           python3 recipe/deploy/contabo/build_context.py source bridge-context --bridge
           docker build --platform linux/amd64 \
             -t "$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" bridge-context
-      - name: Smoke-check API dependencies and bridge without network
+      - name: Checkout exact official OpenClaw source and build the reviewed UI overlay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: openclaw/openclaw
+          ref: ${{ env.OPENCLAW_UPSTREAM_REVISION }}
+          path: openclaw-source
+          persist-credentials: false
+      - name: Select Node 24 for the native toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6, official tag resolved 2026-10-30
+        with:
+          node-version: '24'
+      - name: Install pinned UI build toolchain and run native harness
+        shell: bash
+        env:
+          OPENCLAW_SOURCE_ROOT: ${{ github.workspace }}/openclaw-source
+        run: |
+          set -euo pipefail
+          git -C openclaw-source apply "$GITHUB_WORKSPACE/source/services/openclaw_control_ui/scm-personal-access.patch"
+          corepack enable
+          corepack prepare pnpm@12.5.1 --activate
+          pnpm --dir "$OPENCLAW_SOURCE_ROOT/ui" install --frozen-lockfile --ignore-scripts
+          for scm_flag in false true; do
+            VITE_SCM_PERSONAL_ACCESS="$scm_flag" pnpm --dir "$OPENCLAW_SOURCE_ROOT/ui" exec vitest run --config "$GITHUB_WORKSPACE/source/services/openclaw_control_ui/test/vitest.scm.config.mts" --project unit --project unit-mock-registry \
+              src/components/login-gate.test.ts \
+              src/components/app-sidebar-session-catalog-live.test.ts \
+              src/pages/chat/chat-pane-pull-requests.test.ts \
+              src/app/browser-auth-recovery.test.ts
+          done
+      - name: Generate sealed native build context from exact source and metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPENCLAW_SOURCE_ROOT="$GITHUB_WORKSPACE/openclaw-source" \
+          OPENCLAW_UI_CONTEXT="$GITHUB_WORKSPACE/native-context" \
+            node source/services/openclaw_control_ui/scripts/build-context.mjs
+          node source/services/openclaw_control_ui/scripts/verify-context.mjs native-context native-context/release-metadata.json
+      - name: Build native OpenClaw image from pinned official base
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_tag="$NATIVE_IMAGE:native-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker build --platform linux/amd64 \
+            --build-arg OPENCLAW_BASE_IMAGE="$OPENCLAW_BASE_IMAGE" \
+            -t "$native_tag" native-context
+          docker image inspect "$native_tag" --format '{{json .Config.Labels}}' | grep -F "$OPENCLAW_UPSTREAM_REVISION"
+      - name: Smoke-check API, bridge and native images without network
         shell: bash
         run: |
           set -euo pipefail
@@ -106,22 +157,31 @@ jobs:
             -e SCM_BRIDGE_DB_PATH=/var/lib/scm-openclaw-bridge/bridge.sqlite \
             "$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             sh -ec 'node src/server.js >/dev/null 2>&1 & pid=$!; trap "kill $pid 2>/dev/null || true" EXIT; for i in $(seq 1 30); do node -e "fetch(\"http://127.0.0.1:5182/healthz\").then(async r => { if (r.status !== 200) process.exit(1); const b=await r.json(); if (b.status !== \"ok\") process.exit(1); }).catch(() => process.exit(1))" && exit 0 || true; sleep 1; done; exit 1'
-      - name: Save and inspect every layer of both tested images
+          native_tag="$NATIVE_IMAGE:native-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges "$native_tag" node --version
+      - name: Save and inspect every layer of all tested images
         id: archive
         shell: bash
         run: |
           set -euo pipefail
           api_tag="$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           bridge_tag="$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          native_tag="$NATIVE_IMAGE:native-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker save --output openclaw-base.tar "$OPENCLAW_BASE_IMAGE"
           docker save --output api.tar "$api_tag"
           docker save --output bridge.tar "$bridge_tag"
+          docker save --output native.tar "$native_tag"
           python3 recipe/deploy/contabo/verify_image_layers.py api.tar
           python3 recipe/deploy/contabo/verify_bridge_layers.py bridge.tar
+          python3 recipe/deploy/contabo/verify_native_layers.py native.tar --base-archive openclaw-base.tar --metadata native-context/release-metadata.json
           echo "api_archive_sha256=$(sha256sum api.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
           echo "bridge_archive_sha256=$(sha256sum bridge.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "native_archive_sha256=$(sha256sum native.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "base_archive_sha256=$(sha256sum openclaw-base.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
           echo "api_image_id=$(docker image inspect "$api_tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
           echo "bridge_image_id=$(docker image inspect "$bridge_tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
-      - name: Preserve exact tested images for separate publication job
+          echo "native_image_id=$(docker image inspect "$native_tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+      - name: Preserve exact tested images and native context for separate publication job
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -129,6 +189,10 @@ jobs:
           path: |
             api.tar
             bridge.tar
+            native.tar
+            openclaw-base.tar
+            native-context/release-metadata.json
+            native-context/artifact-manifest.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -148,6 +212,9 @@ jobs:
       EXPECTED_BRIDGE_ARCHIVE_SHA256: ${{ needs.build.outputs.bridge_archive_sha256 }}
       EXPECTED_API_IMAGE_ID: ${{ needs.build.outputs.api_image_id }}
       EXPECTED_BRIDGE_IMAGE_ID: ${{ needs.build.outputs.bridge_image_id }}
+      EXPECTED_NATIVE_ARCHIVE_SHA256: ${{ needs.build.outputs.native_archive_sha256 }}
+      EXPECTED_NATIVE_IMAGE_ID: ${{ needs.build.outputs.native_image_id }}
+      EXPECTED_BASE_ARCHIVE_SHA256: ${{ needs.build.outputs.base_archive_sha256 }}
     steps:
       - name: Checkout immutable reviewed publication checks
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -176,16 +243,25 @@ jobs:
           [[ "$EXPECTED_BRIDGE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_API_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_BRIDGE_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_NATIVE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_NATIVE_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_BASE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           printf '%s  %s\n' "$EXPECTED_API_ARCHIVE_SHA256" tested/api.tar | sha256sum --check --strict
           printf '%s  %s\n' "$EXPECTED_BRIDGE_ARCHIVE_SHA256" tested/bridge.tar | sha256sum --check --strict
+          printf '%s  %s\n' "$EXPECTED_NATIVE_ARCHIVE_SHA256" tested/native.tar | sha256sum --check --strict
+          printf '%s  %s\n' "$EXPECTED_BASE_ARCHIVE_SHA256" tested/openclaw-base.tar | sha256sum --check --strict
           python3 recipe/deploy/contabo/verify_image_layers.py tested/api.tar
           python3 recipe/deploy/contabo/verify_bridge_layers.py tested/bridge.tar
+          python3 recipe/deploy/contabo/verify_native_layers.py tested/native.tar --base-archive tested/openclaw-base.tar --metadata tested/native-context/release-metadata.json
           docker load --input tested/api.tar
           docker load --input tested/bridge.tar
+          docker load --input tested/native.tar
           api_tag="$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           bridge_tag="$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          native_tag="$NATIVE_IMAGE:native-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           test "$(docker image inspect "$api_tag" --format '{{.Id}}')" = "$EXPECTED_API_IMAGE_ID"
           test "$(docker image inspect "$bridge_tag" --format '{{.Id}}')" = "$EXPECTED_BRIDGE_IMAGE_ID"
+          test "$(docker image inspect "$native_tag" --format '{{.Id}}')" = "$EXPECTED_NATIVE_IMAGE_ID"
       - name: Login using ephemeral publication token
         env:
           GH_TOKEN: ${{ github.token }}
@@ -197,19 +273,26 @@ jobs:
           set -euo pipefail
           api_tag="$API_IMAGE:sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           bridge_tag="$BRIDGE_IMAGE:bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          native_tag="$NATIVE_IMAGE:native-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           docker push "$api_tag"
           docker push "$bridge_tag"
+          docker push "$native_tag"
           docker image inspect "$api_tag" --format '{{json .RepoDigests}}' > api-repo-digests.json
           docker image inspect "$bridge_tag" --format '{{json .RepoDigests}}' > bridge-repo-digests.json
+          docker image inspect "$native_tag" --format '{{json .RepoDigests}}' > native-repo-digests.json
           export API_DIGEST="$(python3 -c "import json,os; x=json.load(open('api-repo-digests.json')); print(next(r for r in x if r.startswith(os.environ['API_IMAGE']+'@sha256:')))" )"
           export BRIDGE_DIGEST="$(python3 -c "import json,os; x=json.load(open('bridge-repo-digests.json')); print(next(r for r in x if r.startswith(os.environ['BRIDGE_IMAGE']+'@sha256:')))" )"
+          export NATIVE_DIGEST="$(python3 -c "import json,os; x=json.load(open('native-repo-digests.json')); print(next(r for r in x if r.startswith(os.environ['NATIVE_IMAGE']+'@sha256:')))" )"
           test "$API_DIGEST" != "$BRIDGE_DIGEST"
+          test "$API_DIGEST" != "$NATIVE_DIGEST"
+          test "$BRIDGE_DIGEST" != "$NATIVE_DIGEST"
           anon_config="$RUNNER_TEMP/scm-anonymous-docker-config"
           test ! -e "$anon_config"
           mkdir "$anon_config"
           test -z "$(find "$anon_config" -mindepth 1 -print -quit)"
           env -u GH_TOKEN -u GH_ACTOR docker --config "$anon_config" pull "$API_DIGEST"
           env -u GH_TOKEN -u GH_ACTOR docker --config "$anon_config" pull "$BRIDGE_DIGEST"
+          env -u GH_TOKEN -u GH_ACTOR docker --config "$anon_config" pull "$NATIVE_DIGEST"
           python3 - <<'PY'
           import json, os, re, runpy
           def digest(path, image):
@@ -218,29 +301,37 @@ jobs:
               return refs[0]
           api=digest('api-repo-digests.json',os.environ['API_IMAGE'])
           bridge=digest('bridge-repo-digests.json',os.environ['BRIDGE_IMAGE'])
-          assert api == os.environ['API_DIGEST'] and bridge == os.environ['BRIDGE_DIGEST']
-          assert api != bridge
+          native=digest('native-repo-digests.json',os.environ['NATIVE_IMAGE'])
+          assert api == os.environ['API_DIGEST'] and bridge == os.environ['BRIDGE_DIGEST'] and native == os.environ['NATIVE_DIGEST']
+          assert len({api,bridge,native}) == 3
           checks=runpy.run_path('recipe/deploy/contabo/check_ci.py',run_name='recipe_checks')
           bridge_manifest=json.load(open('recipe/deploy/contabo/bridge-runtime-allowlist.json'))
+          native_metadata=json.load(open('tested/native-context/release-metadata.json'))
           assert checks['SOURCE_SHA'] == os.environ['SOURCE_SHA']
           assert bridge_manifest['source_sha'] == os.environ['SOURCE_SHA']
           assert bridge_manifest['base_image'] == os.environ['BRIDGE_BASE']
+          assert native_metadata['upstream']['revision'] == os.environ['OPENCLAW_UPSTREAM_REVISION']
+          assert native_metadata['baseImage'] == os.environ['OPENCLAW_BASE_IMAGE']
           result={
               'source_sha':os.environ['SOURCE_SHA'], 'recipe_sha':os.environ['RECIPE_SHA'],
               'workflow_sha':os.environ['GITHUB_SHA'], 'python_base':os.environ['PYTHON_BASE'],
-              'bridge_base':os.environ['BRIDGE_BASE'], 'api_image':api, 'bridge_image':bridge,
+              'bridge_base':os.environ['BRIDGE_BASE'], 'native_base':os.environ['OPENCLAW_BASE_IMAGE'],
+              'api_image':api, 'bridge_image':bridge, 'native_image':native,
               'ci_run_id':checks['RUN_ID'], 'ci_run_url':checks['RUN_URL'],
               'ci_branch':checks['BRANCH'], 'ci_workflow':'.github/workflows/tests.yml',
               'api_archive_sha256':os.environ['EXPECTED_API_ARCHIVE_SHA256'],
               'bridge_archive_sha256':os.environ['EXPECTED_BRIDGE_ARCHIVE_SHA256'],
+              'native_archive_sha256':os.environ['EXPECTED_NATIVE_ARCHIVE_SHA256'],
               'api_image_id':os.environ['EXPECTED_API_IMAGE_ID'],
               'bridge_image_id':os.environ['EXPECTED_BRIDGE_IMAGE_ID'],
+              'native_image_id':os.environ['EXPECTED_NATIVE_IMAGE_ID'],
               'run_id':os.environ['GITHUB_RUN_ID'], 'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'],
               'deployed':False,
           }
           with open('release-image.json','w') as f: json.dump(result,f,indent=2)
           print('Candidate API image:',api)
           print('Candidate bridge image:',bridge)
+          print('Candidate native image:',native)
           PY
       - name: Preserve release evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

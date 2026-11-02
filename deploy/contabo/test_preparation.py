@@ -31,6 +31,9 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaises(ValueError):gate.select_success(dict(row,**{key:value}),sha)
         gate.validate_inputs(sha,'python:3.12-slim@sha256:'+'b'*64)
         with self.assertRaises(ValueError):gate.validate_inputs('a'*40,'python:3.12-slim@sha256:'+'b'*64)
+        jobs=[{'name':name,'status':'completed','conclusion':'success'} for name in gate.REQUIRED_JOBS]
+        self.assertTrue(gate.validate_jobs({'jobs':jobs}))
+        with self.assertRaises(ValueError):gate.validate_jobs({'jobs':jobs[:-1]})
 
     def test_context_ignores_unapproved_files_and_checks_bytes(self):
         builder=load('build_context')
@@ -95,18 +98,32 @@ class PreparationTests(unittest.TestCase):
         self.assertNotIn('node_modules',manifest['files'])
         self.assertTrue(all(not path.startswith('test/') for path in manifest['files']))
 
-    def test_workflow_builds_and_publishes_two_images_under_one_gate(self):
+    def test_workflow_builds_and_publishes_three_images_under_one_gate(self):
         workflow=(ROOT.parent.parent/'.github'/'workflows'/'contabo-image.yml').read_text()
         self.assertIn('scm-pilot-image-public',workflow)
         self.assertEqual(workflow.count('environment: scm-pilot-image-public'),1)
         self.assertIn('verify_image_layers.py api.tar',workflow)
         self.assertIn('verify_bridge_layers.py bridge.tar',workflow)
+        self.assertIn('verify_native_layers.py native.tar',workflow)
+        self.assertIn('--base-archive openclaw-base.tar',workflow)
+        self.assertIn("node-version: '24'",workflow)
+        self.assertIn('OPENCLAW_SOURCE_ROOT: ${{ github.workspace }}/openclaw-source',workflow)
+        self.assertIn('src/components/login-gate.test.ts',workflow)
+        self.assertIn('src/components/app-sidebar-session-catalog-live.test.ts',workflow)
+        self.assertIn('src/pages/chat/chat-pane-pull-requests.test.ts',workflow)
+        self.assertIn('src/app/browser-auth-recovery.test.ts',workflow)
+        self.assertIn('for scm_flag in false true; do',workflow)
+        self.assertIn('VITE_SCM_PERSONAL_ACCESS="$scm_flag"',workflow)
+        self.assertIn('actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38',workflow)
+        self.assertNotIn('uses: actions/setup-node@v6',workflow)
         self.assertIn('docker push "$api_tag"',workflow)
         self.assertIn('docker push "$bridge_tag"',workflow)
+        self.assertIn('docker push "$native_tag"',workflow)
         self.assertIn('BRIDGE_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api',workflow)
         self.assertIn('bridge-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT',workflow)
         self.assertIn('docker --config "$anon_config" pull "$API_DIGEST"',workflow)
         self.assertIn('docker --config "$anon_config" pull "$BRIDGE_DIGEST"',workflow)
+        self.assertIn('docker --config "$anon_config" pull "$NATIVE_DIGEST"',workflow)
 
     def test_bridge_config_verifier_rejects_root_and_secret_env(self):
         verifier=load('verify_bridge_layers')
@@ -127,6 +144,45 @@ class PreparationTests(unittest.TestCase):
                     body=json.dumps(bad).encode(); info=tarfile.TarInfo('config.json'); info.size=len(body); archive.addfile(info,io.BytesIO(body))
                 with tarfile.open(p,'r') as archive:
                     with self.assertRaises(ValueError): verifier._load_lockfile(archive,'config.json')
+
+    def test_native_overlay_verifier_seals_only_control_ui_layer(self):
+        verifier=load('verify_native_layers')
+        metadata={'baseImage':'ghcr.io/openclaw/openclaw@sha256:'+'a'*64,
+                  'upstream':{'version':'2026.9.8','revision':'b'*40,'patchSha256':'c'*64},
+                  'overlay':{'buildId':'overlay-build','builtAt':'2026-10-30T19:57:28.135Z'}}
+        labels={'org.opencontainers.image.version':'2026.9.8',
+                'org.opencontainers.image.revision':'b'*40,
+                'io.envaperu.openclaw.base-image':metadata['baseImage'],
+                'io.envaperu.openclaw.patch.sha256':'c'*64,
+                'io.envaperu.openclaw.control-ui.build-id':'overlay-build',
+                'io.envaperu.openclaw.control-ui.built-at':'2026-10-30T19:57:28.135Z'}
+        def layer(entries):
+            out=io.BytesIO()
+            with tarfile.open(fileobj=out,mode='w') as archive:
+                for name,data in entries:
+                    info=tarfile.TarInfo(name);info.size=len(data);archive.addfile(info,io.BytesIO(data))
+            return out.getvalue()
+        def write_archive(path, overlay_entries, base=False):
+            config_name='config.json';base_name='base.tar';overlay_names=['overlay-0.tar','overlay-1.tar']
+            config={'config':{'Labels':labels,'Env':['PATH=/usr/bin']},'rootfs':{'type':'layers','diff_ids':['sha256:base'] if base else ['sha256:base','sha256:overlay-0','sha256:overlay-1']}}
+            layers=[base_name] if base else [base_name,*overlay_names]
+            with tarfile.open(path,'w') as image:
+                entries=[(config_name,json.dumps(config).encode()),(base_name,layer([('usr/bin/node',b'node')]))]
+                entries.extend((name,layer([entry])) for name,entry in zip(overlay_names,overlay_entries))
+                for name,data in entries:
+                    if base and name != config_name and name != base_name: continue
+                    info=tarfile.TarInfo(name);info.size=len(data);image.addfile(info,io.BytesIO(data))
+                data=json.dumps([{'Config':config_name,'Layers':layers}]).encode();info=tarfile.TarInfo('manifest.json');info.size=len(data);image.addfile(info,io.BytesIO(data))
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'native.tar'
+            base=Path(d)/'base.tar'
+            write_archive(base,[('usr/bin/node',b'node')],base=True)
+            write_archive(p,[('app/dist/control-ui/index.html',b'ui'),('app/dist/build-info.json',b'{}')])
+            verifier.verify(p,metadata,base)
+            with self.assertRaises(ValueError):
+                verifier.verify(p, {**metadata, 'overlay': {'buildId': '', 'builtAt': metadata['overlay']['builtAt']}}, base)
+            write_archive(p,[('app/etc/config.json',b'bad'),('app/dist/build-info.json',b'{}')])
+            with self.assertRaises(ValueError):verifier.verify(p,metadata,base)
 
     def test_release_pins_images_and_preserves_secret_placeholders(self):
         renderer=load('render_release');sha='a'*40

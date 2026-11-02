@@ -1,38 +1,52 @@
-# SCM Contabo: reviewed API + bridge image preparation
+# SCM Contabo: reviewed API + bridge + native OpenClaw image preparation
 
 Status: local preparation; independent review required before pushing or publishing.
-The user authorized PUBLIC GHCR images containing the API and the personal-agent
-bridge, with code, dependencies and necessary runtime templates. No VPS deployment,
+The user authorized PUBLIC GHCR images containing the API, personal-agent bridge
+and official OpenClaw Control UI overlay, with code, dependencies and necessary
+runtime templates. No VPS deployment,
 credentials, Odoo changes or data migration are part of this package.
 
-The exact application source is `d9662d5581e780b0b9f64ae40208884f2add6403` and
-the candidate CI gate is run `41098144080` on branch
-`codex/personal-agent-assets-20261030`. The API context is independently hashed
+The exact application source is `831d6deb940dcefc5f7837129f1741662642f516` and
+the candidate CI gate is run `41127566753` on branch
+`codex/personal-agent-simple-20261030`. The API context is independently hashed
 by `runtime-allowlist.json`; the bridge context is independently hashed by
 `bridge-runtime-allowlist.json` and includes only its pinned Dockerfile,
 package manifests and `src/**`. Tests, examples, `.env` files, fixtures and
 `node_modules` are never copied into either context.
 
-Both images use the existing public GHCR package
+All three images use the existing public GHCR package
 `ghcr.io/estebansulcainfante/envaperu-scm-api`, with distinct immutable tags
 `sha-<source>-<run>-<attempt>` and
-`bridge-sha-<source>-<run>-<attempt>`. The manual workflow builds, smoke-checks
-and layer-verifies both images in the unprivileged job, uploads `api.tar` and
-`bridge.tar` together, then has one `scm-pilot-image-public` protected publish
-job re-check both archives, pushes both tags, and pulls both resulting digests
+`bridge-sha-<source>-<run>-<attempt>` and
+`native-sha-<source>-<run>-<attempt>`. The manual workflow builds, smoke-checks
+and layer-verifies all three images in the unprivileged job, uploads `api.tar`,
+`bridge.tar`, `native.tar` and the unpublished `openclaw-base.tar` evidence
+together, then has one `scm-pilot-image-public`
+protected publish job re-checks all archives, pushes all tags, and pulls all digests
 with an empty anonymous Docker config before writing evidence. A private or
 unpullable package therefore cannot produce `release-image.json`.
 
 ## Source and trusted CI
 
-Application source is fixed to d9662d5581e780b0b9f64ae40208884f2add6403.
-check_ci.py accepts only GitHub Actions run 41098144080, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/personal-agent-assets-20261030,
+Application source is fixed to 831d6deb940dcefc5f7837129f1741662642f516.
+check_ci.py accepts only GitHub Actions run 41127566753, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/personal-agent-simple-20261030,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
-At recipe preparation time that run was in progress; publication remains blocked
-until this exact run is observed completed with success.
+The coordinator verified this exact run completed successfully with all four
+required jobs. The workflow rechecks the same run before building or publishing.
 It does not accept a green run from an arbitrary branch or require main: main is
-older than this source. The existing source CI includes fast-suite/postgres-smoke.
+older than this source. The source CI must include successful
+`personal-agent-bridge`, `fast-suite`, `postgres-smoke` and `native-ui-overlay`
+jobs; `check_ci.py` fails closed if any required job is absent or unsuccessful.
+
+The native image checks out official OpenClaw revision
+`fc23bc864e4553c2d215e479eeec47b67a0bf943` without credentials, applies the exact
+overlay patch SHA recorded in `services/openclaw_control_ui/release-metadata.json`,
+installs with Node 24 and pnpm 12.5.1 using frozen lockfiles and ignored scripts,
+runs the bounded source UI harness, compares the native archive's layer prefix
+with the separately saved pinned base archive, and verifies a sealed context containing only
+`dist/control-ui/` and `dist/build-info.json` over the pinned official base. No
+gateway config, state, environment, credentials or scope is added.
 
 The source preserves the API currently deployed on 27 October (including its five
 performance patches and schema head ff60718293a4). This release adds an owner-bound,
@@ -105,11 +119,11 @@ It requires environment scm-pilot-image-public. check_publish_gate.py fails unle
 that environment has a required reviewer and exactly one allowed deployment branch,
 codex/scm-contabo-image. The build also checks this gate when publication is requested,
 before the privileged job. No script creates or weakens environment protections.
-The publish job downloads the artifact by its exact ID from this run, verifies both
-archive hashes and all layers again, loads the tested images and checks both image
-IDs. It never builds or executes application code. GHCR login uses the ephemeral
+The publish job downloads the artifact by its exact ID from this run, verifies all
+archive hashes and layers again, loads the tested images and checks all image IDs.
+It never builds or executes application code. GHCR login uses the ephemeral
 workflow token. Tags include source SHA, run ID and attempt; release-image.json
-records both registry digests, source SHA, pinned recipe SHA, both bases and run.
+records all registry digests, source SHA, pinned recipe SHA, all bases and run.
 There is no deploy step.
 
 Execution prerequisites still needing coordinator resolution:
@@ -122,19 +136,27 @@ Execution prerequisites still needing coordinator resolution:
    to enable dispatch. Coordinate a reviewed workflow-only bootstrap before execution.
 4. Supply a reviewed immutable python:3.12-slim@sha256 digest. No fabricated digest.
 5. A supported authenticated GitHub execution path. No PAT or credentials are created.
-6. Both images use disjoint tags in the existing public GHCR package. The workflow
-   does not change visibility: it requires anonymous pulls of both distinct digests
-   before emitting release evidence. If either pull fails, the run fails and no
-   deployable candidate is emitted. Two pushes are not atomic; a partial publication
+6. All three images use disjoint tags in the existing public GHCR package. The workflow
+   does not change visibility: it requires anonymous pulls of all distinct digests
+   before emitting release evidence. If any pull fails, the run fails and no
+   deployable candidate is emitted. Three pushes are not atomic; a partial publication
    without release evidence must not be deployed and may be retried in a new run.
+
+7. The API and bridge allowlists have been regenerated from the immutable Git
+   blobs of source `831d6deb940dcefc5f7837129f1741662642f516`, including the approved
+   runtime template. Both generated contexts and preparation tests were verified.
+   Any later source change requires new reviewed hashes and CI identity. Do not
+   claim publication until
+   the exact CI run, three archives, image IDs, context manifests, anonymous pulls
+   and protected environment approval are recorded.
 
 ## Later deployment, outside current publication scope
 
-The existing Dokploy scm-pilot service remains idle. Future generic Git configuration:
-https://github.com/estebanSulcaInfante/envaperu-workflow.git, release/scm-pilot,
-./deploy/contabo/compose.release.yaml, no SSH key/submodules, AutoDeploy OFF.
-That release branch/manifest must be created only after image digest review; no
-GitHub App, webhook or new Dokploy API key is required for public HTTPS Git cloning.
+This publication workflow does not deploy or change the running SCM service.
+Deployment uses the existing reviewed production configuration after immutable
+digest review and verified backups. Preserve database, resources, secret files,
+mounts and AutoDeploy settings; do not replace the production compose with a
+generic template or create a new service as part of image publication.
 
 render_release.py resolves the API digest plus an approved immutable PostgreSQL
 15-17 reference into a new compose.release.yaml; it rejects unpinned references,
