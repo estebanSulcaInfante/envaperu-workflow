@@ -114,6 +114,7 @@ class PreparationTests(unittest.TestCase):
         self.assertIn('src/app/browser-auth-recovery.test.ts',workflow)
         self.assertIn('for scm_flag in false true; do',workflow)
         self.assertIn('VITE_SCM_PERSONAL_ACCESS="$scm_flag"',workflow)
+        self.assertIn('OPENCLAW_VITEST_FS_MODULE_CACHE_PATH="$RUNNER_TEMP/openclaw-vitest-fs-cache-$scm_flag"',workflow)
         self.assertIn('actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38',workflow)
         self.assertNotIn('uses: actions/setup-node@v6',workflow)
         self.assertIn('docker push "$api_tag"',workflow)

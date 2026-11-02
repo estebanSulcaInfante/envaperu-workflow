@@ -111,7 +111,13 @@ jobs:
           corepack prepare pnpm@12.5.1 --activate
           pnpm --dir "$OPENCLAW_SOURCE_ROOT/ui" install --frozen-lockfile --ignore-scripts
           for scm_flag in false true; do
-            VITE_SCM_PERSONAL_ACCESS="$scm_flag" pnpm --dir "$OPENCLAW_SOURCE_ROOT/ui" exec vitest run --config "$GITHUB_WORKSPACE/source/services/openclaw_control_ui/test/vitest.scm.config.mts" --project unit --project unit-mock-registry \
+            # The upstream Linux config enables fsModuleCache by default. Its
+            # transform cache embeds VITE_SCM_PERSONAL_ACCESS through
+            # import.meta.env, so sharing it across the off/on matrix would
+            # reuse the first flag's UI modules. Keep both runs cached, but
+            # give each build-flag variant an isolated cache namespace.
+            OPENCLAW_VITEST_FS_MODULE_CACHE_PATH="$RUNNER_TEMP/openclaw-vitest-fs-cache-$scm_flag" \
+              VITE_SCM_PERSONAL_ACCESS="$scm_flag" pnpm --dir "$OPENCLAW_SOURCE_ROOT/ui" exec vitest run --config "$GITHUB_WORKSPACE/source/services/openclaw_control_ui/test/vitest.scm.config.mts" --project unit --project unit-mock-registry \
               src/components/login-gate.test.ts \
               src/components/app-sidebar-session-catalog-live.test.ts \
               src/pages/chat/chat-pane-pull-requests.test.ts \
