@@ -3,7 +3,7 @@
 # Project name is controlled by Dokploy: envaperuscmpilot-scmpilot-cnxr9n
 services:
   api:
-    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:70a650995808f158e7d73c08db5edb3d359bf2c0bfdce1d934a261f19ada9ea1
+    image: ghcr.io/estebansulcainfante/envaperu-scm-api@sha256:6851fef6f791164a48473cad7592b9c996f2c001ed780e274b293d328181d818
     restart: unless-stopped
     init: true
     user: "10001:10001"
