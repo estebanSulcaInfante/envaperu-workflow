@@ -23,6 +23,11 @@ class EngineeringApiPreparationTests(unittest.TestCase):
         self.assertTrue(gate['validate_jobs']({'jobs': jobs}))
         with self.assertRaises(ValueError):
             gate['validate_jobs']({'jobs': jobs[:-1]})
+        with self.assertRaises(ValueError):
+            gate['validate_inputs'](
+                gate['SOURCE_SHA'],
+                'python:3.12-slim@sha256:' + 'a' * 64,
+            )
 
     def test_allowlist_is_engineering_source_and_has_four_overlays(self):
         manifest = json.loads((RECIPE / 'runtime-allowlist.json').read_text())

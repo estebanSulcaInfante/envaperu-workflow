@@ -1,7 +1,6 @@
 """Validate the exact reviewed Engineering source CI run."""
 import json
 import os
-import re
 import urllib.request
 
 SOURCE_SHA = '564be49ec362b574c873a30b33c4c5265dedb426'
@@ -10,13 +9,14 @@ BRANCH = 'codex/ingenieria-source-20261102'
 REPOSITORY = 'estebanSulcaInfante/envaperu-workflow'
 RUN_URL = f'https://github.com/{REPOSITORY}/actions/runs/{RUN_ID}'
 REQUIRED_JOBS = {'personal-agent-bridge', 'fast-suite', 'postgres-smoke'}
+PYTHON_BASE = 'python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f'
 
 
 def validate_inputs(source_sha, python_base):
     if source_sha != SOURCE_SHA:
         raise ValueError('Only reviewed Engineering source SHA is approved')
-    if not re.fullmatch(r'python:3\.12[.\w-]*@sha256:[0-9a-f]{64}', python_base):
-        raise ValueError('Approved Python 3.12 immutable base required')
+    if python_base != PYTHON_BASE:
+        raise ValueError('Only the reviewed immutable Python base is approved')
 
 
 def select_success(run, source_sha):
