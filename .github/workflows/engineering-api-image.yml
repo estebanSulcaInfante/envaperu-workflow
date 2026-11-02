@@ -1,0 +1,200 @@
+name: Prepare Engineering API image (manual)
+
+# API-only candidate. No deploy, VPS access or automatic push.
+on:
+  push:
+    branches:
+      - codex/ingenieria-release-20261102
+    paths:
+      - '.github/workflows/engineering-api-image.yml'
+      - 'deploy/engineering-api/**'
+  workflow_dispatch:
+    inputs:
+      python_base:
+        description: Reviewed python:3.12-slim variant with immutable @sha256 digest
+        required: true
+        type: string
+      publish:
+        description: Publish the tested Engineering API image after environment approval
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+concurrency:
+  group: engineering-api-image
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 564be49ec362b574c873a30b33c4c5265dedb426
+  RECIPE_SHA: ${{ github.sha }}
+  PYTHON_BASE: ${{ inputs.python_base || 'python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f' }}
+  API_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
+
+jobs:
+  build:
+    if: github.repository == 'estebanSulcaInfante/envaperu-workflow' && ((github.event_name == 'push' && github.ref == 'refs/heads/codex/ingenieria-release-20261102') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/scm-contabo-image'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      api_archive_sha256: ${{ steps.archive.outputs.api_archive_sha256 }}
+      api_image_id: ${{ steps.archive.outputs.api_image_id }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout immutable Engineering API recipe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RECIPE_SHA }}
+          path: recipe
+          persist-credentials: false
+      - name: Verify recipe checkout and exact Engineering source CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git -C recipe rev-parse HEAD)" = "$RECIPE_SHA"
+          python3 recipe/deploy/engineering-api/check_ci.py
+      - name: Verify publication protection before requesting privileged job
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 recipe/deploy/contabo/check_publish_gate.py
+      - name: Checkout exact Engineering application source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - name: Build Engineering API from hashed context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 recipe/deploy/engineering-api/build_context.py source api-context
+          docker build --platform linux/amd64 --build-arg PYTHON_BASE="$PYTHON_BASE" \
+            --build-arg SOURCE_SHA="$SOURCE_SHA" -f api-context/Dockerfile \
+            -t "$API_IMAGE:engineering-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" api-context
+      - name: Smoke-check Engineering API without network
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --entrypoint python \
+            "$API_IMAGE:engineering-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -c "import gunicorn, flask, psycopg2, openpyxl; from pathlib import Path; assert Path('/app/run.py').is_file(); assert Path('/app/migrations').is_dir(); w=openpyxl.load_workbook('/app/app/templates/excel/OrdenProduccion/Book2.xlsx'); assert 'IMPRIMIR OP' in w.sheetnames; w.close()"
+      - name: Save and inspect tested Engineering API image
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_tag="$API_IMAGE:engineering-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker save --output api.tar "$api_tag"
+          python3 recipe/deploy/engineering-api/verify_image_layers.py api.tar
+          echo "api_archive_sha256=$(sha256sum api.tar | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          echo "api_image_id=$(docker image inspect "$api_tag" --format '{{.Id}}')" >> "$GITHUB_OUTPUT"
+      - name: Preserve exact tested Engineering API image
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: engineering-api-${{ github.run_id }}-${{ github.run_attempt }}
+          path: api.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.repository == 'estebanSulcaInfante/envaperu-workflow' && github.ref == 'refs/heads/codex/scm-contabo-image'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: scm-pilot-image-public
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    env:
+      EXPECTED_API_ARCHIVE_SHA256: ${{ needs.build.outputs.api_archive_sha256 }}
+      EXPECTED_API_IMAGE_ID: ${{ needs.build.outputs.api_image_id }}
+    steps:
+      - name: Checkout immutable Engineering publication checks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RECIPE_SHA }}
+          path: recipe
+          persist-credentials: false
+      - name: Recheck recipe and actual environment policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git -C recipe rev-parse HEAD)" = "$RECIPE_SHA"
+          python3 recipe/deploy/contabo/check_publish_gate.py
+      - name: Download only the successful Engineering API artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: tested
+          merge-multiple: true
+      - name: Verify archive, layer and image identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_API_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_API_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "$EXPECTED_API_ARCHIVE_SHA256" tested/api.tar | sha256sum --check --strict
+          python3 recipe/deploy/engineering-api/verify_image_layers.py tested/api.tar
+          docker load --input tested/api.tar
+          api_tag="$API_IMAGE:engineering-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$(docker image inspect "$api_tag" --format '{{.Id}}')" = "$EXPECTED_API_IMAGE_ID"
+      - name: Login using ephemeral publication token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GH_ACTOR" --password-stdin
+      - name: Publish exact tested Engineering API image and record digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_tag="$API_IMAGE:engineering-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker push "$api_tag"
+          docker image inspect "$api_tag" --format '{{json .RepoDigests}}' > api-repo-digests.json
+          export API_DIGEST="$(python3 -c "import json,os; x=json.load(open('api-repo-digests.json')); print(next(r for r in x if r.startswith(os.environ['API_IMAGE']+'@sha256:')))" )"
+          anon_config="$RUNNER_TEMP/engineering-api-anonymous-docker-config"
+          test ! -e "$anon_config"
+          mkdir "$anon_config"
+          env -u GH_TOKEN -u GH_ACTOR docker --config "$anon_config" pull "$API_DIGEST"
+          python3 - <<'PY'
+          import json, os, re, runpy
+          refs=[r for r in json.load(open('api-repo-digests.json')) if r.startswith(os.environ['API_IMAGE']+'@sha256:')]
+          assert len(refs) == 1 and re.fullmatch(r'.+@sha256:[0-9a-f]{64}', refs[0])
+          assert refs[0] == os.environ['API_DIGEST']
+          checks=runpy.run_path('recipe/deploy/engineering-api/check_ci.py', run_name='recipe_checks')
+          manifest=json.load(open('recipe/deploy/engineering-api/runtime-allowlist.json'))
+          assert checks['SOURCE_SHA'] == os.environ['SOURCE_SHA']
+          assert manifest['source_sha'] == os.environ['SOURCE_SHA']
+          result={
+              'source_sha':os.environ['SOURCE_SHA'], 'recipe_sha':os.environ['RECIPE_SHA'],
+              'workflow_sha':os.environ['GITHUB_SHA'], 'python_base':os.environ['PYTHON_BASE'],
+              'api_image':os.environ['API_DIGEST'], 'ci_run_id':checks['RUN_ID'],
+              'ci_run_url':checks['RUN_URL'], 'ci_branch':checks['BRANCH'],
+              'ci_workflow':'.github/workflows/tests.yml',
+              'api_archive_sha256':os.environ['EXPECTED_API_ARCHIVE_SHA256'],
+              'api_image_id':os.environ['EXPECTED_API_IMAGE_ID'],
+              'run_id':os.environ['GITHUB_RUN_ID'], 'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'],
+              'deployed':False,
+          }
+          with open('release-image.json','w') as f: json.dump(result,f,indent=2)
+          print('Candidate Engineering API image:',os.environ['API_DIGEST'])
+          PY
+      - name: Preserve Engineering API release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: engineering-api-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-image.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Logout
+        if: always()
+        run: docker logout ghcr.io
