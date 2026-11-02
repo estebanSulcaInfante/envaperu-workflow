@@ -5,9 +5,9 @@ The user authorized PUBLIC GHCR images containing the API and the personal-agent
 bridge, with code, dependencies and necessary runtime templates. No VPS deployment,
 credentials, Odoo changes or data migration are part of this package.
 
-The exact application source is `73f560aa190dc7565772a14e6cc5f4acc6412f10` and
-the reviewed CI gate is run `40953346956` on branch
-`codex/personal-agent-access-20261029`. The API context is independently hashed
+The candidate application source is `564be49ec362b574c873a30b33c4c5265dedb426`,
+whose source CI gate is run `41475743315` on branch
+`codex/ingenieria-release-20261102`. The API context is independently hashed
 by `runtime-allowlist.json`; the bridge context is independently hashed by
 `bridge-runtime-allowlist.json` and includes only its pinned Dockerfile,
 package manifests and `src/**`. Tests, examples, `.env` files, fixtures and
@@ -25,9 +25,9 @@ unpullable package therefore cannot produce `release-image.json`.
 
 ## Source and trusted CI
 
-Application source is fixed to 73f560aa190dc7565772a14e6cc5f4acc6412f10.
-check_ci.py accepts only GitHub Actions run 40953346956, repository
-estebanSulcaInfante/envaperu-workflow, branch codex/personal-agent-access-20261029,
+Application source is fixed to 564be49ec362b574c873a30b33c4c5265dedb426.
+check_ci.py accepts only GitHub Actions run 41475743315, repository
+estebanSulcaInfante/envaperu-workflow, branch codex/ingenieria-release-20261102,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 It does not accept a green run from an arbitrary branch or require main: main is
 older than this source. The existing source CI includes fast-suite/postgres-smoke.
