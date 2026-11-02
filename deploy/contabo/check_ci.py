@@ -3,10 +3,11 @@ import json
 import os
 import re
 import urllib.request
-SOURCE_SHA='167154600b58f62e536fc1cf7b0764713ab0860d'
-RUN_ID=36900452865
-BRANCH='codex/render-provisional-dashboard'
+SOURCE_SHA='73f560aa190dc7565772a14e6cc5f4acc6412f10'
+RUN_ID=40953346956
+BRANCH='codex/personal-agent-access-20261029'
 REPOSITORY='estebanSulcaInfante/envaperu-workflow'
+RUN_URL=f'https://github.com/{REPOSITORY}/actions/runs/{RUN_ID}'
 def validate_inputs(source_sha, python_base):
     if source_sha!=SOURCE_SHA: raise ValueError('Only reviewed source SHA is approved')
     if not re.fullmatch(r'python:3\.12[.\w-]*@sha256:[0-9a-f]{64}',python_base):
