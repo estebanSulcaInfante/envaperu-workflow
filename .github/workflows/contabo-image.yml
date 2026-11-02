@@ -135,6 +135,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # BuildKit's content store does not register FROM references in the
+          # daemon image store. Materialize the same pinned base for docker save
+          # and the independent base-prefix comparison below.
+          docker pull --platform linux/amd64 "$OPENCLAW_BASE_IMAGE"
+          test "$(docker image inspect "$OPENCLAW_BASE_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = "linux/amd64"
           native_tag="$NATIVE_IMAGE:native-sha-$SOURCE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           docker build --platform linux/amd64 \
             --build-arg OPENCLAW_BASE_IMAGE="$OPENCLAW_BASE_IMAGE" \
