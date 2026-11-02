@@ -39,7 +39,7 @@ class EngineeringApiPreparationTests(unittest.TestCase):
     def test_workflow_is_api_only_and_keeps_protected_gate(self):
         workflow = WORKFLOW.read_text()
         self.assertIn('permissions: {}', workflow)
-        self.assertIn('codex/ingenieria-release-20261102', workflow)
+        self.assertIn('codex/ingenieria-api-recipe-20261102', workflow)
         self.assertIn('python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f', workflow)
         self.assertIn("github.event_name == 'workflow_dispatch' && inputs.publish", workflow)
         self.assertIn("github.ref == 'refs/heads/codex/scm-contabo-image'", workflow)

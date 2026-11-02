@@ -4,7 +4,7 @@ name: Prepare Engineering API image (manual)
 on:
   push:
     branches:
-      - codex/ingenieria-release-20261102
+      - codex/ingenieria-api-recipe-20261102
     paths:
       - '.github/workflows/engineering-api-image.yml'
       - 'deploy/engineering-api/**'
@@ -33,7 +33,7 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'estebanSulcaInfante/envaperu-workflow' && ((github.event_name == 'push' && github.ref == 'refs/heads/codex/ingenieria-release-20261102') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/scm-contabo-image'))
+    if: github.repository == 'estebanSulcaInfante/envaperu-workflow' && ((github.event_name == 'push' && github.ref == 'refs/heads/codex/ingenieria-api-recipe-20261102') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/scm-contabo-image'))
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
