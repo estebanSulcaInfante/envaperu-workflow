@@ -1,5 +1,5 @@
 {
-  "source_sha": "831d6deb940dcefc5f7837129f1741662642f516",
+  "source_sha": "1ec2da4cc0e626debf4a1ee94ba6ecabab0adbab",
   "files": {
     "app/__init__.py": "3bffb676bbb41f4f8e14779c31bfb3ed13813224afa80df7f61b77222967efb8",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -16,7 +16,7 @@
     "app/api/rutas_scm_packaging_reads.py": "147e080c9e0e04e7846e19202593bc59500c7a3020baeb5037f481b9a45f7f3b",
     "app/api/rutas_scm_reproceso.py": "2a5bf7988f4e1596afde68840ce75dc6a855a7292ef905e08d3734515319ae84",
     "app/api/rutas_scm_warehouse.py": "b45b150f4ddcf3897f6b3d9e5ac3b64b6b47c6c2f2d2cb2868fb285a2397cec4",
-    "app/api/rutas_scm.py": "5727210e91deb8d5c1cdde8864a538295345b16e812bd340dcb03683ca1f6692",
+    "app/api/rutas_scm.py": "dab1505f53da5b63e817ed6454c88605a7c7f91f42fcbd43d132361fe98ee19d",
     "app/api/rutas_sync.py": "b90df5f5a69d91b0b1c323aad57c27eba2248106ae4a6bdc269a8c4e56fe0e26",
     "app/api/rutas_talonarios.py": "166cc35e658b0ef239e3331f97da2bb14934048fd7e0bbea2ea8171d08c5bdfb",
     "app/api/rutas_trabajadores.py": "fed9469d580ff7e7006071d4b583a83607528bf32af9801b3588cb51d3db2b15",
@@ -88,7 +88,7 @@
     "app/services/produccion_service.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "app/services/qr_service.py": "43fca2d363d27f4921689d6329a1b3c35d88caec3be93f179bd51362b84200e1",
     "app/services/scm_alert_service.py": "1a691dc707d0868e8ab652286d6766b8ba0cfadbf1e4088be19baa6c12928339",
-    "app/services/scm_article_service.py": "17d64438341a9bc4527a2158d798fa875806a8899605258b1652dccd79c4163a",
+    "app/services/scm_article_service.py": "3c19c5569998ea2a2b98d93b196907a0a685ed583a5374f7372860d15d7f74c7",
     "app/services/scm_assembly_execution_service.py": "0d7caaa2c99f6a378cc537d2e605a3a39bba952859f2e8d9dea3008c423ed8f4",
     "app/services/scm_assembly_order_service.py": "afe89a62eeb43fa6397165aa3faaa46f715d21ef53d877d81674420ea8043b91",
     "app/services/scm_assignment_correction_service.py": "41b4a64f040dc39af0820fdfb6ba32d8bba5e7198ec69be4f2a3736bba8d01d3",
@@ -130,7 +130,7 @@
     "app/services/scm_operation_schedule_projection.py": "41fb4a1afb26a8b7d2cfea752c82d6d346e955ea316f7189e84066c3cf4eb70b",
     "app/services/scm_ot_service.py": "8d81ebcdb26080cf67e9fc35cce8f28258d6102c23ce0a3f1dc14afbbbb5b108",
     "app/services/scm_packaging_reads.py": "5b32e9da230bbca3b0123f34a5236ae35a58729af7d19b5b54245cc2476255c2",
-    "app/services/scm_packaging_service.py": "f292689c6547f1b81f9e45aebf8be98eae165754b4466ad74ae5ad8cffd2f3ed",
+    "app/services/scm_packaging_service.py": "6bb13128d8351a7d0ae8247fa5c5dce4395ea618c7ac08a2d4569b5df10650b1",
     "app/services/scm_postpesaje_identity.py": "1cab1a201a735553857023dd451fb93c453fc1fee3a1b6bc7e80d5ad65adbed4",
     "app/services/scm_postpesaje_reprint_service.py": "ca525b2f65f3fa8095d522246b18a11542d4181630cd15d8e5c74f27e3cabb12",
     "app/services/scm_prepared_material_service.py": "48f98eb19e7ead220bdbd08424514c5f87722914c2acc0c2a504f4ed579635b9",
@@ -264,7 +264,8 @@
     "migrations/versions/ff60718293a4_add_of_execution_lifecycle.py": "4d9515dd390df330410bd56789cac7da298db1eb5799e1bed86d357e81313815",
     "requirements.txt": "997b9b593b16f184d63b9499830655723ade0c3e312501a31652b1c81322ffd2",
     "run.py": "3c39bfce280061f10fc9f12bf9185ce33e73cd1546c5b125da5f17011bd8b59d",
-    "app/services/scm_agent_chat_gateway.py": "b104e25e38d28c91c8e9637996520690de3cc5526eae7ae0ddb141868c01b057"
+    "app/services/scm_agent_chat_gateway.py": "b104e25e38d28c91c8e9637996520690de3cc5526eae7ae0ddb141868c01b057",
+    "app/services/scm_engineering_reads.py": "fe59a163fd0e054060aa58248795dda0c904ea02e6c5ff4972c13b7a1121a2c2"
   },
   "excluded_runtime_resources": [
     "app/templates/OCR/RegistroDiarioProduccion/image.png",

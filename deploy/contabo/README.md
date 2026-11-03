@@ -6,8 +6,8 @@ and official OpenClaw Control UI overlay, with code, dependencies and necessary
 runtime templates. No VPS deployment,
 credentials, Odoo changes or data migration are part of this package.
 
-The exact application source is `831d6deb940dcefc5f7837129f1741662642f516` and
-the candidate CI gate is run `41127566753` on branch
+The exact application source is `1ec2da4cc0e626debf4a1ee94ba6ecabab0adbab` and
+the candidate CI gate is run `41682781955` on branch
 `codex/personal-agent-simple-20261030`. The API context is independently hashed
 by `runtime-allowlist.json`; the bridge context is independently hashed by
 `bridge-runtime-allowlist.json` and includes only its pinned Dockerfile,
@@ -28,8 +28,8 @@ unpullable package therefore cannot produce `release-image.json`.
 
 ## Source and trusted CI
 
-Application source is fixed to 831d6deb940dcefc5f7837129f1741662642f516.
-check_ci.py accepts only GitHub Actions run 41127566753, repository
+Application source is fixed to 1ec2da4cc0e626debf4a1ee94ba6ecabab0adbab.
+check_ci.py accepts only GitHub Actions run 41682781955, repository
 estebanSulcaInfante/envaperu-workflow, branch codex/personal-agent-simple-20261030,
 push event, .github/workflows/tests.yml, exact source SHA, completed and success.
 The coordinator verified this exact run completed successfully with all four
@@ -143,7 +143,7 @@ Execution prerequisites still needing coordinator resolution:
    without release evidence must not be deployed and may be retried in a new run.
 
 7. The API and bridge allowlists have been regenerated from the immutable Git
-   blobs of source `831d6deb940dcefc5f7837129f1741662642f516`, including the approved
+   blobs of source `1ec2da4cc0e626debf4a1ee94ba6ecabab0adbab`, including the approved
    runtime template. Both generated contexts and preparation tests were verified.
    Any later source change requires new reviewed hashes and CI identity. Do not
    claim publication until

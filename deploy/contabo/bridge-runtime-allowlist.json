@@ -1,5 +1,5 @@
 {
-  "source_sha": "831d6deb940dcefc5f7837129f1741662642f516",
+  "source_sha": "1ec2da4cc0e626debf4a1ee94ba6ecabab0adbab",
   "source_prefix": "services/openclaw_access_bridge",
   "files": {
     "package-lock.json": "ad8a81685f7229b0e03d3d691e835ede3f1f5553edf7fc5c907d1188da8ddacb",

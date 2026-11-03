@@ -3,8 +3,8 @@ import json
 import os
 import re
 import urllib.request
-SOURCE_SHA='831d6deb940dcefc5f7837129f1741662642f516'
-RUN_ID=41127566753
+SOURCE_SHA='1ec2da4cc0e626debf4a1ee94ba6ecabab0adbab'
+RUN_ID=41682781955
 BRANCH='codex/personal-agent-simple-20261030'
 REPOSITORY='estebanSulcaInfante/envaperu-workflow'
 RUN_URL=f'https://github.com/{REPOSITORY}/actions/runs/{RUN_ID}'
