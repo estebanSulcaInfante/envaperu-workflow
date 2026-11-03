@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 
 from app.models.producto import PiezaColor, ProductoTerminado
 from app.models.scm_articulos import (
@@ -165,7 +166,11 @@ def list_articles(session, *, actor_id, active=None):
     if active is not None:
         statement = statement.where(ScmArticulo.activo.is_(active))
     articles = session.scalars(
-        statement.order_by(ScmArticulo.codigo)
+        statement.options(
+            selectinload(ScmArticulo.pieza_color),
+            selectinload(ScmArticulo.definicion_wip),
+            selectinload(ScmArticulo.producto),
+        ).order_by(ScmArticulo.codigo)
     ).all()
     return {"items": [article.to_dict() for article in articles]}
 

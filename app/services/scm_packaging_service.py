@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import joinedload
 
 from app.models.scm_articulos import ScmArticulo
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
@@ -902,7 +903,14 @@ def list_packaging_rules(
             == positive_integer(container_id, field="tipo_contenedor_id")
         )
     items = session.scalars(
-        statement.order_by(
+        statement.options(
+            joinedload(ScmReglaEmpaqueRevision.regla).joinedload(
+                ScmReglaEmpaque.perfil
+            ),
+            joinedload(ScmReglaEmpaqueRevision.regla).joinedload(
+                ScmReglaEmpaque.tipo_contenedor
+            ),
+        ).order_by(
             ScmReglaEmpaqueRevision.regla_id,
             ScmReglaEmpaqueRevision.numero_revision.desc(),
         )
