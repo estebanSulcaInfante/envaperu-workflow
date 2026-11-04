@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: 564be49ec362b574c873a30b33c4c5265dedb426
+  SOURCE_SHA: 6154e1f98d9f8629d9ee3a0d140f07e7dd779824
   RECIPE_SHA: ${{ github.sha }}
   PYTHON_BASE: ${{ inputs.python_base || 'python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f' }}
   API_IMAGE: ghcr.io/estebansulcainfante/envaperu-scm-api
@@ -102,7 +102,7 @@ jobs:
           path: api.tar
           if-no-files-found: error
           compression-level: 0
-          retention-days: 1
+          retention-days: 7
 
   publish:
     needs: build

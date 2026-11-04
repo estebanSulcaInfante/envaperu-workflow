@@ -1,5 +1,5 @@
 {
-  "source_sha": "564be49ec362b574c873a30b33c4c5265dedb426",
+  "source_sha": "6154e1f98d9f8629d9ee3a0d140f07e7dd779824",
   "files": {
     "app/__init__.py": "3bffb676bbb41f4f8e14779c31bfb3ed13813224afa80df7f61b77222967efb8",
     "app/api/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -16,7 +16,7 @@
     "app/api/rutas_scm_packaging_reads.py": "147e080c9e0e04e7846e19202593bc59500c7a3020baeb5037f481b9a45f7f3b",
     "app/api/rutas_scm_reproceso.py": "2a5bf7988f4e1596afde68840ce75dc6a855a7292ef905e08d3734515319ae84",
     "app/api/rutas_scm_warehouse.py": "b45b150f4ddcf3897f6b3d9e5ac3b64b6b47c6c2f2d2cb2868fb285a2397cec4",
-    "app/api/rutas_scm.py": "dab1505f53da5b63e817ed6454c88605a7c7f91f42fcbd43d132361fe98ee19d",
+    "app/api/rutas_scm.py": "1f5d86e924bf5ae9460eecff4477aecae60a32802d73b279451c950d00d02d8b",
     "app/api/rutas_sync.py": "b90df5f5a69d91b0b1c323aad57c27eba2248106ae4a6bdc269a8c4e56fe0e26",
     "app/api/rutas_talonarios.py": "166cc35e658b0ef239e3331f97da2bb14934048fd7e0bbea2ea8171d08c5bdfb",
     "app/api/rutas_trabajadores.py": "fed9469d580ff7e7006071d4b583a83607528bf32af9801b3588cb51d3db2b15",
@@ -67,7 +67,7 @@
     "app/models/scm_production_orders.py": "a31e53b624d8118aa46094c1b8d6bc559489e7be5ed87ee3b23448113342bdaf",
     "app/models/scm_recepcion.py": "4998e730eb855208ff3c7061487a17f8f05f67388852d8e064d0faa343a7080c",
     "app/models/scm_reproceso.py": "17abea578fe0729fd41833d5780574cec80caed054947a7b7391c9beb0122f29",
-    "app/models/scm_rutas.py": "14f41363fe61b0e7102bf8e0828cdb6bb93f8bfd366a59059e930407ddeb6ba2",
+    "app/models/scm_rutas.py": "716f8f7195b4e795a602aaa85d43305702652619436cc12bf40efa658baf5f7e",
     "app/models/scm_warehouse.py": "54a5e6793dd457315153d366cd84966789648234d08b5d695d7c8c9e0354c1fa",
     "app/models/talonario.py": "6fc605eb329dd51d6f743b16812d1ce56eb44bc7eddb0743bf4806d3f150baa9",
     "app/models/trabajador.py": "dd3c3e73c3c00e91255b3a8a18627ae3d7acda230d6e05f0725f01b118e456cd",
@@ -96,7 +96,7 @@
     "app/services/scm_assistant_gateway.py": "7569bcfc6a932c816fb5900dabca963782e472abc80176b617c621b218f597d9",
     "app/services/scm_assistant_proposals.py": "c3de1ae15385c4a75e4c75ce0f25bddc5fe6575f3fdc4b8d7d6dbf85428f2a1d",
     "app/services/scm_auth.py": "448f727913e6a45d3e7d6d65af1b95be40f71d972ee923f081ded5b8d9311fa5",
-    "app/services/scm_personal_agent_access.py": "7decb1f0974bf8cdb12082cdaab92deaee847f283d4e7c47e8b808a7a011f245",
+    "app/services/scm_personal_agent_access.py": "0d65523d1a5f0991a120d10ea78a483ccdfe162205ee558ccdcd8e6179f61164",
     "app/services/scm_color_identity.py": "b779858af327279836aa9204576c0eb7bca80868d268b5bf46c1cd9dbdd0a4ff",
     "app/services/scm_commercial_presentation_service.py": "3d163529d21286a87843ebdbc3635d8f125f2aac5eea34a3791eb4ac80d8c8f3",
     "app/services/scm_configuration.py": "fafb32252c12293a831ae4ca0c798f4a07b7f9ae891d3738e8fa3893ae073d78",
@@ -106,7 +106,7 @@
     "app/services/scm_execution_guards.py": "046b4f9d98c60b9f20cbd9231b052e889888509235833a5888d3f62ff12bd24e",
     "app/services/scm_fabrication_contextual_recipe_service.py": "23a844bd53562452a33f00a79686de5e6c19cd9666071a513beb4de221c4556f",
     "app/services/scm_fabrication_execution_service.py": "7bdb746b2813e33c579510e838563c01fe93a35de6fba24872c39c2bf8459219",
-    "app/services/scm_fabrication_order_service.py": "4c8d248ef3d8d8e41c90a6596f347515c20fbef3347c62b04a1d25178b362016",
+    "app/services/scm_fabrication_order_service.py": "56a55cefd311907184615032f25bc05e36b3d90c674f790fed38a49284faf5fe",
     "app/services/scm_fulfillment_service.py": "0ce0757e3a0433f758f99c2beafbe62c067d73b9c3092e594c64713f19546c0b",
     "app/services/scm_internal_supply_service.py": "3a4e7de26ec0070e736b7c9d349600f5c141593aaca8432207e8823d02609db5",
     "app/services/scm_inventory_opening_service.py": "d47558eb3b9e1073603410136708c441efc0afff63643927be4f1687e82a1f93",
@@ -131,11 +131,10 @@
     "app/services/scm_ot_service.py": "8d81ebcdb26080cf67e9fc35cce8f28258d6102c23ce0a3f1dc14afbbbb5b108",
     "app/services/scm_packaging_reads.py": "5b32e9da230bbca3b0123f34a5236ae35a58729af7d19b5b54245cc2476255c2",
     "app/services/scm_packaging_service.py": "6bb13128d8351a7d0ae8247fa5c5dce4395ea618c7ac08a2d4569b5df10650b1",
-    "app/services/scm_engineering_reads.py": "fe59a163fd0e054060aa58248795dda0c904ea02e6c5ff4972c13b7a1121a2c2",
     "app/services/scm_postpesaje_identity.py": "1cab1a201a735553857023dd451fb93c453fc1fee3a1b6bc7e80d5ad65adbed4",
     "app/services/scm_postpesaje_reprint_service.py": "ca525b2f65f3fa8095d522246b18a11542d4181630cd15d8e5c74f27e3cabb12",
     "app/services/scm_prepared_material_service.py": "48f98eb19e7ead220bdbd08424514c5f87722914c2acc0c2a504f4ed579635b9",
-    "app/services/scm_process_resolution.py": "bd5ee2465e5d651cd17a90bf35dae71783394049d2d29f10a9ac0708ac5e58d8",
+    "app/services/scm_process_resolution.py": "f1599b2943c9dd1c30d1d1b889969c25a20d09d6a04a347260ad322cc3682573",
     "app/services/scm_product_onboarding_service.py": "3efb5284793ff1d12b6d8a94969d582a1264b6b30abf7c71b334635625242143",
     "app/services/scm_production_observability_service.py": "985c63cd8b5e4703fc70673d8fcd54304dbf74f865853da74b09db6593628c31",
     "app/services/scm_production_order_service.py": "9e750a4bb327eedef38436883eb2db5853e77436973bd7ff7827d214be8388ab",
@@ -265,7 +264,9 @@
     "migrations/versions/ff60718293a4_add_of_execution_lifecycle.py": "4d9515dd390df330410bd56789cac7da298db1eb5799e1bed86d357e81313815",
     "requirements.txt": "997b9b593b16f184d63b9499830655723ade0c3e312501a31652b1c81322ffd2",
     "run.py": "3c39bfce280061f10fc9f12bf9185ce33e73cd1546c5b125da5f17011bd8b59d",
-    "app/services/scm_agent_chat_gateway.py": "b104e25e38d28c91c8e9637996520690de3cc5526eae7ae0ddb141868c01b057"
+    "app/services/scm_agent_chat_gateway.py": "b104e25e38d28c91c8e9637996520690de3cc5526eae7ae0ddb141868c01b057",
+    "app/services/scm_engineering_reads.py": "78372e28ccb76535f4a5922e50c847b0a335e623303e5b486f4f162c8c416a7e",
+    "migrations/versions/fb7c8d9e0a12_add_output_route_operation_reader_index.py": "a557f1bd3852e96aed5ae58270b66f4fee3f3ac887d93ea1d14eb19a0bb0bf6e"
   },
   "excluded_runtime_resources": [
     "app/templates/OCR/RegistroDiarioProduccion/image.png",
@@ -281,4 +282,3 @@
     "app/templates/excel/OrdenProduccion/Book2.xlsx": "Runtime reference: app/services/excel_service.py TEMPLATE_PATH; owner confirmed templates must remain."
   }
 }
-

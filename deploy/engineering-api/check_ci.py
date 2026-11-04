@@ -3,12 +3,12 @@ import json
 import os
 import urllib.request
 
-SOURCE_SHA = '564be49ec362b574c873a30b33c4c5265dedb426'
-RUN_ID = 41476580052
-BRANCH = 'codex/ingenieria-source-20261102'
+SOURCE_SHA = '6154e1f98d9f8629d9ee3a0d140f07e7dd779824'
+RUN_ID = 41896378594
+BRANCH = 'codex/publish-wip-bom-api-20261104'
 REPOSITORY = 'estebanSulcaInfante/envaperu-workflow'
 RUN_URL = f'https://github.com/{REPOSITORY}/actions/runs/{RUN_ID}'
-REQUIRED_JOBS = {'personal-agent-bridge', 'fast-suite', 'postgres-smoke'}
+REQUIRED_JOBS = {'personal-agent-bridge', 'native-ui-overlay', 'fast-suite', 'postgres-smoke'}
 PYTHON_BASE = 'python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f'
 
 

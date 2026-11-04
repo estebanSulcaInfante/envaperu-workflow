@@ -13,9 +13,9 @@ RECIPE = Path(__file__).resolve().parent
 class EngineeringApiPreparationTests(unittest.TestCase):
     def test_exact_ci_gate_has_three_successful_jobs(self):
         gate = runpy.run_path(str(RECIPE / 'check_ci.py'), run_name='engineering_checks')
-        self.assertEqual(gate['SOURCE_SHA'], '564be49ec362b574c873a30b33c4c5265dedb426')
-        self.assertEqual(gate['RUN_ID'], 41476580052)
-        self.assertEqual(gate['BRANCH'], 'codex/ingenieria-source-20261102')
+        self.assertEqual(gate['SOURCE_SHA'], '6154e1f98d9f8629d9ee3a0d140f07e7dd779824')
+        self.assertEqual(gate['RUN_ID'], 41896378594)
+        self.assertEqual(gate['BRANCH'], 'codex/publish-wip-bom-api-20261104')
         jobs = [
             {'name': name, 'status': 'completed', 'conclusion': 'success'}
             for name in gate['REQUIRED_JOBS']
@@ -31,7 +31,7 @@ class EngineeringApiPreparationTests(unittest.TestCase):
 
     def test_allowlist_is_engineering_source_and_has_four_overlays(self):
         manifest = json.loads((RECIPE / 'runtime-allowlist.json').read_text())
-        self.assertEqual(manifest['source_sha'], '564be49ec362b574c873a30b33c4c5265dedb426')
+        self.assertEqual(manifest['source_sha'], '6154e1f98d9f8629d9ee3a0d140f07e7dd779824')
         overlays = {
             'app/api/rutas_scm.py',
             'app/services/scm_article_service.py',
