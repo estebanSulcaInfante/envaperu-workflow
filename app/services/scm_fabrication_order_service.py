@@ -39,6 +39,7 @@ from app.models.scm_production_orders import (
     ScmOrdenOperacionSalida,
     utc_now,
 )
+from app.models.scm_rutas import ScmOperacionRuta, ScmRutaRevision
 from app.services.catalog_code_generator import generar_codigo_catalogo
 from app.services.scm_color_identity import serialize_color_identity
 from app.services.color_recipe_service import serialize_recipe
@@ -729,6 +730,15 @@ def _load_fabrication(session, operation_id, *, lock=False):
     statement = select(ScmOrdenOperacion).where(
         ScmOrdenOperacion.id == operation_id,
         ScmOrdenOperacion.tipo == "FABRICACION",
+    ).options(
+        selectinload(ScmOrdenOperacion.fabricacion)
+        .selectinload(ScmOrdenFabricacion.corridas)
+        .selectinload(ScmCorridaFabricacion.operacion_ruta)
+        .options(
+            selectinload(ScmOperacionRuta.ruta)
+            .selectinload(ScmRutaRevision.articulo_objetivo),
+            selectinload(ScmOperacionRuta.articulo_salida),
+        )
     )
     if lock:
         statement = statement.with_for_update(of=ScmOrdenOperacion).execution_options(populate_existing=True)
@@ -1099,8 +1109,20 @@ def list_fabrication_orders(session, *, actor_id, filters=None):
     operations = session.scalars(
         select(ScmOrdenOperacion)
         .where(ScmOrdenOperacion.tipo == "FABRICACION")
+        .options(
+            selectinload(ScmOrdenOperacion.fabricacion)
+            .selectinload(ScmOrdenFabricacion.corridas)
+            .options(
+                selectinload(ScmCorridaFabricacion.operacion_ruta)
+                .options(
+                    selectinload(ScmOperacionRuta.ruta)
+                    .selectinload(ScmRutaRevision.articulo_objetivo),
+                    selectinload(ScmOperacionRuta.articulo_salida),
+                ),
+            ),
+        )
         .order_by(ScmOrdenOperacion.created_at.desc())
-    ).all()
+    ).unique().all()
     projections = operation_schedule_projections(session, operations)
     return {
         "items": [

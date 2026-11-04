@@ -96,6 +96,7 @@ from app.services.scm_engineering_reads import (
     hydrate_structures,
     list_article_page,
     list_engineering_approvals,
+    list_output_route_operations,
     list_packaging_rule_page,
     resolve_articles,
 )
@@ -2326,6 +2327,18 @@ def rutas_articulo_listar(article_id):
         db.session,
         actor_id=_actor_id(),
         article_id=article_id,
+    ))
+
+
+@scm_bp.get("/articulos/<int:output_article_id>/operaciones-ruta")
+def rutas_operaciones_por_salida_listar(output_article_id):
+    return jsonify(list_output_route_operations(
+        db.session,
+        actor_id=_actor_id(),
+        output_article_id=output_article_id,
+        query=request.args.get("q"),
+        limit=request.args.get("limite", 25),
+        cursor=request.args.get("cursor"),
     ))
 
 

@@ -2,9 +2,10 @@ import base64
 import binascii
 import json
 import unicodedata
+from datetime import datetime, timezone
 
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy.orm import aliased, joinedload, selectinload
 
 from app.models.scm_articulos import (
     CLASE_PIEZA_COLOR,
@@ -27,7 +28,13 @@ from app.models.scm_estructuras import (
     ScmEstructuraComponente,
     ScmEstructuraRevision,
 )
-from app.models.scm_rutas import ESTADO_RUTA_BORRADOR, ScmRutaRevision
+from app.models.scm_rutas import (
+    ESTADO_RUTA_APROBADA,
+    ESTADO_RUTA_BORRADOR,
+    ScmCentroTrabajo,
+    ScmOperacionRuta,
+    ScmRutaRevision,
+)
 from app.services.scm_service_support import ScmServiceError, load_actor
 from app.services.scm_structure_service import serialize_structure
 
@@ -504,6 +511,7 @@ ARTICLE_PAGE_ENDPOINT = "articulos/pagina"
 ARTICLE_RESOLUTION_ENDPOINT = "articulos/resolver"
 STRUCTURE_HYDRATION_ENDPOINT = "estructuras/hidratacion"
 PACKAGING_PAGE_ENDPOINT = "reglas-empaque/pagina"
+OUTPUT_ROUTE_OPERATIONS_ENDPOINT = "articulos/operaciones-ruta"
 ARTICLE_CLASSES = (
     CLASE_PIEZA_COLOR,
     CLASE_SUBENSAMBLE_WIP,
@@ -513,6 +521,238 @@ ARTICLE_CLASSES = (
 
 def _invalid_read(code, message, *, details=None):
     raise ScmServiceError(code, message, status_code=400, details=details)
+
+
+def _output_route_article_ref(row, prefix):
+    return {
+        "id": getattr(row, f"{prefix}_id"),
+        "codigo": getattr(row, f"{prefix}_code"),
+        "nombre": getattr(row, f"{prefix}_name"),
+        "clase": getattr(row, f"{prefix}_class"),
+        "activo": getattr(row, f"{prefix}_active"),
+    }
+
+
+def list_output_route_operations(
+    session,
+    *,
+    actor_id,
+    output_article_id,
+    query=None,
+    limit=DEFAULT_LIMIT,
+    cursor=None,
+):
+    """List approved OP/OT operations that produce one exact output article.
+
+    This is deliberately separate from ``list_article_routes``: that legacy
+    reader addresses a route owner, while this reader addresses an operation's
+    physical output.  The projection is column-based to keep the count and
+    page to two SQL statements without relationship-driven N+1 queries.
+    """
+    capability = "RUTA_VER"
+    load_actor(session, actor_id, capability=capability)
+    if (
+        not isinstance(output_article_id, int)
+        or isinstance(output_article_id, bool)
+        or output_article_id <= 0
+    ):
+        _invalid_read(
+            "INVALID_OUTPUT_ARTICLE",
+            "salida debe ser un ID de articulo positivo.",
+        )
+    output = session.get(ScmArticulo, output_article_id)
+    if output is None:
+        raise ScmServiceError(
+            "ARTICLE_NOT_FOUND",
+            "El articulo de salida no existe.",
+            status_code=404,
+            details={"article_id": output_article_id},
+        )
+    if not output.activo:
+        raise ScmServiceError(
+            "ARTICLE_INACTIVE",
+            "El articulo de salida debe estar activo.",
+            status_code=422,
+            details={"article_id": output_article_id},
+        )
+
+    query = _parse_query(query, code="INVALID_OUTPUT_ROUTE_PAGE")
+    limit = _parse_limit(limit, code="INVALID_OUTPUT_ROUTE_PAGE")
+    cursor_filters = {
+        "output_article_id": output_article_id,
+        "q": query,
+        "limit": limit,
+    }
+    order = "route_id_desc_operation_id_desc"
+    last = _page_cursor_decode(
+        cursor,
+        endpoint=OUTPUT_ROUTE_OPERATIONS_ENDPOINT,
+        actor_id=actor_id,
+        capability=capability,
+        filters=cursor_filters,
+        order=order,
+        code="INVALID_OUTPUT_ROUTE_PAGE",
+        last_shape=(int, int),
+    )
+
+    operation = ScmOperacionRuta
+    route = ScmRutaRevision
+    owner = ScmArticulo
+    # Use an explicit ORM alias for the second article identity.  The route
+    # owner and the operation output must never be conflated in the DTO.
+    output_article = aliased(ScmArticulo)
+    center_model = ScmCentroTrabajo
+    base_filters = [
+        route.estado == ESTADO_RUTA_APROBADA,
+        route.content_hash.is_not(None),
+        operation.ruta_id == route.id,
+        operation.executor_kind == "OP_OT",
+        operation.tipo.in_(("INYECCION", "SOPLADO")),
+        operation.articulo_salida_id == output_article_id,
+        output_article.id == operation.articulo_salida_id,
+        output_article.clase == CLASE_PIEZA_COLOR,
+        output_article.activo.is_(True),
+        owner.id == route.articulo_objetivo_id,
+        owner.activo.is_(True),
+    ]
+    if query is not None:
+        for term in query.split(" "):
+            base_filters.append(or_(
+                _like_literal(owner.codigo, term),
+                _like_literal(owner.nombre, term),
+                _like_literal(operation.clave, term),
+                _like_literal(operation.nombre, term),
+            ))
+
+    count_query = (
+        select(func.count(operation.id))
+        .select_from(operation)
+        .join(route, route.id == operation.ruta_id)
+        .join(owner, owner.id == route.articulo_objetivo_id)
+        .join(output_article, output_article.id == operation.articulo_salida_id)
+        .where(*base_filters)
+    )
+    total = session.scalar(count_query)
+
+    page_filters = list(base_filters)
+    if last is not None:
+        page_filters.append(or_(
+            route.id < last[0],
+            and_(route.id == last[0], operation.id < last[1]),
+        ))
+    rows = session.execute(
+        select(
+            operation.id.label("operation_id"),
+            operation.clave.label("operation_code"),
+            operation.nombre.label("operation_name"),
+            operation.tipo.label("operation_type"),
+            operation.executor_kind.label("executor_kind"),
+            route.id.label("route_id"),
+            route.numero_revision.label("route_number"),
+            route.content_hash.label("route_hash"),
+            route.estado.label("route_state"),
+            owner.id.label("owner_id"),
+            owner.codigo.label("owner_code"),
+            owner.nombre.label("owner_name"),
+            owner.clase.label("owner_class"),
+            owner.activo.label("owner_active"),
+            output_article.id.label("output_id"),
+            output_article.codigo.label("output_code"),
+            output_article.nombre.label("output_name"),
+            output_article.clase.label("output_class"),
+            output_article.activo.label("output_active"),
+            center_model.id.label("center_id"),
+            center_model.codigo.label("center_code"),
+            center_model.nombre.label("center_name"),
+            center_model.tipo.label("center_type"),
+            center_model.activo.label("center_active"),
+        )
+        .select_from(operation)
+        .join(route, route.id == operation.ruta_id)
+        .join(owner, owner.id == route.articulo_objetivo_id)
+        .join(output_article, output_article.id == operation.articulo_salida_id)
+        .join(center_model, center_model.id == operation.centro_trabajo_id)
+        .where(*page_filters)
+        .order_by(route.id.desc(), operation.id.desc())
+        .limit(limit + 1)
+    ).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = []
+    for row in rows:
+        operation_ref = {
+            "id": row.operation_id,
+            "clave": row.operation_code,
+            "nombre": row.operation_name,
+            "tipo": row.operation_type,
+            "executor_kind": row.executor_kind,
+            "centro_trabajo": {
+                "id": row.center_id,
+                "codigo": row.center_code,
+                "nombre": row.center_name,
+                "tipo": row.center_type,
+                "activo": row.center_active,
+            },
+        }
+        output_ref = _output_route_article_ref(row, "output")
+        owner_ref = _output_route_article_ref(row, "owner")
+        item = {
+            "operation_id": row.operation_id,
+            "route_revision_id": row.route_id,
+            "route_revision_number": row.route_number,
+            "route_content_hash": row.route_hash,
+            "route_state": row.route_state,
+            "operation": operation_ref,
+            "output_article": output_ref,
+            "owner_route_target_article": owner_ref,
+            # Existing SCM consumers use these Spanish aliases.  Keep them
+            # additive and preserve the operation/revision distinction.
+            "id": row.operation_id,
+            "clave": row.operation_code,
+            "nombre": row.operation_name,
+            "tipo": row.operation_type,
+            "executor_kind": row.executor_kind,
+            "ruta_revision_id": row.route_id,
+            "ruta_numero_revision": row.route_number,
+            "ruta_content_hash": row.route_hash,
+            "articulo_salida_id": row.output_id,
+            "articulo_salida": output_ref,
+            "articulo_objetivo_id": row.owner_id,
+            "articulo_objetivo": owner_ref,
+            "owner_route_target_article_id": row.owner_id,
+            "output_article_id": row.output_id,
+            # JSON clients that use the OF workbench naming convention can
+            # consume the same identity without translating Spanish keys.
+            "operationId": row.operation_id,
+            "routeRevisionId": row.route_id,
+            "routeRevisionNumber": row.route_number,
+            "routeContentHash": row.route_hash,
+            "routeState": row.route_state,
+            "ownerRouteTargetArticle": owner_ref,
+            "outputArticle": output_ref,
+        }
+        items.append(item)
+    next_cursor = (
+        _page_cursor_encode(
+            endpoint=OUTPUT_ROUTE_OPERATIONS_ENDPOINT,
+            actor_id=actor_id,
+            capability=capability,
+            filters=cursor_filters,
+            order=order,
+            code="INVALID_OUTPUT_ROUTE_PAGE",
+            last=[items[-1]["route_revision_id"], items[-1]["operation_id"]],
+        )
+        if has_more
+        else None
+    )
+    return {
+        "items": items,
+        "total": total,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "q": query,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _page_cursor_encode(*, endpoint, actor_id, capability, filters, order, last, code):

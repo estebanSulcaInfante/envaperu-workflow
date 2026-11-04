@@ -1,6 +1,8 @@
 """Canonical process and route snapshot resolution for OF/OT."""
 
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select
+from sqlalchemy.exc import NoInspectionAvailable
+from sqlalchemy.orm.attributes import NO_VALUE
 
 from app.models.scm_rutas import (
     ScmOperacionRuta,
@@ -120,7 +122,7 @@ def route_operation_dto(route_operation):
     if route_operation is None:
         return None
     route = route_operation.ruta
-    return {
+    payload = {
         "id": route_operation.id,
         "clave": route_operation.clave,
         "nombre": route_operation.nombre,
@@ -140,3 +142,30 @@ def route_operation_dto(route_operation):
             if route_operation.articulo_salida is not None else None
         ),
     }
+    # A route may be owned by a WIP/PT article while this operation produces
+    # the physical PC output used by an OF.  Add the owner only when the
+    # relationship is present; legacy lightweight DTO fixtures and callers
+    # without that relationship retain their exact additive-compatible shape.
+    # The OF list serializer must never turn a DTO read into one lazy query per
+    # run. Eager readers populate this relationship; legacy/lightweight callers
+    # keep the frozen DTO shape when it is not loaded.
+    try:
+        owner = sa_inspect(route).attrs.articulo_objetivo.loaded_value
+    except (NoInspectionAvailable, AttributeError):
+        # Unit/legacy DTO fixtures can be plain namespaces. Reading their
+        # instance dictionary preserves the additive owner fields without
+        # invoking a descriptor that could hide a lazy ORM load.
+        owner = getattr(route, "__dict__", {}).get("articulo_objetivo")
+    if owner is NO_VALUE:
+        owner = None
+    if owner is not None:
+        payload.update({
+            "owner_route_target_article_id": owner.id,
+            "owner_route_target_article": {
+                "id": owner.id,
+                "codigo": owner.codigo,
+                "nombre": owner.nombre,
+                "clase": owner.clase,
+            },
+        })
+    return payload

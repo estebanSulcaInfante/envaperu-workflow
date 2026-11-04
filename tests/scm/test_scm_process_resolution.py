@@ -95,3 +95,38 @@ def test_route_dto_exposes_revision_and_output_article():
             "clase": "PIEZA_COLOR",
         },
     }
+
+
+def test_route_dto_adds_distinct_owner_when_route_target_is_available():
+    owner = SimpleNamespace(
+        id=506,
+        codigo="WIP-506",
+        nombre="WIP propietario",
+        clase="SUBENSAMBLE_WIP",
+    )
+    operation = SimpleNamespace(
+        id=6,
+        clave="INYECTAR_PC",
+        nombre="Inyectar pieza",
+        tipo="INYECCION",
+        executor_kind="OP_OT",
+        ruta=SimpleNamespace(
+            id=35,
+            numero_revision=1,
+            content_hash="b" * 64,
+            articulo_objetivo=owner,
+        ),
+        articulo_salida_id=501,
+        articulo_salida=SimpleNamespace(
+            id=501,
+            codigo="PC-501",
+            nombre="Pieza salida",
+            clase="PIEZA_COLOR",
+        ),
+    )
+
+    dto = route_operation_dto(operation)
+
+    assert dto["id"] == 6
+    assert dto["owner_route_target_article_id"] == 506
+    assert dto["owner_route_target_article"]["id"] == 506

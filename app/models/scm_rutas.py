@@ -301,6 +301,12 @@ class ScmOperacionRuta(db.Model):
             "id",
             name="uq_scm_operacion_ruta_parent_id",
         ),
+        db.Index(
+            "ix_scm_operacion_ruta_output_route_id",
+            "articulo_salida_id",
+            "ruta_id",
+            "id",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)

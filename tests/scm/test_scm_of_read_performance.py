@@ -20,6 +20,12 @@ from app.models.scm_production_orders import (
     ScmOrdenFabricacion,
     ScmOrdenOperacion,
 )
+from app.models.scm_articulos import ScmArticulo
+from app.models.scm_rutas import (
+    ScmCentroTrabajo,
+    ScmOperacionRuta,
+    ScmRutaRevision,
+)
 from app.models.producto import ColorBase, ColorProduccion, FamiliaColor
 from app.services import scm_fabrication_order_service as fabrication_service
 from app.services.scm_production_reports_service import (
@@ -360,6 +366,93 @@ def test_of_summary_metrics_are_measured_on_the_same_synthetic_dataset(app, monk
         assert page_25_queries > 0
         assert page_100_queries > 0
         assert abs(page_100_queries - page_25_queries) <= 2
+
+
+def test_of_summary_sql_budget_does_not_hydrate_route_owner_graph(app, monkeypatch):
+    with app.app_context():
+        from app.models.trabajador import Trabajador
+
+        actor = Trabajador.query.filter_by(codigo="TRB-01").one()
+        output = ScmArticulo(
+            codigo="PC-SUMMARY-BUDGET",
+            nombre="Salida resumen",
+            clase="PIEZA_COLOR",
+            unidad_base="UN",
+            unidad_inventario="KG",
+            activo=True,
+        )
+        owner = ScmArticulo(
+            codigo="WIP-SUMMARY-BUDGET",
+            nombre="Owner resumen",
+            clase="SUBENSAMBLE_WIP",
+            unidad_base="UN",
+            unidad_inventario="KG",
+            activo=True,
+        )
+        center = ScmCentroTrabajo(
+            codigo="CT-SUMMARY-BUDGET",
+            nombre="Centro resumen",
+            tipo="INYECCION",
+            activo=True,
+        )
+        db.session.add_all([output, owner, center])
+        db.session.flush()
+        route = ScmRutaRevision(
+            articulo_objetivo=owner,
+            numero_revision=1,
+            estado="APROBADA",
+            content_hash="d" * 64,
+            creada_por_id=actor.id,
+        )
+        route_operation = ScmOperacionRuta(
+            ruta=route,
+            clave="SUMMARY_BUDGET",
+            secuencia_visible=10,
+            nombre="Operacion resumen",
+            tipo="INYECCION",
+            executor_kind="OP_OT",
+            centro_trabajo=center,
+            articulo_salida=output,
+        )
+        operation = ScmOrdenOperacion(
+            codigo="OF-SUMMARY-BUDGET",
+            tipo="FABRICACION",
+            origen_demanda="PRUEBA_SINTETICA",
+            motivo="summary query budget",
+            created_by_id=actor.id,
+        )
+        fabrication = ScmOrdenFabricacion(orden_operacion=operation)
+        fabrication.corridas.append(ScmCorridaFabricacion(
+            codigo="RUN-SUMMARY-BUDGET",
+            secuencia=1,
+            estado="BORRADOR",
+            operacion_ruta=route_operation,
+            operacion_ruta_hash=route.content_hash,
+        ))
+        db.session.add(fabrication)
+        db.session.commit()
+        db.session.expire_all()
+        monkeypatch.setattr(fabrication_service, "load_actor", lambda *args, **kwargs: None)
+        query_count = 0
+
+        def count_query(*_args):
+            nonlocal query_count
+            query_count += 1
+
+        event.listen(db.engine, "before_cursor_execute", count_query)
+        try:
+            payload = fabrication_service.list_fabrication_orders(
+                db.session,
+                actor_id=actor.id,
+                filters={"vista": "resumen", "pagina": 1, "tamano": 25},
+            )
+        finally:
+            event.remove(db.engine, "before_cursor_execute", count_query)
+
+        assert len(payload["items"]) == 1
+        # SummaryItem never emits route_operation_dto; its fixed seven-query
+        # budget must not grow just because a run has a route owner.
+        assert query_count == 7
 
 
 def test_of_progress_empty_scope_is_not_promoted_to_global_read():
