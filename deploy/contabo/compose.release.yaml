@@ -35,7 +35,7 @@ services:
       - KG_AUTOMATIC_INTAKE_ENABLED=true
       # List syntax keeps the ISO instant inside a KEY=value scalar so
       # Dokploy cannot coerce it into a Go time rendering.
-      - KG_AUTOMATIC_INTAKE_CUTOFF_AT=2026-10-08T18:16:04Z
+      - KG_AUTOMATIC_INTAKE_CUTOFF_AT=1970-01-01T00:00:00Z
       - KG_PRODUCTION_LOCATION_CODE=PRODUCCION_KG
       - CATALOG_IMAGE_STORAGE=supabase_s3
       - CATALOG_IMAGE_KEEP_DATABASE_COPY=true
