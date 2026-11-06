@@ -639,7 +639,7 @@ def test_tv_progress_keeps_percentage_null_when_kg_is_not_attributable(monkeypat
 
     assert output["avance"] is None
     assert output["porcentaje"] is None
-    assert output["estado_avance"] == "SIN_PESAJES"
+    assert output["estado_avance"] == "INCOMPLETO"
 
 
 def test_tv_progress_preserves_meta_but_hides_weighted_progress_without_permission(monkeypatch):
@@ -671,7 +671,9 @@ def test_tv_actual_ignores_known_foreign_mass_but_marks_own_plus_ownerless_incom
 
     from app.services.scm_production_reports_service import _progress_tv_actual
 
-    assert _progress_tv_actual({"works": run["works"], "mangas": {1: foreign_only}}, 201, "KG") == (None, False)
+    # The manga owner is in scope but its physical ledger is foreign; that
+    # mismatch is ambiguous, not an unambiguously foreign contribution.
+    assert _progress_tv_actual({"works": run["works"], "mangas": {1: foreign_only}}, 201, "KG") == (None, True)
     assert _progress_tv_actual({"works": run["works"], "mangas": {2: own_plus_unknown}}, 201, "KG") == (None, True)
 
 
@@ -1037,6 +1039,239 @@ def test_open_control_is_attributed_only_when_kg_segments_conciliate():
     manga._report_open_kg = Decimal("5")
     assert _run_manga_values(run_a)[:5] == (Decimal("0"), Decimal("0"), None, 0, 0)
     assert _run_manga_values(run_b)[:5] == (Decimal("0"), Decimal("0"), None, 1, 0)
+
+
+def test_tv_progress_counts_current_open_controls_once_with_active_same_owner_segments():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-mineropower")
+    article = SimpleNamespace(id=120)
+
+    def opened(manga_id, net, start=None):
+        segment = _segment(manga_id, "0", "1", "0")
+        segment.estado = "ACTIVO"
+        segment.trabajo = work
+        segment.cantidad_inicio_kg = None if start is None else Decimal(start)
+        segment.cantidad_fin_kg = None
+        segment.cantidad_atribuida_kg = Decimal("0")
+        return SimpleNamespace(
+            id=manga_id,
+            estado="EN_LLENADO",
+            trabajo=work,
+            correccion_asignacion=None,
+            lote_articulo=SimpleNamespace(articulo=article),
+            _report_segments=[],
+            _report_all_segments=[segment],
+            _report_final_kg=None,
+            _report_open_kg=Decimal(net),
+            _report_quantity_un=None,
+            _report_weight_corrected=False,
+        )
+
+    annulled = opened(3, "100")
+    annulled.estado = "ANULADA"
+    run = {
+        "works": [(work, None, None)],
+        "mangas": {
+            1: opened(1, "6.3"), 2: opened(2, "6.6", start="0"),
+            3: annulled,
+        },
+    }
+
+    assert _progress_tv_actual(run, article.id, "KG") == (Decimal("12.9"), False)
+
+
+def test_tv_progress_serializes_open_controls_instead_of_suppressing_known_advance(monkeypatch):
+    work = SimpleNamespace(id="work-tv-open")
+    run = _tv_aggregate_run(works=[work], output_meta="250")
+    article = run["corrida"].salidas[0].articulo
+
+    def opened(manga_id, net):
+        segment = _segment(manga_id, "0", "1", "0")
+        segment.estado = "ACTIVO"
+        segment.trabajo = work
+        segment.cantidad_inicio_kg = None
+        segment.cantidad_fin_kg = None
+        segment.cantidad_atribuida_kg = Decimal("0")
+        return SimpleNamespace(
+            id=manga_id,
+            estado="EN_LLENADO",
+            trabajo=work,
+            correccion_asignacion=None,
+            lote_articulo=SimpleNamespace(articulo=article),
+            _report_segments=[], _report_all_segments=[segment],
+            _report_final_kg=None, _report_open_kg=Decimal(net),
+            _report_quantity_un=None, _report_weight_corrected=False,
+        )
+
+    run["mangas"] = {1: opened(1, "6.3"), 2: opened(2, "6.6")}
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _capability: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    output = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+
+    assert output["avance"] == pytest.approx(12.9)
+    assert output["porcentaje"] == pytest.approx(5.16)
+    assert output["peso_fisico_kg"] == pytest.approx(12.9)
+    assert output["estado_avance"] == "EN_AVANCE"
+
+
+def test_tv_progress_prefers_current_final_over_open_control_after_reopen_or_correction():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-current-final")
+    article = SimpleNamespace(id=121)
+    manga = SimpleNamespace(
+        id=1,
+        estado="PESADA",
+        trabajo=work,
+        correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[],
+        _report_all_segments=[],
+        _report_final_kg=Decimal("3.3"),
+        _report_open_kg=Decimal("6.3"),
+        _report_quantity_un=None,
+        _report_weight_corrected=True,
+    )
+    run = {"works": [(work, None, None)], "mangas": {1: manga}}
+
+    assert _progress_tv_actual(run, article.id, "KG") == (Decimal("3.3"), False)
+
+
+def test_tv_progress_does_not_reuse_open_control_from_terminal_manga_state():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-terminal")
+    article = SimpleNamespace(id=123)
+    manga = SimpleNamespace(
+        id=1,
+        estado="PENDIENTE_RECEPCION_ALMACEN",
+        trabajo=work,
+        correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[],
+        _report_final_kg=None, _report_open_kg=Decimal("6.3"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (None, False)
+
+
+def test_tv_progress_rejects_open_control_with_ambiguous_owner_or_corrupt_ledger():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work_a = SimpleNamespace(id="work-a")
+    work_b = SimpleNamespace(id="work-b")
+    article = SimpleNamespace(id=122)
+
+    first = _segment(1, "0", "2", "2")
+    first.estado = "ACTIVO"
+    first.trabajo = work_a
+    first.cantidad_fin_kg = None
+    first.cantidad_atribuida_kg = Decimal("0")
+    second = _segment(2, "0", "2", "2")
+    second.estado = "ACTIVO"
+    second.trabajo = work_b
+    second.cantidad_fin_kg = None
+    second.cantidad_atribuida_kg = Decimal("0")
+    ambiguous = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work_a, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[first, second],
+        _report_final_kg=None, _report_open_kg=Decimal("8"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+    ambiguous_run = {
+        "works": [(work_a, None, None), (work_b, None, None)],
+        "mangas": {1: ambiguous},
+    }
+
+    corrupt = _segment(3, "0", "2", "2")
+    corrupt.trabajo = work_a
+    corrupt.cantidad_fin_kg = None
+    corrupt.cantidad_atribuida_kg = Decimal("0")
+    corrupt.estado = "CERRADO"
+    corrupt_manga = SimpleNamespace(
+        id=2, estado="EN_LLENADO", trabajo=work_a, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[corrupt],
+        _report_final_kg=None, _report_open_kg=Decimal("4"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+    corrupt_run = {"works": [(work_a, None, None)], "mangas": {2: corrupt_manga}}
+
+    assert _progress_tv_actual(ambiguous_run, article.id, "KG") == (None, True)
+    assert _progress_tv_actual(corrupt_run, article.id, "KG") == (None, True)
+
+
+def test_tv_progress_marks_ownerless_open_control_without_segments_incomplete():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-ownerless")
+    article = SimpleNamespace(id=124)
+    manga = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=None, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[],
+        _report_final_kg=None, _report_open_kg=Decimal("4"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (None, True)
+
+
+def test_tv_progress_does_not_reconcile_open_control_against_closed_only_ledger():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-closed-only")
+    article = SimpleNamespace(id=125)
+    segment = _segment(1, "0", "4", "4")
+    segment.trabajo = work
+    manga = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[segment],
+        _report_final_kg=None, _report_open_kg=Decimal("4"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (None, True)
+
+
+def test_tv_progress_marks_in_scope_manga_with_foreign_segments_incomplete():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-in-scope")
+    foreign = SimpleNamespace(id="work-foreign")
+    article = SimpleNamespace(id=126)
+    segment = _segment(1, "0", "1", "0")
+    segment.estado = "ACTIVO"
+    segment.trabajo = foreign
+    segment.cantidad_inicio_kg = None
+    segment.cantidad_fin_kg = None
+    segment.cantidad_atribuida_kg = Decimal("0")
+    manga = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[segment],
+        _report_final_kg=None, _report_open_kg=Decimal("4"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (None, True)
 
 
 def test_identity_dimensions_keep_canonical_key_and_readable_metadata():

@@ -54,6 +54,7 @@ from app.services.scm_manga_assignment_projection import effective_work, effecti
 
 
 KG = Decimal("0.001")
+OPEN_CONTROL_MANGA_STATES = frozenset({"EN_LLENADO"})
 GROUP_OPTIONS = (
     "DIA", "MES", "OF", "CORRIDA", "COLOR", "OT", "RECURSO",
     "RESPONSABLE", "MOLDE", "PIEZA", "ARTICULO",
@@ -268,6 +269,83 @@ def _valid_kg_segments(manga, controls_by_tramo):
     ]
     segments.sort(key=lambda item: item.secuencia)
     return segments
+
+
+def _manga_allows_open_control(manga):
+    """Open controls are current progress only while the manga is filling."""
+    state = getattr(manga, "estado", None)
+    # Keep small, legacy in-memory report fixtures compatible. Persisted rows
+    # always carry the state and therefore use the fail-closed gate below.
+    return state is None or str(state).upper() in OPEN_CONTROL_MANGA_STATES
+
+
+def _has_active_open_segment(segments):
+    return sum(
+        str(getattr(segment, "estado", "")).upper() == "ACTIVO"
+        for segment in segments
+    ) == 1
+
+
+def _open_control_has_safe_attribution(manga, segments, work_ids):
+    """Allow one current control only when its ownership is unambiguous.
+
+    An active segment may legitimately have no KG endpoint yet: the control is
+    the current cumulative observation. Closed history, when present, must be
+    a contiguous KG ledger. Multiple owners, ownerless segments, duplicate
+    active spans, or malformed closed history remain incomplete.
+    """
+    if not _manga_allows_open_control(manga):
+        return False
+    if not segments:
+        # Runtime rows expose _report_all_segments even when empty.  Only old
+        # projection fixtures without that field may use direct manga owner.
+        if hasattr(manga, "_report_all_segments"):
+            return False
+        owner = effective_work(manga)
+        return owner is not None and owner.id in work_ids
+    if not _has_active_open_segment(segments):
+        return False
+    owners = []
+    closed = []
+    for segment in segments:
+        if str(getattr(segment, "estado", "")).upper() == "ANULADO":
+            continue
+        segment_owner = effective_work_for_segment(manga, segment)
+        if segment_owner is None:
+            return False
+        owners.append(segment_owner)
+        if str(getattr(segment, "estado", "")).upper() != "ACTIVO":
+            closed.append(segment)
+    if not owners:
+        return False
+    owner_ids = {owner.id for owner in owners}
+    manga_owner = effective_work(manga)
+    if len(owner_ids) != 1 or manga_owner is None or manga_owner.id not in work_ids:
+        return False
+    if manga_owner.id not in owner_ids:
+        return False
+    if not closed:
+        return True
+    previous = Decimal("0")
+    for segment in sorted(closed, key=lambda item: getattr(item, "secuencia", 0)):
+        if str(getattr(segment, "estado", "")).upper() != "CERRADO":
+            return False
+        start = _d(getattr(segment, "cantidad_inicio_kg", None))
+        end = _d(getattr(segment, "cantidad_fin_kg", None))
+        attributed = _d(getattr(segment, "cantidad_atribuida_kg", None))
+        if (
+            start is None
+            or end is None
+            or attributed is None
+            or start != previous
+            or end <= start
+            or attributed != (end - start).quantize(KG)
+            or str(getattr(segment, "calidad_evidencia_kg", "")).upper()
+            not in {"MEDIDA_DIRECTA", "MEDIDA_DIRECTA_CIERRE_CONTROL", "CONCILIADA"}
+        ):
+            return False
+        previous = end
+    return True
 
 
 def _segment_conciliates(segments, net):
@@ -826,6 +904,8 @@ def _progress_tv_actual(run, article_id, unit):
         segments = list(getattr(manga, "_report_all_segments", None) or getattr(manga, "_report_segments", ()) or ())
         net = _d(getattr(manga, "_report_final_kg", None))
         open_net = _d(getattr(manga, "_report_open_kg", None))
+        if net is None and not _manga_allows_open_control(manga):
+            open_net = None
         observed = net if net is not None else open_net
         if segments:
             corrected_segments = (
@@ -849,7 +929,8 @@ def _progress_tv_actual(run, article_id, unit):
             ]
             has_ownerless_segment = any(owner is None for owner in segment_owners)
             has_own_segment = any(getattr(owner, "id", None) in work_ids for owner in segment_owners if owner is not None)
-            if unit == "KG" and observed is not None and _segment_conciliates(corrected_segments, observed):
+            manga_owner_in_scope = owner is not None and owner.id in work_ids
+            if unit == "KG" and net is not None and _segment_conciliates(corrected_segments, net):
                 attributed = sum((
                     _d(segment.cantidad_atribuida_kg) or Decimal("0")
                     for segment in corrected_segments
@@ -859,7 +940,12 @@ def _progress_tv_actual(run, article_id, unit):
                 if net is not None and attributed > 0 and not has_ownerless_segment:
                     total += attributed
                     evidence = True
-                elif net is not None and (has_ownerless_segment or has_own_segment):
+                elif net is not None and (
+                    has_ownerless_segment
+                    or has_own_segment
+                    or manga_owner_in_scope
+                    or owner is None
+                ):
                     # A known foreign owner is safely ignored.  An absent
                     # owner, even alongside attributable mass, makes the
                     # objective incomplete because the physical net cannot be
@@ -868,10 +954,24 @@ def _progress_tv_actual(run, article_id, unit):
             elif unit == "KG":
                 valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
                 segment_owner_ids = {owner.id for owner in segment_owners if owner is not None}
-                if not has_kg_ledger and valid_un and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment and net is not None:
+                if (
+                    open_net is not None
+                    and _open_control_has_safe_attribution(manga, corrected_segments, work_ids)
+                ):
+                    # The latest open control is cumulative evidence for the
+                    # current manga. It replaces older controls and is never
+                    # added to a vigente final weighing.
+                    total += open_net
+                    evidence = True
+                elif not has_kg_ledger and valid_un and segment_owner_ids and segment_owner_ids <= work_ids and not has_ownerless_segment and net is not None:
                     total += net
                     evidence = True
-                elif has_ownerless_segment or has_own_segment:
+                elif (
+                    has_ownerless_segment
+                    or has_own_segment
+                    or manga_owner_in_scope
+                    or owner is None
+                ):
                     incomplete = True
             elif unit == "UN":
                 valid_un = _progress_tv_un_ledger_is_valid(manga, corrected_segments)
@@ -891,7 +991,11 @@ def _progress_tv_actual(run, article_id, unit):
         if owner is None:
             # A manga with physical evidence but no current owner is not a
             # foreign contribution: it is an attribution failure.
-            if net is not None or _d(getattr(manga, "_report_quantity_un", None)) is not None:
+            if (
+                net is not None
+                or open_net is not None
+                or _d(getattr(manga, "_report_quantity_un", None)) is not None
+            ):
                 incomplete = True
             continue
         if owner.id not in work_ids:
@@ -902,6 +1006,12 @@ def _progress_tv_actual(run, article_id, unit):
             if net is not None:
                 total += net
                 evidence = True
+            elif open_net is not None:
+                if _open_control_has_safe_attribution(manga, segments, work_ids):
+                    total += open_net
+                    evidence = True
+                else:
+                    incomplete = True
             elif _d(getattr(manga, "_report_quantity_un", None)):
                 incomplete = True
         else:
