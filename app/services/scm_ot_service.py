@@ -14,6 +14,7 @@ from sqlalchemy import String, and_, case, cast, func, literal, or_, select, uni
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased, selectinload
 
+from app.extensions import db
 from app.models.lote import LoteSalidaPiezaColor
 from app.models.maquina import Maquina
 from app.models.orden import OrdenProduccion
@@ -854,7 +855,12 @@ def _serialize_ot(
             ScmManga.secuencia_ot
         ).all()
     payload = ot.to_dict()
-    payload["bloqueo_anulacion"] = _empty_ot_annulment_blocker(ot)
+    serialization_order = None
+    if assembly_context is not _SERIALIZATION_CONTEXT_UNSET:
+        serialization_order = assembly_context[0]
+    payload["bloqueo_anulacion"] = _empty_ot_annulment_blocker(
+        ot, order=serialization_order, mangas=mangas
+    )
     payload["anulacion"] = None
     if ot.estado == "ANULADA":
         annulment = ScmEvento.query.filter_by(
@@ -5170,7 +5176,134 @@ def list_ots(
     }
 
 
-def _empty_ot_annulment_blocker(ot):
+_ASSEMBLY_OT_ANNULMENT_LINKS = {
+    ("scm_manga", "ot_id"),
+    ("scm_asignacion_plan_manga_ot", "ot_id"),
+    ("scm_solicitud_abastecimiento", "orden_trabajo_id"),
+}
+_ASSEMBLY_MANGA_ANNULMENT_LINKS = {
+    ("scm_etiqueta_manga", "manga_id"),
+    ("scm_reserva_wip_salida", "manga_id"),
+}
+
+
+def _has_fk_rows(session, foreign_key, value):
+    return session.scalar(
+        select(foreign_key.parent)
+        .where(foreign_key.parent == value)
+        .limit(1)
+    ) is not None
+
+
+def _assembly_ot_annulment_blocker(
+    ot, *, session, lock=False, order=None, mangas=None
+):
+    """Check the narrow, history-preserving ENSAMBLE OT exception."""
+    if ot.codigo_ot_sintetico or ot.estado != "PLANIFICADA" \
+            or ot.iniciada_at or ot.cerrada_at:
+        return "Solo se puede anular una OT de armado planificada que nunca haya iniciado."
+    if ot.orden_operacion_id is None:
+        return "La OT de armado no conserva una OA operativa resoluble."
+    if order is None:
+        order = session.scalar(
+            select(ScmOrdenOperacion).where(
+                ScmOrdenOperacion.id == ot.orden_operacion_id,
+            )
+        )
+    if order is None or order.tipo != "ENSAMBLE":
+        return "La OT de armado no conserva una OA operativa resoluble."
+    if ot.trabajos_ot:
+        return "La OT tiene trabajos vinculados; no se anula en cascada."
+
+    if mangas is None:
+        manga_statement = select(ScmManga).where(
+            ScmManga.ot_id == ot.id,
+        ).order_by(ScmManga.secuencia_ot)
+        if lock:
+            manga_statement = manga_statement.with_for_update()
+        mangas = session.scalars(manga_statement).all()
+    if not mangas:
+        return "La OT de armado debe conservar al menos una manga histórica anulada."
+    if any(manga.estado != "ANULADA" for manga in mangas):
+        return "Todas las mangas de la OT de armado deben estar anuladas."
+
+    manga_ids = [manga.id for manga in mangas]
+    reservation_statement = select(ScmReservaWipSalida).where(
+        ScmReservaWipSalida.manga_id.in_(manga_ids),
+    ).order_by(ScmReservaWipSalida.id)
+    if lock:
+        reservation_statement = reservation_statement.with_for_update()
+    reservations = session.scalars(reservation_statement).all()
+    if any(
+        reservation.estado != "CANCELADA"
+        or Decimal(reservation.cantidad_aplicada or 0) != Decimal("0")
+        for reservation in reservations
+    ):
+        return "La OT conserva reservas de armado activas o aplicadas."
+
+    assignment_statement = select(ScmAsignacionPlanMangaOt).where(
+        ScmAsignacionPlanMangaOt.ot_id == ot.id,
+    ).order_by(ScmAsignacionPlanMangaOt.id)
+    if lock:
+        assignment_statement = assignment_statement.with_for_update()
+    assignments = session.scalars(assignment_statement).all()
+    if any(
+        assignment.trabajo_ot_id is not None
+        or Decimal(assignment.cantidad_asignada_un or 0) != Decimal("0")
+        or assignment.mangas_asignadas != 0
+        for assignment in assignments
+    ):
+        return "La OT conserva cuota de mangas activa o aplicada."
+
+    request_statement = select(ScmSolicitudAbastecimiento).where(
+        ScmSolicitudAbastecimiento.orden_trabajo_id == ot.id,
+    ).order_by(ScmSolicitudAbastecimiento.created_at)
+    if lock:
+        request_statement = request_statement.with_for_update()
+    requests = session.scalars(request_statement).all()
+    if any(request.estado != "CANCELADA" for request in requests):
+        return "La OT conserva una solicitud de abastecimiento operativa."
+
+    for manga in mangas:
+        if any(label.estado != "INVALIDADA" for label in manga.etiquetas):
+            return "La OT conserva etiquetas de mangas que no fueron invalidadas."
+
+    # Enumerate every incoming FK and fail closed for links not explicitly
+    # admitted above; this prevents future operational tables widening scope.
+    target = RegistroDiarioProduccion.__table__
+    for table in target.metadata.tables.values():
+        for foreign_key in table.foreign_keys:
+            if foreign_key.column is not target.c.id:
+                continue
+            link = (table.name, foreign_key.parent.name)
+            if link not in _ASSEMBLY_OT_ANNULMENT_LINKS \
+                    and _has_fk_rows(session, foreign_key, ot.id):
+                return "La OT tiene registros operativos vinculados; conserva la jornada y revisa su historial."
+
+    manga_table = ScmManga.__table__
+    for manga_id in manga_ids:
+        for table in target.metadata.tables.values():
+            for foreign_key in table.foreign_keys:
+                if foreign_key.column is not manga_table.c.id:
+                    continue
+                link = (table.name, foreign_key.parent.name)
+                if link not in _ASSEMBLY_MANGA_ANNULMENT_LINKS \
+                        and _has_fk_rows(session, foreign_key, manga_id):
+                    return "La manga conserva hechos físicos u operativos; revisa su historial."
+    return None
+
+
+def _empty_ot_annulment_blocker(
+    ot, *, session=None, lock=False, order=None, mangas=None
+):
+    if ot.tipo_ot == "ENSAMBLE":
+        return _assembly_ot_annulment_blocker(
+            ot,
+            session=session or db.session,
+            lock=lock,
+            order=order,
+            mangas=mangas,
+        )
     if (ot.tipo_ot != "FABRICACION" or ot.codigo_ot_sintetico
             or ot.orden_id is not None or ot.orden_operacion_id is not None
             or ot.corrida_fabricacion_id is not None):
@@ -5201,24 +5334,27 @@ def annul_empty_fabrication_ot(session, *, actor_id, public_id, operation_id, da
             raise ScmServiceError("OT_NOT_FOUND", "La OT no existe.", status_code=404)
         if ot.version != version:
             raise ScmServiceError("VERSION_CONFLICT", "La OT cambió. Actualiza y revisa antes de anular.", status_code=409)
-        blocker = _empty_ot_annulment_blocker(ot)
+        blocker = _empty_ot_annulment_blocker(
+            ot, session=session, lock=True
+        )
         if blocker:
             raise ScmServiceError("OT_ANNULMENT_BLOCKED", blocker, status_code=409)
-        # Fail closed for every operational FK, including future incoming links.
-        # The journal references aggregate identity, not an operational FK.
-        target = RegistroDiarioProduccion.__table__
-        for table in target.metadata.tables.values():
-            for foreign_key in table.foreign_keys:
-                if foreign_key.column is target.c.id:
-                    linked = session.scalar(select(foreign_key.parent).where(
-                        foreign_key.parent == ot.id,
-                    ).limit(1))
-                    if linked is not None:
-                        raise ScmServiceError(
-                            "OT_ANNULMENT_BLOCKED",
-                            "La OT tiene registros operativos vinculados. Conserva la jornada y revisa su historial.",
-                            status_code=409,
-                        )
+        # The assembly helper above performs the explicit allow-list census;
+        # retain the original all-links guard unchanged for fabrication OT.
+        if ot.tipo_ot != "ENSAMBLE":
+            target = RegistroDiarioProduccion.__table__
+            for table in target.metadata.tables.values():
+                for foreign_key in table.foreign_keys:
+                    if foreign_key.column is target.c.id:
+                        linked = session.scalar(select(foreign_key.parent).where(
+                            foreign_key.parent == ot.id,
+                        ).limit(1))
+                        if linked is not None:
+                            raise ScmServiceError(
+                                "OT_ANNULMENT_BLOCKED",
+                                "La OT tiene registros operativos vinculados. Conserva la jornada y revisa su historial.",
+                                status_code=409,
+                            )
         before = ot.to_dict()
         ot.estado = "ANULADA"
         ot.version += 1

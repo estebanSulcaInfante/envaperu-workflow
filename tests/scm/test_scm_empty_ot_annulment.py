@@ -5,8 +5,16 @@ import pytest
 from app.extensions import db
 from app.models.registro import RegistroDiarioProduccion
 from app.models.scm_auditoria import ScmEvento
+from app.models.scm_inline_wip import ScmReservaWipSalida
+from app.models.scm_ot import ScmManga
 from app.models.trabajador import RolOperativo
 from app.services import scm_ot_service as service
+from app.services.scm_assembly_execution_service import (
+    assign_assembly_output_mangas,
+    recalculate_assembly_manga_plan,
+)
+from app.services.scm_internal_supply_service import create_assembly_ot
+from tests.scm.test_scm_inline_assembly import _seed_concurrent_wip_flow
 from tests.scm.test_scm_ot_service import _seed_fabrication_order, _seed_aggregate_color_work
 
 
@@ -26,6 +34,124 @@ def post(client, actor, header, *, key=None, version=None, motivo="Creada por er
         json={"version": header["version"] if version is None else version, "motivo": motivo},
         headers={"X-Actor-Id": str(actor.id), "Idempotency-Key": str(key or uuid4())},
     )
+
+
+def seed_cancelled_assembly_ot(*, quantity=10):
+    actor, order, center, color_work, *_ = _seed_concurrent_wip_flow()
+    order.salidas[0].cantidad_objetivo = quantity
+    color_work.cantidad_objetivo_un = quantity
+    color_work.orden_operacion.salidas[0].cantidad_objetivo = quantity
+    for output in color_work.trabajo_color.corrida.salidas:
+        if output.orden_operacion_id == color_work.orden_operacion_id:
+            output.cantidad_objetivo = quantity
+    db.session.commit()
+    recalculate_assembly_manga_plan(
+        db.session,
+        actor_id=actor.id,
+        order_id=order.id,
+        operation_id=uuid4(),
+        data={},
+    )
+    created = create_assembly_ot(
+        db.session,
+        actor_id=actor.id,
+        order_id=order.id,
+        operation_id=uuid4(),
+        data={
+            "fecha_operativa": "2026-08-29",
+            "turno": "DIA",
+            "centro_trabajo_id": center.id,
+            "responsable_id": actor.id,
+            "cantidad_objetivo": quantity,
+            "modo_ejecucion": "CONCURRENTE",
+            "trabajo_color_contexto_id": str(color_work.id),
+        },
+    )["ot"]
+    assigned = assign_assembly_output_mangas(
+        db.session,
+        actor_id=actor.id,
+        ot_id=UUID(created["public_id"]),
+        operation_id=uuid4(),
+        data={"version": created["version"]},
+    )
+    for manga in assigned["mangas"]:
+        service.annul_manga(
+            db.session,
+            actor_id=actor.id,
+            manga_id=UUID(manga["public_id"]),
+            operation_id=uuid4(),
+            data={"motivo": "Manga creada por error"},
+        )
+    db.session.expire_all()
+    return actor, created
+
+
+def test_assembly_ot_annulment_accepts_only_cancelled_children_and_replays(
+    app, client
+):
+    with app.app_context():
+        actor, header = seed_cancelled_assembly_ot()
+        ot = RegistroDiarioProduccion.query.filter_by(
+            public_id=UUID(header["public_id"])
+        ).one()
+        assert ScmManga.query.filter_by(ot_id=ot.id).count() == 1
+        assert ScmManga.query.filter_by(ot_id=ot.id, estado="ANULADA").count() == 1
+        assert ScmReservaWipSalida.query.count() == 1
+        assert all(
+            item.estado == "CANCELADA"
+            and item.cantidad_aplicada == 0
+            for item in ScmReservaWipSalida.query.all()
+        )
+        listed = client.get(
+            f'/api/scm/v1/ots/{header["public_id"]}',
+            headers={"X-Actor-Id": str(actor.id)},
+        )
+        assert listed.status_code == 200, listed.json
+        assert listed.json["ot"]["bloqueo_anulacion"] is None
+
+        key = uuid4()
+        result = post(client, actor, header, key=key)
+        assert result.status_code == 200, result.json
+        assert result.json["ot"]["estado"] == "ANULADA"
+        assert post(client, actor, header, key=key).json == result.json
+        assert ScmEvento.query.filter_by(
+            tipo="FABRICATION_OT_HEADER_ANNULLED"
+        ).count() == 1
+        db.session.expire_all()
+        assert db.session.get(RegistroDiarioProduccion, ot.id).estado == "ANULADA"
+        assert ScmManga.query.filter_by(ot_id=ot.id).count() == 1
+        assert ScmReservaWipSalida.query.count() == 1
+
+
+def test_assembly_ot_annulment_rejects_non_cancelled_reservation(app, client):
+    with app.app_context():
+        actor, header = seed_cancelled_assembly_ot()
+        reservation = ScmReservaWipSalida.query.first()
+        reservation.estado = "CREDITO_EN_LINEA_PENDIENTE"
+        db.session.commit()
+        result = post(client, actor, header)
+        assert result.status_code == 409, result.json
+        assert result.json["error"]["code"] == "OT_ANNULMENT_BLOCKED"
+        assert RegistroDiarioProduccion.query.filter_by(
+            public_id=UUID(header["public_id"])
+        ).one().estado == "PLANIFICADA"
+
+
+def test_assembly_ot_annulment_fails_closed_for_unknown_operational_link(
+    app, client
+):
+    from app.models.registro import DetalleProduccionHora
+
+    with app.app_context():
+        actor, header = seed_cancelled_assembly_ot()
+        ot = RegistroDiarioProduccion.query.filter_by(
+            public_id=UUID(header["public_id"])
+        ).one()
+        db.session.add(DetalleProduccionHora(registro_id=ot.id, hora="08:00"))
+        db.session.commit()
+        result = post(client, actor, header)
+        assert result.status_code == 409, result.json
+        assert result.json["error"]["code"] == "OT_ANNULMENT_BLOCKED"
 
 
 def test_m4_annul_empty_ot_audited_replay_and_new_identity(app, client):
