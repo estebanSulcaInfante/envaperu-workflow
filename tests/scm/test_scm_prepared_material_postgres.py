@@ -8,21 +8,28 @@ from threading import Barrier
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app import create_app, db
 from app.config import Config
 from app.models.maquina import Maquina, TipoMaquina
+from app.models.scm_auditoria import ScmEvento
+from app.models.scm_inventory import ScmMovimientoMaterialInventario
 from app.models.scm_prepared_material import (
     ScmAsignacionRequerimientoPreparacion,
     ScmBolsaMaterialPreparado,
     ScmRequerimientoMaterialPreparado,
     ScmSaldoMaterialPreparado,
 )
-from app.models.scm_material_execution import ScmLotePremezcla, ScmRequerimientoMaterial
-from app.models.scm_production_orders import ScmOrdenOperacion
+from app.models.scm_material_execution import (
+    ScmEmisionMaterial,
+    ScmLotePremezcla,
+    ScmRequerimientoMaterial,
+    ScmReservaMaterial,
+)
+from app.models.scm_production_orders import ScmCorridaFabricacion, ScmOrdenOperacion
 from app.models.scm_catalogos import ScmCapacidad
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_configuration import ensure_initial_scm_configuration
@@ -464,9 +471,10 @@ def test_cancel_vs_confirm_premix_uses_of_lock_and_has_one_winner():
                     json={"cantidad_kg": reservation["cantidad_kg"], "motivo": "Carrera OF"},
                 )
                 assert emitted.status_code == 201, emitted.get_json()
-        # Fully emitted legacy reservations have no remaining active reserve
-        # balance for the OF cancellation preflight, while confirm_premix still
-        # consumes their immutable emission facts.
+        # Test-only fixture: the real endpoints above create the emissions, then
+        # this direct ORM state adjustment makes the legacy reservations
+        # explicitly LIBERADA.  It isolates the OF-lock race; it is not an
+        # operational material-flow transition.
         with app.app_context():
             for requirement in ScmRequerimientoMaterial.query.filter_by(
                 corrida_fabricacion_id=run_id
@@ -474,6 +482,40 @@ def test_cancel_vs_confirm_premix_uses_of_lock_and_has_one_winner():
                 for reservation in requirement.reservas:
                     reservation.estado = "LIBERADA"
             db.session.commit()
+
+            emissions = db.session.scalars(
+                select(ScmEmisionMaterial)
+                .join(ScmReservaMaterial)
+                .join(ScmRequerimientoMaterial)
+                .where(ScmRequerimientoMaterial.corrida_fabricacion_id == run_id)
+            ).all()
+            emitted_total = sum(
+                (Decimal(emission.cantidad_kg) for emission in emissions),
+                Decimal("0"),
+            )
+            consumed_before = sum(
+                (Decimal(emission.cantidad_consumida_kg) for emission in emissions),
+                Decimal("0"),
+            )
+            emitted_net_before = sum(
+                (
+                    Decimal(reservation.emitida_neta_kg)
+                    for requirement in ScmRequerimientoMaterial.query.filter_by(
+                        corrida_fabricacion_id=run_id
+                    ).all()
+                    for reservation in requirement.reservas
+                ),
+                Decimal("0"),
+            )
+            consumption_moves_before = ScmMovimientoMaterialInventario.query.filter_by(
+                tipo="CONSUMO"
+            ).count()
+            premix_events_before = ScmEvento.query.filter_by(
+                tipo="PREMIX_CONFIRMED"
+            ).count()
+            cancel_events_before = ScmEvento.query.filter_by(
+                tipo="OF_CANCELAR_EJECUCION"
+            ).count()
 
         impact = client.get(
             f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion=CANCELAR",
@@ -513,13 +555,59 @@ def test_cancel_vs_confirm_premix_uses_of_lock_and_has_one_winner():
         assert sum(response.status_code == 409 for response in results) == 1, [response.get_json() for response in results]
         with app.app_context():
             order = db.session.get(ScmOrdenOperacion, order_id)
+            run = db.session.get(ScmCorridaFabricacion, run_id)
             premix_count = ScmLotePremezcla.query.filter_by(corrida_fabricacion_id=run_id).count()
-            assert order.estado in {"LIBERADA", "CANCELADA"}
-            assert premix_count in {0, 1}
+            emissions_after = db.session.scalars(
+                select(ScmEmisionMaterial)
+                .join(ScmReservaMaterial)
+                .join(ScmRequerimientoMaterial)
+                .where(ScmRequerimientoMaterial.corrida_fabricacion_id == run_id)
+            ).all()
+            consumed_after = sum(
+                (Decimal(emission.cantidad_consumida_kg) for emission in emissions_after),
+                Decimal("0"),
+            )
+            emitted_net_after = sum(
+                (
+                    Decimal(reservation.emitida_neta_kg)
+                    for requirement in ScmRequerimientoMaterial.query.filter_by(
+                        corrida_fabricacion_id=run_id
+                    ).all()
+                    for reservation in requirement.reservas
+                ),
+                Decimal("0"),
+            )
+            consumption_moves_after = ScmMovimientoMaterialInventario.query.filter_by(
+                tipo="CONSUMO"
+            ).count()
+            premix_events_after = ScmEvento.query.filter_by(
+                tipo="PREMIX_CONFIRMED"
+            ).count()
+            cancel_events_after = ScmEvento.query.filter_by(
+                tipo="OF_CANCELAR_EJECUCION"
+            ).count()
+
             if confirm_response.status_code == 201:
+                assert cancel_response.status_code == 409
+                assert order.estado == "LIBERADA"
+                assert run.estado == "LIBERADA"
                 assert premix_count == 1
+                assert consumed_after == consumed_before + emitted_total
+                assert emitted_net_after == emitted_net_before - emitted_total
+                assert consumption_moves_after == consumption_moves_before + len(emissions)
+                assert premix_events_after == premix_events_before + 1
+                assert cancel_events_after == cancel_events_before
             else:
+                assert confirm_response.status_code == 409
+                assert cancel_response.status_code == 200
+                assert order.estado == "CANCELADA"
+                assert run.estado == "CANCELADA"
                 assert premix_count == 0
+                assert consumed_after == consumed_before
+                assert emitted_net_after == emitted_net_before
+                assert consumption_moves_after == consumption_moves_before
+                assert premix_events_after == premix_events_before
+                assert cancel_events_after == cancel_events_before + 1
     finally:
         Config.SQLALCHEMY_DATABASE_URI = original_uri
         if app is not None:
