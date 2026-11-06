@@ -21,7 +21,8 @@ from app.models.scm_prepared_material import (
     ScmRequerimientoMaterialPreparado,
     ScmSaldoMaterialPreparado,
 )
-from app.models.scm_material_execution import ScmLotePremezcla
+from app.models.scm_material_execution import ScmLotePremezcla, ScmRequerimientoMaterial
+from app.models.scm_production_orders import ScmOrdenOperacion
 from app.models.scm_catalogos import ScmCapacidad
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_configuration import ensure_initial_scm_configuration
@@ -417,6 +418,108 @@ def test_legacy_premix_and_canonical_requirement_are_mutually_exclusive():
             ).count()
             assert canonical_count + legacy_count == 1
             assert not (canonical_count and legacy_count)
+    finally:
+        Config.SQLALCHEMY_DATABASE_URI = original_uri
+        if app is not None:
+            with app.app_context():
+                db.session.remove()
+                db.engine.dispose()
+        try:
+            with admin_engine.begin() as connection:
+                connection.execute(DropSchema(schema, cascade=True))
+        finally:
+            admin_engine.dispose()
+
+
+def test_cancel_vs_confirm_premix_uses_of_lock_and_has_one_winner():
+    """Cancellation and legacy premix confirmation serialize on the OF lock."""
+    admin_engine, schema, schema_url = _isolated_postgres_schema()
+    app = None
+    original_uri = Config.SQLALCHEMY_DATABASE_URI
+    try:
+        _upgrade_schema(schema_url)
+        Config.SQLALCHEMY_DATABASE_URI = schema_url.render_as_string(hide_password=False)
+        app = create_app()
+        app.config.update(TESTING=True)
+        _seed_postgres_baseline(app)
+        with app.app_context():
+            planner_id, warehouse_id, order_id, run_id, _resin_id, _pigment_id = _seed_us010b()
+
+        client = app.test_client()
+        generated = client.post(
+            f"/api/scm/v1/ordenes-fabricacion/{order_id}/requerimientos-material/generar",
+            headers=_headers(planner_id), json={},
+        )
+        assert generated.status_code == 201, generated.get_json()
+        reserved = client.post(
+            f"/api/scm/v1/corridas-fabricacion/{run_id}/materiales/reservar",
+            headers=_headers(planner_id), json={},
+        )
+        assert reserved.status_code == 200, reserved.get_json()
+        for requirement in reserved.get_json()["requerimientos"]:
+            for reservation in requirement["reservas"]:
+                emitted = client.post(
+                    f"/api/scm/v1/reservas-material/{reservation['id']}/emitir",
+                    headers=_headers(warehouse_id),
+                    json={"cantidad_kg": reservation["cantidad_kg"], "motivo": "Carrera OF"},
+                )
+                assert emitted.status_code == 201, emitted.get_json()
+        # Fully emitted legacy reservations have no remaining active reserve
+        # balance for the OF cancellation preflight, while confirm_premix still
+        # consumes their immutable emission facts.
+        with app.app_context():
+            for requirement in ScmRequerimientoMaterial.query.filter_by(
+                corrida_fabricacion_id=run_id
+            ).all():
+                for reservation in requirement.reservas:
+                    reservation.estado = "LIBERADA"
+            db.session.commit()
+
+        impact = client.get(
+            f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion=CANCELAR",
+            headers=_headers(planner_id),
+        )
+        assert impact.status_code == 200, impact.get_json()
+        impact_body = impact.get_json()
+        barrier = Barrier(2)
+
+        def confirm():
+            with app.test_client() as concurrent_client:
+                barrier.wait(timeout=10)
+                return concurrent_client.post(
+                    f"/api/scm/v1/corridas-fabricacion/{run_id}/premezclas",
+                    headers=_headers(planner_id),
+                    json={"motivo": "Confirmacion concurrente", "genealogia_tipo": "EXACTA"},
+                )
+
+        def cancel():
+            with app.test_client() as concurrent_client:
+                barrier.wait(timeout=10)
+                return concurrent_client.post(
+                    f"/api/scm/v1/ordenes-fabricacion/{order_id}/cancelar-ejecucion",
+                    headers=_headers(planner_id),
+                    json={
+                        "version": impact_body["version"],
+                        "impact_hash": impact_body["impact_hash"],
+                        "motivo": "Cancelacion concurrente",
+                    },
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            confirm_response, cancel_response = executor.map(lambda fn: fn(), (confirm, cancel))
+        results = [confirm_response, cancel_response]
+        assert all(response.status_code < 500 for response in results), [response.get_json() for response in results]
+        assert sum(response.status_code in {200, 201} for response in results) == 1, [response.get_json() for response in results]
+        assert sum(response.status_code == 409 for response in results) == 1, [response.get_json() for response in results]
+        with app.app_context():
+            order = db.session.get(ScmOrdenOperacion, order_id)
+            premix_count = ScmLotePremezcla.query.filter_by(corrida_fabricacion_id=run_id).count()
+            assert order.estado in {"LIBERADA", "CANCELADA"}
+            assert premix_count in {0, 1}
+            if confirm_response.status_code == 201:
+                assert premix_count == 1
+            else:
+                assert premix_count == 0
     finally:
         Config.SQLALCHEMY_DATABASE_URI = original_uri
         if app is not None:

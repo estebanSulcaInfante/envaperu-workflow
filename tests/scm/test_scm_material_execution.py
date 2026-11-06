@@ -8,6 +8,8 @@ from app.models.scm_articulos import ScmArticulo
 from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial
 from app.models.scm_inventory import ScmSaldoMaterialInventario, ScmUbicacionInventario
 from app.models.scm_material_execution import ScmLotePremezcla
+from app.models.scm_auditoria import ScmEvento
+from app.models.scm_inventory import ScmMovimientoMaterialInventario
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
     ScmOrdenFabricacion,
@@ -291,6 +293,45 @@ def test_premezcla_consume_emisiones_y_crea_wip_genealogico(app, client, scm_con
         json={"cantidad_kg": "0.001", "motivo": "No debe permitirse"},
     )
     assert rejected_return.status_code == 409
+
+
+def test_premezcla_rejects_cancelled_of_without_side_effects(app, client, scm_config):
+    """A stopped OF cannot consume legacy premix inputs after cancellation."""
+    with app.app_context():
+        planner_id, _warehouse_id, order_id, run_id, _resin_id, _pigment_id = _seed_us010b()
+
+    impact_response = client.get(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion=CANCELAR",
+        headers=_headers(planner_id),
+    )
+    assert impact_response.status_code == 200, impact_response.get_json()
+    impact = impact_response.get_json()
+    cancelled = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/cancelar-ejecucion",
+        headers={**_headers(planner_id, idempotent=True)},
+        json={
+            "version": impact["version"],
+            "impact_hash": impact["impact_hash"],
+            "motivo": "OF duplicada antes de preparar materiales",
+        },
+    )
+    assert cancelled.status_code == 200, cancelled.get_json()
+    with app.app_context():
+        events_before = ScmEvento.query.count()
+        movements_before = ScmMovimientoMaterialInventario.query.count()
+        premixes_before = ScmLotePremezcla.query.filter_by(corrida_fabricacion_id=run_id).count()
+
+    rejected = client.post(
+        f"/api/scm/v1/corridas-fabricacion/{run_id}/premezclas",
+        headers=_headers(planner_id, idempotent=True),
+        json={"motivo": "No consumir tras cancelar", "genealogia_tipo": "EXACTA"},
+    )
+    assert rejected.status_code == 409, rejected.get_json()
+    assert rejected.get_json()["error"]["code"] == "OF_EXECUTION_STOPPED"
+    with app.app_context():
+        assert ScmEvento.query.count() == events_before
+        assert ScmMovimientoMaterialInventario.query.count() == movements_before
+        assert ScmLotePremezcla.query.filter_by(corrida_fabricacion_id=run_id).count() == premixes_before
 
 
 def test_cutover_impide_premezcla_legacy_si_corrida_ya_usa_opm_canonica(

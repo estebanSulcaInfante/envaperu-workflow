@@ -609,7 +609,23 @@ def confirm_premix(session, *, actor_id, operation_id, run_id, data):
         )
         if replay is not None:
             return replay
+        # The OF is the aggregate serialization point shared with
+        # cancel_execution.  Resolve the corrida identity first, lock and
+        # validate the OF, then lock the corrida in the same OF -> corrida
+        # order used by prepared-material generation.
+        run_probe = _load_run(session, run_id)
+        order = ensure_of_accepts_execution_write(
+            session,
+            run_probe.orden_fabricacion_id,
+            action="confirmar premezcla",
+        )
         run = _load_run(session, run_id, lock=True)
+        if run.orden_fabricacion_id != order.id:
+            raise ScmServiceError(
+                "FABRICATION_RUN_NOT_FOUND",
+                "La corrida no pertenece a la orden de fabricacion esperada.",
+                status_code=404,
+            )
         canonical_requirement = session.scalar(
             select(ScmRequerimientoMaterialPreparado)
             .where(
