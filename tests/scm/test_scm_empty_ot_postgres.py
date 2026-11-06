@@ -3,15 +3,18 @@ from threading import Barrier, Event
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
 
 from app.extensions import db
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion
 from app.models.scm_auditoria import ScmEvento
+from app.models.scm_ot import ScmEtiquetaManga
 from app.models.trabajador import RolOperativo, Trabajador
 from app.services.scm_ot_service import create_fabrication_ot_header
 from app.services import scm_ot_service
 from tests.scm.test_scm_inline_assembly_postgres import postgres_inline_app
+from tests.scm.test_scm_empty_ot_annulment import seed_cancelled_assembly_ot
 
 pytestmark = pytest.mark.postgres
 
@@ -121,3 +124,50 @@ def test_m4_start_refreshes_identity_after_annul_commits(
         "INVALID_STATE_TRANSITION",
         "VERSION_CONFLICT",
     }
+
+
+def test_assembly_annulment_waits_for_locked_label_before_committing(
+    postgres_inline_app,
+):
+    """A concurrent label mutation cannot slip past the annulment census."""
+    app = postgres_inline_app
+    with app.app_context():
+        _, header = seed_cancelled_assembly_ot(with_label=True)
+        label = ScmEtiquetaManga.query.one()
+        lock_connection = db.engine.connect()
+        lock_transaction = lock_connection.begin()
+        lock_connection.execute(
+            select(ScmEtiquetaManga.id)
+            .where(ScmEtiquetaManga.id == label.id)
+            .with_for_update()
+        )
+
+    entered_census = Event()
+    finished = Event()
+
+    def inspect():
+        try:
+            with app.app_context():
+                ot = db.session.scalar(
+                    select(RegistroDiarioProduccion).where(
+                        RegistroDiarioProduccion.public_id
+                        == UUID(header["public_id"])
+                    ).with_for_update()
+                )
+                entered_census.set()
+                return scm_ot_service._assembly_ot_annulment_blocker(
+                    ot, session=db.session, lock=True
+                )
+        finally:
+            finished.set()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(inspect)
+            assert entered_census.wait(timeout=10)
+            assert not finished.wait(timeout=1)
+            lock_transaction.commit()
+            result = future.result(timeout=30)
+        assert result is None
+    finally:
+        lock_connection.close()
