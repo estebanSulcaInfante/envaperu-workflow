@@ -4,6 +4,7 @@ from datetime import date
 import hashlib
 import json
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -12,9 +13,13 @@ from openpyxl import load_workbook
 from app.extensions import db
 from app.models.scm_ot import (
     ScmAnulacionPesajeManga,
+    ScmAsignacionPersonalTrabajoOt,
+    ScmControlPesoManga,
     ScmManga,
     ScmLoteArticulo,
     ScmPesajeManga,
+    ScmReaperturaManga,
+    ScmTramoMangaTrabajo,
     ScmTrabajoColor,
     ScmTrabajoOt,
 )
@@ -24,6 +29,8 @@ from app.models.scm_production_orders import (
     ScmOrdenOperacionSalida,
     ScmOrdenOperacion,
 )
+from app.models.scm_auditoria import ScmOperacion
+from app.models.scm_articulos import ScmArticulo
 from app.models.trabajador import Trabajador
 from app.services.scm_production_reports_service import (
     _filters,
@@ -1267,6 +1274,76 @@ def test_progress_keeps_known_measured_subtotal_when_another_manga_has_no_weight
     assert item["porcentaje"] == pytest.approx(50.0)
     assert item["coverage"]["estado"] == "INCOMPLETA"
     assert "SUBTOTAL_PARCIAL" in item["coverage"]["motivos"]
+    assert "PESO_MANGA_SIN_EVIDENCIA" in item["coverage"]["motivos"]
+
+
+def test_single_closed_null_boundary_counts_final_with_traceability_incident():
+    work = SimpleNamespace(id="work-null-boundary")
+    article = SimpleNamespace(id=901)
+    segment = SimpleNamespace(
+        secuencia=1, estado="CERRADO", trabajo=work,
+        cantidad_inicio_kg=None, cantidad_fin_kg=Decimal("11.500"),
+        cantidad_atribuida_kg=Decimal("11.500"),
+        calidad_evidencia_kg="MEDIDA_DIRECTA",
+    )
+    manga = SimpleNamespace(
+        id=1, estado="PESADA", trabajo=work, ot_id=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[segment],
+        _report_final_kg=Decimal("11.500"), _report_open_kg=None,
+        _report_weight_corrected=False,
+    )
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("20")),
+        "contexts": [{"work": work}], "works": [(work, None, None)],
+        "ots": [], "mangas": {1: manga},
+    }
+
+    final, opened, measured, total, known, _objective = _run_manga_values(run)
+
+    assert (final, opened, measured, total, known) == (
+        Decimal("11.500"), Decimal("0"), Decimal("11.500"), 1, 1,
+    )
+    assert run["_report_attribution_reasons"] == ["TRAMO_INICIO_NO_REGISTRADO"]
+    tv = production_reports_service._progress_tv_breakdown(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    )
+    assert tv["medido"] == Decimal("11.500")
+    assert tv["motivos_atribucion"] == ["TRAMO_INICIO_NO_REGISTRADO"]
+
+
+@pytest.mark.parametrize("variant", ("foreign", "multiple", "corrected"))
+def test_single_closed_null_boundary_fails_closed_for_ambiguous_variants(variant):
+    work = SimpleNamespace(id="work-null-boundary-safe")
+    foreign = SimpleNamespace(id="work-null-boundary-foreign")
+    first = SimpleNamespace(
+        secuencia=1, estado="CERRADO", trabajo=foreign if variant == "foreign" else work,
+        cantidad_inicio_kg=None, cantidad_fin_kg=Decimal("11.500"),
+        cantidad_atribuida_kg=Decimal("11.500"), calidad_evidencia_kg="MEDIDA_DIRECTA",
+    )
+    segments = [first]
+    if variant == "multiple":
+        second = _segment(2, "11.5", "12.5", "1")
+        second.trabajo = work
+        segments.append(second)
+    manga = SimpleNamespace(
+        id=1, estado="PESADA", trabajo=work, ot_id=None,
+        _report_segments=[], _report_all_segments=segments,
+        _report_final_kg=Decimal("11.500"), _report_open_kg=None,
+        _report_weight_corrected=variant == "corrected",
+    )
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("20")),
+        "contexts": [{"work": work}], "works": [(work, None, None)],
+        "ots": [], "mangas": {1: manga},
+    }
+
+    final, _opened, measured, total, known, _objective = _run_manga_values(run)
+
+    assert final == Decimal("0")
+    assert measured is None
+    assert total == 1
+    assert known == 0
 
 
 def test_tv_progress_serializes_open_controls_instead_of_suppressing_known_advance(monkeypatch):
@@ -1484,6 +1561,28 @@ def test_tv_progress_rejects_active_segment_with_closed_kg_boundary():
     assert _progress_tv_actual(
         {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
     ) == (None, True)
+
+
+def test_tv_progress_accepts_post_reopen_control_with_historical_active_boundary():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-reopened-control")
+    article = SimpleNamespace(id=1271)
+    active = _segment(1, "0", "5", "5")
+    active.estado = "ACTIVO"
+    active.trabajo = work
+    manga = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[active],
+        _report_final_kg=None, _report_open_kg=Decimal("5.7"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+        _report_reopened_with_new_control=True,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (Decimal("5.7"), False)
 
 
 def test_tv_progress_rejects_active_start_that_breaks_closed_frontier():
@@ -2256,6 +2355,208 @@ def test_tv_progress_http_consolidates_real_multi_ot_contexts(app, client, scm_c
         assert cards[0]["group_id"].startswith("tvgrp-") or cards[0]["group_id"] == f"{order.id}|{corrida.id}|ML-OBS|1"
         assert len(cards[0]["ots"]) == 2
         assert len(cards[0]["salidas"]) == 1
+
+
+def test_progress_loader_counts_real_single_closed_null_kg_boundary_with_incident(app, scm_config):
+    """ORM regression for the legacy first-segment missing KG start."""
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabrication = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabrication)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=order.id, codigo="C-REPORT-NULL-BOUNDARY",
+            secuencia=31, objetivo_neto_kg=Decimal("20"), estado="EN_EJECUCION",
+        )
+        db.session.add(corrida)
+        db.session.flush()
+        blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
+        color_work = ScmTrabajoColor.query.filter_by(trabajo_ot_id=blue.id).one()
+        color_work.corrida_fabricacion_id = corrida.id
+        manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-03").one()
+        manga.estado = "PESADA"
+        weighing = ScmPesajeManga.query.filter_by(manga_id=manga.id).one()
+        weighing.estado = "VIGENTE"
+        article = ScmArticulo(
+            codigo="PC-REPORT-NULL-BOUNDARY", nombre="Salida null boundary",
+            clase="SUBENSAMBLE_WIP", unidad_inventario="KG",
+        )
+        db.session.add(article)
+        db.session.flush()
+        output = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=corrida.id,
+            articulo_scm_id=article.id, cantidad_objetivo=20,
+            kg_estandar_objetivo=20, excedente_objetivo=0,
+        )
+        db.session.add(output)
+        db.session.flush()
+        lot = ScmLoteArticulo(
+            codigo="LOTE-REPORT-NULL-BOUNDARY", articulo_id=article.id,
+            clase="SALIDA_ORDEN_OPERACION", orden_operacion_salida_id=output.id,
+            cantidad_acreditada=1,
+        )
+        db.session.add(lot)
+        manga.lote_articulo = lot
+        assignment = ScmAsignacionPersonalTrabajoOt(
+            trabajo_ot_id=blue.id, trabajador_id=seeded["full"].id,
+            estado="CERRADA", finalizada_at=weighing.pesada_at,
+            asignada_por_id=seeded["full"].id, finalizada_por_id=seeded["full"].id,
+        )
+        db.session.add(assignment)
+        db.session.flush()
+        manga.trabajo_ot_id = blue.id
+        manga.asignacion_personal_trabajo_id = assignment.id
+        db.session.add(ScmTramoMangaTrabajo(
+            manga_id=manga.id, trabajo_ot_id=blue.id,
+            asignacion_personal_trabajo_id=assignment.id, secuencia=1,
+            estado="CERRADO", cantidad_inicio_un=0, cantidad_fin_un=1,
+            cantidad_atribuida_un=1, cantidad_inicio_kg=None,
+            cantidad_fin_kg=Decimal("8.000"), cantidad_atribuida_kg=Decimal("8.000"),
+            calidad_evidencia_kg="MEDIDA_DIRECTA", cerrada_at=weighing.pesada_at,
+            motivo_cierre="PESAJE_FINAL", created_by_id=seeded["full"].id,
+        ))
+        db.session.commit()
+
+        loaded = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        row = next(item for item in loaded if item["corrida"].codigo == "C-REPORT-NULL-BOUNDARY")
+        loaded_manga = row["mangas"][manga.id]
+        breakdown = production_reports_service._progress_tv_breakdown(
+            row, article.id, "KG"
+        )
+        assert loaded_manga._report_final_kg == Decimal("8.000")
+        assert breakdown["medido"] == Decimal("8.000")
+        assert breakdown["motivos_atribucion"] == ["TRAMO_INICIO_NO_REGISTRADO"]
+
+
+def test_progress_loader_uses_control_after_reopen_with_historical_active_kg_boundary(app, scm_config):
+    """ORM regression: a post-reopen control supersedes the old closure fact."""
+    from datetime import datetime, timezone
+    from test_scm_production_observability import _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        order = ScmOrdenOperacion.query.filter_by(codigo="OF-OBS-001").one()
+        fabrication = ScmOrdenFabricacion(orden_operacion_id=order.id)
+        db.session.add(fabrication)
+        db.session.flush()
+        corrida = ScmCorridaFabricacion(
+            orden_fabricacion_id=order.id, codigo="C-REPORT-REOPEN-CONTROL",
+            secuencia=32, objetivo_neto_kg=Decimal("20"), estado="EN_EJECUCION",
+        )
+        db.session.add(corrida)
+        db.session.flush()
+        blue = ScmTrabajoOt.query.filter_by(codigo="TC-OBS-AZUL").one()
+        ScmTrabajoColor.query.filter_by(trabajo_ot_id=blue.id).one().corrida_fabricacion_id = corrida.id
+        manga = ScmManga.query.filter_by(codigo="M-OT-OBS-FAB-03").one()
+        weighing = ScmPesajeManga.query.filter_by(manga_id=manga.id).one()
+        weighing.estado = "REABIERTO"
+        article = ScmArticulo(
+            codigo="PC-REPORT-REOPEN-CONTROL", nombre="Salida reopen control",
+            clase="SUBENSAMBLE_WIP", unidad_inventario="KG",
+        )
+        db.session.add(article)
+        db.session.flush()
+        output = ScmOrdenOperacionSalida(
+            orden_operacion_id=order.id, corrida_fabricacion_id=corrida.id,
+            articulo_scm_id=article.id, cantidad_objetivo=20,
+            kg_estandar_objetivo=20, excedente_objetivo=0,
+        )
+        db.session.add(output)
+        db.session.flush()
+        lot = ScmLoteArticulo(
+            codigo="LOTE-REPORT-REOPEN-CONTROL", articulo_id=article.id,
+            clase="SALIDA_ORDEN_OPERACION", orden_operacion_salida_id=output.id,
+            cantidad_acreditada=1,
+        )
+        db.session.add(lot)
+        manga.lote_articulo = lot
+        assignment = ScmAsignacionPersonalTrabajoOt(
+            trabajo_ot_id=blue.id, trabajador_id=seeded["full"].id,
+            estado="CERRADA", finalizada_at=weighing.pesada_at,
+            asignada_por_id=seeded["full"].id, finalizada_por_id=seeded["full"].id,
+        )
+        db.session.add(assignment)
+        db.session.flush()
+        manga.trabajo_ot_id = blue.id
+        manga.asignacion_personal_trabajo_id = assignment.id
+        historical_at = datetime(2026, 8, 10, 15, tzinfo=timezone.utc)
+        reopen_at = datetime(2026, 8, 10, 16, tzinfo=timezone.utc)
+        control_at = datetime(2026, 8, 10, 17, tzinfo=timezone.utc)
+        segment = ScmTramoMangaTrabajo(
+            manga_id=manga.id, trabajo_ot_id=blue.id,
+            asignacion_personal_trabajo_id=assignment.id, secuencia=1,
+            estado="ACTIVO", cantidad_inicio_un=0, cantidad_fin_un=None,
+            cantidad_atribuida_un=0, cantidad_inicio_kg=0,
+            cantidad_fin_kg=Decimal("5"), cantidad_atribuida_kg=Decimal("5"),
+            calidad_evidencia_kg="MEDIDA_DIRECTA", iniciada_at=historical_at,
+            created_by_id=seeded["full"].id,
+        )
+        db.session.add(segment)
+        db.session.flush()
+        reopen_operation = ScmOperacion(
+            operation_id=uuid4(), endpoint="/test/reopen", actor_id=seeded["full"].id,
+            request_sha256="a" * 64, response_json={}, estado_http=201,
+        )
+        control_operation = ScmOperacion(
+            operation_id=uuid4(), endpoint="/test/control", actor_id=seeded["full"].id,
+            request_sha256="b" * 64, response_json={}, estado_http=201,
+        )
+        old_control_operation = ScmOperacion(
+            operation_id=uuid4(), endpoint="/test/control-old", actor_id=seeded["full"].id,
+            request_sha256="c" * 64, response_json={}, estado_http=201,
+        )
+        db.session.add_all([reopen_operation, control_operation, old_control_operation])
+        db.session.flush()
+        db.session.add(ScmReaperturaManga(
+            manga_id=manga.id, pesaje_id=weighing.id, motivo="Continuar llenado",
+            tipo_reapertura="CONTINUAR_LLENADO", peso_base_neto_kg=Decimal("5"),
+            reabierta_por_id=seeded["full"].id, reabierta_at=reopen_at,
+            operation_id=reopen_operation.operation_id,
+        ))
+        db.session.add(ScmControlPesoManga(
+            manga_id=manga.id, tramo_id=segment.id,
+            operation_id=old_control_operation.operation_id, source_system="TEST",
+            station_id="ST-OBS", capture_id=uuid4(), tipo="CORTE_TURNO",
+            peso_bruto_kg=Decimal("5.1"), tara_kg=Decimal("0.1"),
+            peso_neto_kg=Decimal("5"), aporte_desde_control_anterior_kg=Decimal("5"),
+            tara_fuente="TIPO_MANGA", conteo_acumulado_un=None, unidad_evidencia="KG",
+            calidad_evidencia="MEDIDA_DIRECTA", motivo="Control de corte previo",
+            pesado_at=historical_at, timezone_snapshot="America/Lima",
+            fecha_local_pesaje=historical_at.date(), pesado_por_id=seeded["full"].id,
+        ))
+        db.session.add(ScmControlPesoManga(
+            manga_id=manga.id, tramo_id=segment.id,
+            operation_id=control_operation.operation_id, source_system="TEST",
+            station_id="ST-OBS", capture_id=uuid4(), tipo="AVANCE_KG",
+            peso_bruto_kg=Decimal("5.8"), tara_kg=Decimal("0.1"),
+            peso_neto_kg=Decimal("5.7"), aporte_desde_control_anterior_kg=Decimal("0.7"),
+            tara_fuente="TIPO_MANGA", conteo_acumulado_un=None, unidad_evidencia="KG",
+            calidad_evidencia="MEDIDA_DIRECTA", motivo="Control posterior a reapertura",
+            pesado_at=control_at, timezone_snapshot="America/Lima",
+            fecha_local_pesaje=control_at.date(), pesado_por_id=seeded["full"].id,
+        ))
+        manga.estado = "EN_LLENADO"
+        db.session.commit()
+
+        loaded = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        row = next(item for item in loaded if item["corrida"].codigo == "C-REPORT-REOPEN-CONTROL")
+        breakdown = production_reports_service._progress_tv_breakdown(
+            row, article.id, "KG"
+        )
+
+        assert breakdown["medido"] == Decimal("5.7")
+        assert breakdown["incomplete"] is False
+        loaded_manga = row["mangas"][manga.id]
+        assert loaded_manga._report_open_kg == Decimal("5.7")
 
 
 def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, scm_config):

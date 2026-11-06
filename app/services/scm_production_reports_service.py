@@ -57,6 +57,7 @@ KG = Decimal("0.001")
 OPEN_CONTROL_MANGA_STATES = frozenset({"CONTINUIDAD_PENDIENTE", "EN_LLENADO"})
 ATTRIBUTION_INCOMPLETE_REASON = "ATRIBUCION_INCOMPLETA"
 KG_WITHOUT_UN_SEGMENTS_REASON = "KG_SIN_TRAMOS_UN"
+KG_START_MISSING_REASON = "TRAMO_INICIO_NO_REGISTRADO"
 GROUP_OPTIONS = (
     "DIA", "MES", "OF", "CORRIDA", "COLOR", "OT", "RECURSO",
     "RESPONSABLE", "MOLDE", "PIEZA", "ARTICULO",
@@ -107,6 +108,15 @@ def _history_color_metadata(rows):
 
 def _iso(value):
     return value.isoformat() if value is not None else None
+
+
+def _timestamp_after(value, boundary):
+    """Compare possibly-naive ORM timestamps on one UTC timeline."""
+    if value is None or boundary is None:
+        return False
+    value = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    boundary = boundary if boundary.tzinfo is not None else boundary.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc) > boundary.astimezone(timezone.utc)
 
 
 def _date(value, field):
@@ -347,7 +357,11 @@ def _open_control_has_safe_attribution(manga, segments, work_ids):
         active_end = _d(getattr(active, "cantidad_fin_kg", None))
         active_attributed = _d(getattr(active, "cantidad_atribuida_kg", None))
         if active_end is not None or active_attributed not in (None, Decimal("0")):
-            return False
+            # Reopening preserves the historical KG boundary on the active
+            # segment. It is usable only when the loader proved that the
+            # selected control was captured after that reopening.
+            if not getattr(manga, "_report_reopened_with_new_control", False):
+                return False
 
     if not closed:
         if state == "CONTINUIDAD_PENDIENTE":
@@ -394,6 +408,41 @@ def _segment_conciliates(segments, net):
         previous = end
         total += attributed
     return previous == net.quantize(KG) and total == net.quantize(KG)
+
+
+def _single_closed_kg_boundary_incident(manga, segments, net, work_ids):
+    """Accept one legacy closed KG boundary with a missing initial value.
+
+    This is deliberately narrower than normal ledger reconciliation: one
+    sequence-one closed segment, one effective owner in the current run, and
+    an exact final/attributed boundary are required.  The caller records the
+    traceability incident; no segment data is repaired or rewritten.
+    """
+    if net is None or len(segments) != 1 or getattr(manga, "_report_weight_corrected", False):
+        return False
+    segment = segments[0]
+    if (
+        str(getattr(segment, "estado", "")).upper() != "CERRADO"
+        or getattr(segment, "secuencia", None) != 1
+        or _d(getattr(segment, "cantidad_inicio_kg", None)) is not None
+        or str(getattr(segment, "calidad_evidencia_kg", "")).upper()
+        not in {"MEDIDA_DIRECTA", "MEDIDA_DIRECTA_CIERRE_CONTROL", "CONCILIADA"}
+    ):
+        return False
+    end = _d(getattr(segment, "cantidad_fin_kg", None))
+    attributed = _d(getattr(segment, "cantidad_atribuida_kg", None))
+    if end is None or attributed is None or end != attributed or end != net.quantize(KG):
+        return False
+    owner = effective_work_for_segment(manga, segment)
+    manga_owner = effective_work(manga)
+    scope = {str(item) for item in work_ids}
+    return (
+        owner is not None
+        and manga_owner is not None
+        and str(owner.id) in scope
+        and str(manga_owner.id) in scope
+        and str(owner.id) == str(manga_owner.id)
+    )
 
 
 def _continuity_control_ledger_is_valid(manga, segments, latest_control, *, frontier=None):
@@ -701,6 +750,13 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
                 last_reopen = max((item.reabierta_at for item in manga.reaperturas if item.reabierta_at), default=None)
                 if closure_event is not None and last_reopen is not None and closure_event.occurred_at <= last_reopen:
                     closure_event = None
+            control_after_reopen = (
+                last_reopen is None
+                or (
+                    latest_control is not None
+                    and _timestamp_after(latest_control.pesado_at, last_reopen)
+                )
+            )
             direct_close_segment = next(
                 (segment for segment in reversed(segments)
                  if str(segment.calidad_evidencia_kg or "").upper() == "MEDIDA_DIRECTA_CIERRE_CONTROL"),
@@ -724,8 +780,9 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
             control_allowed = (
                 manga.estado != "ANULADA"
                 and _manga_allows_open_control(manga)
+                and control_after_reopen
             )
-            open_kg = _d(latest_control.peso_neto_kg) if final is None and latest_control is not None and manga.estado != "ANULADA" else None
+            open_kg = _d(latest_control.peso_neto_kg) if final is None and latest_control is not None and control_allowed else None
             manga._report_final_kg = final
             manga._report_open_kg = open_kg
             manga._report_physical_kg = (
@@ -735,6 +792,8 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
             )
             manga._report_open_control_allowed = control_allowed
             manga._report_continuity_ledger_valid = continuity_ledger_valid
+            manga._report_reopened_at = last_reopen
+            manga._report_reopened_with_new_control = bool(last_reopen is not None and control_allowed)
             quantity_projection = (
                 correction_by_weight.get(current_weighing.id).result_projection_json
                 if current_weighing is not None and current_weighing.id in correction_by_weight
@@ -870,12 +929,15 @@ def _run_manga_values(run):
             segments = _project_corrected_kg_segments(segments, observed)
             segment_owners = [effective_work_for_segment(manga, segment) for segment in segments]
             has_ownerless_segment = any(owner is None for owner in segment_owners)
+        boundary_incident = _single_closed_kg_boundary_incident(
+            manga, segments, observed, work_ids
+        )
         assigned = False
         attributed_evidence = False
         if (
             segments and observed is not None
             and (net is not None or continuity_ledger_valid)
-            and _segment_conciliates(segments, observed)
+            and (_segment_conciliates(segments, observed) or boundary_incident)
         ):
             attributed = sum(
                 (
@@ -890,6 +952,8 @@ def _run_manga_values(run):
             if assigned:
                 attributed_evidence = True
                 measured_evidence = True
+                if boundary_incident:
+                    attribution_reasons.add(KG_START_MISSING_REASON)
                 if net is not None:
                     final += attributed
                 else:
@@ -1149,7 +1213,10 @@ def _progress_tv_breakdown(run, article_id, unit):
             has_ownerless = any(item is None for item in segment_owners)
             has_own = any(item is not None and item.id in work_ids for item in segment_owners)
             open_safe = _open_control_has_safe_attribution(manga, corrected, work_ids)
-            if unit == "KG" and observed is not None and (net is not None or (continuity_valid and open_safe)) and _segment_conciliates(corrected, observed):
+            boundary_incident = _single_closed_kg_boundary_incident(
+                manga, corrected, observed, work_ids
+            )
+            if unit == "KG" and observed is not None and (net is not None or (continuity_valid and open_safe)) and (_segment_conciliates(corrected, observed) or boundary_incident):
                 attributed = sum(
                     (_d(segment.cantidad_atribuida_kg) or Decimal("0"))
                     for segment in corrected
@@ -1162,6 +1229,8 @@ def _progress_tv_breakdown(run, article_id, unit):
                     else:
                         open_total += attributed
                     evidence = True
+                    if boundary_incident:
+                        attribution_reasons.add(KG_START_MISSING_REASON)
                 if has_ownerless and observed is not None:
                     incomplete = True
                     attribution_reasons.add(ATTRIBUTION_INCOMPLETE_REASON)
