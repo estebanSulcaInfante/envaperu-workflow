@@ -229,13 +229,17 @@ def _impact(session, order, action, works):
     if action == "PAUSAR":
         if order.estado != "EN_EJECUCION":
             blockers.append({"code": "OF_NOT_EXECUTING", "message": "Solo una OF en ejecucion puede pausarse."})
-        if not executable:
+        # Aggregate pause is allowed for a real OF with historical work even
+        # when no child remains executable (individual pause or terminal work).
+        # An OF with no work history is still a planning/no-op case.
+        if not works:
             blockers.append({"code": "NO_EXECUTABLE_WORKS", "message": "La OF no tiene trabajos propios ejecutables pendientes."})
     elif action == "REANUDAR":
         if order.estado != "PAUSADA":
             blockers.append({"code": "OF_NOT_PAUSED", "message": "Solo una OF pausada puede reanudarse."})
-        if not any(work.estado == "PAUSADO" and work.estado_previo_pausa for work in works):
-            blockers.append({"code": "NO_WORKS_PAUSED_BY_OF", "message": "No hay trabajos pausados por esta OF para reanudar."})
+        # A header may be paused while every child was already paused
+        # individually or terminal.  Resume changes only children carrying
+        # this aggregate command's provenance marker below.
     elif action == "CANCELAR":
         pending_works = [work for work in works if work.estado in PENDING_WORK_STATES]
         if order.estado not in CANCELABLE_OF_STATES:
@@ -252,18 +256,20 @@ def _impact(session, order, action, works):
             blockers.append({"code": "NO_PENDING_WORKS", "message": "La OF no conserva trabajos propios pendientes cancelables."})
     open_mangas = [m for m in mangas if m.estado in OPEN_MANGA_STATES]
     open_tramos = [t for t in tramos if t.estado in {"PROGRAMADO", "ACTIVO"}]
-    if open_mangas and action in {"PAUSAR", "CANCELAR"}:
+    # Physical/custody obligations are preserved by PAUSAR and remain
+    # fail-closed only for terminal CANCELAR reconciliation.
+    if open_mangas and action == "CANCELAR":
         blockers.append({"code": "OPEN_MANGAS", "message": "Hay mangas abiertas; ciérralas o reconcilia su estado antes de continuar.", "count": len(open_mangas)})
-    if open_tramos and action in {"PAUSAR", "CANCELAR"}:
+    if open_tramos and action == "CANCELAR":
         blockers.append({"code": "OPEN_MANGA_SEGMENTS", "message": "Hay tramos de manga abiertos; completa la continuidad antes de continuar.", "count": len(open_tramos)})
     # Pausing preserves an unissued reservation as pending work.  Cancellation
     # remains fail-closed until the residual, unissued quantity has a safe
     # release/reconciliation path.
     if reservations and action == "CANCELAR":
         blockers.append({"code": "ACTIVE_MATERIAL_RESERVATIONS", "message": "Hay reservas de material activas; concilia el saldo no emitido antes de cancelar.", "count": len(reservations)})
-    if inline_wip and action in {"PAUSAR", "CANCELAR"}:
+    if inline_wip and action == "CANCELAR":
         blockers.append({"code": "PENDING_INLINE_WIP", "message": "Hay salidas WIP en linea pendientes de conciliacion.", "count": len(inline_wip)})
-    if prepared_reservations and action in {"PAUSAR", "CANCELAR"}:
+    if prepared_reservations and action == "CANCELAR":
         blockers.append({"code": "PENDING_PREPARED_MATERIAL", "message": "Hay material preparado pendiente de conciliacion o custodia.", "count": len(prepared_reservations)})
     if prepared_requirements and action == "CANCELAR" and empty_or_annulled:
         blockers.append({"code": "PENDING_PREPARED_REQUIREMENTS", "message": "Hay requerimientos de material preparado vivos para corridas de esta OF; concilia su OPM, asignacion o custodia antes de cancelar.", "count": len(prepared_requirements)})

@@ -551,8 +551,48 @@ def test_tv_progress_excludes_released_without_work_but_keeps_legacy_active(monk
 
     items = list_production_progress_tv(object(), actor_id=7, filters={})["items"]
 
-    assert [item["estado"] for item in items] == ["EN_EJECUCION"]
-    assert items[0]["of_id"] == "of-EN_EJECUCION"
+    assert [item["estado"] for item in items] == ["EN_EJECUCION", "PAUSADA"]
+    assert [item["of_id"] for item in items] == ["of-EN_EJECUCION", "of-PAUSADA"]
+
+
+def test_tv_progress_keeps_paused_kg_identical_to_active_kg(monkeypatch):
+    active_work = SimpleNamespace(id="work-active")
+    paused_work = SimpleNamespace(id="work-paused")
+    active = _tv_aggregate_run(
+        corrida_id="run-active", works=[active_work],
+        contexts=[{"work": active_work}],
+        mangas={1: _tv_manga(1, active_work, "7.5")},
+    )
+    paused = _tv_aggregate_run(
+        corrida_id="run-paused", works=[paused_work],
+        contexts=[{"work": paused_work}],
+        mangas={2: _tv_manga(2, paused_work, "7.5")},
+    )
+    active["orden"] = SimpleNamespace(
+        id="of-active", codigo="OF-ACTIVE", estado="EN_EJECUCION", molde_id="ML-1",
+    )
+    paused["orden"] = SimpleNamespace(
+        id="of-paused", codigo="OF-PAUSED", estado="PAUSADA", molde_id="ML-1",
+    )
+    monkeypatch.setattr(
+        production_reports_service, "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [active, paused])
+
+    items = list_production_progress_tv(object(), actor_id=7, filters={})["items"]
+
+    by_state = {item["estado"]: item for item in items}
+    assert set(by_state) == {"EN_EJECUCION", "PAUSADA"}
+    active_output = by_state["EN_EJECUCION"]["salidas"][0]
+    paused_output = by_state["PAUSADA"]["salidas"][0]
+    for field in (
+        "unidad", "meta", "avance", "pendiente", "porcentaje",
+        "peso_fisico_kg", "finalizados_kg", "en_proceso_kg",
+        "avance_medido_kg", "pendientes_sin_peso", "mangas_total",
+        "mangas_conocidas",
+    ):
+        assert paused_output[field] == active_output[field]
 
 
 def test_tv_progress_consolidates_two_ots_into_one_output_target(monkeypatch):

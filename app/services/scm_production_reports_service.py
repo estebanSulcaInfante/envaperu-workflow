@@ -1610,14 +1610,14 @@ def list_production_progress_tv(session, *, actor_id, filters=None):
     runs = _load_rows(
         session,
         normalized,
-        order_states={"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "ABIERTA", "EN_COBERTURA"},
+        order_states={"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "PAUSADA", "ABIERTA", "EN_COBERTURA"},
         exclude_annulled_runs=True,
     )
     grouped = {}
     for run in runs:
         order = run["orden"]
         state = str(getattr(order, "estado", "")).upper()
-        if state not in {"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "ABIERTA", "EN_COBERTURA"}:
+        if state not in {"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "PAUSADA", "ABIERTA", "EN_COBERTURA"}:
             continue
         # A released OF without any own work is planning noise for TV.  Legacy
         # active OFs without a work FK remain visible because their historical

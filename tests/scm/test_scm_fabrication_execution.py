@@ -87,6 +87,136 @@ def test_pause_without_own_executable_work_is_a_readable_blocker(app, client, sc
     assert any(item["code"] == "NO_EXECUTABLE_WORKS" for item in body["blockers"])
 
 
+@pytest.mark.parametrize("work_state", ["PAUSADO", "ANULADO", "COMPLETADO"])
+def test_pause_accepts_historical_work_without_executable_work(
+    app, client, scm_config, work_state,
+):
+    order_id, actor_id = _seed_active_execution(app)
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, UUID(order_id))
+        work = ScmTrabajoOt.query.filter_by(orden_operacion_id=order.id).one()
+        work.estado = work_state
+        work.estado_previo_pausa = None
+        db.session.commit()
+
+    impact = client.get(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion=PAUSAR",
+        headers={"X-Actor-Id": str(actor_id)},
+    )
+    assert impact.status_code == 200, impact.get_json()
+    body = impact.get_json()
+    assert body["can_execute"] is True
+    assert body["trabajos"]["ejecutables"] == 0
+    assert body["trabajos"]["afectados"] == 0
+
+    paused = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/pausar-ejecucion",
+        json={
+            "version": body["version"],
+            "impact_hash": body["impact_hash"],
+            "motivo": "Suspender OF con historial",
+        },
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert paused.status_code == 200, paused.get_json()
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, UUID(order_id))
+        assert order.estado == "PAUSADA"
+        assert order.fabricacion.corridas[0].estado == "PAUSADA"
+        work = ScmTrabajoOt.query.filter_by(orden_operacion_id=order.id).one()
+        assert work.estado == work_state
+        assert work.estado_previo_pausa is None
+
+
+def test_pause_mixed_work_history_only_suspends_executable_work(app, client, scm_config):
+    order_id, actor_id = _seed_active_execution(app)
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, UUID(order_id))
+        active = ScmTrabajoOt.query.filter_by(orden_operacion_id=order.id).one()
+        active_code = active.codigo
+        paused = ScmTrabajoOt(
+            orden_trabajo_id=active.orden_trabajo_id,
+            codigo=f"{active.codigo}-PAUSED",
+            secuencia=2,
+            estado="PAUSADO",
+            orden_operacion_id=order.id,
+            cantidad_objetivo_un=20,
+            estado_previo_pausa=None,
+        )
+        annulled = ScmTrabajoOt(
+            orden_trabajo_id=active.orden_trabajo_id,
+            codigo=f"{active.codigo}-ANNULLED",
+            secuencia=3,
+            estado="ANULADO",
+            orden_operacion_id=order.id,
+            cantidad_objetivo_un=20,
+        )
+        db.session.add_all([paused, annulled])
+        db.session.commit()
+
+    impact = client.get(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion=PAUSAR",
+        headers={"X-Actor-Id": str(actor_id)},
+    ).get_json()
+    assert impact["can_execute"] is True
+    paused_response = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/pausar-ejecucion",
+        json={
+            "version": impact["version"],
+            "impact_hash": impact["impact_hash"],
+            "motivo": "Suspender trabajo activo",
+        },
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert paused_response.status_code == 200, paused_response.get_json()
+    with app.app_context():
+        states = {
+            work.codigo: (work.estado, work.estado_previo_pausa)
+            for work in ScmTrabajoOt.query.filter_by(orden_operacion_id=UUID(order_id)).all()
+        }
+        assert states[active_code] == ("PAUSADO", "EN_EJECUCION")
+        assert states[f"{active_code}-PAUSED"] == ("PAUSADO", None)
+        assert states[f"{active_code}-ANNULLED"] == ("ANULADO", None)
+
+
+def test_resume_accepts_paused_order_without_aggregate_markers(app, client, scm_config):
+    order_id, actor_id = _seed_active_execution(app)
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, UUID(order_id))
+        order.estado = "PAUSADA"
+        order.fabricacion.corridas[0].estado = "PAUSADA"
+        work = ScmTrabajoOt.query.filter_by(orden_operacion_id=order.id).one()
+        work.estado = "PAUSADO"
+        work.estado_previo_pausa = None
+        db.session.commit()
+
+    impact_response = client.get(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion=REANUDAR",
+        headers={"X-Actor-Id": str(actor_id)},
+    )
+    assert impact_response.status_code == 200, impact_response.get_json()
+    impact = impact_response.get_json()
+    assert impact["can_execute"] is True
+
+    resumed = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reanudar-ejecucion",
+        json={
+            "version": impact["version"],
+            "impact_hash": impact["impact_hash"],
+            "motivo": "Retomar OF sin reactivar pausa individual",
+        },
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert resumed.status_code == 200, resumed.get_json()
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, UUID(order_id))
+        assert order.estado == "EN_EJECUCION"
+        assert order.fabricacion.corridas[0].estado == "EN_EJECUCION"
+        work = ScmTrabajoOt.query.filter_by(orden_operacion_id=order.id).one()
+        assert work.estado == "PAUSADO"
+        assert work.estado_previo_pausa is None
+
+
 def _seed_cancel_case(app, order_state, work_state=None):
     if work_state is None:
         order_id, actor_id, _run_id, _recipe_id = _seed_released_order(app)
@@ -414,3 +544,50 @@ def test_impact_hash_is_stable_when_relationship_and_query_order_changes():
     changed_order.salidas[0].cantidad_real = Decimal("99")
     changed = _impact(changed_session, changed_order, "PAUSAR", changed_works)
     assert changed["impact_hash"] != second["impact_hash"]
+
+
+def test_pause_preserves_open_physical_obligations_while_cancel_keeps_blockers():
+    session, order, works = _hash_order_fixture()
+    session._collections = iter([
+        [SimpleNamespace(id="manga-open", estado="CONTINUIDAD_PENDIENTE", version=4)],
+        [SimpleNamespace(id="tramo-open", estado="ACTIVO")],
+        [SimpleNamespace(id="reservation-active", estado="ACTIVA", emitida_neta_kg=Decimal("0"), cantidad_consumida_kg=Decimal("0"))],
+        [SimpleNamespace(
+            id="prepared-requirement", estado="CUBIERTA", version=1,
+            cantidad_requerida_kg=Decimal("3"), asignaciones=[],
+        )],
+        [SimpleNamespace(id="premix-lot", estado="DISPONIBLE_MAQUINA", cantidad_kg=Decimal("3"))],
+        [SimpleNamespace(id="wip-pending")],
+        [SimpleNamespace(id="prepared-pending")],
+    ])
+
+    pause = _impact(session, order, "PAUSAR", works)
+
+    assert pause["can_execute"] is True
+    assert pause["mangas_abiertas"] == 1
+    assert pause["wip_pendiente"] == 1
+    assert pause["material_preparado_pendiente"] == 1
+    assert not {item["code"] for item in pause["blockers"]} & {
+        "OPEN_MANGAS", "OPEN_MANGA_SEGMENTS", "PENDING_INLINE_WIP",
+        "PENDING_PREPARED_MATERIAL",
+    }
+
+    session._collections = iter([
+        [SimpleNamespace(id="manga-open", estado="CONTINUIDAD_PENDIENTE", version=4)],
+        [SimpleNamespace(id="tramo-open", estado="ACTIVO")],
+        [SimpleNamespace(id="reservation-active", estado="ACTIVA", emitida_neta_kg=Decimal("0"), cantidad_consumida_kg=Decimal("0"))],
+        [SimpleNamespace(
+            id="prepared-requirement", estado="CUBIERTA", version=1,
+            cantidad_requerida_kg=Decimal("3"), asignaciones=[],
+        )],
+        [SimpleNamespace(id="premix-lot", estado="DISPONIBLE_MAQUINA", cantidad_kg=Decimal("3"))],
+        [SimpleNamespace(id="wip-pending")],
+        [SimpleNamespace(id="prepared-pending")],
+    ])
+    cancel = _impact(session, order, "CANCELAR", works)
+
+    assert cancel["can_execute"] is False
+    assert {
+        "OPEN_MANGAS", "OPEN_MANGA_SEGMENTS", "PENDING_INLINE_WIP",
+        "PENDING_PREPARED_MATERIAL", "ACTIVE_MATERIAL_RESERVATIONS",
+    } <= {item["code"] for item in cancel["blockers"]}
