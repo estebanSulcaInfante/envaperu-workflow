@@ -410,15 +410,19 @@ def _segment_conciliates(segments, net):
     return previous == net.quantize(KG) and total == net.quantize(KG)
 
 
-def _single_closed_kg_boundary_incident(manga, segments, net, work_ids):
+def _single_closed_kg_boundary_incident(
+    manga, segments, net, work_ids, *, historical_net=None
+):
     """Accept one legacy closed KG boundary with a missing initial value.
 
     This is deliberately narrower than normal ledger reconciliation: one
     sequence-one closed segment, one effective owner in the current run, and
-    an exact final/attributed boundary are required.  The caller records the
-    traceability incident; no segment data is repaired or rewritten.
+    an exact historical final/attributed boundary are required.  When a
+    vigente correction exists, the original weighing NET proves that boundary
+    while the corrected NET is counted once by the caller.  No segment data is
+    repaired or rewritten.
     """
-    if net is None or len(segments) != 1 or getattr(manga, "_report_weight_corrected", False):
+    if net is None or len(segments) != 1:
         return False
     segment = segments[0]
     if (
@@ -431,7 +435,19 @@ def _single_closed_kg_boundary_incident(manga, segments, net, work_ids):
         return False
     end = _d(getattr(segment, "cantidad_fin_kg", None))
     attributed = _d(getattr(segment, "cantidad_atribuida_kg", None))
-    if end is None or attributed is None or end != attributed or end != net.quantize(KG):
+    if getattr(manga, "_report_weight_corrected", False):
+        if historical_net is None:
+            return False
+        boundary_net = _d(historical_net)
+    else:
+        boundary_net = net
+    if (
+        boundary_net is None
+        or end is None
+        or attributed is None
+        or end != attributed
+        or end != boundary_net.quantize(KG)
+    ):
         return False
     owner = effective_work_for_segment(manga, segment)
     manga_owner = effective_work(manga)
@@ -808,6 +824,11 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
             )
             open_kg = reference_kg if final is None and control_allowed else None
             manga._report_final_kg = final
+            manga._report_original_final_kg = (
+                _d(getattr(current_weighing, "peso_fisico_neto_kg", None))
+                if current_weighing is not None
+                else None
+            )
             manga._report_open_kg = open_kg
             manga._report_physical_kg = (
                 final
@@ -954,7 +975,11 @@ def _run_manga_values(run):
             segment_owners = [effective_work_for_segment(manga, segment) for segment in segments]
             has_ownerless_segment = any(owner is None for owner in segment_owners)
         boundary_incident = _single_closed_kg_boundary_incident(
-            manga, segments, observed, work_ids
+            manga,
+            segments,
+            observed,
+            work_ids,
+            historical_net=getattr(manga, "_report_original_final_kg", None),
         )
         assigned = False
         attributed_evidence = False
@@ -972,6 +997,8 @@ def _run_manga_values(run):
                 ),
                 Decimal("0"),
             )
+            if boundary_incident and getattr(manga, "_report_weight_corrected", False):
+                attributed = observed
             assigned = attributed > 0
             if assigned:
                 attributed_evidence = True
@@ -1238,7 +1265,11 @@ def _progress_tv_breakdown(run, article_id, unit):
             has_own = any(item is not None and item.id in work_ids for item in segment_owners)
             open_safe = _open_control_has_safe_attribution(manga, corrected, work_ids)
             boundary_incident = _single_closed_kg_boundary_incident(
-                manga, corrected, observed, work_ids
+                manga,
+                corrected,
+                observed,
+                work_ids,
+                historical_net=getattr(manga, "_report_original_final_kg", None),
             )
             if unit == "KG" and observed is not None and (net is not None or (continuity_valid and open_safe)) and (_segment_conciliates(corrected, observed) or boundary_incident):
                 attributed = sum(
@@ -1247,6 +1278,8 @@ def _progress_tv_breakdown(run, article_id, unit):
                     if (segment_owner := effective_work_for_segment(manga, segment)) is not None
                     and segment_owner.id in work_ids
                 )
+                if boundary_incident and getattr(manga, "_report_weight_corrected", False):
+                    attributed = observed
                 if attributed > 0 and not has_ownerless:
                     if net is not None:
                         final_total += attributed

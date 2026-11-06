@@ -1312,7 +1312,7 @@ def test_single_closed_null_boundary_counts_final_with_traceability_incident():
     assert tv["motivos_atribucion"] == ["TRAMO_INICIO_NO_REGISTRADO"]
 
 
-@pytest.mark.parametrize("variant", ("foreign", "multiple", "corrected"))
+@pytest.mark.parametrize("variant", ("foreign", "multiple", "assignment"))
 def test_single_closed_null_boundary_fails_closed_for_ambiguous_variants(variant):
     work = SimpleNamespace(id="work-null-boundary-safe")
     foreign = SimpleNamespace(id="work-null-boundary-foreign")
@@ -1327,10 +1327,10 @@ def test_single_closed_null_boundary_fails_closed_for_ambiguous_variants(variant
         second.trabajo = work
         segments.append(second)
     manga = SimpleNamespace(
-        id=1, estado="PESADA", trabajo=work, ot_id=None,
+        id=1, estado="PESADA", trabajo=foreign if variant == "assignment" else work, ot_id=None,
         _report_segments=[], _report_all_segments=segments,
         _report_final_kg=Decimal("11.500"), _report_open_kg=None,
-        _report_weight_corrected=variant == "corrected",
+        _report_weight_corrected=False,
     )
     run = {
         "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("20")),
@@ -1342,8 +1342,70 @@ def test_single_closed_null_boundary_fails_closed_for_ambiguous_variants(variant
 
     assert final == Decimal("0")
     assert measured is None
-    assert total == 1
+    assert total == (0 if variant == "assignment" else 1)
     assert known == 0
+
+
+def test_single_closed_null_boundary_accepts_vigente_corrected_weight_without_mutating_history():
+    work = SimpleNamespace(id="work-null-boundary-corrected")
+    article = SimpleNamespace(id=902)
+    segment = SimpleNamespace(
+        secuencia=1, estado="CERRADO", trabajo=work,
+        cantidad_inicio_kg=None, cantidad_fin_kg=Decimal("11.300"),
+        cantidad_atribuida_kg=Decimal("11.300"), calidad_evidencia_kg="MEDIDA_DIRECTA",
+    )
+    manga = SimpleNamespace(
+        id=2, estado="PESADA", trabajo=work, ot_id=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[segment],
+        _report_final_kg=Decimal("12.100"), _report_original_final_kg=Decimal("11.300"),
+        _report_open_kg=None, _report_weight_corrected=True,
+    )
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("20")),
+        "contexts": [{"work": work}], "works": [(work, None, None)],
+        "ots": [], "mangas": {2: manga},
+    }
+
+    final, opened, measured, total, known, _objective = _run_manga_values(run)
+
+    assert (final, opened, measured, total, known) == (
+        Decimal("12.100"), Decimal("0"), Decimal("12.100"), 1, 1,
+    )
+    assert segment.cantidad_fin_kg == Decimal("11.300")
+    assert segment.cantidad_atribuida_kg == Decimal("11.300")
+    assert run["_report_attribution_reasons"] == ["TRAMO_INICIO_NO_REGISTRADO"]
+    tv = production_reports_service._progress_tv_breakdown(
+        {"works": [(work, None, None)], "mangas": {2: manga}}, article.id, "KG"
+    )
+    assert tv["medido"] == Decimal("12.100")
+    assert tv["motivos_atribucion"] == ["TRAMO_INICIO_NO_REGISTRADO"]
+
+
+def test_single_closed_null_boundary_accepts_quantity_only_correction_without_double_count():
+    work = SimpleNamespace(id="work-null-boundary-quantity")
+    segment = SimpleNamespace(
+        secuencia=1, estado="CERRADO", trabajo=work,
+        cantidad_inicio_kg=None, cantidad_fin_kg=Decimal("11.300"),
+        cantidad_atribuida_kg=Decimal("11.300"), calidad_evidencia_kg="MEDIDA_DIRECTA",
+    )
+    manga = SimpleNamespace(
+        id=3, estado="PESADA", trabajo=work, ot_id=None,
+        lote_articulo=SimpleNamespace(articulo=SimpleNamespace(id=903)),
+        _report_segments=[], _report_all_segments=[segment],
+        _report_final_kg=Decimal("11.300"), _report_original_final_kg=Decimal("11.300"),
+        _report_quantity_un=Decimal("42"), _report_open_kg=None, _report_weight_corrected=True,
+    )
+    run = {
+        "corrida": SimpleNamespace(objetivo_neto_kg=Decimal("20")),
+        "contexts": [{"work": work}], "works": [(work, None, None)],
+        "ots": [], "mangas": {3: manga},
+    }
+
+    final, _opened, measured, _total, _known, _objective = _run_manga_values(run)
+
+    assert (final, measured) == (Decimal("11.300"), Decimal("11.300"))
+    assert segment.cantidad_fin_kg == Decimal("11.300")
 
 
 def test_tv_progress_serializes_open_controls_instead_of_suppressing_known_advance(monkeypatch):
@@ -2667,6 +2729,18 @@ def test_register_control_corte_turno_enters_continuidad_pendiente_for_report_co
         db.session.refresh(manga)
         assert control["control"]["peso_neto_kg"] == "5.000"
         assert manga.estado == "CONTINUIDAD_PENDIENTE"
+        loaded = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        row = next(item for item in loaded if item["corrida"].id == _run.id)
+        breakdown = production_reports_service._progress_tv_breakdown(
+            row, manga.lote_articulo.articulo.id, "KG"
+        )
+        assert breakdown["medido"] == Decimal("5.000")
+        assert breakdown["en_proceso"] == Decimal("5.000")
+        assert breakdown["finalizados"] == Decimal("0")
+        assert breakdown["incomplete"] is False
 
 
 def test_progress_loader_keeps_pre_reopen_control_for_cierre_accidental(app):
