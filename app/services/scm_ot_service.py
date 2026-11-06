@@ -858,14 +858,24 @@ def _serialize_ot(
     serialization_order = None
     if assembly_context is not _SERIALIZATION_CONTEXT_UNSET:
         serialization_order = assembly_context[0]
+    # Listing/detail serialization is intentionally conservative.  The
+    # mutation path performs the exhaustive, locked dependency census; doing
+    # that census here would multiply all operational-FK probes by every OT
+    # returned in a list and could falsely advertise a race-free result.
     payload["bloqueo_anulacion"] = _empty_ot_annulment_blocker(
-        ot, order=serialization_order, mangas=mangas
+        ot,
+        order=serialization_order,
+        mangas=mangas,
+        inspect_dependencies=False,
     )
     payload["anulacion"] = None
     if ot.estado == "ANULADA":
-        annulment = ScmEvento.query.filter_by(
-            aggregate_type="ORDEN_TRABAJO", aggregate_id=str(ot.id),
-            tipo="FABRICATION_OT_HEADER_ANNULLED",
+        annulment = ScmEvento.query.filter(
+            ScmEvento.aggregate_type == "ORDEN_TRABAJO",
+            ScmEvento.aggregate_id == str(ot.id),
+            ScmEvento.tipo.in_(
+                ("FABRICATION_OT_HEADER_ANNULLED", "ASSEMBLY_OT_HEADER_ANNULLED")
+            ),
         ).order_by(ScmEvento.id.desc()).first()
         if annulment is not None:
             payload["anulacion"] = {
@@ -5196,7 +5206,8 @@ def _has_fk_rows(session, foreign_key, value):
 
 
 def _assembly_ot_annulment_blocker(
-    ot, *, session, lock=False, order=None, mangas=None
+    ot, *, session, lock=False, order=None, mangas=None,
+    inspect_dependencies=True,
 ):
     """Check the narrow, history-preserving ENSAMBLE OT exception."""
     if ot.codigo_ot_sintetico or ot.estado != "PLANIFICADA" \
@@ -5205,11 +5216,12 @@ def _assembly_ot_annulment_blocker(
     if ot.orden_operacion_id is None:
         return "La OT de armado no conserva una OA operativa resoluble."
     if order is None:
-        order = session.scalar(
-            select(ScmOrdenOperacion).where(
-                ScmOrdenOperacion.id == ot.orden_operacion_id,
-            )
+        order_statement = select(ScmOrdenOperacion).where(
+            ScmOrdenOperacion.id == ot.orden_operacion_id,
         )
+        if lock:
+            order_statement = order_statement.with_for_update()
+        order = session.scalar(order_statement)
     if order is None or order.tipo != "ENSAMBLE":
         return "La OT de armado no conserva una OA operativa resoluble."
     if ot.trabajos_ot:
@@ -5227,7 +5239,22 @@ def _assembly_ot_annulment_blocker(
     if any(manga.estado != "ANULADA" for manga in mangas):
         return "Todas las mangas de la OT de armado deben estar anuladas."
 
+    if not inspect_dependencies:
+        return "La elegibilidad de anulación requiere verificación transaccional al anular."
+
     manga_ids = [manga.id for manga in mangas]
+    # Keep label rows in the same deterministic manga order as the parent
+    # rows.  Mutation callers pass lock=True, so a concurrent label state
+    # change cannot slip between eligibility validation and the OT update.
+    label_statement = select(ScmEtiquetaManga).where(
+        ScmEtiquetaManga.manga_id.in_(manga_ids),
+    ).order_by(ScmEtiquetaManga.manga_id, ScmEtiquetaManga.id)
+    if lock:
+        label_statement = label_statement.with_for_update()
+    labels = session.scalars(label_statement).all()
+    if any(label.estado != "INVALIDADA" for label in labels):
+        return "La OT conserva etiquetas de mangas que no fueron invalidadas."
+
     reservation_statement = select(ScmReservaWipSalida).where(
         ScmReservaWipSalida.manga_id.in_(manga_ids),
     ).order_by(ScmReservaWipSalida.id)
@@ -5264,10 +5291,6 @@ def _assembly_ot_annulment_blocker(
     if any(request.estado != "CANCELADA" for request in requests):
         return "La OT conserva una solicitud de abastecimiento operativa."
 
-    for manga in mangas:
-        if any(label.estado != "INVALIDADA" for label in manga.etiquetas):
-            return "La OT conserva etiquetas de mangas que no fueron invalidadas."
-
     # Enumerate every incoming FK and fail closed for links not explicitly
     # admitted above; this prevents future operational tables widening scope.
     target = RegistroDiarioProduccion.__table__
@@ -5294,7 +5317,8 @@ def _assembly_ot_annulment_blocker(
 
 
 def _empty_ot_annulment_blocker(
-    ot, *, session=None, lock=False, order=None, mangas=None
+    ot, *, session=None, lock=False, order=None, mangas=None,
+    inspect_dependencies=True,
 ):
     if ot.tipo_ot == "ENSAMBLE":
         return _assembly_ot_annulment_blocker(
@@ -5303,6 +5327,7 @@ def _empty_ot_annulment_blocker(
             lock=lock,
             order=order,
             mangas=mangas,
+            inspect_dependencies=inspect_dependencies,
         )
     if (ot.tipo_ot != "FABRICACION" or ot.codigo_ot_sintetico
             or ot.orden_id is not None or ot.orden_operacion_id is not None
@@ -5358,7 +5383,12 @@ def annul_empty_fabrication_ot(session, *, actor_id, public_id, operation_id, da
         before = ot.to_dict()
         ot.estado = "ANULADA"
         ot.version += 1
-        event = _event("ORDEN_TRABAJO", ot.id, "FABRICATION_OT_HEADER_ANNULLED",
+        event_type = (
+            "ASSEMBLY_OT_HEADER_ANNULLED"
+            if ot.tipo_ot == "ENSAMBLE"
+            else "FABRICATION_OT_HEADER_ANNULLED"
+        )
+        event = _event("ORDEN_TRABAJO", ot.id, event_type,
                        actor, operation, ot.to_dict())
         event.before_json = before
         event.motivo = reason
