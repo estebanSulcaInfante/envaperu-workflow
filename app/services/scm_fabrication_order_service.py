@@ -540,14 +540,15 @@ def _serialize(session, operation, *, schedule_projection=None, include_catalog_
             compatibility = "RUTA_CABECERA_NO_VERIFICABLE"
     replacement = replacement_summary(session, operation)
     origin_op = operation.plan_produccion.orden_produccion if operation.plan_produccion else None
-    kg_closure = session.scalar(
+    kg_closures = session.scalars(
         select(ScmCierreProductivoKg)
         .where(
             ScmCierreProductivoKg.documento_tipo == "OF",
             ScmCierreProductivoKg.documento_id == str(operation.id),
         )
-        .order_by(ScmCierreProductivoKg.created_at.desc(), ScmCierreProductivoKg.id.desc())
-    )
+        .order_by(ScmCierreProductivoKg.secuencia.desc(), ScmCierreProductivoKg.id.desc())
+    ).all()
+    kg_closure = next((item for item in kg_closures if item.vigente), None)
     payload = {
         **(
             schedule_projection
@@ -595,6 +596,7 @@ def _serialize(session, operation, *, schedule_projection=None, include_catalog_
         "created_at": _iso(operation.created_at),
         "updated_at": _iso(operation.updated_at),
         "cierre_kg": kg_closure.to_dict() if kg_closure is not None else None,
+        "cierre_kg_historial": [item.to_dict() for item in kg_closures],
         "molde_id": fabrication.molde_id,
         "maquina_prevista_id": fabrication.maquina_prevista_id,
         "snapshot_tiempo_ciclo_seg": (

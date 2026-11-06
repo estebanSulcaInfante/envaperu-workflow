@@ -936,15 +936,20 @@ def _serialize_ot(
     closure_query = ScmCierreProductivoKg.query.filter_by(
         documento_tipo="OT",
         documento_id=str(ot.public_id),
-    )
-    payload["cierre_kg"] = closure_query.order_by(
-        ScmCierreProductivoKg.created_at.desc(),
+    ).order_by(
+        ScmCierreProductivoKg.secuencia.desc(),
         ScmCierreProductivoKg.id.desc(),
-    ).first()
-    payload["cierre_kg"] = (
-        payload["cierre_kg"].to_dict()
-        if payload["cierre_kg"] is not None else None
     )
+    closure_history = closure_query.all()
+    current_closure = next(
+        (item for item in closure_history if item.vigente), None
+    )
+    payload["cierre_kg"] = (
+        current_closure.to_dict() if current_closure is not None else None
+    )
+    payload["cierre_kg_historial"] = [
+        item.to_dict() for item in closure_history
+    ]
     color_works = [
         item for item in ot.trabajos_ot if item.tipo == "COLOR"
     ]

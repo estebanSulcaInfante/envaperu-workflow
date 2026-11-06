@@ -158,14 +158,15 @@ def _serialize(session, order, *, schedule_projection=None):
     lot = session.scalar(select(ScmLoteArticulo).where(
         ScmLoteArticulo.orden_operacion_salida_id == output.id,
     ))
-    kg_closure = session.scalar(
+    kg_closures = session.scalars(
         select(ScmCierreProductivoKg)
         .where(
             ScmCierreProductivoKg.documento_tipo == "OA",
             ScmCierreProductivoKg.documento_id == str(order.id),
         )
-        .order_by(ScmCierreProductivoKg.created_at.desc(), ScmCierreProductivoKg.id.desc())
-    )
+        .order_by(ScmCierreProductivoKg.secuencia.desc(), ScmCierreProductivoKg.id.desc())
+    ).all()
+    kg_closure = next((item for item in kg_closures if item.vigente), None)
     return {
         **(
             schedule_projection
@@ -216,6 +217,7 @@ def _serialize(session, order, *, schedule_projection=None):
             ),
         },
         "cierre_kg": kg_closure.to_dict() if kg_closure is not None else None,
+        "cierre_kg_historial": [item.to_dict() for item in kg_closures],
         "entradas_planificadas": _planned_inputs(
             operation,
             output.cantidad_objetivo,

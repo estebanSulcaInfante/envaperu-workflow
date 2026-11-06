@@ -2197,7 +2197,15 @@ class ScmCierreProductivoKg(db.Model):
         ),
         db.UniqueConstraint("public_id", name="uq_scm_cierre_kg_public"),
         db.UniqueConstraint(
-            "documento_tipo", "documento_id", name="uq_scm_cierre_kg_documento"
+            "documento_tipo", "documento_id", "secuencia",
+            name="uq_scm_cierre_kg_documento_secuencia",
+        ),
+        db.Index(
+            "uq_scm_cierre_kg_documento_vigente",
+            "documento_tipo", "documento_id",
+            unique=True,
+            postgresql_where=db.text("vigente IS TRUE"),
+            sqlite_where=db.text("vigente = 1"),
         ),
         db.UniqueConstraint("operation_id", name="uq_scm_cierre_kg_operation"),
         db.Index("ix_scm_cierre_kg_ot", "ot_id"),
@@ -2212,6 +2220,8 @@ class ScmCierreProductivoKg(db.Model):
         nullable=True,
     )
     tipo_cierre = db.Column(db.String(8), nullable=False)
+    secuencia = db.Column(db.Integer, nullable=False, default=1, server_default="1")
+    vigente = db.Column(db.Boolean, nullable=False, default=True, server_default="true")
     kg_medido = db.Column(db.Numeric(15, 3), nullable=False, default=0, server_default="0")
     kg_fabricacion_estimado = db.Column(db.Numeric(15, 3), nullable=True)
     kg_previo_estimado = db.Column(db.Numeric(15, 3), nullable=True)
@@ -2241,6 +2251,8 @@ class ScmCierreProductivoKg(db.Model):
             "documento_id": self.documento_id,
             "ot_id": self.ot_id,
             "tipo_cierre": self.tipo_cierre,
+            "secuencia": self.secuencia,
+            "vigente": self.vigente,
             "kg_medido": _decimal_text(self.kg_medido),
             "kg_fabricacion_estimado": _decimal_text(self.kg_fabricacion_estimado),
             "kg_previo_estimado": _decimal_text(self.kg_previo_estimado),
@@ -2248,6 +2260,63 @@ class ScmCierreProductivoKg(db.Model):
             "motivo": self.motivo,
             "pendientes": self.pendientes_json,
             "evidencia": self.evidencia_json,
+            "actor_id": self.actor_id,
+            "operation_id": str(self.operation_id),
+            "created_at": _isoformat(self.created_at),
+        }
+
+
+class ScmReaperturaProductivaKg(db.Model):
+    """Append-only administrative ledger for an OF KG closure reopening."""
+
+    __tablename__ = "scm_reapertura_productiva_kg"
+    __table_args__ = (
+        db.CheckConstraint(
+            "documento_tipo = 'OF'",
+            name="ck_scm_reapertura_kg_documento_tipo",
+        ),
+        db.UniqueConstraint("public_id", name="uq_scm_reapertura_kg_public"),
+        db.UniqueConstraint("operation_id", name="uq_scm_reapertura_kg_operation"),
+        db.Index("ix_scm_reapertura_kg_documento", "documento_tipo", "documento_id"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(Uuid(as_uuid=True), nullable=False, default=uuid.uuid4)
+    documento_tipo = db.Column(db.String(2), nullable=False, default="OF")
+    documento_id = db.Column(db.String(64), nullable=False)
+    cierre_previo_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_cierre_productivo_kg.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    secuencia_previa = db.Column(db.Integer, nullable=False)
+    version_previa = db.Column(db.Integer, nullable=False)
+    version_resultante = db.Column(db.Integer, nullable=False)
+    motivo = db.Column(db.String(500), nullable=False)
+    actor_id = db.Column(
+        db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False,
+    )
+    operation_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now, server_default=db.func.now(),
+    )
+
+    cierre_previo = db.relationship("ScmCierreProductivoKg")
+    actor = db.relationship("Trabajador")
+
+    def to_dict(self):
+        return {
+            "id": str(self.public_id),
+            "documento_tipo": self.documento_tipo,
+            "documento_id": self.documento_id,
+            "cierre_previo_id": str(self.cierre_previo.public_id) if self.cierre_previo else None,
+            "secuencia_previa": self.secuencia_previa,
+            "version_previa": self.version_previa,
+            "version_resultante": self.version_resultante,
+            "motivo": self.motivo,
             "actor_id": self.actor_id,
             "operation_id": str(self.operation_id),
             "created_at": _isoformat(self.created_at),

@@ -139,7 +139,10 @@ from app.services.scm_weighing_service import (
     request_weighing_correction,
     reopen_manga_after_accidental_close,
 )
-from app.services.scm_kg_production_service import close_kg_from_last_control
+from app.services.scm_kg_production_service import (
+    close_kg_from_last_control,
+    reopen_fabrication_document_kg,
+)
 from app.services.scm_assignment_correction_service import (
     apply_assignment_correction,
     preview_assignment_correction,
@@ -1285,6 +1288,17 @@ def orden_armado_anular(order_id):
 @scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/cerrar")
 def orden_fabricacion_cerrar(order_id):
     return jsonify(close_fabrication_order(
+        db.session,
+        actor_id=_actor_id(),
+        operation_id=_idempotency_key(),
+        operation_order_id=order_id,
+        data=_json_body(),
+    ))
+
+
+@scm_bp.post("/ordenes-fabricacion/<uuid:order_id>/reabrir-kg")
+def orden_fabricacion_reabrir_kg(order_id):
+    return jsonify(reopen_fabrication_document_kg(
         db.session,
         actor_id=_actor_id(),
         operation_id=_idempotency_key(),

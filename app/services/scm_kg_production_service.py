@@ -20,6 +20,7 @@ from app.models.scm_prepared_material import ScmRequerimientoMaterialPreparado
 from app.models.scm_ot import (
     ScmAtribucionProduccionKg,
     ScmCierreProductivoKg,
+    ScmReaperturaProductivaKg,
     ScmControlPesoManga,
     ScmCorreccionAsignacionManga,
     ScmLoteArticulo,
@@ -41,6 +42,8 @@ from app.services.scm_service_support import (
     acquire_kg_productive_write_lock,
     load_actor,
     reject_unknown_fields,
+    expected_version,
+    required_text,
 )
 from app.services.scm_manga_assignment_projection import (
     effective_work,
@@ -2123,11 +2126,32 @@ def close_productive_document_kg(
                 "codigo": "KG_BOM_ATTRIBUTION_PENDING",
                 "pesajes": pending_bom,
             })
+        closure_rows = session.scalars(
+            select(ScmCierreProductivoKg)
+            .where(
+                ScmCierreProductivoKg.documento_tipo == tipo,
+                ScmCierreProductivoKg.documento_id == str(documento_id),
+            )
+            .order_by(ScmCierreProductivoKg.secuencia.desc(), ScmCierreProductivoKg.id.desc())
+            .with_for_update()
+        ).all()
+        current_closure = next(
+            (item for item in closure_rows if item.vigente), None
+        )
+        if current_closure is not None:
+            raise ScmServiceError(
+                "DOCUMENT_ALREADY_CLOSED",
+                "El documento ya tiene un cierre KG vigente.",
+                status_code=409,
+            )
+        next_sequence = (closure_rows[0].secuencia + 1) if closure_rows else 1
         closure = ScmCierreProductivoKg(
             documento_tipo=tipo,
             documento_id=str(documento_id),
             ot_id=aggregate.id if tipo == "OT" else None,
             tipo_cierre=close_type,
+            secuencia=next_sequence,
+            vigente=True,
             kg_medido=measured,
             desviacion_plan_kg=deviation,
             motivo=reason,
@@ -2163,6 +2187,124 @@ def close_productive_document_kg(
             "idempotent_replay": False,
         }
         session.add(_event("DOCUMENTO_PRODUCTIVO", closure.id, "KG_DOCUMENT_CLOSED", actor, operation, response))
+        _complete_operation(operation, response)
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+
+def reopen_fabrication_document_kg(
+    session, *, actor_id, operation_id, operation_order_id, data
+):
+    """Reopen only a closed KG fabrication order, preserving its closure."""
+    actor = load_actor(session, actor_id, capability="OF_CERRAR")
+    reject_unknown_fields(data, allowed={"version", "motivo"})
+    requested_version = expected_version((data or {}).get("version"))
+    reason = required_text(
+        (data or {}).get("motivo"), field="motivo", max_length=500
+    )
+    command = {
+        "documento_tipo": "OF",
+        "documento_id": str(operation_order_id),
+        "version": requested_version,
+        "motivo": reason,
+    }
+    operation, replay = _reserve_operation(
+        session,
+        operation_id,
+        f"/kg/OF/{operation_order_id}/reabrir",
+        actor,
+        command,
+    )
+    if replay is not None:
+        return replay
+    acquire_kg_productive_write_lock(session)
+    try:
+        aggregate, _works = _document_aggregate(
+            session,
+            documento_tipo="OF",
+            documento_id=operation_order_id,
+        )
+        if aggregate.tipo != "FABRICACION":
+            raise ScmServiceError(
+                "KG_REOPEN_OF_ONLY",
+                "La reapertura KG solo aplica a una OF de fabricación.",
+                status_code=409,
+            )
+        if aggregate.version != requested_version:
+            raise ScmServiceError(
+                "VERSION_CONFLICT",
+                "La OF fue modificada por otra operación.",
+                status_code=409,
+            )
+        if aggregate.estado != "CERRADA" or aggregate.closed_at is None:
+            raise ScmServiceError(
+                "KG_REOPEN_STATE_INVALID",
+                "La OF debe estar cerrada para reabrirse.",
+                status_code=409,
+            )
+        outputs = list(getattr(aggregate, "salidas", ()) or ())
+        if not outputs or any(
+            getattr(getattr(output, "articulo", None), "unidad_inventario", None)
+            != "KG"
+            for output in outputs
+        ):
+            raise ScmServiceError(
+                "KG_REOPEN_OF_ONLY",
+                "La reapertura KG solo aplica a una OF con salidas KG.",
+                status_code=409,
+            )
+        closure = session.scalar(
+            select(ScmCierreProductivoKg)
+            .where(
+                ScmCierreProductivoKg.documento_tipo == "OF",
+                ScmCierreProductivoKg.documento_id == str(aggregate.id),
+                ScmCierreProductivoKg.vigente.is_(True),
+            )
+            .order_by(ScmCierreProductivoKg.secuencia.desc(), ScmCierreProductivoKg.id.desc())
+            .with_for_update()
+        )
+        if closure is None:
+            raise ScmServiceError(
+                "KG_REOPEN_CLOSURE_NOT_FOUND",
+                "La OF no conserva un cierre KG vigente para reabrir.",
+                status_code=409,
+            )
+        closure.vigente = False
+        aggregate.estado = "EN_EJECUCION"
+        aggregate.closed_at = None
+        aggregate.closed_by_id = None
+        aggregate.version += 1
+        reopening = ScmReaperturaProductivaKg(
+            documento_tipo="OF",
+            documento_id=str(aggregate.id),
+            cierre_previo_id=closure.id,
+            secuencia_previa=closure.secuencia,
+            version_previa=requested_version,
+            version_resultante=aggregate.version,
+            motivo=reason,
+            actor_id=actor.id,
+            operation_id=operation.operation_id,
+        )
+        session.add(reopening)
+        session.flush()
+        from app.services.scm_fabrication_order_service import _serialize
+
+        response = {
+            "orden": _serialize(session, aggregate),
+            "reapertura": reopening.to_dict(),
+            "idempotent_replay": False,
+        }
+        session.add(_event(
+            "ORDEN_FABRICACION",
+            aggregate.id,
+            "KG_DOCUMENT_REOPENED",
+            actor,
+            operation,
+            response,
+        ))
         _complete_operation(operation, response)
         session.commit()
         return response
