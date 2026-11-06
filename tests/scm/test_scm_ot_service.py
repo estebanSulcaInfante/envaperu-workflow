@@ -2190,11 +2190,7 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
         correction_id = UUID(correction_request["correction"]["id"])
         assert correction_request["correction"]["estado"] == "PENDIENTE"
 
-        creator.roles.append(
-            RolOperativo.query.filter_by(codigo="JEFE_PRODUCCION").one()
-        )
-        db.session.commit()
-        with pytest.raises(ScmServiceError) as four_eyes:
+        with pytest.raises(ScmServiceError) as missing_approval_capability:
             approve_weighing_correction(
                 db.session,
                 actor_id=creator.id,
@@ -2202,14 +2198,20 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
                 operation_id=uuid4(),
                 data={},
             )
-        assert four_eyes.value.code == "FOUR_EYES_REQUIRED"
+        assert missing_approval_capability.value.code == "CAPABILITY_REQUIRED"
 
+        creator.roles.append(
+            RolOperativo.query.filter_by(codigo="JEFE_PRODUCCION").one()
+        )
+        db.session.commit()
+        approval_operation_id = uuid4()
+        approval_data = {"motivo_aprobacion": "Validado contra evidencia fisica"}
         corrected = approve_weighing_correction(
             db.session,
-            actor_id=approver.id,
+            actor_id=creator.id,
             correction_id=correction_id,
-            operation_id=uuid4(),
-            data={"motivo_aprobacion": "Validado contra evidencia fisica"},
+            operation_id=approval_operation_id,
+            data=approval_data,
         )
         assert corrected["correction"]["estado"] == "APLICADA"
         assert corrected["correction"]["result_projection"][
@@ -2232,6 +2234,30 @@ def test_pesaje_scm_es_idempotente_y_no_crea_kardex(app):
         assert format(original.peso_bruto_kg, "f") == "10.100"
         assert format(original.peso_fisico_neto_kg, "f") == "10.000"
         assert ScmCorreccionPesajeManga.query.count() == 1
+        persisted_correction = ScmCorreccionPesajeManga.query.one()
+        assert persisted_correction.requested_by_id == creator.id
+        assert persisted_correction.resolved_by_id == creator.id
+        assert persisted_correction.approval_operation_id is not None
+        counts_before_replay = (
+            ScmCorreccionPesajeManga.query.count(),
+            ScmEtiquetaManga.query.count(),
+            ScmTrabajoImpresionManga.query.count(),
+            ScmEvento.query.count(),
+        )
+        replay = approve_weighing_correction(
+            db.session,
+            actor_id=creator.id,
+            correction_id=correction_id,
+            operation_id=approval_operation_id,
+            data=approval_data,
+        )
+        assert replay == corrected
+        assert (
+            ScmCorreccionPesajeManga.query.count(),
+            ScmEtiquetaManga.query.count(),
+            ScmTrabajoImpresionManga.query.count(),
+            ScmEvento.query.count(),
+        ) == counts_before_replay
         projection = get_manga_weighing(
             db.session,
             actor_id=creator.id,

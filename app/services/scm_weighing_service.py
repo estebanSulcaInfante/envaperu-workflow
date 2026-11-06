@@ -3041,12 +3041,6 @@ def approve_weighing_correction(
                 "La correccion ya fue resuelta.",
                 status_code=409,
             )
-        if correction.requested_by_id == actor.id:
-            raise ScmServiceError(
-                "FOUR_EYES_REQUIRED",
-                "Solicitante y aprobador deben ser distintos.",
-                status_code=409,
-            )
         _ensure_operational_order_mutable(manga)
         _reject_active_kg_receipt(session, manga.id)
         current = _effective_projection(weighing)
