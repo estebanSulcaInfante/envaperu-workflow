@@ -1684,9 +1684,25 @@ def test_of_kg_reopen_allows_new_ot_weighing_and_accumulates_only_new_kg(app, cl
         ).one()
         old_weighing_id = old_weighing.id
         old_closure_id = old_closure.id
+        target_before = Decimal(order.salidas[0].cantidad_objetivo)
         old_movements = {
-            row.id: Decimal(row.cantidad_delta_kg)
+            str(row.id): row.to_dict()
             for row in ScmMovimientoInventarioKg.query.all()
+        }
+        old_existences = {
+            str(row.id): row.to_dict()
+            for row in ScmExistenciaMangaKg.query.all()
+        }
+        old_saldos = {
+            str(row.id): {
+                "cantidad_fisica_kg": Decimal(row.cantidad_fisica_kg),
+                "cantidad_reservada_kg": Decimal(row.cantidad_reservada_kg),
+                "cantidad_no_disponible_kg": Decimal(row.cantidad_no_disponible_kg),
+                "cantidad_retirada_kg": Decimal(row.cantidad_retirada_kg),
+                "atributo_proceso": row.atributo_proceso,
+                "version": row.version,
+            }
+            for row in ScmSaldoInventarioKg.query.all()
         }
         version = order.version
         order_id = order.id
@@ -1703,8 +1719,9 @@ def test_of_kg_reopen_allows_new_ot_weighing_and_accumulates_only_new_kg(app, cl
         order = db.session.get(ScmOrdenOperacion, order_id)
         creator = db.session.get(Trabajador, actor_id)
         output = order.salidas[0]
-        output.cantidad_objetivo = Decimal("150")
-        db.session.flush()
+        # The fixture's OF target is 250 UN; the first OT consumed 100, so
+        # this new OT uses the existing 150-UN plan balance.  Reopening must
+        # not edit the OF target/meta.
         plan = recalculate_fabrication_manga_plan(
             db.session,
             actor_id=actor_id,
@@ -1781,15 +1798,61 @@ def test_of_kg_reopen_allows_new_ot_weighing_and_accumulates_only_new_kg(app, cl
             data={"version": order.version},
         )
         assert recerrada["kg_medido"] == "17.000"
+        assert Decimal(output.cantidad_objetivo) == target_before
         assert db.session.get(ScmCierreProductivoKg, old_closure_id).kg_medido == Decimal("12.000")
         assert db.session.get(ScmPesajeManga, old_weighing_id).peso_fisico_neto_kg == Decimal("12.000")
         assert new_weighed["weighing"]["peso_fisico_neto_kg"] == "5.000"
-        assert {
-            row.id: Decimal(row.cantidad_delta_kg)
-            for row in ScmMovimientoInventarioKg.query.filter(
-                ScmMovimientoInventarioKg.id.in_(old_movements)
-            ).all()
-        } == old_movements
+        current_movements = {
+            str(row.id): row.to_dict()
+            for row in ScmMovimientoInventarioKg.query.all()
+        }
+        current_existences = {
+            str(row.id): row.to_dict()
+            for row in ScmExistenciaMangaKg.query.all()
+        }
+        current_saldos = {
+            str(row.id): row
+            for row in ScmSaldoInventarioKg.query.all()
+        }
+        assert set(old_movements) <= set(current_movements)
+        new_movement_ids = set(current_movements) - set(old_movements)
+        assert len(new_movement_ids) <= 1
+        new_inventory_movement = bool(new_movement_ids)
+        if new_movement_ids:
+            new_movement = current_movements[new_movement_ids.pop()]
+            assert new_movement["tipo"] == "INGRESO_PRODUCCION"
+            assert new_movement["cantidad_delta"] == "5.000"
+            assert new_movement["pesaje_public_id"] == new_weighed["weighing"]["public_id"]
+        assert set(old_existences) <= set(current_existences)
+        new_existence_ids = set(current_existences) - set(old_existences)
+        assert len(new_existence_ids) <= 1
+        assert all(
+            current_movements[row_id] == before
+            for row_id, before in old_movements.items()
+        )
+        assert all(
+            current_existences[row_id] == before
+            for row_id, before in old_existences.items()
+        )
+        assert set(current_saldos) == set(old_saldos)
+        changed_saldos = []
+        for saldo_id, before in old_saldos.items():
+            row = current_saldos[saldo_id]
+            after = {
+                "cantidad_fisica_kg": Decimal(row.cantidad_fisica_kg),
+                "cantidad_reservada_kg": Decimal(row.cantidad_reservada_kg),
+                "cantidad_no_disponible_kg": Decimal(row.cantidad_no_disponible_kg),
+                "cantidad_retirada_kg": Decimal(row.cantidad_retirada_kg),
+                "atributo_proceso": row.atributo_proceso,
+                "version": row.version,
+            }
+            if after != before:
+                changed_saldos.append((saldo_id, before, after))
+        assert len(changed_saldos) == (1 if new_inventory_movement else 0)
+        if changed_saldos:
+            _, saldo_before, saldo_after = changed_saldos[0]
+            assert saldo_after["cantidad_fisica_kg"] == saldo_before["cantidad_fisica_kg"] + Decimal("5.000")
+            assert saldo_after["version"] == saldo_before["version"] + 1
 
 
 def test_of_kg_reopen_rejects_non_kg_output_without_mutation(app, client):
