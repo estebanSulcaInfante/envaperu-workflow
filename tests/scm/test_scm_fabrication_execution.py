@@ -8,8 +8,18 @@ import pytest
 from app import db
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion
-from app.models.scm_auditoria import ScmEvento
-from app.models.scm_ot import ScmTrabajoOt
+from app.models.scm_auditoria import ScmEvento, ScmOperacion
+from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial
+from app.models.scm_inline_wip import ScmReservaWipSalida, ScmSaldoWipSalida
+from app.models.scm_inventory import ScmSaldoMaterialInventario, ScmUbicacionInventario
+from app.models.scm_material_execution import ScmRequerimientoMaterial, ScmReservaMaterial
+from app.models.scm_ot import (
+    ScmControlPesoManga,
+    ScmManga,
+    ScmPesajeManga,
+    ScmTramoMangaTrabajo,
+    ScmTrabajoOt,
+)
 from app.models.scm_material_execution import ScmLotePremezcla
 from app.models.scm_prepared_material import (
     ScmAsignacionRequerimientoPreparacion,
@@ -17,8 +27,15 @@ from app.models.scm_prepared_material import (
     ScmRequerimientoMaterialPreparado,
 )
 from app.models.scm_production_orders import ScmOrdenOperacion
+from app.models.receta_color import RecetaColorMaestra
 from app.services.scm_fabrication_execution_service import _impact
+from app.services.scm_ot_service import transition_color_work
+from app.services.scm_weighing_service import (
+    confirm_manga_weighing,
+    register_manga_weighing_control,
+)
 from tests.scm.test_scm_fabrication_replacement import _seed_released_order
+from tests.scm.test_scm_ot_service import _print_color_manga, _seed_aggregate_color_work
 
 
 def _seed_active_execution(app):
@@ -591,3 +608,251 @@ def test_pause_preserves_open_physical_obligations_while_cancel_keeps_blockers()
         "OPEN_MANGAS", "OPEN_MANGA_SEGMENTS", "PENDING_INLINE_WIP",
         "PENDING_PREPARED_MATERIAL", "ACTIVE_MATERIAL_RESERVATIONS",
     } <= {item["code"] for item in cancel["blockers"]}
+
+
+def test_pause_endpoint_preserves_real_manga_control_and_weighing_facts(
+    app, client, scm_config,
+):
+    with app.app_context():
+        creator, _approver, order, run, output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=200)
+        )
+        order.estado = "EN_EJECUCION"
+        run.estado = "EN_EJECUCION"
+        db.session.commit()
+        started = transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]),
+            operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]},
+            action="iniciar",
+        )
+        work_id = UUID(started["trabajo_color"]["id"])
+        manga_ids = [UUID(item["public_id"]) for item in created["mangas"]]
+        assert len(manga_ids) >= 2
+        mangas = ScmManga.query.filter(ScmManga.public_id.in_(manga_ids)).order_by(ScmManga.id).all()
+        assert len(mangas) == len(manga_ids)
+        for manga in mangas:
+            manga.lote_articulo.articulo.unidad_inventario = "KG"
+        db.session.flush()
+
+        control_station, control_label = _print_color_manga(
+            actor=creator, manga_id=manga_ids[0], station_code="PAUSE-CONTROL-REAL",
+        )
+        control = register_manga_weighing_control(
+            db.session,
+            station_id=control_station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": control_label["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "5.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-11-06T16:55:00-05:00",
+                "reading_stable": True,
+                "control_type": "AVANCE_KG",
+            },
+        )
+        final_station, final_label = _print_color_manga(
+            actor=creator, manga_id=manga_ids[1], station_code="PAUSE-PESAJE-REAL",
+        )
+        final = confirm_manga_weighing(
+            db.session,
+            station_id=final_station.station_id,
+            operation_id=uuid4(),
+            actor_id=creator.id,
+            data={
+                "label_id": final_label["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "12.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-11-06T17:00:00-05:00",
+                "reading_stable": True,
+            },
+        )
+        assert control["control"]["peso_neto_kg"] == "5.000"
+        assert final["weighing"]["peso_fisico_neto_kg"] == "12.000"
+        wip_operation_id = uuid4()
+        material_operation_id = uuid4()
+        db.session.add(ScmOperacion(
+            operation_id=wip_operation_id,
+            endpoint="TEST /pause/wip",
+            actor_id=creator.id,
+            request_sha256="a" * 64,
+            estado_http=201,
+            response_json={},
+        ))
+        db.session.add(ScmOperacion(
+            operation_id=material_operation_id,
+            endpoint="TEST /pause/material",
+            actor_id=creator.id,
+            request_sha256="b" * 64,
+            estado_http=201,
+            response_json={},
+        ))
+        db.session.flush()
+        wip_saldo = ScmSaldoWipSalida(
+            trabajo_color_id=work_id,
+            orden_operacion_salida_id=output.id,
+            articulo_id=output.articulo_scm_id,
+            cantidad_acreditada=Decimal("1.000"),
+            cantidad_consumida=Decimal("0.000"),
+        )
+        db.session.add(wip_saldo)
+        db.session.flush()
+        assert mangas[0].asignacion_id is not None
+        wip_reservation = ScmReservaWipSalida(
+            saldo_id=wip_saldo.id,
+            manga_id=mangas[0].id,
+            asignacion_plan_id=mangas[0].asignacion_id,
+            articulo_componente_id=output.articulo_scm_id,
+            cantidad_reservada=Decimal("1.000"),
+            cantidad_aplicada=Decimal("0.000"),
+            estado="CREDITO_EN_LINEA_PENDIENTE",
+            creada_por_id=creator.id,
+            operation_id=wip_operation_id,
+        )
+        db.session.add(wip_reservation)
+        category = ScmCategoriaRecepcion.query.first()
+        material = ScmMaterial(
+            codigo=f"MP-PAUSE-{uuid4().hex[:8].upper()}",
+            nombre="Materia prima fixture pausa",
+            clase="MATERIA_PRIMA",
+            categoria_recepcion_id=category.id,
+        )
+        location = ScmUbicacionInventario(
+            codigo=f"PAUSE-MAT-{uuid4().hex[:8].upper()}",
+            nombre="Ubicacion material fixture pausa",
+            clases_articulo_json=["MATERIA_PRIMA"],
+        )
+        db.session.add_all([material, location])
+        db.session.flush()
+        recipe = RecetaColorMaestra(
+            color_produccion_id=run.color_produccion_id,
+            producto_scope="*",
+            nombre_variante=f"PAUSE-{uuid4().hex[:8]}",
+            revision=1,
+            estado="APROBADA",
+            base_virgen_kg=Decimal("25"),
+        )
+        db.session.add(recipe)
+        db.session.flush()
+        run.receta_revision_id = recipe.id
+        material_balance = ScmSaldoMaterialInventario(
+            material_id=material.id,
+            ubicacion_id=location.id,
+            cantidad_fisica_kg=Decimal("2.000"),
+            cantidad_reservada_kg=Decimal("1.000"),
+        )
+        requirement = ScmRequerimientoMaterial(
+            corrida_fabricacion_id=run.id,
+            material_id=material.id,
+            tipo_componente="MATERIA_PRIMA",
+            cantidad_plan_kg=Decimal("1.000"),
+            receta_revision_id=run.receta_revision_id,
+            calculo_snapshot_json={"fixture": "pause"},
+            created_by_id=creator.id,
+        )
+        db.session.add_all([material_balance, requirement])
+        db.session.flush()
+        material_reservation = ScmReservaMaterial(
+            requerimiento_id=requirement.id,
+            saldo_material_id=material_balance.id,
+            cantidad_kg=Decimal("1.000"),
+            emitida_neta_kg=Decimal("0.000"),
+            cantidad_consumida_kg=Decimal("0.000"),
+            estado="ACTIVA",
+            created_by_id=creator.id,
+        )
+        db.session.add(material_reservation)
+        db.session.commit()
+        requirement_id = requirement.id
+        db.session.expire_all()
+        order = db.session.get(ScmOrdenOperacion, order.id)
+        physical_before = {
+            "order_version": order.version,
+            "output": (
+                output.cantidad_real,
+                output.cantidad_rechazada,
+                [(a.id, a.estado, a.cantidad_comprometida, a.cantidad_satisfecha)
+                 for a in output.asignaciones],
+            ),
+            "mangas": [
+                (m.id, m.estado, m.version, m.cantidad_confirmada_un)
+                for m in ScmManga.query.filter(ScmManga.id.in_([m.id for m in mangas])).order_by(ScmManga.id)
+            ],
+            "tramos": [
+                (t.id, t.estado, t.cantidad_inicio_kg, t.cantidad_fin_kg, t.cantidad_atribuida_kg)
+                for t in ScmTramoMangaTrabajo.query.filter(ScmTramoMangaTrabajo.manga_id.in_([m.id for m in mangas])).order_by(ScmTramoMangaTrabajo.id)
+            ],
+            "controls": [
+                (c.id, c.tipo, c.peso_neto_kg, c.aporte_desde_control_anterior_kg)
+                for c in ScmControlPesoManga.query.filter(ScmControlPesoManga.manga_id.in_([m.id for m in mangas])).order_by(ScmControlPesoManga.id)
+            ],
+            "weighings": [
+                (p.id, p.estado, p.peso_fisico_neto_kg)
+                for p in ScmPesajeManga.query.filter(ScmPesajeManga.manga_id.in_([m.id for m in mangas])).order_by(ScmPesajeManga.id)
+            ],
+            "wip": [
+                (wip_saldo.id, wip_saldo.cantidad_acreditada, wip_saldo.cantidad_consumida,
+                 wip_reservation.estado, wip_reservation.cantidad_aplicada),
+            ],
+            "material": [
+                (material_reservation.id, material_reservation.estado,
+                 material_reservation.emitida_neta_kg, material_reservation.cantidad_consumida_kg),
+            ],
+        }
+        order_id, actor_id = str(order.id), creator.id
+
+    impact_response = client.get(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/impacto-ejecucion?accion=PAUSAR",
+        headers={"X-Actor-Id": str(actor_id)},
+    )
+    assert impact_response.status_code == 200, impact_response.get_json()
+    impact = impact_response.get_json()
+    assert impact["can_execute"] is True
+    assert impact["mangas_abiertas"] >= 1
+    paused = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/pausar-ejecucion",
+        json={
+            "version": impact["version"],
+            "impact_hash": impact["impact_hash"],
+            "motivo": "Preservar hechos fisicos durante pausa",
+        },
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert paused.status_code == 200, paused.get_json()
+
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, UUID(order_id))
+        assert order.estado == "PAUSADA"
+        assert order.fabricacion.corridas[0].estado == "PAUSADA"
+        assert {
+            (m.id, m.estado, m.version, m.cantidad_confirmada_un)
+            for m in ScmManga.query.filter(ScmManga.id.in_([row[0] for row in physical_before["mangas"]]))
+        } == {row for row in physical_before["mangas"]}
+        assert [
+            (t.id, t.estado, t.cantidad_inicio_kg, t.cantidad_fin_kg, t.cantidad_atribuida_kg)
+            for t in ScmTramoMangaTrabajo.query.filter(ScmTramoMangaTrabajo.manga_id.in_([row[0] for row in physical_before["mangas"]])).order_by(ScmTramoMangaTrabajo.id)
+        ] == physical_before["tramos"]
+        assert [
+            (c.id, c.tipo, c.peso_neto_kg, c.aporte_desde_control_anterior_kg)
+            for c in ScmControlPesoManga.query.filter(ScmControlPesoManga.manga_id.in_([row[0] for row in physical_before["mangas"]])).order_by(ScmControlPesoManga.id)
+        ] == physical_before["controls"]
+        assert [
+            (p.id, p.estado, p.peso_fisico_neto_kg)
+            for p in ScmPesajeManga.query.filter(ScmPesajeManga.manga_id.in_([row[0] for row in physical_before["mangas"]])).order_by(ScmPesajeManga.id)
+        ] == physical_before["weighings"]
+        assert [
+            (s.id, s.cantidad_acreditada, s.cantidad_consumida, r.estado, r.cantidad_aplicada)
+            for s in ScmSaldoWipSalida.query.filter_by(trabajo_color_id=work_id).all()
+            for r in s.reservas
+        ] == physical_before["wip"]
+        assert [
+            (r.id, r.estado, r.emitida_neta_kg, r.cantidad_consumida_kg)
+            for r in ScmReservaMaterial.query.filter_by(requerimiento_id=requirement_id).all()
+        ] == physical_before["material"]
