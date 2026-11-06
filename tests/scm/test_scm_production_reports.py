@@ -1081,6 +1081,194 @@ def test_tv_progress_counts_current_open_controls_once_with_active_same_owner_se
     assert _progress_tv_actual(run, article.id, "KG") == (Decimal("12.9"), False)
 
 
+def test_tv_progress_counts_reconciled_control_from_continuity_pending_once():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-continuity-pending")
+    article = SimpleNamespace(id=130)
+    closed = _segment(1, "0", "5", "5")
+    closed.trabajo = work
+    manga = SimpleNamespace(
+        id=1,
+        estado="CONTINUIDAD_PENDIENTE",
+        trabajo=work,
+        correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[],
+        _report_all_segments=[closed],
+        _report_final_kg=None,
+        _report_open_kg=Decimal("5"),
+        _report_quantity_un=None,
+        _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}},
+        article.id,
+        "KG",
+    ) == (Decimal("5"), False)
+
+
+def test_tv_serializes_measured_breakdown_and_physical_observation_for_continuity(monkeypatch):
+    work = SimpleNamespace(id="work-continuity-output")
+    closed = _segment(1, "0", "5", "5")
+    closed.trabajo = work
+    manga = _tv_manga(1, work, "5", segments=[closed])
+    manga.estado = "CONTINUIDAD_PENDIENTE"
+    manga._report_final_kg = None
+    manga._report_open_kg = Decimal("5")
+    manga._report_all_segments = [closed]
+    manga._report_continuity_ledger_valid = True
+    run = _tv_aggregate_run(works=[work], mangas={1: manga}, output_meta="10")
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_a, **_k: SimpleNamespace(tiene_capacidad=lambda _c: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_a, **_k: [run])
+
+    output = list_production_progress_tv(object(), actor_id=7, filters={})["items"][0]["salidas"][0]
+
+    assert output["finalizados_kg"] == 0.0
+    assert output["en_proceso_kg"] == 5.0
+    assert output["avance_medido_kg"] == 5.0
+    assert output["peso_fisico_kg"] == 5.0
+    assert output["pendientes_sin_peso"] == 0
+    assert output["motivos_atribucion"] == []
+    assert output["avance"] == 5.0
+    assert output["porcentaje"] == 50.0
+
+
+def test_tv_progress_counts_conciliated_closed_and_active_continuity_once():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    origin = SimpleNamespace(id="work-continuity-origin")
+    destination = SimpleNamespace(id="work-continuity-destination")
+    article = SimpleNamespace(id=131)
+    closed = _segment(1, "0", "5", "5")
+    closed.trabajo = origin
+    active = _segment(2, "5", "5", "0")
+    active.estado = "ACTIVO"
+    active.trabajo = destination
+    active.cantidad_inicio_kg = Decimal("5")
+    active.cantidad_fin_kg = None
+    active.cantidad_atribuida_kg = Decimal("0")
+    active.calidad_evidencia_kg = None
+    manga = SimpleNamespace(
+        id=1,
+        estado="EN_LLENADO",
+        trabajo=destination,
+        correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[],
+        _report_all_segments=[closed, active],
+        _report_final_kg=None,
+        _report_open_kg=Decimal("7"),
+        _report_quantity_un=None,
+        _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {
+            "works": [(origin, None, None), (destination, None, None)],
+            "mangas": {1: manga},
+        },
+        article.id,
+        "KG",
+    ) == (Decimal("7"), False)
+
+
+def test_progress_percentage_uses_measured_final_plus_open_control(monkeypatch):
+    work = SimpleNamespace(id="work-progress-measured")
+    corrida = SimpleNamespace(
+        id="corrida-progress-measured",
+        codigo="C-PROGRESS-MEASURED",
+        objetivo_neto_kg=Decimal("10"),
+        color_produccion=None,
+        salidas=[],
+    )
+    manga = SimpleNamespace(
+        id=1,
+        estado="EN_LLENADO",
+        trabajo=work,
+        _report_segments=[],
+        _report_final_kg=None,
+        _report_open_kg=Decimal("5"),
+        _report_weight_corrected=False,
+    )
+    run = {
+        "corrida": corrida,
+        "orden": SimpleNamespace(codigo="OF-PROGRESS-MEASURED", estado="EN_EJECUCION"),
+        "ot": None,
+        "color_name": "Rojo",
+        "molde": None,
+        "mangas": {1: manga},
+        "contexts": [{"work": work}],
+    }
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            tiene_capacidad=lambda _capability: True,
+        ),
+    )
+    monkeypatch.setattr(
+        production_reports_service,
+        "_load_rows",
+        lambda *_args, **_kwargs: [run],
+    )
+
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+
+    assert item["kg_finalizados_efectivos"] == 0.0
+    assert item["kg_medidos_en_abiertas"] == 5.0
+    assert item["kg_medidos_efectivos"] == 5.0
+    assert item["porcentaje"] == pytest.approx(50.0)
+    assert item["restante_kg"] == pytest.approx(5.0)
+
+
+def test_progress_keeps_known_measured_subtotal_when_another_manga_has_no_weight(monkeypatch):
+    work = SimpleNamespace(id="work-partial-measured")
+    corrida = SimpleNamespace(
+        id="corrida-partial-measured",
+        codigo="C-PROGRESS-PARTIAL",
+        objetivo_neto_kg=Decimal("10"),
+        color_produccion=None,
+        salidas=[],
+    )
+    measured = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work,
+        _report_segments=[], _report_final_kg=None, _report_open_kg=Decimal("5"),
+        _report_weight_corrected=False,
+    )
+    pending = SimpleNamespace(
+        id=2, estado="EN_LLENADO", trabajo=work,
+        _report_segments=[], _report_final_kg=None, _report_open_kg=None,
+        _report_weight_corrected=False,
+    )
+    run = {
+        "corrida": corrida,
+        "orden": SimpleNamespace(codigo="OF-PROGRESS-PARTIAL", estado="EN_EJECUCION"),
+        "ot": None, "color_name": "Rojo", "molde": None,
+        "mangas": {1: measured, 2: pending},
+        "contexts": [{"work": work}],
+    }
+    monkeypatch.setattr(
+        production_reports_service,
+        "load_actor",
+        lambda *_args, **_kwargs: SimpleNamespace(tiene_capacidad=lambda _capability: True),
+    )
+    monkeypatch.setattr(production_reports_service, "_load_rows", lambda *_args, **_kwargs: [run])
+
+    item = list_production_progress(object(), actor_id=1, filters={})["items"][0]
+
+    assert item["kg_medidos_efectivos"] == 5.0
+    assert item["subtotal_conocido_kg"] == 5.0
+    assert item["porcentaje"] == pytest.approx(50.0)
+    assert item["coverage"]["estado"] == "INCOMPLETA"
+    assert "SUBTOTAL_PARCIAL" in item["coverage"]["motivos"]
+
+
 def test_tv_progress_serializes_open_controls_instead_of_suppressing_known_advance(monkeypatch):
     work = SimpleNamespace(id="work-tv-open")
     run = _tv_aggregate_run(works=[work], output_meta="250")
