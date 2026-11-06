@@ -1274,6 +1274,80 @@ def test_tv_progress_marks_in_scope_manga_with_foreign_segments_incomplete():
     ) == (None, True)
 
 
+def test_tv_progress_rejects_active_segment_with_closed_kg_boundary():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-active-invalid")
+    article = SimpleNamespace(id=127)
+    segment = _segment(1, "0", "1", "0")
+    segment.estado = "ACTIVO"
+    segment.trabajo = work
+    segment.cantidad_inicio_kg = Decimal("0")
+    segment.cantidad_fin_kg = Decimal("1")
+    segment.cantidad_atribuida_kg = Decimal("1")
+    manga = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[segment],
+        _report_final_kg=None, _report_open_kg=Decimal("4"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (None, True)
+
+
+def test_tv_progress_rejects_active_start_that_breaks_closed_frontier():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-frontier")
+    article = SimpleNamespace(id=128)
+    closed = _segment(1, "0", "2", "2")
+    closed.trabajo = work
+    active = _segment(2, "0", "1", "0")
+    active.estado = "ACTIVO"
+    active.trabajo = work
+    active.cantidad_inicio_kg = Decimal("3")
+    active.cantidad_fin_kg = None
+    active.cantidad_atribuida_kg = Decimal("0")
+    manga = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[closed, active],
+        _report_final_kg=None, _report_open_kg=Decimal("4"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (None, True)
+
+
+def test_tv_progress_never_falls_back_to_open_control_when_final_is_present():
+    from app.services.scm_production_reports_service import _progress_tv_actual
+
+    work = SimpleNamespace(id="work-final-open-conflict")
+    article = SimpleNamespace(id=129)
+    active = _segment(1, "0", "1", "0")
+    active.estado = "ACTIVO"
+    active.trabajo = work
+    active.cantidad_inicio_kg = None
+    active.cantidad_fin_kg = None
+    active.cantidad_atribuida_kg = Decimal("0")
+    manga = SimpleNamespace(
+        id=1, estado="EN_LLENADO", trabajo=work, correccion_asignacion=None,
+        lote_articulo=SimpleNamespace(articulo=article),
+        _report_segments=[], _report_all_segments=[active],
+        _report_final_kg=Decimal("3.3"), _report_open_kg=Decimal("6.3"),
+        _report_quantity_un=None, _report_weight_corrected=False,
+    )
+
+    assert _progress_tv_actual(
+        {"works": [(work, None, None)], "mangas": {1: manga}}, article.id, "KG"
+    ) == (None, True)
+
+
 def test_identity_dimensions_keep_canonical_key_and_readable_metadata():
     row = {
         "MOLDE": "ML-001", "MOLDE_NOMBRE": "Molde multipieza", "MOLDE_CODIGO": "ML-001",

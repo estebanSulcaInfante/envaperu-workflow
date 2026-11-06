@@ -306,6 +306,7 @@ def _open_control_has_safe_attribution(manga, segments, work_ids):
     if not _has_active_open_segment(segments):
         return False
     owners = []
+    active_segments = []
     closed = []
     for segment in segments:
         if str(getattr(segment, "estado", "")).upper() == "ANULADO":
@@ -314,9 +315,16 @@ def _open_control_has_safe_attribution(manga, segments, work_ids):
         if segment_owner is None:
             return False
         owners.append(segment_owner)
-        if str(getattr(segment, "estado", "")).upper() != "ACTIVO":
+        if str(getattr(segment, "estado", "")).upper() == "ACTIVO":
+            active_segments.append(segment)
+        else:
             closed.append(segment)
-    if not owners:
+    if not owners or len(active_segments) != 1:
+        return False
+    active = active_segments[0]
+    active_end = _d(getattr(active, "cantidad_fin_kg", None))
+    active_attributed = _d(getattr(active, "cantidad_atribuida_kg", None))
+    if active_end is not None or active_attributed not in (None, Decimal("0")):
         return False
     owner_ids = {owner.id for owner in owners}
     manga_owner = effective_work(manga)
@@ -325,7 +333,8 @@ def _open_control_has_safe_attribution(manga, segments, work_ids):
     if manga_owner.id not in owner_ids:
         return False
     if not closed:
-        return True
+        active_start = _d(getattr(active, "cantidad_inicio_kg", None))
+        return active_start in (None, Decimal("0"))
     previous = Decimal("0")
     for segment in sorted(closed, key=lambda item: getattr(item, "secuencia", 0)):
         if str(getattr(segment, "estado", "")).upper() != "CERRADO":
@@ -345,7 +354,8 @@ def _open_control_has_safe_attribution(manga, segments, work_ids):
         ):
             return False
         previous = end
-    return True
+    active_start = _d(getattr(active, "cantidad_inicio_kg", None))
+    return active_start is None or active_start == previous
 
 
 def _segment_conciliates(segments, net):
@@ -956,6 +966,7 @@ def _progress_tv_actual(run, article_id, unit):
                 segment_owner_ids = {owner.id for owner in segment_owners if owner is not None}
                 if (
                     open_net is not None
+                    and net is None
                     and _open_control_has_safe_attribution(manga, corrected_segments, work_ids)
                 ):
                     # The latest open control is cumulative evidence for the
