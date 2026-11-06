@@ -360,7 +360,7 @@ def _open_control_has_safe_attribution(manga, segments, work_ids):
             # Reopening preserves the historical KG boundary on the active
             # segment. It is usable only when the loader proved that the
             # selected control was captured after that reopening.
-            if not getattr(manga, "_report_reopened_with_new_control", False):
+            if not getattr(manga, "_report_reopened_with_reference", False):
                 return False
 
     if not closed:
@@ -742,21 +742,33 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
                 if str(getattr(segment, "estado", "")).upper() != "ANULADO"
             ]
             segments = _valid_kg_segments(manga, {})
-            latest_control = controls_by_manga.get(manga.id, [])[-1] if controls_by_manga.get(manga.id) else None
+            manga_controls = controls_by_manga.get(manga.id, [])
+            latest_control = manga_controls[-1] if manga_controls else None
             closure_event = None
             last_reopen = None
+            last_reopening = None
             if manga.estado != "ANULADA":
                 closure_event = closure_events.get(str(manga.id))
-                last_reopen = max((item.reabierta_at for item in manga.reaperturas if item.reabierta_at), default=None)
+                last_reopening = max(
+                    (item for item in manga.reaperturas if item.reabierta_at),
+                    key=lambda item: item.reabierta_at,
+                    default=None,
+                )
+                last_reopen = last_reopening.reabierta_at if last_reopening else None
                 if closure_event is not None and last_reopen is not None and closure_event.occurred_at <= last_reopen:
                     closure_event = None
-            control_after_reopen = (
-                last_reopen is None
-                or (
-                    latest_control is not None
-                    and _timestamp_after(latest_control.pesado_at, last_reopen)
-                )
-            )
+            controls_after_reopen = [
+                control for control in manga_controls
+                if last_reopen is not None
+                and _timestamp_after(control.pesado_at, last_reopen)
+            ]
+            post_reopen_control = controls_after_reopen[-1] if controls_after_reopen else None
+            controls_before_reopen = [
+                control for control in manga_controls
+                if last_reopen is None
+                or not _timestamp_after(control.pesado_at, last_reopen)
+            ]
+            pre_reopen_control = controls_before_reopen[-1] if controls_before_reopen else None
             direct_close_segment = next(
                 (segment for segment in reversed(segments)
                  if str(segment.calidad_evidencia_kg or "").upper() == "MEDIDA_DIRECTA_CIERRE_CONTROL"),
@@ -777,23 +789,35 @@ def _load_rows(session, filters=None, *, order_states=None, exclude_annulled_run
             continuity_ledger_valid = _continuity_control_ledger_is_valid(
                 manga, segments, latest_control, frontier=final
             )
+            reference_control = latest_control
+            reference_kg = _d(getattr(reference_control, "peso_neto_kg", None)) if reference_control else None
+            if last_reopening is not None and last_reopen is not None:
+                if post_reopen_control is not None:
+                    reference_control = post_reopen_control
+                    reference_kg = _d(post_reopen_control.peso_neto_kg)
+                elif last_reopening.tipo_reapertura == "CONTINUAR_LLENADO":
+                    reference_control = None
+                    reference_kg = _d(last_reopening.peso_base_neto_kg)
+                else:
+                    reference_control = pre_reopen_control
+                    reference_kg = _d(pre_reopen_control.peso_neto_kg) if pre_reopen_control else None
             control_allowed = (
                 manga.estado != "ANULADA"
                 and _manga_allows_open_control(manga)
-                and control_after_reopen
+                and reference_kg is not None
             )
-            open_kg = _d(latest_control.peso_neto_kg) if final is None and latest_control is not None and control_allowed else None
+            open_kg = reference_kg if final is None and control_allowed else None
             manga._report_final_kg = final
             manga._report_open_kg = open_kg
             manga._report_physical_kg = (
                 final
                 if final is not None
-                else (_d(latest_control.peso_neto_kg) if latest_control is not None and control_allowed else None)
+                else (reference_kg if control_allowed else None)
             )
             manga._report_open_control_allowed = control_allowed
             manga._report_continuity_ledger_valid = continuity_ledger_valid
             manga._report_reopened_at = last_reopen
-            manga._report_reopened_with_new_control = bool(last_reopen is not None and control_allowed)
+            manga._report_reopened_with_reference = bool(last_reopen is not None and control_allowed)
             quantity_projection = (
                 correction_by_weight.get(current_weighing.id).result_projection_json
                 if current_weighing is not None and current_weighing.id in correction_by_weight

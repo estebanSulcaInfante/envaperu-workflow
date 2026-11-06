@@ -4,7 +4,7 @@ from datetime import date
 import hashlib
 import json
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -1577,7 +1577,7 @@ def test_tv_progress_accepts_post_reopen_control_with_historical_active_boundary
         _report_segments=[], _report_all_segments=[active],
         _report_final_kg=None, _report_open_kg=Decimal("5.7"),
         _report_quantity_un=None, _report_weight_corrected=False,
-        _report_reopened_with_new_control=True,
+        _report_reopened_with_reference=True,
     )
 
     assert _progress_tv_actual(
@@ -2557,6 +2557,180 @@ def test_progress_loader_uses_control_after_reopen_with_historical_active_kg_bou
         assert breakdown["incomplete"] is False
         loaded_manga = row["mangas"][manga.id]
         assert loaded_manga._report_open_kg == Decimal("5.7")
+
+
+def test_progress_loader_uses_canonical_reopen_reference_before_and_after_new_control(app):
+    """The report must follow the service ledger across a real KG reopen."""
+    from tests.scm.test_scm_kg_receipt import _print_color_manga, _seed_aggregate_color_work
+    from app.services.scm_ot_service import transition_color_work
+    from app.services.scm_weighing_service import (
+        confirm_manga_weighing,
+        register_manga_weighing_control,
+        reopen_manga_after_accidental_close,
+    )
+
+    with app.app_context():
+        creator, approver, _order, run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=50, operational_date="2026-09-04")
+        )
+        manga = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+        manga.lote_articulo.articulo.unidad_inventario = "KG"
+        transition_color_work(
+            db.session, actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]), operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]}, action="iniciar",
+        )
+        station, label = _print_color_manga(
+            actor=creator, manga_id=manga.public_id, station_code="PESAJE-REPORT-REOPEN",
+        )
+        confirm_manga_weighing(
+            db.session, station_id=station.station_id, operation_id=uuid4(), actor_id=creator.id,
+            data={
+                "label_id": label["public_id"], "capture_id": str(uuid4()),
+                "peso_bruto_kg": "5.100", "tara_kg": "0.100", "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-04T15:00:00-05:00", "reading_stable": True,
+            },
+        )
+        manga = db.session.get(ScmManga, manga.id)
+        reopened = reopen_manga_after_accidental_close(
+            db.session, actor_id=approver.id, manga_id=manga.public_id,
+            operation_id=uuid4(), data={
+                "version": manga.version, "tipo_reapertura": "CONTINUAR_LLENADO",
+                "motivo": "Continuar llenado para reporte",
+            },
+        )
+        assert reopened["reapertura"]["peso_base_neto_kg"] == "5.000"
+
+        def report_breakdown():
+            loaded = production_reports_service._load_rows(
+                db.session, production_reports_service._filters({}, require_dates=False),
+                order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+            )
+            row = next(item for item in loaded if item["corrida"].id == run.id)
+            return production_reports_service._progress_tv_breakdown(
+                row, manga.lote_articulo.articulo.id, "KG"
+            )
+
+        before_new_control = report_breakdown()
+        assert before_new_control["medido"] == Decimal("5.000")
+        assert before_new_control["incomplete"] is False
+
+        control = register_manga_weighing_control(
+            db.session, station_id=station.station_id, operation_id=uuid4(), actor_id=approver.id,
+            data={
+                "label_id": label["public_id"], "capture_id": str(uuid4()),
+                "control_type": "AVANCE_KG", "peso_bruto_kg": "5.800", "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA", "pesada_at": "2026-11-07T16:05:00-05:00",
+                "pesado_por_id": approver.id, "reading_stable": True,
+            },
+        )
+        assert control["control"]["peso_neto_kg"] == "5.700"
+        after_new_control = report_breakdown()
+        assert after_new_control["medido"] == Decimal("5.700")
+        assert after_new_control["incomplete"] is False
+
+
+def test_register_control_corte_turno_enters_continuidad_pendiente_for_report_contract(app):
+    """The canonical control service state is observable to the report loader."""
+    from tests.scm.test_scm_kg_receipt import _print_color_manga, _seed_aggregate_color_work
+    from app.services.scm_ot_service import transition_color_work
+    from app.services.scm_weighing_service import register_manga_weighing_control
+
+    with app.app_context():
+        creator, _approver, _order, _run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=50, operational_date="2026-09-05")
+        )
+        manga = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+        manga.lote_articulo.articulo.unidad_inventario = "KG"
+        transition_color_work(
+            db.session, actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]), operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]}, action="iniciar",
+        )
+        station, label = _print_color_manga(
+            actor=creator, manga_id=manga.public_id, station_code="PESAJE-REPORT-CORTE",
+        )
+        control = register_manga_weighing_control(
+            db.session, station_id=station.station_id, operation_id=uuid4(), actor_id=creator.id,
+            data={
+                "label_id": label["public_id"], "capture_id": str(uuid4()),
+                "control_type": "CORTE_TURNO", "peso_bruto_kg": "5.100", "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA", "pesada_at": "2026-09-05T16:05:00-05:00",
+                "pesado_por_id": creator.id, "reading_stable": True,
+                "motivo": "Corte de turno para continuidad",
+            },
+        )
+        db.session.refresh(manga)
+        assert control["control"]["peso_neto_kg"] == "5.000"
+        assert manga.estado == "CONTINUIDAD_PENDIENTE"
+
+
+def test_progress_loader_keeps_pre_reopen_control_for_cierre_accidental(app):
+    """An accidental close with no base keeps the last accepted control reference."""
+    from tests.scm.test_scm_kg_receipt import _print_color_manga, _seed_aggregate_color_work
+    from app.services.scm_ot_service import transition_color_work
+    from app.services.scm_weighing_service import (
+        confirm_manga_weighing,
+        register_manga_weighing_control,
+        reopen_manga_after_accidental_close,
+    )
+
+    with app.app_context():
+        creator, approver, _order, run, _output, _line, _header, created = (
+            _seed_aggregate_color_work(quantity=50, operational_date="2026-11-06")
+        )
+        manga = ScmManga.query.filter_by(
+            public_id=UUID(created["mangas"][0]["public_id"])
+        ).one()
+        manga.lote_articulo.articulo.unidad_inventario = "KG"
+        transition_color_work(
+            db.session, actor_id=creator.id,
+            work_id=UUID(created["trabajo_color"]["id"]), operation_id=uuid4(),
+            data={"version": created["trabajo_color"]["version"]}, action="iniciar",
+        )
+        station, label = _print_color_manga(
+            actor=creator, manga_id=manga.public_id, station_code="PESAJE-REPORT-ACCIDENT",
+        )
+        register_manga_weighing_control(
+            db.session, station_id=station.station_id, operation_id=uuid4(), actor_id=creator.id,
+            data={
+                "label_id": label["public_id"], "capture_id": str(uuid4()),
+                "control_type": "AVANCE_KG", "peso_bruto_kg": "4.890", "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA", "pesada_at": "2026-11-06T16:30:00-05:00",
+                "pesado_por_id": creator.id, "reading_stable": True,
+            },
+        )
+        confirm_manga_weighing(
+            db.session, station_id=station.station_id, operation_id=uuid4(), actor_id=creator.id,
+            data={
+                "label_id": label["public_id"], "capture_id": str(uuid4()),
+                "peso_bruto_kg": "9.100", "tara_kg": "0.100", "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-11-06T17:00:00-05:00", "reading_stable": True,
+            },
+        )
+        manga = db.session.get(ScmManga, manga.id)
+        reopened = reopen_manga_after_accidental_close(
+            db.session, actor_id=approver.id, manga_id=manga.public_id,
+            operation_id=uuid4(), data={
+                "version": manga.version, "tipo_reapertura": "CIERRE_ACCIDENTAL",
+                "motivo": "Cierre accidental para preservar referencia",
+            },
+        )
+        assert reopened["reapertura"]["peso_base_neto_kg"] is None
+        loaded = production_reports_service._load_rows(
+            db.session, production_reports_service._filters({}, require_dates=False),
+            order_states={"EN_EJECUCION"}, exclude_annulled_runs=True,
+        )
+        row = next(item for item in loaded if item["corrida"].id == run.id)
+        breakdown = production_reports_service._progress_tv_breakdown(
+            row, manga.lote_articulo.articulo.id, "KG"
+        )
+        assert breakdown["medido"] == Decimal("4.790")
+        assert breakdown["incomplete"] is False
 
 
 def test_tv_loader_preserves_shared_un_segments_for_distinct_work_owners(app, scm_config):
