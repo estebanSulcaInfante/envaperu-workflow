@@ -2272,6 +2272,9 @@ def reopen_fabrication_document_kg(
                 "La OF no conserva un cierre KG vigente para reabrir.",
                 status_code=409,
             )
+        from app.services.scm_fabrication_order_service import _serialize
+
+        before = _serialize(session, aggregate)
         closure.vigente = False
         aggregate.estado = "EN_EJECUCION"
         aggregate.closed_at = None
@@ -2290,21 +2293,22 @@ def reopen_fabrication_document_kg(
         )
         session.add(reopening)
         session.flush()
-        from app.services.scm_fabrication_order_service import _serialize
-
         response = {
             "orden": _serialize(session, aggregate),
             "reapertura": reopening.to_dict(),
             "idempotent_replay": False,
         }
-        session.add(_event(
+        event = _event(
             "ORDEN_FABRICACION",
             aggregate.id,
             "KG_DOCUMENT_REOPENED",
             actor,
             operation,
             response,
-        ))
+        )
+        event.before_json = before
+        event.motivo = reason
+        session.add(event)
         _complete_operation(operation, response)
         session.commit()
         return response

@@ -1,5 +1,6 @@
 """KG005-KG007 production evidence tests."""
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -18,6 +19,7 @@ from app.models.scm_ot import (
     ScmTrabajoOt,
     ScmLoteArticulo,
 )
+from app.models.scm_auditoria import ScmEvento
 from app.models.scm_articulos import ScmArticulo
 from app.models.receta_color import RecetaColorMaestra
 from app.models.scm_catalogos import ScmCategoriaRecepcion, ScmMaterial
@@ -113,6 +115,29 @@ def _weigh_kg_fixture(*, quantity=120):
         data=weighing_data,
     )
     return creator, work, manga, weighed
+
+
+def _closed_of_reopen_fixture():
+    creator, work_payload, manga, _weighed = _weigh_kg_fixture(quantity=100)
+    _grant_capabilities(creator, ("OF_CERRAR",))
+    work = db.session.get(ScmTrabajoOt, UUID(work_payload["id"]))
+    transition_color_work(
+        db.session,
+        actor_id=creator.id,
+        work_id=work.id,
+        operation_id=uuid4(),
+        data={"version": work.version},
+        action="completar",
+    )
+    order = work.orden_operacion
+    close_fabrication_order(
+        db.session,
+        actor_id=creator.id,
+        operation_id=uuid4(),
+        operation_order_id=order.id,
+        data={"version": order.version},
+    )
+    return creator.id, order.id, order.version
 
 
 def _add_cancelled_un_output(order, *, color_produccion_id=None):
@@ -1573,10 +1598,22 @@ def test_of_kg_reopen_preserves_history_replays_and_recloses_without_double_sum(
     )
     assert reopened.status_code == 200, reopened.json
     assert reopened.json["orden"]["estado"] == "EN_EJECUCION"
+    assert reopened.json["orden"]["version"] == initial_version + 1
     assert reopened.json["orden"]["cierre_kg"] is None
     assert len(reopened.json["orden"]["cierre_kg_historial"]) == 1
     assert reopened.json["orden"]["cierre_kg_historial"][0]["vigente"] is False
     assert reopened.json["reapertura"]["secuencia_previa"] == 1
+    with app.app_context():
+        event = ScmEvento.query.filter_by(
+            aggregate_type="ORDEN_FABRICACION",
+            aggregate_id=str(order_id),
+            tipo="KG_DOCUMENT_REOPENED",
+        ).one()
+        assert event.motivo == "Continuar pesaje OF71"
+        assert event.before_json["estado"] == "CERRADA"
+        assert event.before_json["version"] == initial_version
+        assert event.before_json["cierre_kg"]["vigente"] is True
+        assert event.before_json["cierre_kg_historial"][0]["secuencia"] == 1
     assert client.post(
         f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
         json={"version": initial_version, "motivo": "Continuar pesaje OF71"},
@@ -1616,6 +1653,143 @@ def test_of_kg_reopen_preserves_history_replays_and_recloses_without_double_sum(
         assert ScmCierreProductivoKg.query.filter_by(
             id=closure_id
         ).one().kg_medido == Decimal("12.000")
+
+
+def test_of_kg_reopen_allows_new_ot_weighing_and_accumulates_only_new_kg(app, client):
+    with app.app_context():
+        creator, work_payload, manga, weighed = _weigh_kg_fixture(quantity=100)
+        _grant_capabilities(creator, ("OF_CERRAR", "OT_CREAR", "MANGA_PESAR"))
+        work = db.session.get(ScmTrabajoOt, UUID(work_payload["id"]))
+        transition_color_work(
+            db.session,
+            actor_id=creator.id,
+            work_id=work.id,
+            operation_id=uuid4(),
+            data={"version": work.version},
+            action="completar",
+        )
+        order = work.orden_operacion
+        close_fabrication_order(
+            db.session,
+            actor_id=creator.id,
+            operation_id=uuid4(),
+            operation_order_id=order.id,
+            data={"version": order.version},
+        )
+        old_closure = ScmCierreProductivoKg.query.filter_by(
+            documento_tipo="OF", documento_id=str(order.id)
+        ).one()
+        old_weighing = ScmPesajeManga.query.filter_by(
+            public_id=UUID(weighed["weighing"]["public_id"])
+        ).one()
+        old_weighing_id = old_weighing.id
+        old_closure_id = old_closure.id
+        old_movements = {
+            row.id: Decimal(row.cantidad_delta_kg)
+            for row in ScmMovimientoInventarioKg.query.all()
+        }
+        version = order.version
+        order_id = order.id
+        actor_id = creator.id
+
+    reopened = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
+        json={"version": version, "motivo": "Continuar pesaje OF71"},
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert reopened.status_code == 200, reopened.json
+
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, order_id)
+        creator = db.session.get(Trabajador, actor_id)
+        output = order.salidas[0]
+        output.cantidad_objetivo = Decimal("150")
+        db.session.flush()
+        plan = recalculate_fabrication_manga_plan(
+            db.session,
+            actor_id=actor_id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={},
+        )["plan"]
+        run = output.corrida_fabricacion
+        created = create_fabrication_ot(
+            db.session,
+            actor_id=actor_id,
+            order_id=order.id,
+            operation_id=uuid4(),
+            data={
+                "corrida_fabricacion_id": str(run.id),
+                "fecha_operativa": "2026-09-19",
+                "turno": "NOCHE",
+                "maquinista_id": actor_id,
+                "asignaciones": [{
+                    "plan_linea_id": plan["lineas"][0]["id"],
+                    "cantidad_un": 50,
+                }],
+            },
+        )
+        new_work = db.session.get(
+            ScmTrabajoOt, UUID(created["trabajo_color"]["id"])
+        )
+        new_manga = ScmManga.query.filter_by(
+            trabajo_ot_id=new_work.id
+        ).one()
+        new_manga.lote_articulo.articulo.unidad_inventario = "KG"
+        db.session.flush()
+        transition_color_work(
+            db.session,
+            actor_id=actor_id,
+            work_id=new_work.id,
+            operation_id=uuid4(),
+            data={"version": new_work.version},
+            action="iniciar",
+        )
+        station, label = _print_color_manga(
+            actor=creator,
+            manga_id=new_manga.public_id,
+            station_code="PESAJE-OF71-REOPEN",
+        )
+        new_weighed = confirm_manga_weighing(
+            db.session,
+            station_id=station.station_id,
+            operation_id=uuid4(),
+            actor_id=actor_id,
+            data={
+                "label_id": label["public_id"],
+                "capture_id": str(uuid4()),
+                "peso_bruto_kg": "5.100",
+                "tara_kg": "0.100",
+                "tara_fuente": "TIPO_MANGA",
+                "pesada_at": "2026-09-19T18:00:00-05:00",
+                "reading_stable": True,
+            },
+        )
+        transition_color_work(
+            db.session,
+            actor_id=actor_id,
+            work_id=new_work.id,
+            operation_id=uuid4(),
+            data={"version": new_work.version},
+            action="completar",
+        )
+        recerrada = close_fabrication_order(
+            db.session,
+            actor_id=actor_id,
+            operation_id=uuid4(),
+            operation_order_id=order.id,
+            data={"version": order.version},
+        )
+        assert recerrada["kg_medido"] == "17.000"
+        assert db.session.get(ScmCierreProductivoKg, old_closure_id).kg_medido == Decimal("12.000")
+        assert db.session.get(ScmPesajeManga, old_weighing_id).peso_fisico_neto_kg == Decimal("12.000")
+        assert new_weighed["weighing"]["peso_fisico_neto_kg"] == "5.000"
+        assert {
+            row.id: Decimal(row.cantidad_delta_kg)
+            for row in ScmMovimientoInventarioKg.query.filter(
+                ScmMovimientoInventarioKg.id.in_(old_movements)
+            ).all()
+        } == old_movements
 
 
 def test_of_kg_reopen_rejects_non_kg_output_without_mutation(app, client):
@@ -1660,6 +1834,81 @@ def test_of_kg_reopen_rejects_non_kg_output_without_mutation(app, client):
         row = db.session.get(ScmOrdenOperacion, order_id)
         assert row.estado == "CERRADA"
         assert ScmReaperturaProductivaKg.query.count() == 0
+
+
+def test_of_kg_reopen_rejects_missing_capability(app, client):
+    with app.app_context():
+        _actor_id, order_id, version = _closed_of_reopen_fixture()
+        unauthorized = Trabajador(
+            codigo=f"NO-OF-CERRAR-{uuid4().hex[:8]}",
+            nombres="Sin",
+            apellidos="Permiso",
+            activo=True,
+        )
+        db.session.add(unauthorized)
+        db.session.commit()
+        unauthorized_id = unauthorized.id
+    result = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
+        json={"version": version, "motivo": "Sin permiso"},
+        headers={"X-Actor-Id": str(unauthorized_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert result.status_code == 403
+    assert result.json["error"]["code"] == "CAPABILITY_REQUIRED"
+
+
+def test_of_kg_reopen_rejects_stale_version_and_empty_reason(app, client):
+    with app.app_context():
+        actor_id, order_id, version = _closed_of_reopen_fixture()
+    stale = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
+        json={"version": version - 1, "motivo": "Version vieja"},
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert stale.status_code == 409
+    assert stale.json["error"]["code"] == "VERSION_CONFLICT"
+    empty_reason = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
+        json={"version": version, "motivo": ""},
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert empty_reason.status_code == 400
+    assert empty_reason.json["error"]["code"] == "REQUIRED_FIELD"
+
+
+def test_of_kg_reopen_rejects_already_open_and_missing_closure(app, client):
+    with app.app_context():
+        actor_id, order_id, version = _closed_of_reopen_fixture()
+    reopened = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
+        json={"version": version, "motivo": "Abrir una vez"},
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert reopened.status_code == 200
+    already_open = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
+        json={
+            "version": reopened.json["orden"]["version"],
+            "motivo": "Abrir dos veces",
+        },
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert already_open.status_code == 409
+    assert already_open.json["error"]["code"] == "KG_REOPEN_STATE_INVALID"
+
+    with app.app_context():
+        order = db.session.get(ScmOrdenOperacion, order_id)
+        order.estado = "CERRADA"
+        order.closed_at = datetime.now(timezone.utc)
+        db.session.commit()
+        version = order.version
+    missing = client.post(
+        f"/api/scm/v1/ordenes-fabricacion/{order_id}/reabrir-kg",
+        json={"version": version, "motivo": "Falta cierre"},
+        headers={"X-Actor-Id": str(actor_id), "Idempotency-Key": str(uuid4())},
+    )
+    assert missing.status_code == 409
+    assert missing.json["error"]["code"] == "KG_REOPEN_CLOSURE_NOT_FOUND"
 
 
 def test_kg_continuity_closes_each_ot_by_owned_segment_delta(app):
