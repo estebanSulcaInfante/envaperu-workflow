@@ -12,10 +12,17 @@ from decimal import Decimal
 from sqlalchemy import func, select
 
 from app.models.scm_auditoria import ScmEvento
-from app.models.scm_material_execution import ScmReservaMaterial, ScmRequerimientoMaterial
+from app.models.scm_material_execution import (
+    ScmLotePremezcla,
+    ScmReservaMaterial,
+    ScmRequerimientoMaterial,
+)
 from app.models.scm_inline_wip import ScmReservaWipSalida, ScmSaldoWipSalida
 from app.models.scm_ot import ScmManga, ScmTrabajoOt, ScmTramoMangaTrabajo
-from app.models.scm_prepared_material import ScmReservaMaterialPreparado
+from app.models.scm_prepared_material import (
+    ScmRequerimientoMaterialPreparado,
+    ScmReservaMaterialPreparado,
+)
 from app.models.scm_production_orders import ScmAsignacionDemandaSuministro
 from app.models.maquina import Maquina
 from app.models.registro import RegistroDiarioProduccion
@@ -45,6 +52,8 @@ OPEN_MANGA_STATES = {
     "PLANIFICADA", "PREETIQUETADA", "EN_ARMADO", "CONTINUIDAD_PENDIENTE",
     "EN_LLENADO", "CERRADA_ARMADO_PENDIENTE_PESAJE",
 }
+CANCELABLE_OF_STATES = {"LIBERADA", "PROGRAMADA", "EN_EJECUCION", "PAUSADA"}
+PENDING_WORK_STATES = {"PLANIFICADO", "EN_EJECUCION", "PAUSADO"}
 
 
 def _hash(value):
@@ -181,7 +190,22 @@ def _impact(session, order, action, works):
         })
     work_ids = [work.id for work in works]
     inline_wip = []
+    prepared_requirements = []
+    premezcla_lots = []
     prepared_reservations = []
+    if corrida_ids:
+        prepared_requirements = session.scalars(
+            select(ScmRequerimientoMaterialPreparado).where(
+                ScmRequerimientoMaterialPreparado.corrida_fabricacion_id.in_(corrida_ids),
+                ScmRequerimientoMaterialPreparado.estado != "CANCELADA",
+            ).order_by(ScmRequerimientoMaterialPreparado.id)
+        ).all()
+        premezcla_lots = session.scalars(
+            select(ScmLotePremezcla).where(
+                ScmLotePremezcla.corrida_fabricacion_id.in_(corrida_ids),
+                ScmLotePremezcla.estado.in_({"DISPONIBLE_MAQUINA", "CONSUMIDO_MAQUINA"}),
+            ).order_by(ScmLotePremezcla.id)
+        ).all()
     if work_ids:
         inline_wip = session.scalars(
             select(ScmReservaWipSalida)
@@ -201,6 +225,7 @@ def _impact(session, order, action, works):
     prepared_reservations = _ordered_by_id(prepared_reservations)
     blockers = []
     executable = [work for work in works if work.estado in {"PLANIFICADO", "EN_EJECUCION"}]
+    empty_or_annulled = not works or all(work.estado == "ANULADO" for work in works)
     if action == "PAUSAR":
         if order.estado != "EN_EJECUCION":
             blockers.append({"code": "OF_NOT_EXECUTING", "message": "Solo una OF en ejecucion puede pausarse."})
@@ -212,10 +237,19 @@ def _impact(session, order, action, works):
         if not any(work.estado == "PAUSADO" and work.estado_previo_pausa for work in works):
             blockers.append({"code": "NO_WORKS_PAUSED_BY_OF", "message": "No hay trabajos pausados por esta OF para reanudar."})
     elif action == "CANCELAR":
-        if order.estado not in {"EN_EJECUCION", "PAUSADA"}:
-            blockers.append({"code": "OF_NOT_CANCELLABLE", "message": "Solo una OF en ejecucion o pausada puede cancelarse."})
-        if not any(work.estado in {"PLANIFICADO", "EN_EJECUCION", "PAUSADO"} for work in works):
-            blockers.append({"code": "NO_PENDING_WORKS", "message": "La OF no conserva trabajos propios pendientes."})
+        pending_works = [work for work in works if work.estado in PENDING_WORK_STATES]
+        if order.estado not in CANCELABLE_OF_STATES:
+            blockers.append({"code": "OF_NOT_CANCELLABLE", "message": "Solo una OF liberada, programada, en ejecucion o pausada puede cancelarse."})
+        elif order.estado in {"LIBERADA", "PROGRAMADA"}:
+            # Pre-execution cancellation is intentionally narrow: no work, or
+            # every existing work is already ANULADO.  A pending or completed
+            # work must never be hidden by this duplicate-order pathway.
+            if not empty_or_annulled:
+                blockers.append({"code": "NO_PENDING_WORKS", "message": "En pre-ejecucion la OF solo puede cancelarse sin trabajos o con todos sus trabajos anulados."})
+        elif not pending_works and not empty_or_annulled:
+            # Preserve the existing running/paused flow, while keeping an OF
+            # with completed work out of the no-pending shortcut.
+            blockers.append({"code": "NO_PENDING_WORKS", "message": "La OF no conserva trabajos propios pendientes cancelables."})
     open_mangas = [m for m in mangas if m.estado in OPEN_MANGA_STATES]
     open_tramos = [t for t in tramos if t.estado in {"PROGRAMADO", "ACTIVO"}]
     if open_mangas and action in {"PAUSAR", "CANCELAR"}:
@@ -231,6 +265,10 @@ def _impact(session, order, action, works):
         blockers.append({"code": "PENDING_INLINE_WIP", "message": "Hay salidas WIP en linea pendientes de conciliacion.", "count": len(inline_wip)})
     if prepared_reservations and action in {"PAUSAR", "CANCELAR"}:
         blockers.append({"code": "PENDING_PREPARED_MATERIAL", "message": "Hay material preparado pendiente de conciliacion o custodia.", "count": len(prepared_reservations)})
+    if prepared_requirements and action == "CANCELAR" and empty_or_annulled:
+        blockers.append({"code": "PENDING_PREPARED_REQUIREMENTS", "message": "Hay requerimientos de material preparado vivos para corridas de esta OF; concilia su OPM, asignacion o custodia antes de cancelar.", "count": len(prepared_requirements)})
+    if premezcla_lots and action == "CANCELAR" and empty_or_annulled:
+        blockers.append({"code": "PENDING_PREMIX_LOTS", "message": "Hay lotes de premezcla en custodia o consumo para corridas de esta OF; concilia su estado antes de cancelar.", "count": len(premezcla_lots)})
     fingerprint = {
         "of": str(order.id),
         "action": action,
@@ -249,6 +287,24 @@ def _impact(session, order, action, works):
         "asignaciones": assignment_fingerprint,
         "wip": [str(item.id) for item in inline_wip],
         "material_preparado": [str(item.id) for item in prepared_reservations],
+        "requerimientos_material_preparado": [{
+            "id": str(item.id),
+            "estado": item.estado,
+            "version": item.version,
+            "cantidad_requerida_kg": item.cantidad_requerida_kg,
+            "asignaciones": [{
+                "id": str(assignment.id),
+                "estado": assignment.estado,
+                "cantidad_planificada_kg": assignment.cantidad_planificada_kg,
+                "cantidad_comprometida_kg": assignment.cantidad_comprometida_kg,
+                "cantidad_consumida_kg": assignment.cantidad_consumida_kg,
+            } for assignment in _ordered_by_id(getattr(item, "asignaciones", ()))],
+        } for item in prepared_requirements],
+        "lotes_premezcla": [{
+            "id": str(item.id),
+            "estado": item.estado,
+            "cantidad_kg": item.cantidad_kg,
+        } for item in premezcla_lots],
     }
     impact_hash = _hash(fingerprint)
     return {
@@ -263,6 +319,8 @@ def _impact(session, order, action, works):
         "reservas_activas": len(reservations),
         "wip_pendiente": len(inline_wip),
         "material_preparado_pendiente": len(prepared_reservations),
+        "requerimientos_material_preparado_pendientes": len(prepared_requirements),
+        "lotes_premezcla_pendientes": len(premezcla_lots),
         "producido_conservado": True,
         "producido": produced,
         "compromisos_residuales": residuals,

@@ -1181,13 +1181,15 @@ def generate_prepared_requirement(session, *, actor_id, operation_id, run_id):
         )
         if replay is not None:
             return replay
-        run = _load_run(session, run_id, lock=True)
-        # Keep the existing corrida -> OF lock order, then refresh and
-        # revalidate the parent before creating/updating the child plan.
+        # Resolve only the parent id first.  The OF is the aggregate
+        # serialization point shared with cancel_execution; lock and refresh
+        # it before taking the child corrida lock so both paths use OF ->
+        # corrida ordering and cannot deadlock each other.
+        run_probe = _load_run(session, run_id)
         order = session.scalar(
             select(ScmOrdenOperacion)
             .where(
-                ScmOrdenOperacion.id == run.orden_fabricacion_id,
+                ScmOrdenOperacion.id == run_probe.orden_fabricacion_id,
                 ScmOrdenOperacion.tipo == "FABRICACION",
             )
             .with_for_update(of=ScmOrdenOperacion)
@@ -1197,8 +1199,21 @@ def generate_prepared_requirement(session, *, actor_id, operation_id, run_id):
             raise ScmServiceError(
                 "OF_NOT_FOUND", "La orden de fabricacion no existe.", status_code=404
             )
-        # The parent refresh also expires relationship state; use the locked
-        # row's current status for the eligibility check below.
+        run = session.scalar(
+            select(ScmCorridaFabricacion)
+            .where(
+                ScmCorridaFabricacion.id == run_probe.id,
+                ScmCorridaFabricacion.orden_fabricacion_id == order.id,
+            )
+            .with_for_update(of=ScmCorridaFabricacion)
+            .execution_options(populate_existing=True)
+        )
+        if run is None:
+            raise ScmServiceError(
+                "FABRICATION_RUN_NOT_FOUND", "La corrida no existe.", status_code=404
+            )
+        # The parent and corrida are now refreshed under their locks; use the
+        # current OF/run states for all eligibility checks below.
         if order.estado not in ("LIBERADA", "PROGRAMADA", "EN_EJECUCION"):
             raise ScmServiceError(
                 "OF_NOT_RELEASED",
