@@ -127,13 +127,15 @@ def test_m4_start_refreshes_identity_after_annul_commits(
 
 
 def test_assembly_annulment_waits_for_locked_label_before_committing(
-    postgres_inline_app,
+    postgres_inline_app, monkeypatch
 ):
-    """A concurrent label mutation cannot slip past the annulment census."""
+    """A concurrent label change is observed after the row lock releases."""
     app = postgres_inline_app
     with app.app_context():
-        _, header = seed_cancelled_assembly_ot(with_label=True)
+        actor, header = seed_cancelled_assembly_ot(with_label=True)
+        actor_id = actor.id
         label = ScmEtiquetaManga.query.one()
+        ot_id = UUID(header["public_id"])
         lock_connection = db.engine.connect()
         lock_transaction = lock_connection.begin()
         lock_connection.execute(
@@ -145,29 +147,61 @@ def test_assembly_annulment_waits_for_locked_label_before_committing(
     entered_census = Event()
     finished = Event()
 
-    def inspect():
+    original_blocker = scm_ot_service._assembly_ot_annulment_blocker
+
+    def observe_locked_census(*args, **kwargs):
+        if kwargs.get("lock"):
+            entered_census.set()
+        return original_blocker(*args, **kwargs)
+
+    # The service call below runs in a separate request/session, while the
+    # test transaction owns the label lock and performs the competing update.
+    monkeypatch.setattr(
+        scm_ot_service,
+        "_assembly_ot_annulment_blocker",
+        observe_locked_census,
+    )
+
+    def annul():
         try:
             with app.app_context():
-                ot = db.session.scalar(
-                    select(RegistroDiarioProduccion).where(
-                        RegistroDiarioProduccion.public_id
-                        == UUID(header["public_id"])
-                    ).with_for_update()
-                )
-                entered_census.set()
-                return scm_ot_service._assembly_ot_annulment_blocker(
-                    ot, session=db.session, lock=True
-                )
+                try:
+                        scm_ot_service.annul_empty_fabrication_ot(
+                        db.session,
+                            actor_id=actor_id,
+                        public_id=ot_id,
+                        operation_id=uuid4(),
+                        data={
+                            "version": header["version"],
+                            "motivo": "Carrera etiqueta",
+                        },
+                    )
+                except scm_ot_service.ScmServiceError as error:
+                    return error.code, error.status_code
+                return "unexpected-success", 200
         finally:
             finished.set()
 
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(inspect)
-            assert entered_census.wait(timeout=10)
+            future = pool.submit(annul)
+            if not entered_census.wait(timeout=10):
+                assert finished.is_set(), "annulment worker neither entered nor finished"
+                raise AssertionError(f"annulment result before census: {future.result()}")
             assert not finished.wait(timeout=1)
+            lock_connection.execute(
+                ScmEtiquetaManga.__table__.update()
+                .where(ScmEtiquetaManga.id == label.id)
+                .values(estado="GENERADA")
+            )
             lock_transaction.commit()
             result = future.result(timeout=30)
-        assert result is None
+        assert result == ("OT_ANNULMENT_BLOCKED", 409)
+        with app.app_context():
+            row = RegistroDiarioProduccion.query.filter_by(public_id=ot_id).one()
+            assert row.estado == "PLANIFICADA"
+            assert ScmEvento.query.filter_by(
+                tipo="ASSEMBLY_OT_HEADER_ANNULLED"
+            ).count() == 0
     finally:
         lock_connection.close()

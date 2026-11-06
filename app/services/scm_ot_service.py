@@ -5248,7 +5248,10 @@ def _assembly_ot_annulment_blocker(
     # change cannot slip between eligibility validation and the OT update.
     label_statement = select(ScmEtiquetaManga).where(
         ScmEtiquetaManga.manga_id.in_(manga_ids),
-    ).order_by(ScmEtiquetaManga.manga_id, ScmEtiquetaManga.id)
+    ).order_by(
+        ScmEtiquetaManga.manga_id,
+        ScmEtiquetaManga.id,
+    ).execution_options(populate_existing=True)
     if lock:
         label_statement = label_statement.with_for_update()
     labels = session.scalars(label_statement).all()
