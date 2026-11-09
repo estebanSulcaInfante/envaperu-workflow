@@ -504,12 +504,17 @@ def reverse_mn31_dispatch(session, *, actor_id, dispatch_operation_id, operation
             unit = session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == UUID(str(unit_id))).with_for_update())
             if unit is None:
                 raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "La identidad KG no existe.", status_code=409)
+            _scope_unit(session, actor, unit)
             manga = session.scalar(select(ScmManga).where(ScmManga.public_id == UUID(str(manga_id))).with_for_update())
             if manga is None or manga.estado != "DESPACHADA_CLIENTE_MN31":
                 raise ScmServiceError("MN31_NOT_REVERSIBLE", "El despacho ya fue revertido o cambió de estado.", status_code=409)
-            movement = session.scalar(select(ScmMovimientoInventarioKg).where(ScmMovimientoInventarioKg.tipo == "SALIDA_CLIENTE_MN31", ScmMovimientoInventarioKg.referencia_id == str(manga.public_id)).order_by(ScmMovimientoInventarioKg.created_at.desc(), ScmMovimientoInventarioKg.id.desc()).with_for_update())
+            movement_id = dispatch.get("movimiento_salida_id")
+            movement = session.get(ScmMovimientoInventarioKg, UUID(str(movement_id))) if movement_id else None
             if movement is None:
                 raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "No existe salida compensable.", status_code=409)
+            current_movement = session.scalar(select(ScmMovimientoInventarioKg).where(ScmMovimientoInventarioKg.tipo == "SALIDA_CLIENTE_MN31", ScmMovimientoInventarioKg.referencia_id == str(manga.public_id)).order_by(ScmMovimientoInventarioKg.created_at.desc(), ScmMovimientoInventarioKg.id.desc()))
+            if movement.tipo != "SALIDA_CLIENTE_MN31" or movement.referencia_id != str(manga.public_id) or current_movement is None or current_movement.id != movement.id:
+                raise ScmServiceError("MN31_NOT_REVERSIBLE", "El comprobante ya no corresponde a la salida vigente de la manga.", status_code=409)
             balance = session.scalar(select(ScmSaldoInventarioKg).where(ScmSaldoInventarioKg.id == movement.saldo_id).with_for_update())
             if balance is None:
                 raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "No existe saldo compensable.", status_code=409)
