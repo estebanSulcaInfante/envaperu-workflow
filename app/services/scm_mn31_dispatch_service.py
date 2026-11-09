@@ -52,15 +52,48 @@ def _decimal(value):
     return format(Decimal(value).quantize(Decimal("0.001")), "f") if value is not None else None
 
 
-def _lot_for_manga(session, manga):
+def _lot_for_manga(session, manga, *, selected_code=None, productive_change=False):
     assigned = session.scalar(select(ScmMn31LoteAsignacion).where(ScmMn31LoteAsignacion.manga_id == manga.id))
     if assigned is not None:
         return assigned.to_dict()
-    raise ScmServiceError(
-        "MN31_LOT_AMBIGUOUS",
-        "La manga no tiene asignación documental de lote; no se inventa por fecha/turno de OT.",
-        status_code=409,
-    )
+    candidates = []
+    for candidate in session.scalars(select(ScmMn31LoteAsignacion)).all():
+        candidate_manga = candidate.manga
+        candidate_ot = getattr(candidate_manga, "ot", None)
+        current_ot = getattr(manga, "ot", None)
+        if (getattr(candidate_ot, "fecha", None), getattr(candidate_ot, "turno", None)) == (getattr(current_ot, "fecha", None), getattr(current_ot, "turno", None)) and candidate_manga.pieza_color_sku_snapshot == manga.pieza_color_sku_snapshot:
+            candidates.append(candidate)
+    candidate_codes = {candidate.lote_codigo for candidate in candidates}
+    if selected_code:
+        if not selected_code.startswith("MN31-") or len(selected_code) > 80:
+            raise ScmServiceError("MN31_LOT_SELECTION_INVALID", "El código de lote no cumple el formato MN31.", status_code=422)
+        selected = next((candidate for candidate in candidates if candidate.lote_codigo == selected_code), None)
+        if selected is not None:
+            return selected.to_dict()
+        if not candidates and not productive_change:
+            ot = getattr(manga, "ot", None)
+            ot_date = getattr(ot, "fecha", None)
+            shift = getattr(ot, "turno", None)
+            if isinstance(ot_date, date) and shift in {"DIA", "NOCHE", "DIURNO", "NOCTURNO"}:
+                shift_code = "D" if shift in {"DIA", "DIURNO"} else "N"
+                suggested = f"MN31-{ot_date:%Y%m%d}-{shift_code}-01"
+                if selected_code == suggested:
+                    return {"id": str(uuid5(MN31_LOT_NAMESPACE, selected_code)), "codigo": selected_code, "criterio": "SELECCION_PRIMER_LOTE_TURNO"}
+        raise ScmServiceError("MN31_LOT_SELECTION_INVALID", "El lote elegido no pertenece al conjunto documental disponible.", status_code=409, details={"candidatos": sorted(candidate_codes)})
+    if productive_change or len(candidate_codes) > 1:
+        raise ScmServiceError("MN31_LOT_SELECTION_REQUIRED", "Existe cambio productivo o más de un lote candidato; seleccione lote.", status_code=409, details={"candidatos": sorted(candidate_codes)})
+    ot = getattr(manga, "ot", None)
+    ot_date = getattr(ot, "fecha", None)
+    shift = getattr(ot, "turno", None)
+    if len(candidate_codes) == 1:
+        code = next(iter(candidate_codes))
+        candidate = next(candidate for candidate in candidates if candidate.lote_codigo == code)
+        return candidate.to_dict()
+    if not isinstance(ot_date, date) or shift not in {"DIA", "NOCHE", "DIURNO", "NOCTURNO"}:
+        raise ScmServiceError("MN31_LOT_AMBIGUOUS", "La OT no permite determinar fecha/turno de lote.", status_code=409)
+    shift_code = "D" if shift in {"DIA", "DIURNO"} else "N"
+    code = f"MN31-{ot_date:%Y%m%d}-{shift_code}-01"
+    raise ScmServiceError("MN31_LOT_SELECTION_REQUIRED", "Primera apertura de turno: confirme explícitamente el candidato de lote.", status_code=409, details={"candidato_sugerido": code})
 
 
 def _weight_source(session, manga, unit, existence=None):
@@ -134,7 +167,14 @@ def _persist_lot_assignment(session, manga, lot):
     assigned = session.scalar(select(ScmMn31LoteAsignacion).where(ScmMn31LoteAsignacion.manga_id == manga.id).with_for_update())
     if assigned is not None:
         return assigned.to_dict()
-    raise ScmServiceError("MN31_LOT_AMBIGUOUS", "La manga no tiene asignación documental de lote.", status_code=409)
+    assigned = ScmMn31LoteAsignacion(
+        manga_id=manga.id, manga_public_id=manga.public_id, manga_codigo=manga.codigo,
+        lote_public_id=UUID(str(lot["id"])), lote_codigo=lot["codigo"],
+        fuente=lot.get("criterio", "MN31_CONFIRMACION"),
+    )
+    session.add(assigned)
+    session.flush()
+    return assigned.to_dict()
 
 
 def list_mn31_clients(session, *, actor_id, query=None):
@@ -149,7 +189,7 @@ def list_mn31_clients(session, *, actor_id, query=None):
     return {"items": [item.to_dict() for item in session.scalars(statement.limit(100)).all()]}
 
 
-def resolve_mn31_dispatch(session, *, actor_id, code, client_id=None):
+def resolve_mn31_dispatch(session, *, actor_id, code, client_id=None, lote_codigo=None, hubo_cambio_productivo=False):
     load_actor(session, actor_id, capability="DESPACHO_MN31_CONFIRMAR")
     actor = load_actor(session, actor_id)
     unit = _unit_by_code(session, code, actor=actor)
@@ -185,7 +225,7 @@ def resolve_mn31_dispatch(session, *, actor_id, code, client_id=None):
     if unit.estado_calidad != "SIN_CONTROL" or unit.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"} or existence is None or existence.estado_calidad != "SIN_CONTROL" or existence.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"}:
         raise ScmServiceError("MN31_STOCK_NOT_AVAILABLE", "La identidad no tiene custodia KG acreditada disponible.", status_code=409)
     weight, source_type, source_id, _source_at = _weight_source(session, manga, unit, existence)
-    lot = _lot_for_manga(session, manga)
+    lot = _lot_for_manga(session, manga, selected_code=lote_codigo, productive_change=hubo_cambio_productivo)
     client = session.get(ScmClienteMn31, int(client_id)) if client_id is not None else None
     if client_id is not None and (client is None or not client.activo):
         raise ScmServiceError("MN31_CLIENT_NOT_FOUND", "El cliente no existe o no está activo.", status_code=404)
@@ -217,7 +257,7 @@ def _child_operation(session, root_id, suffix, actor, command):
 def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_transaction=True, batch_parent_operation_id=None):
     assert_custody_enabled()
     actor = load_actor(session, actor_id, capability="DESPACHO_MN31_CONFIRMAR")
-    reject_unknown_fields(data, allowed={"codigo", "unit_id", "version", "cliente_id", "documento", "motivo"})
+    reject_unknown_fields(data, allowed={"codigo", "unit_id", "version", "cliente_id", "documento", "motivo", "lote_codigo", "hubo_cambio_productivo"})
     code = str(data.get("codigo") or "").strip()
     if not code:
         raise ScmServiceError("MN31_CODE_REQUIRED", "codigo es obligatorio.", status_code=400)
@@ -231,7 +271,8 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_trans
     reason = str(data.get("motivo") or "").strip()
     if not reason:
         raise ScmServiceError("MN31_MOTIVO_REQUIRED", "motivo es obligatorio para generar el comprobante causal SCM.", status_code=422)
-    command = {"codigo": code, "unit_id": str(data.get("unit_id") or ""), "version": data.get("version"), "cliente_id": client.id, "documento": str(data.get("documento") or "").strip() or None, "motivo": reason}
+    productive_change = data.get("hubo_cambio_productivo") is True or str(data.get("hubo_cambio_productivo") or "").strip().lower() == "true"
+    command = {"codigo": code, "unit_id": str(data.get("unit_id") or ""), "version": data.get("version"), "cliente_id": client.id, "documento": str(data.get("documento") or "").strip() or None, "motivo": reason, "lote_codigo": str(data.get("lote_codigo") or "").strip() or None, "hubo_cambio_productivo": productive_change}
     acquire_kg_productive_write_lock(session)
     operation, replay = _reserve_operation(session, operation_id, MN31_ENDPOINT, actor, command)
     if replay is not None:
@@ -278,7 +319,7 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_trans
         if existence is None or existence.estado_calidad != "SIN_CONTROL" or existence.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"}:
             raise ScmServiceError("MN31_STOCK_NOT_AVAILABLE", "La existencia KG no tiene custodia disponible.", status_code=409)
         weight, source_type, source_id, source_at = _weight_source(session, manga, unit, existence)
-        lot = _lot_for_manga(session, manga)
+        lot = _lot_for_manga(session, manga, selected_code=command["lote_codigo"], productive_change=command["hubo_cambio_productivo"])
         lot = _persist_lot_assignment(session, manga, lot)
         balance = session.scalar(select(ScmSaldoInventarioKg).where(ScmSaldoInventarioKg.id == unit.saldo_id).with_for_update())
         if balance is None or balance.articulo_scm_id != unit.articulo_scm_id or balance.ubicacion_id != unit.ubicacion_id:
@@ -405,7 +446,7 @@ def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             raise ScmServiceError("MN31_ITEM_INVALID", "Cada item debe ser un objeto.", status_code=422, details={"index": index})
-        reject_unknown_fields(item, allowed={"codigo", "unit_id", "version"})
+        reject_unknown_fields(item, allowed={"codigo", "unit_id", "version", "lote_codigo", "hubo_cambio_productivo"})
         code = str(item.get("codigo") or "").strip()
         if not code:
             raise ScmServiceError("MN31_CODE_REQUIRED", "Cada item requiere codigo.", status_code=422, details={"index": index})
@@ -416,7 +457,8 @@ def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
         if key in seen:
             raise ScmServiceError("MN31_DUPLICATE_ITEM", "Una identidad aparece más de una vez.", status_code=422, details={"codigo": code})
         seen.add(key)
-        normalized.append({"codigo": code, "unit_id": item.get("unit_id"), "version": version})
+        productive_change = item.get("hubo_cambio_productivo") is True or str(item.get("hubo_cambio_productivo") or "").strip().lower() == "true"
+        normalized.append({"codigo": code, "unit_id": item.get("unit_id"), "version": version, "lote_codigo": item.get("lote_codigo"), "hubo_cambio_productivo": productive_change})
     normalized.sort(key=lambda item: (str(item.get("unit_id") or ""), item["codigo"]))
     command = {"cliente_id": client.id, "items": normalized, "documento": str(data.get("documento") or "").strip() or None, "motivo": reason}
     acquire_kg_productive_write_lock(session)
@@ -431,6 +473,7 @@ def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
             item_data = {
                 "codigo": item["codigo"], "unit_id": item.get("unit_id"), "version": item["version"],
                 "cliente_id": client.id, "documento": command["documento"], "motivo": reason,
+                "lote_codigo": item.get("lote_codigo"), "hubo_cambio_productivo": item.get("hubo_cambio_productivo", False),
             }
             result = confirm_mn31_dispatch(
                 session, actor_id=actor.id, operation_id=child_id,

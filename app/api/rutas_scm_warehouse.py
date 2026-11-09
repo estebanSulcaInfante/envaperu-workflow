@@ -406,7 +406,7 @@ def mn31_dispatch_resolve(code):
         client_id = int(raw_client) if raw_client is not None else None
     except ValueError as error:
         raise ScmServiceError("MN31_CLIENT_INVALID", "cliente_id debe ser entero.", status_code=400) from error
-    return jsonify(resolve_mn31_dispatch(db.session, actor_id=_actor_id(), code=code, client_id=client_id))
+    return jsonify(resolve_mn31_dispatch(db.session, actor_id=_actor_id(), code=code, client_id=client_id, lote_codigo=request.args.get("lote_codigo"), hubo_cambio_productivo=request.args.get("hubo_cambio_productivo", "false").lower() == "true"))
 
 
 @scm_warehouse_bp.post("/despachos-mn31/confirmar")
