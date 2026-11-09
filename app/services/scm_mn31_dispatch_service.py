@@ -56,24 +56,11 @@ def _lot_for_manga(session, manga):
     assigned = session.scalar(select(ScmMn31LoteAsignacion).where(ScmMn31LoteAsignacion.manga_id == manga.id))
     if assigned is not None:
         return assigned.to_dict()
-    ot = getattr(manga, "ot", None)
-    ot_date = getattr(ot, "fecha", None)
-    shift = getattr(ot, "turno", None)
-    if not isinstance(ot_date, date) or shift not in {"DIA", "NOCHE", "DIURNO", "NOCTURNO"}:
-        raise ScmServiceError(
-            "MN31_LOT_AMBIGUOUS",
-            "No se puede determinar un lote independiente por turno de la OT.",
-            status_code=409,
-        )
-    shift_code = "D" if shift in {"DIA", "DIURNO"} else "N"
-    code = f"MN31-{ot_date:%Y%m%d}-{shift_code}-01"
-    return {
-        "id": None,
-        "codigo": code,
-        "fecha": ot_date.isoformat(),
-        "turno": shift,
-        "criterio": "OT_FECHA_TURNO",
-    }
+    raise ScmServiceError(
+        "MN31_LOT_AMBIGUOUS",
+        "La manga no tiene asignación documental de lote; no se inventa por fecha/turno de OT.",
+        status_code=409,
+    )
 
 
 def _weight_source(session, manga, unit, existence=None):
@@ -147,14 +134,7 @@ def _persist_lot_assignment(session, manga, lot):
     assigned = session.scalar(select(ScmMn31LoteAsignacion).where(ScmMn31LoteAsignacion.manga_id == manga.id).with_for_update())
     if assigned is not None:
         return assigned.to_dict()
-    assigned = ScmMn31LoteAsignacion(
-        manga_id=manga.id, manga_public_id=manga.public_id, manga_codigo=manga.codigo,
-        lote_public_id=uuid5(MN31_LOT_NAMESPACE, lot["codigo"]), lote_codigo=lot["codigo"],
-        fuente="OT_FECHA_TURNO_CONFIRMACION",
-    )
-    session.add(assigned)
-    session.flush()
-    return assigned.to_dict()
+    raise ScmServiceError("MN31_LOT_AMBIGUOUS", "La manga no tiene asignación documental de lote.", status_code=409)
 
 
 def list_mn31_clients(session, *, actor_id, query=None):
@@ -234,7 +214,7 @@ def _child_operation(session, root_id, suffix, actor, command):
     return child
 
 
-def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_transaction=True):
+def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_transaction=True, batch_parent_operation_id=None):
     assert_custody_enabled()
     actor = load_actor(session, actor_id, capability="DESPACHO_MN31_CONFIRMAR")
     reject_unknown_fields(data, allowed={"codigo", "unit_id", "version", "cliente_id", "documento", "motivo"})
@@ -365,6 +345,8 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_trans
         manga.estado = "DESPACHADA_CLIENTE_MN31"
         manga.version += 1
         if existence is not None:
+            existence.cantidad_fisica_kg = weight
+            existence.peso_neto_snapshot_kg = weight
             existence.estado_logistico = "DESPACHADA_CLIENTE_MN31"
             existence.cantidad_reservada_kg = 0
             existence.version += 1
@@ -379,9 +361,11 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_trans
             "comprobante_scm": {"tipo": "DESPACHO_CLIENTE_MN31", "id": str(operation_id)},
             "despacho": {"codigo": code, "unidad_id": str(unit.id), "manga_id": str(manga.public_id), "manga_codigo": manga.codigo, "peso_neto_kg": _decimal(weight), "documento": command["documento"], "causa": "DESPACHO_CLIENTE_MN31", "lote": lot},
             "peso_fuente": _source_snapshot(session, source_type, source_id, weight, source_at),
-            "conciliacion": {"delta_kg": _decimal(delta), "movimiento_ingreso": delta > 0},
+            "conciliacion": {"delta_kg": _decimal(delta), "cantidad_acreditada_previa_kg": _decimal(credited), "movimiento_ingreso": delta > 0},
             "movimiento_salida_id": str(movement.id), "terminal": True,
         }
+        if batch_parent_operation_id is not None:
+            response["batch_parent_operation_id"] = str(batch_parent_operation_id)
         _complete(output_op, {"movement_id": str(movement.id), "parent_operation_id": str(operation_id)}, 201)
         _complete(operation, response, 201)
         session.add(ScmEvento(
@@ -451,6 +435,7 @@ def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
             result = confirm_mn31_dispatch(
                 session, actor_id=actor.id, operation_id=child_id,
                 data=item_data, manage_transaction=False,
+                batch_parent_operation_id=operation_id,
             )
             results.append(result)
             total += Decimal(result["despacho"]["peso_neto_kg"])
@@ -485,6 +470,8 @@ def reverse_mn31_dispatch(session, *, actor_id, dispatch_operation_id, operation
     original = session.get(ScmOperacion, dispatch_operation_id)
     if original is None or original.endpoint != MN31_ENDPOINT or original.response_json is None:
         raise ScmServiceError("MN31_OPERATION_NOT_FOUND", "La operación MN31 no existe.", status_code=404)
+    if original.response_json.get("batch_parent_operation_id"):
+        raise ScmServiceError("MN31_BATCH_CHILD_NOT_REVERSIBLE", "Reversa el comprobante raíz del lote.", status_code=409)
     command = {"dispatch_operation_id": str(dispatch_operation_id), "motivo": reason}
     acquire_kg_productive_write_lock(session)
     operation, replay = _reserve_operation(session, operation_id, "POST /despachos-mn31/revertir", actor, command)
@@ -508,7 +495,7 @@ def reverse_mn31_dispatch(session, *, actor_id, dispatch_operation_id, operation
             manga = session.scalar(select(ScmManga).where(ScmManga.public_id == UUID(str(manga_id))).with_for_update())
             if manga is None or manga.estado != "DESPACHADA_CLIENTE_MN31":
                 raise ScmServiceError("MN31_NOT_REVERSIBLE", "El despacho ya fue revertido o cambió de estado.", status_code=409)
-            movement_id = dispatch.get("movimiento_salida_id")
+            movement_id = item.get("movimiento_salida_id") or dispatch.get("movimiento_salida_id")
             movement = session.get(ScmMovimientoInventarioKg, UUID(str(movement_id))) if movement_id else None
             if movement is None:
                 raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "No existe salida compensable.", status_code=409)
@@ -519,6 +506,7 @@ def reverse_mn31_dispatch(session, *, actor_id, dispatch_operation_id, operation
             if balance is None:
                 raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "No existe saldo compensable.", status_code=409)
             qty = Decimal(movement.peso_neto_snapshot_kg).quantize(Decimal("0.001"))
+            delta = Decimal(str((item.get("conciliacion") or {}).get("delta_kg") or "0")).quantize(Decimal("0.001"))
             child_id = uuid5(operation_id, f"reversa:{index}:{unit.id}")
             child, child_replay = _reserve_operation(session, child_id, "POST /despachos-mn31/revertir/movimiento", actor, command)
             if child_replay is not None:
@@ -542,8 +530,29 @@ def reverse_mn31_dispatch(session, *, actor_id, dispatch_operation_id, operation
             unit.version += 1
             existence = session.scalar(select(ScmExistenciaMangaKg).where(ScmExistenciaMangaKg.unidad_fisica_kg_id == unit.id).with_for_update())
             if existence is not None:
+                existence.cantidad_fisica_kg = (qty - delta).quantize(Decimal("0.001"))
+                existence.peso_neto_snapshot_kg = existence.cantidad_fisica_kg
                 existence.estado_logistico = "DISPONIBLE_PRODUCCION"
                 existence.version += 1
+            if delta != 0:
+                correction_id = uuid5(operation_id, f"reversa-conciliacion:{index}:{unit.id}")
+                correction_op, correction_replay = _reserve_operation(session, correction_id, "POST /despachos-mn31/revertir/conciliacion", actor, command)
+                if correction_replay is not None:
+                    raise ScmServiceError("IDEMPOTENCY_OPERATION_INCOMPLETE", "La compensación de conciliación ya existe.", status_code=409)
+                correction_delta = -delta
+                balance.cantidad_fisica_kg = Decimal(balance.cantidad_fisica_kg) + correction_delta
+                balance.version += 1
+                correction = ScmMovimientoInventarioKg(
+                    saldo_id=balance.id, tipo="AJUSTE_POSITIVO" if correction_delta > 0 else "AJUSTE_NEGATIVO",
+                    cantidad_delta_kg=correction_delta, saldo_fisico_resultante_kg=balance.cantidad_fisica_kg,
+                    motivo="Reversa de conciliación de peso MN31",
+                    referencia_tipo="REVERSA_DESPACHO_MN31", referencia_id=str(manga.public_id), actor_id=actor.id,
+                    operation_id=correction_id, projection_sha256=_hash([str(movement.id), str(correction_id)]),
+                    peso_neto_snapshot_kg=abs(correction_delta), pesada_at_snapshot=movement.pesada_at_snapshot, fuente_tipo="MN31_REVERSA",
+                )
+                session.add(correction)
+                session.flush()
+                _complete(correction_op, {"movement_id": str(correction.id), "delta_kg": _decimal(correction_delta)}, 201)
             manga.estado = "DESPACHO_MN31_REVERTIDO"
             manga.version += 1
             session.flush()
