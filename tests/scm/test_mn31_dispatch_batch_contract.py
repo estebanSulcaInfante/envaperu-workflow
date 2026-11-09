@@ -8,6 +8,9 @@ import pytest
 from app.services import scm_mn31_dispatch_service as service
 
 
+TOKEN = {"manga": 1, "unidad": 1, "peso_fuente": {"id": "source-1", "tipo": "CONTROL_AVANCE", "kg": "2.000"}}
+
+
 class FakeSession:
     def __init__(self, client):
         self.client = client
@@ -54,7 +57,7 @@ def test_batch_has_one_root_commit_and_deterministic_children(monkeypatch):
     monkeypatch.setattr(service, "confirm_mn31_dispatch", confirm)
     key = uuid4()
     body = {"cliente_id": 3, "documento": "DOC-MN31-01", "motivo": "Venta MN31", "items": [
-        {"codigo": "U-2", "version": 1}, {"codigo": "U-1", "version": 1}
+        {"codigo": "U-2", "version": 1, "version_token": TOKEN}, {"codigo": "U-1", "version": 1, "version_token": TOKEN}
     ]}
     result = service.confirm_mn31_dispatch_batch(session, actor_id=7, operation_id=key, data=body)
     assert result["cantidad_mangas"] == 2
@@ -88,7 +91,7 @@ def test_batch_replay_is_exact(monkeypatch):
     monkeypatch.setattr(service, "_reserve_operation", reserve)
     monkeypatch.setattr(service, "_complete", complete)
     monkeypatch.setattr(service, "confirm_mn31_dispatch", lambda session, **kwargs: {"despacho": {"peso_neto_kg": "2.000"}, "operation_id": str(kwargs["operation_id"])})
-    body = {"cliente_id": 3, "documento": "DOC-MN31-01", "motivo": "Venta MN31", "items": [{"codigo": "U-1", "version": 1}]}
+    body = {"cliente_id": 3, "documento": "DOC-MN31-01", "motivo": "Venta MN31", "items": [{"codigo": "U-1", "version": 1, "version_token": TOKEN}]}
     first = service.confirm_mn31_dispatch_batch(session, actor_id=7, operation_id=key, data=body)
     second = service.confirm_mn31_dispatch_batch(session, actor_id=7, operation_id=key, data=body)
     assert second == first
@@ -112,7 +115,7 @@ def test_batch_rolls_back_when_second_item_fails(monkeypatch):
         service.confirm_mn31_dispatch_batch(
             session, actor_id=7, operation_id=uuid4(),
             data={"cliente_id": 3, "documento": "DOC-MN31-01", "motivo": "Venta MN31", "items": [
-                {"codigo": "U-1", "version": 1}, {"codigo": "U-2", "version": 1}
+                {"codigo": "U-1", "version": 1, "version_token": TOKEN}, {"codigo": "U-2", "version": 1, "version_token": TOKEN}
             ]},
         )
     assert session.commits == 0
@@ -153,6 +156,19 @@ def test_corrected_weight_snapshot_uses_effective_values_and_correction_id():
     assert payload["neto_kg"] == "12.000"
     assert payload["pesado_at"] == "2026-11-09T11:30:00+00:00"
     assert payload["correccion_aplicada_id"] == str(correction.public_id)
+
+
+def test_resolution_token_rejects_changed_effective_weight():
+    manga = SimpleNamespace(version=4, public_id="manga-1")
+    unit = SimpleNamespace(version=9, id="unit-1")
+    token = service._resolution_token(
+        manga, unit, Decimal("12.000"), "PESAJE_FINAL", "peso-1"
+    )
+    with pytest.raises(service.ScmServiceError) as error:
+        service._validate_resolution_token(
+            token, manga, unit, Decimal("12.200"), "PESAJE_FINAL", "peso-1"
+        )
+    assert error.value.code == "MN31_WEIGHT_CONFLICT"
 
 
 def test_productive_change_cannot_reuse_documented_lot(monkeypatch):
