@@ -2000,7 +2000,7 @@ def close_productive_document_kg(
         for manga in mangas:
             if manga.estado in {
                 "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN",
-                "RECIBIDA", "ANULADA",
+                "RECIBIDA", "DESPACHADA_CLIENTE_MN31", "DESPACHO_MN31_REVERTIDO", "ANULADA",
             }:
                 continue
             if tipo == "OT":
