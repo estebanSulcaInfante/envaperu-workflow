@@ -41,7 +41,7 @@ def _patch_batch_dependencies(monkeypatch, fake_session):
     monkeypatch.setattr(service, "_complete", lambda *args, **kwargs: None)
     monkeypatch.setattr(service, "actor_snapshot", lambda actor: {"id": actor.id})
     monkeypatch.setattr(service, "_reserve_operation", lambda *args, **kwargs: (operation, None))
-    monkeypatch.setattr(service, "_preflight_batch_lot_selection", lambda session, normalized: (normalized, None))
+    monkeypatch.setattr(service, "_preflight_batch_lot_selection", lambda session, normalized: (normalized, {item["codigo"]: None for item in normalized}))
     return actor, client
 
 
@@ -91,7 +91,7 @@ def test_batch_replay_is_exact(monkeypatch):
 
     monkeypatch.setattr(service, "_reserve_operation", reserve)
     monkeypatch.setattr(service, "_complete", complete)
-    monkeypatch.setattr(service, "_preflight_batch_lot_selection", lambda session, normalized: (normalized, None))
+    monkeypatch.setattr(service, "_preflight_batch_lot_selection", lambda session, normalized: (normalized, {item["codigo"]: None for item in normalized}))
     monkeypatch.setattr(service, "confirm_mn31_dispatch", lambda session, **kwargs: {"despacho": {"peso_neto_kg": "2.000"}, "operation_id": str(kwargs["operation_id"])})
     body = {"cliente_id": 3, "documento": "DOC-MN31-01", "motivo": "Venta MN31", "items": [{"codigo": "U-1", "version": 1, "version_token": TOKEN}]}
     first = service.confirm_mn31_dispatch_batch(session, actor_id=7, operation_id=key, data=body)
@@ -214,6 +214,21 @@ def test_batch_preflight_reserves_one_lot_for_two_mangas(monkeypatch):
         {"codigo": "M-1", "lote_codigo": "MN31-20261109-D-02", "hubo_cambio_productivo": True},
         {"codigo": "M-2", "lote_codigo": None, "hubo_cambio_productivo": False},
     ]
-    prepared, block = service._preflight_batch_lot_selection(SimpleNamespace(), items)
-    assert block["id"] == "lot-d02"
-    assert [item["lote_codigo"] for item in prepared] == ["MN31-20261109-D-02", "MN31-20261109-D-02"]
+    prepared, lot_by_code = service._preflight_batch_lot_selection(SimpleNamespace(), items)
+    assert lot_by_code["M-1"]["id"] == "lot-d02"
+    assert lot_by_code["M-2"]["id"] == "lot-d02"
+    assert [item["lote_codigo"] for item in prepared] == ["MN31-20261109-D-02", None]
+
+
+def test_batch_preflight_keeps_different_shift_lots_separate(monkeypatch):
+    mangas = {"A": SimpleNamespace(id=1), "B": SimpleNamespace(id=2)}
+    lots = {
+        "A": {"id": "lot-d01", "codigo": "MN31-20261109-D-01"},
+        "B": {"id": "lot-n01", "codigo": "MN31-20261109-N-01"},
+    }
+    monkeypatch.setattr(service, "_manga_for_batch_lot", lambda session, code: mangas[code])
+    monkeypatch.setattr(service, "_lot_for_manga", lambda session, manga, **kwargs: lots["A" if manga.id == 1 else "B"])
+    items = [{"codigo": "A", "lote_codigo": None}, {"codigo": "B", "lote_codigo": None}]
+    _prepared, lot_by_code = service._preflight_batch_lot_selection(SimpleNamespace(), items)
+    assert lot_by_code["A"]["id"] == "lot-d01"
+    assert lot_by_code["B"]["id"] == "lot-n01"

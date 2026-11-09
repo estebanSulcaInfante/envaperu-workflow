@@ -99,10 +99,10 @@ def _lot_response(lot, *, assigned):
     }
 
 
-def _lot_for_manga(session, manga, *, selected_code=None, productive_change=False, allow_new_selected=False, forced_lot=None):
+def _lot_for_manga(session, manga, *, selected_code=None, productive_change=False, forced_lot=None):
     assigned = session.scalar(select(ScmMn31LoteAsignacion).where(ScmMn31LoteAsignacion.manga_id == manga.id))
     if forced_lot is not None:
-        if assigned is not None and assigned.lote_codigo != forced_lot["codigo"]:
+        if assigned is not None and (assigned.lote_codigo != forced_lot["codigo"] or str(assigned.lote_public_id) != str(forced_lot["id"])):
             raise ScmServiceError("MN31_LOT_BLOCK_CONFLICT", "La manga ya tiene un lote distinto al bloque reservado.", status_code=409)
         return forced_lot
     if assigned is not None:
@@ -141,8 +141,6 @@ def _lot_for_manga(session, manga, *, selected_code=None, productive_change=Fals
             return {"id": str(uuid5(MN31_LOT_NAMESPACE, selected_code)), "codigo": selected_code, "criterio": "SELECCION_NUEVO_LOTE_CAMBIO_PRODUCTIVO", "asignado": False}
         if selected is not None:
             return _lot_response(selected.to_dict(), assigned=False)
-        if allow_new_selected and selected_code == suggested:
-            return {"id": str(uuid5(MN31_LOT_NAMESPACE, selected_code)), "codigo": selected_code, "criterio": "SELECCION_NUEVO_LOTE_BLOQUE", "asignado": False}
         if not candidates and not productive_change:
             ot = getattr(manga, "ot", None)
             ot_date = getattr(ot, "fecha", None)
@@ -154,7 +152,10 @@ def _lot_for_manga(session, manga, *, selected_code=None, productive_change=Fals
                     return {"id": str(uuid5(MN31_LOT_NAMESPACE, selected_code)), "codigo": selected_code, "criterio": "SELECCION_PRIMER_LOTE_TURNO", "asignado": False}
         raise ScmServiceError("MN31_LOT_SELECTION_INVALID", "El lote elegido no pertenece al conjunto documental disponible.", status_code=409, details={"candidatos": sorted(candidate_codes)})
     if productive_change or change_detected or len(candidate_codes) > 1:
-        raise ScmServiceError("MN31_LOT_SELECTION_REQUIRED", "Existe cambio productivo o más de un lote candidato; seleccione lote.", status_code=409, details={"candidatos": sorted(candidate_codes), "candidato_sugerido": _suggested_lot_code(manga, candidate_codes)})
+        details = {"candidatos": sorted(candidate_codes)}
+        if productive_change or change_detected:
+            details["candidato_sugerido"] = _suggested_lot_code(manga, candidate_codes)
+        raise ScmServiceError("MN31_LOT_SELECTION_REQUIRED", "Existe cambio productivo o más de un lote candidato; seleccione lote.", status_code=409, details=details)
     ot = getattr(manga, "ot", None)
     ot_date = getattr(ot, "fecha", None)
     shift = getattr(ot, "turno", None)
@@ -662,31 +663,22 @@ def _manga_for_batch_lot(session, code):
 
 
 def _preflight_batch_lot_selection(session, normalized):
-    """Resolve one lot identity for the whole batch before any child writes."""
-    explicit = {str(item["lote_codigo"]).strip() for item in normalized if item.get("lote_codigo")}
-    if len(explicit) > 1:
-        raise ScmServiceError("MN31_LOT_BLOCK_CONFLICT", "Todas las mangas del bloque deben usar la misma selección de lote.", status_code=409, details={"selecciones": sorted(explicit)})
-    block_code = next(iter(explicit), None)
-    block_lot = None
+    """Resolve each line's lot against one pre-write catalog snapshot."""
     prepared = []
+    lot_by_code = {}
     for item in normalized:
-        code = block_code or item.get("lote_codigo")
         manga = _manga_for_batch_lot(session, item["codigo"])
         if manga is None:
             raise ScmServiceError("MN31_MANGA_NOT_FOUND", "Una manga del bloque no existe.", status_code=404, details={"codigo": item["codigo"]})
         lot = _lot_for_manga(
             session,
             manga,
-            selected_code=code,
+            selected_code=item.get("lote_codigo"),
             productive_change=item.get("hubo_cambio_productivo", False),
-            allow_new_selected=block_code is not None,
         )
-        if block_lot is None:
-            block_lot = lot
-        elif (lot["codigo"], lot["id"]) != (block_lot["codigo"], block_lot["id"]):
-            raise ScmServiceError("MN31_LOT_BLOCK_CONFLICT", "Las mangas del bloque no tienen una única selección compatible.", status_code=409, details={"lotes": [block_lot["codigo"], lot["codigo"]]})
-        prepared.append({**item, "lote_codigo": lot["codigo"]})
-    return prepared, block_lot
+        prepared.append(item)
+        lot_by_code[item["codigo"]] = lot
+    return prepared, lot_by_code
 
 
 def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
@@ -729,13 +721,13 @@ def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
         productive_change = item.get("hubo_cambio_productivo") is True or str(item.get("hubo_cambio_productivo") or "").strip().lower() == "true"
         normalized.append({"codigo": code, "unit_id": item.get("unit_id"), "version": version, "version_token": resolution_token, "lote_codigo": item.get("lote_codigo"), "hubo_cambio_productivo": productive_change})
     normalized.sort(key=lambda item: (str(item.get("unit_id") or ""), item["codigo"]))
-    acquire_kg_productive_write_lock(session)
-    normalized, block_lot = _preflight_batch_lot_selection(session, normalized)
     command = {"cliente_id": client.id, "items": normalized, "documento": document, "motivo": reason}
+    acquire_kg_productive_write_lock(session)
     operation, replay = _reserve_operation(session, operation_id, MN31_ENDPOINT, actor, command)
     if replay is not None:
         return deepcopy(replay)
     try:
+        normalized, lot_by_code = _preflight_batch_lot_selection(session, normalized)
         results = []
         total = Decimal("0")
         for index, item in enumerate(normalized):
@@ -749,7 +741,7 @@ def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
             result = confirm_mn31_dispatch(
                 session, actor_id=actor.id, operation_id=child_id,
                 data=item_data, manage_transaction=False,
-                batch_parent_operation_id=operation_id, lot_selection=block_lot,
+                batch_parent_operation_id=operation_id, lot_selection=lot_by_code[item["codigo"]],
             )
             results.append(result)
             total += Decimal(result["despacho"]["peso_neto_kg"])
