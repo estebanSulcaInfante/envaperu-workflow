@@ -56,6 +56,12 @@ from app.services.scm_kg_custody_service import (
     withdraw_kg_batch,
     get_kg_withdrawal_batch,
 )
+from app.services.scm_mn31_dispatch_service import (
+    confirm_mn31_dispatch,
+    get_mn31_dispatch,
+    list_mn31_clients,
+    resolve_mn31_dispatch,
+)
 
 
 scm_warehouse_bp = Blueprint("scm_warehouse", __name__)
@@ -384,3 +390,28 @@ def kg_measurement_context(unit_id):
 def kg_label_ack(unit_id, label_id):
     body = _body()
     return jsonify(acknowledge_kg_label(db.session, actor_id=_actor_id(), station_id=str(body.get("station_id") or ""), unit_id=unit_id, label_id=label_id, operation_id=_operation_id(), data=body))
+
+
+@scm_warehouse_bp.get("/despachos-mn31/clientes")
+def mn31_clients_list():
+    return jsonify(list_mn31_clients(db.session, actor_id=_actor_id(), query=request.args.get("q")))
+
+
+@scm_warehouse_bp.get("/despachos-mn31/resolver/<path:code>")
+def mn31_dispatch_resolve(code):
+    raw_client = request.args.get("cliente_id")
+    try:
+        client_id = int(raw_client) if raw_client is not None else None
+    except ValueError as error:
+        raise ScmServiceError("MN31_CLIENT_INVALID", "cliente_id debe ser entero.", status_code=400) from error
+    return jsonify(resolve_mn31_dispatch(db.session, actor_id=_actor_id(), code=code, client_id=client_id))
+
+
+@scm_warehouse_bp.post("/despachos-mn31/confirmar")
+def mn31_dispatch_confirm():
+    return jsonify(confirm_mn31_dispatch(db.session, actor_id=_actor_id(), operation_id=_operation_id(), data=_body())), 201
+
+
+@scm_warehouse_bp.get("/despachos-mn31/operaciones/<uuid:operation_id>")
+def mn31_dispatch_operation(operation_id):
+    return jsonify(get_mn31_dispatch(db.session, actor_id=_actor_id(), operation_id=operation_id))

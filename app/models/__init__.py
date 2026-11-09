@@ -219,3 +219,4 @@ from app.models.scm_postpesaje_reprint import (
     ScmPostpesajeReprintJob,
     ScmPostpesajeReprintAudit,
 )
+from app.models.scm_mn31 import ScmClienteMn31, ScmMn31LoteAsignacion

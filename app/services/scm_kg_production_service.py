@@ -847,6 +847,12 @@ def sync_kg_production_inventory(
     movement is only the delta, so replaying a station command cannot duplicate
     mass.  Receipt later changes the location of this same existence.
     """
+    if manga.estado == "DESPACHADA_CLIENTE_MN31":
+        raise ScmServiceError(
+            "MN31_MANGA_TERMINAL",
+            "La manga ya fue despachada a cliente y no admite reingreso ni repesaje.",
+            status_code=409,
+        )
     if not force and not automatic_kg_intake_enabled():
         from app.models.scm_inventory_kg import ScmExistenciaMangaKg
         existing_stock = session.scalar(select(ScmExistenciaMangaKg.id).where(
@@ -1587,6 +1593,12 @@ def record_kg_production_evidence(
                 "WEIGHING_NOT_FOUND", "El pesaje no existe.", status_code=404
             )
         manga = weighing.manga
+        if manga.estado == "DESPACHADA_CLIENTE_MN31":
+            raise ScmServiceError(
+                "MN31_MANGA_TERMINAL",
+                "La manga ya fue despachada a cliente y no admite nueva evidencia.",
+                status_code=409,
+            )
         _kg_article(manga)
         if weighing.estado != "VIGENTE":
             raise ScmServiceError(

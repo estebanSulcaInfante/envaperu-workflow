@@ -101,7 +101,7 @@ class ScmMovimientoInventarioKg(db.Model):
     __table_args__ = (
         db.CheckConstraint(
             "tipo IN ('INGRESO_PRODUCCION', 'AJUSTE_POSITIVO', 'AJUSTE_NEGATIVO', "
-            "'TRASLADO_SALIDA', 'TRASLADO_ENTRADA', 'RETIRO_ARMADO', 'RETORNO_ENTRADA')",
+            "'TRASLADO_SALIDA', 'TRASLADO_ENTRADA', 'RETIRO_ARMADO', 'RETORNO_ENTRADA', 'SALIDA_CLIENTE_MN31')",
             name="ck_scm_movimiento_inventario_kg_tipo",
         ),
         db.CheckConstraint(
@@ -156,7 +156,7 @@ class ScmExistenciaMangaKg(db.Model):
     __tablename__ = "scm_existencia_manga_kg"
     __table_args__ = (
         db.CheckConstraint(
-            "estado_logistico IN ('EN_PRODUCCION', 'DISPONIBLE_PRODUCCION', 'RECIBIDA_ALMACEN', 'REVERSADA')",
+            "estado_logistico IN ('EN_PRODUCCION', 'DISPONIBLE_PRODUCCION', 'RECIBIDA_ALMACEN', 'REVERSADA', 'DESPACHADA_CLIENTE_MN31')",
             name="ck_scm_existencia_manga_kg_logistica",
         ),
         db.CheckConstraint(
@@ -253,7 +253,7 @@ class ScmUnidadFisicaKg(db.Model):
             name="ck_scm_unidad_fisica_kg_estado",
         ),
         db.CheckConstraint(
-            "estado_logistico IN ('EN_PRODUCCION', 'DISPONIBLE_PRODUCCION', 'RECIBIDA_ALMACEN', 'ALMACENADA_CONTROLADA', 'RESERVADA', 'RETIRADA_ARMADO', 'REPESADA_PENDIENTE_RECEPCION', 'PENDIENTE_CALIDAD', 'PENDIENTE_VERIFICACION', 'REVERSADA')",
+            "estado_logistico IN ('EN_PRODUCCION', 'DISPONIBLE_PRODUCCION', 'RECIBIDA_ALMACEN', 'ALMACENADA_CONTROLADA', 'RESERVADA', 'RETIRADA_ARMADO', 'RETIRADA_CLIENTE_MN31', 'REPESADA_PENDIENTE_RECEPCION', 'PENDIENTE_CALIDAD', 'PENDIENTE_VERIFICACION', 'REVERSADA')",
             name="ck_scm_unidad_fisica_kg_logistica",
         ),
         db.CheckConstraint("(kg_entregado IS NULL OR kg_entregado > 0) AND (kg_verificados IS NULL OR kg_verificados > 0)", name="ck_scm_unidad_fisica_kg_kg"),

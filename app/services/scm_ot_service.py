@@ -2745,6 +2745,7 @@ def _terminal_manga_states():
         "ETIQUETADA_FINAL",
         "PENDIENTE_RECEPCION_ALMACEN",
         "RECIBIDA",
+        "DESPACHADA_CLIENTE_MN31",
         "ANULADA",
     }
 
@@ -4405,7 +4406,7 @@ def _accumulate_manga_summary(summary, *, state, label_state, count):
         return
     summary["total"] += amount
     if state in {
-        "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN", "RECIBIDA",
+        "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN", "RECIBIDA", "DESPACHADA_CLIENTE_MN31",
     }:
         summary["cerradas"] += amount
     elif state in {"ABIERTA", "INCOMPLETA", "PESAJE_PARCIAL", "CONTINUIDAD_PENDIENTE", "EN_LLENADO"}:

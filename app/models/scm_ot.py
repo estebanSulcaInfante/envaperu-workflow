@@ -842,7 +842,7 @@ class ScmManga(db.Model):
             "'CONTINUIDAD_PENDIENTE', 'EN_LLENADO', "
             "'CERRADA_ARMADO_PENDIENTE_PESAJE', 'PESADA', "
             "'ETIQUETADA_FINAL', 'PENDIENTE_RECEPCION_ALMACEN', "
-            "'RECIBIDA', 'ANULADA')",
+            "'RECIBIDA', 'DESPACHADA_CLIENTE_MN31', 'ANULADA')",
             name="ck_scm_manga_estado",
         ),
         db.CheckConstraint(
