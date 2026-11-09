@@ -149,7 +149,7 @@ def _persist_lot_assignment(session, manga, lot):
         return assigned.to_dict()
     assigned = ScmMn31LoteAsignacion(
         manga_id=manga.id, manga_public_id=manga.public_id, manga_codigo=manga.codigo,
-        lote_public_id=uuid5(MN31_LOT_NAMESPACE, str(manga.public_id)), lote_codigo=lot["codigo"],
+        lote_public_id=uuid5(MN31_LOT_NAMESPACE, lot["codigo"]), lote_codigo=lot["codigo"],
         fuente="OT_FECHA_TURNO_CONFIRMACION",
     )
     session.add(assigned)
@@ -202,7 +202,7 @@ def resolve_mn31_dispatch(session, *, actor_id, code, client_id=None):
         raise ScmServiceError("MN31_MANGA_NOT_FOUND", "La identidad no tiene una manga MN31 asociada.", status_code=409)
     if manga.estado == "ANULADA":
         raise ScmServiceError("MN31_MANGA_ANULADA", "La manga anulada no puede despacharse.", status_code=409)
-    if unit.estado_calidad not in {"SIN_CONTROL", "LIBERADA"} or unit.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION", "RECIBIDA_ALMACEN"} or existence is None or existence.estado_calidad not in {"SIN_CONTROL", "LIBERADA"} or existence.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION", "RECIBIDA_ALMACEN"}:
+    if unit.estado_calidad != "SIN_CONTROL" or unit.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"} or existence is None or existence.estado_calidad != "SIN_CONTROL" or existence.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"}:
         raise ScmServiceError("MN31_STOCK_NOT_AVAILABLE", "La identidad no tiene custodia KG acreditada disponible.", status_code=409)
     weight, source_type, source_id, _source_at = _weight_source(session, manga, unit, existence)
     lot = _lot_for_manga(session, manga)
@@ -234,7 +234,7 @@ def _child_operation(session, root_id, suffix, actor, command):
     return child
 
 
-def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
+def confirm_mn31_dispatch(session, *, actor_id, operation_id, data, manage_transaction=True):
     assert_custody_enabled()
     actor = load_actor(session, actor_id, capability="DESPACHO_MN31_CONFIRMAR")
     reject_unknown_fields(data, allowed={"codigo", "unit_id", "version", "cliente_id", "documento", "motivo"})
@@ -243,8 +243,6 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
         raise ScmServiceError("MN31_CODE_REQUIRED", "codigo es obligatorio.", status_code=400)
     if not isinstance(data.get("cliente_id"), int) or isinstance(data.get("cliente_id"), bool):
         raise ScmServiceError("MN31_CLIENT_REQUIRED", "cliente_id es obligatorio.", status_code=422)
-    if not data.get("unit_id"):
-        raise ScmServiceError("MN31_UNIT_REQUIRED", "unit_id es obligatorio y debe coincidir con la resolución.", status_code=422)
     if data.get("version") is None:
         raise ScmServiceError("MN31_VERSION_REQUIRED", "version es obligatoria y debe coincidir con la resolución.", status_code=422)
     client = session.get(ScmClienteMn31, data["cliente_id"])
@@ -278,7 +276,7 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
             raise ScmServiceError("MN31_SKU_REQUIRED", "La identidad no corresponde a PC-000468.", status_code=409)
         if unit is not None and unit.estado != "ACTIVA":
             raise ScmServiceError("MN31_ALREADY_DISPATCHED", "La identidad ya no está vigente para despacho.", status_code=409)
-        if unit is not None and (unit.estado_calidad not in {"SIN_CONTROL", "LIBERADA"} or unit.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION", "RECIBIDA_ALMACEN"}):
+        if unit is not None and (unit.estado_calidad != "SIN_CONTROL" or unit.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"}):
             raise ScmServiceError("MN31_STOCK_NOT_AVAILABLE", "La identidad no tiene custodia KG acreditada disponible.", status_code=409)
         existence = session.scalar(select(ScmExistenciaMangaKg).where(ScmExistenciaMangaKg.unidad_fisica_kg_id == unit.id).with_for_update()) if unit is not None else None
         if existence is None and unit is not None and unit.recepcion_vigente_id:
@@ -297,7 +295,7 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
             raise ScmServiceError("MN31_MANGA_ANULADA", "La manga anulada no puede despacharse.", status_code=409)
         if manga.estado == "DESPACHADA_CLIENTE_MN31":
             raise ScmServiceError("MN31_ALREADY_DISPATCHED", "La manga ya fue despachada.", status_code=409)
-        if existence is None or existence.estado_calidad not in {"SIN_CONTROL", "LIBERADA"} or existence.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION", "RECIBIDA_ALMACEN"}:
+        if existence is None or existence.estado_calidad != "SIN_CONTROL" or existence.estado_logistico not in {"EN_PRODUCCION", "DISPONIBLE_PRODUCCION"}:
             raise ScmServiceError("MN31_STOCK_NOT_AVAILABLE", "La existencia KG no tiene custodia disponible.", status_code=409)
         weight, source_type, source_id, source_at = _weight_source(session, manga, unit, existence)
         lot = _lot_for_manga(session, manga)
@@ -325,7 +323,7 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
                 cantidad_delta_kg=delta, saldo_fisico_resultante_kg=balance.cantidad_fisica_kg,
                 motivo="Conciliación de peso autorizado MN31 antes de salida a cliente",
                 referencia_tipo="DESPACHO_MN31", referencia_id=str(manga.public_id), actor_id=actor.id,
-                operation_id=ingress_op.operation_id, pesaje_public_id=source_id,
+                operation_id=ingress_op.operation_id, pesaje_public_id=source_id if source_type.startswith("PESAJE") else None,
                 projection_sha256=_hash([str(manga.public_id), str(source_id), _decimal(weight)]),
                 peso_neto_snapshot_kg=weight, pesada_at_snapshot=source_at, fuente_tipo="MN31_CONCILIACION",
             )
@@ -341,7 +339,7 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
             saldo_fisico_resultante_kg=balance.cantidad_fisica_kg,
             motivo="Salida directa MN31 a cliente; no Armado",
             referencia_tipo="DESPACHO_MN31", referencia_id=str(manga.public_id), actor_id=actor.id,
-            operation_id=output_op.operation_id, pesaje_public_id=source_id,
+            operation_id=output_op.operation_id, pesaje_public_id=source_id if source_type.startswith("PESAJE") else None,
             projection_sha256=_hash([str(unit.id), str(operation_id), client.ruc]),
             peso_neto_snapshot_kg=weight, pesada_at_snapshot=source_at, fuente_tipo="MN31_CLIENTE",
         )
@@ -378,6 +376,7 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
         session.flush()
         response = {
             "operation_id": str(operation_id), "estado": "CONFIRMADO", "cliente": client.to_dict(),
+            "comprobante_scm": {"tipo": "DESPACHO_CLIENTE_MN31", "id": str(operation_id)},
             "despacho": {"codigo": code, "unidad_id": str(unit.id), "manga_id": str(manga.public_id), "manga_codigo": manga.codigo, "peso_neto_kg": _decimal(weight), "documento": command["documento"], "causa": "DESPACHO_CLIENTE_MN31", "lote": lot},
             "peso_fuente": _source_snapshot(session, source_type, source_id, weight, source_at),
             "conciliacion": {"delta_kg": _decimal(delta), "movimiento_ingreso": delta > 0},
@@ -390,6 +389,164 @@ def confirm_mn31_dispatch(session, *, actor_id, operation_id, data):
             actor_id=actor.id, actor_snapshot=actor_snapshot(actor), motivo=command["motivo"],
             before_json=before, after_json=response, operation_id=operation_id,
         ))
+        if manage_transaction:
+            session.commit()
+        return response
+    except Exception:
+        if manage_transaction:
+            session.rollback()
+        raise
+
+
+def confirm_mn31_dispatch_batch(session, *, actor_id, operation_id, data):
+    """Confirm several mangas under one idempotent, all-or-nothing operation."""
+    assert_custody_enabled()
+    actor = load_actor(session, actor_id, capability="DESPACHO_MN31_CONFIRMAR")
+    reject_unknown_fields(data, allowed={"cliente_id", "items", "documento", "motivo"})
+    if not isinstance(data.get("cliente_id"), int) or isinstance(data.get("cliente_id"), bool):
+        raise ScmServiceError("MN31_CLIENT_REQUIRED", "cliente_id es obligatorio.", status_code=422)
+    client = session.get(ScmClienteMn31, data["cliente_id"])
+    if client is None or not client.activo:
+        raise ScmServiceError("MN31_CLIENT_NOT_FOUND", "El cliente no existe o no está activo.", status_code=404)
+    reason = str(data.get("motivo") or "").strip()
+    if not reason:
+        raise ScmServiceError("MN31_MOTIVO_REQUIRED", "motivo es obligatorio para generar el comprobante causal SCM.", status_code=422)
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ScmServiceError("MN31_ITEMS_REQUIRED", "items requiere al menos una manga.", status_code=422)
+    if len(raw_items) > 200:
+        raise ScmServiceError("MN31_ITEMS_TOO_MANY", "El lote MN31 supera 200 mangas.", status_code=422)
+    normalized = []
+    seen = set()
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            raise ScmServiceError("MN31_ITEM_INVALID", "Cada item debe ser un objeto.", status_code=422, details={"index": index})
+        reject_unknown_fields(item, allowed={"codigo", "unit_id", "version"})
+        code = str(item.get("codigo") or "").strip()
+        if not code:
+            raise ScmServiceError("MN31_CODE_REQUIRED", "Cada item requiere codigo.", status_code=422, details={"index": index})
+        if item.get("version") is None:
+            raise ScmServiceError("MN31_VERSION_REQUIRED", "Cada item requiere version de la resolución.", status_code=422, details={"index": index})
+        version = expected_version(item["version"])
+        key = code
+        if key in seen:
+            raise ScmServiceError("MN31_DUPLICATE_ITEM", "Una identidad aparece más de una vez.", status_code=422, details={"codigo": code})
+        seen.add(key)
+        normalized.append({"codigo": code, "unit_id": item.get("unit_id"), "version": version})
+    normalized.sort(key=lambda item: (str(item.get("unit_id") or ""), item["codigo"]))
+    command = {"cliente_id": client.id, "items": normalized, "documento": str(data.get("documento") or "").strip() or None, "motivo": reason}
+    acquire_kg_productive_write_lock(session)
+    operation, replay = _reserve_operation(session, operation_id, MN31_ENDPOINT, actor, command)
+    if replay is not None:
+        return deepcopy(replay)
+    try:
+        results = []
+        total = Decimal("0")
+        for index, item in enumerate(normalized):
+            child_id = uuid5(operation_id, f"item:{index}:{item['codigo']}:{item.get('unit_id') or ''}")
+            item_data = {
+                "codigo": item["codigo"], "unit_id": item.get("unit_id"), "version": item["version"],
+                "cliente_id": client.id, "documento": command["documento"], "motivo": reason,
+            }
+            result = confirm_mn31_dispatch(
+                session, actor_id=actor.id, operation_id=child_id,
+                data=item_data, manage_transaction=False,
+            )
+            results.append(result)
+            total += Decimal(result["despacho"]["peso_neto_kg"])
+        response = {
+            "operation_id": str(operation_id), "estado": "CONFIRMADO", "cliente": client.to_dict(),
+            "comprobante_scm": {"tipo": "DESPACHO_CLIENTE_MN31_LOTE", "id": str(operation_id)},
+            "documento": command["documento"], "motivo": reason, "items": results,
+            "cantidad_mangas": len(results), "total_kg": _decimal(total), "terminal": True,
+        }
+        _complete(operation, response, 201)
+        session.add(ScmEvento(
+            aggregate_type="DESPACHO_MN31_LOTE", aggregate_id=str(operation_id),
+            tipo="MN31_DESPACHO_CLIENTE_LOTE_CONFIRMADO", actor_id=actor.id,
+            actor_snapshot=actor_snapshot(actor), motivo=reason,
+            after_json=response, operation_id=operation_id,
+        ))
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+
+def reverse_mn31_dispatch(session, *, actor_id, dispatch_operation_id, operation_id, data):
+    """Compensate a client dispatch without reopening production weighing."""
+    assert_custody_enabled()
+    actor = load_actor(session, actor_id, capability="DESPACHO_MN31_CONFIRMAR")
+    reject_unknown_fields(data, allowed={"motivo"})
+    reason = str(data.get("motivo") or "").strip()
+    if not reason:
+        raise ScmServiceError("MN31_MOTIVO_REQUIRED", "motivo es obligatorio para revertir.", status_code=422)
+    original = session.get(ScmOperacion, dispatch_operation_id)
+    if original is None or original.endpoint != MN31_ENDPOINT or original.response_json is None:
+        raise ScmServiceError("MN31_OPERATION_NOT_FOUND", "La operación MN31 no existe.", status_code=404)
+    command = {"dispatch_operation_id": str(dispatch_operation_id), "motivo": reason}
+    acquire_kg_productive_write_lock(session)
+    operation, replay = _reserve_operation(session, operation_id, "POST /despachos-mn31/revertir", actor, command)
+    if replay is not None:
+        return deepcopy(replay)
+    try:
+        items = original.response_json.get("items") if isinstance(original.response_json, dict) else None
+        if not items:
+            items = [original.response_json]
+        restored = []
+        for index, item in enumerate(items):
+            dispatch = item.get("despacho") or {}
+            manga_id = dispatch.get("manga_id")
+            unit_id = dispatch.get("unidad_id")
+            if not manga_id or not unit_id:
+                raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "El comprobante no conserva identidad suficiente.", status_code=409)
+            unit = session.scalar(select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == UUID(str(unit_id))).with_for_update())
+            if unit is None:
+                raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "La identidad KG no existe.", status_code=409)
+            manga = session.scalar(select(ScmManga).where(ScmManga.public_id == UUID(str(manga_id))).with_for_update())
+            if manga is None or manga.estado != "DESPACHADA_CLIENTE_MN31":
+                raise ScmServiceError("MN31_NOT_REVERSIBLE", "El despacho ya fue revertido o cambió de estado.", status_code=409)
+            movement = session.scalar(select(ScmMovimientoInventarioKg).where(ScmMovimientoInventarioKg.tipo == "SALIDA_CLIENTE_MN31", ScmMovimientoInventarioKg.referencia_id == str(manga.public_id)).order_by(ScmMovimientoInventarioKg.created_at.desc(), ScmMovimientoInventarioKg.id.desc()).with_for_update())
+            if movement is None:
+                raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "No existe salida compensable.", status_code=409)
+            balance = session.scalar(select(ScmSaldoInventarioKg).where(ScmSaldoInventarioKg.id == movement.saldo_id).with_for_update())
+            if balance is None:
+                raise ScmServiceError("MN31_REVERSAL_UNRECOVERABLE", "No existe saldo compensable.", status_code=409)
+            qty = Decimal(movement.peso_neto_snapshot_kg).quantize(Decimal("0.001"))
+            child_id = uuid5(operation_id, f"reversa:{index}:{unit.id}")
+            child, child_replay = _reserve_operation(session, child_id, "POST /despachos-mn31/revertir/movimiento", actor, command)
+            if child_replay is not None:
+                raise ScmServiceError("IDEMPOTENCY_OPERATION_INCOMPLETE", "La reversa hija ya existe.", status_code=409)
+            balance.cantidad_fisica_kg = Decimal(balance.cantidad_fisica_kg) + qty
+            balance.cantidad_retirada_kg = max(Decimal("0"), Decimal(balance.cantidad_retirada_kg or 0) - qty)
+            balance.version += 1
+            compensating = ScmMovimientoInventarioKg(
+                saldo_id=balance.id, tipo="AJUSTE_POSITIVO", cantidad_delta_kg=qty,
+                saldo_fisico_resultante_kg=balance.cantidad_fisica_kg,
+                motivo="Reversa compensatoria de despacho MN31 a cliente",
+                referencia_tipo="REVERSA_DESPACHO_MN31", referencia_id=str(manga.public_id), actor_id=actor.id,
+                operation_id=child_id, projection_sha256=_hash([str(movement.id), str(operation_id), reason]),
+                peso_neto_snapshot_kg=qty, pesada_at_snapshot=movement.pesada_at_snapshot, fuente_tipo="MN31_REVERSA",
+            )
+            session.add(compensating)
+            unit.estado = "ACTIVA"
+            unit.estado_logistico = "DISPONIBLE_PRODUCCION"
+            unit.saldo_id = balance.id
+            unit.ubicacion_id = balance.ubicacion_id
+            unit.version += 1
+            existence = session.scalar(select(ScmExistenciaMangaKg).where(ScmExistenciaMangaKg.unidad_fisica_kg_id == unit.id).with_for_update())
+            if existence is not None:
+                existence.estado_logistico = "DISPONIBLE_PRODUCCION"
+                existence.version += 1
+            manga.estado = "DESPACHO_MN31_REVERTIDO"
+            manga.version += 1
+            session.flush()
+            _complete(child, {"movement_id": str(compensating.id), "manga_id": str(manga.public_id)}, 201)
+            restored.append({"manga_id": str(manga.public_id), "unidad_id": str(unit.id), "kg": _decimal(qty), "movimiento_compensatorio_id": str(compensating.id)})
+        response = {"operation_id": str(operation_id), "estado": "REVERTIDO", "comprobante_origen": str(dispatch_operation_id), "motivo": reason, "items": restored, "terminal_produccion_preservada": True}
+        _complete(operation, response, 201)
+        session.add(ScmEvento(aggregate_type="DESPACHO_MN31", aggregate_id=str(dispatch_operation_id), tipo="MN31_DESPACHO_CLIENTE_REVERTIDO", actor_id=actor.id, actor_snapshot=actor_snapshot(actor), motivo=reason, before_json=original.response_json, after_json=response, operation_id=operation_id))
         session.commit()
         return response
     except Exception:

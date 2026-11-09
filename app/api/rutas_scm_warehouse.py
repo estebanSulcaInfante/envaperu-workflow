@@ -58,9 +58,11 @@ from app.services.scm_kg_custody_service import (
 )
 from app.services.scm_mn31_dispatch_service import (
     confirm_mn31_dispatch,
+    confirm_mn31_dispatch_batch,
     get_mn31_dispatch,
     list_mn31_clients,
     resolve_mn31_dispatch,
+    reverse_mn31_dispatch,
 )
 
 
@@ -409,9 +411,16 @@ def mn31_dispatch_resolve(code):
 
 @scm_warehouse_bp.post("/despachos-mn31/confirmar")
 def mn31_dispatch_confirm():
-    return jsonify(confirm_mn31_dispatch(db.session, actor_id=_actor_id(), operation_id=_operation_id(), data=_body())), 201
+    body = _body()
+    function = confirm_mn31_dispatch_batch if isinstance(body.get("items"), list) else confirm_mn31_dispatch
+    return jsonify(function(db.session, actor_id=_actor_id(), operation_id=_operation_id(), data=body)), 201
 
 
 @scm_warehouse_bp.get("/despachos-mn31/operaciones/<uuid:operation_id>")
 def mn31_dispatch_operation(operation_id):
     return jsonify(get_mn31_dispatch(db.session, actor_id=_actor_id(), operation_id=operation_id))
+
+
+@scm_warehouse_bp.post("/despachos-mn31/operaciones/<uuid:operation_id>/revertir")
+def mn31_dispatch_reverse(operation_id):
+    return jsonify(reverse_mn31_dispatch(db.session, actor_id=_actor_id(), dispatch_operation_id=operation_id, operation_id=_operation_id(), data=_body())), 201

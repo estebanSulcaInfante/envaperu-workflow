@@ -122,7 +122,7 @@ def _lock_manga_inventory_authority(session, *, manga_id=None, manga_public_id=N
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if manga is not None and manga.estado == "DESPACHADA_CLIENTE_MN31":
+    if manga is not None and manga.estado in {"DESPACHADA_CLIENTE_MN31", "DESPACHO_MN31_REVERTIDO"}:
         raise ScmServiceError(
             "MN31_MANGA_TERMINAL",
             "La manga ya fue despachada a cliente y no admite pesajes, reapertura ni correcciones.",
