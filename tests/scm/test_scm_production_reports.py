@@ -1,6 +1,6 @@
 from decimal import Decimal
 from io import BytesIO
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from types import SimpleNamespace
@@ -2718,13 +2718,17 @@ def test_progress_loader_uses_canonical_reopen_reference_before_and_after_new_co
         before_new_control = report_breakdown()
         assert before_new_control["medido"] == Decimal("5.000")
         assert before_new_control["incomplete"] is False
+        reopened_at = datetime.fromisoformat(reopened["reapertura"]["reabierta_at"])
+        if reopened_at.tzinfo is None:
+            reopened_at = reopened_at.replace(tzinfo=timezone.utc)
+        measured_at = reopened_at + timedelta(seconds=1)
 
         control = register_manga_weighing_control(
             db.session, station_id=station.station_id, operation_id=uuid4(), actor_id=approver.id,
             data={
                 "label_id": label["public_id"], "capture_id": str(uuid4()),
                 "control_type": "AVANCE_KG", "peso_bruto_kg": "5.800", "tara_kg": "0.100",
-                "tara_fuente": "TIPO_MANGA", "pesada_at": "2026-11-07T16:05:00-05:00",
+                "tara_fuente": "TIPO_MANGA", "pesada_at": measured_at.isoformat(),
                 "pesado_por_id": approver.id, "reading_stable": True,
             },
         )
