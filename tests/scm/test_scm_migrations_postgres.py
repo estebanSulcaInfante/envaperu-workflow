@@ -37,6 +37,7 @@ PRODUCT_ONBOARDING_REVISION = "f81d0e6f2b53"
 UNCLASSIFIED_PIECE_COLOR_REVISION = "f82e1f7a3c64"
 PRODUCTION_PROGRESS_VIEW_REVISION = "606aba7e7f3c"
 OPM_PREPARED_MATERIAL_REVISION = "c3a91f6e2d47"
+ARTICLE_FUNCTION_GRANT_REVISION = "fb2c3d4e5f60"
 ARTICLE_FUNCTION_GRANT_BASE_REVISION = "fa1b2c3d4e50"
 GLOBAL_KG_POLICY_BASE_REVISION = "f074de2410ac"
 HEAD_REVISION = ScriptDirectory(str(BACKEND_ROOT / "migrations")).get_current_head()
@@ -110,7 +111,7 @@ def _run_flask_db_failure(schema_url, *args):
     return result
 
 
-def _upgrade_head_after_global_kg_recovery(schema_url, schema_engine):
+def _upgrade_after_global_kg_recovery(schema_url, schema_engine, target=HEAD_REVISION):
     """Model the required data-recovery gate before installing KG policy."""
     _run_flask_db(schema_url, "upgrade", GLOBAL_KG_POLICY_BASE_REVISION)
     with schema_engine.begin() as connection:
@@ -119,7 +120,7 @@ def _upgrade_head_after_global_kg_recovery(schema_url, schema_engine):
             SET unidad_inventario = 'KG'
             WHERE clase IN ('PIEZA_COLOR', 'SUBENSAMBLE_WIP')
         """))
-    _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+    _run_flask_db(schema_url, "upgrade", target)
 
 
 def _downgrade_after_global_kg_policy(schema_url, schema_engine, target):
@@ -136,7 +137,7 @@ def _downgrade_after_global_kg_policy(schema_url, schema_engine, target):
 
 def _repeat_article_subtype_grant_upgrade(connection):
     revision = ScriptDirectory(str(BACKEND_ROOT / "migrations")).get_revision(
-        "fb2c3d4e5f60"
+        ARTICLE_FUNCTION_GRANT_REVISION
     )
     with Operations.context(MigrationContext.configure(connection)):
         revision.module.upgrade()
@@ -272,7 +273,7 @@ def test_article_subtype_helper_is_granted_only_to_scm_api_and_guard_stays_activ
             denied.value
         ).lower()
 
-        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        _run_flask_db(schema_url, "upgrade", ARTICLE_FUNCTION_GRANT_REVISION)
         # Re-executing this grant-only revision is explicitly idempotent.
         with schema_engine.begin() as connection:
             acl_before_repeat = _article_subtype_function_acl(connection)
@@ -367,7 +368,7 @@ def test_article_subtype_helper_downgrade_preserves_preexisting_scm_api_grant():
                 f"{quoted_schema}.scm_assert_article_subtype(integer) TO scm_api"
             ))
 
-        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        _run_flask_db(schema_url, "upgrade", ARTICLE_FUNCTION_GRANT_REVISION)
         _run_flask_db(schema_url, "downgrade", ARTICLE_FUNCTION_GRANT_BASE_REVISION)
         with schema_engine.connect() as connection:
             assert connection.execute(text("""
@@ -405,7 +406,7 @@ def test_article_subtype_helper_grant_upgrade_and_downgrade_with_missing_role():
             acl_before = _article_subtype_function_acl(connection)
 
         # With no runtime role, both upgrade and downgrade remain harmless.
-        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        _run_flask_db(schema_url, "upgrade", ARTICLE_FUNCTION_GRANT_REVISION)
         with schema_engine.connect() as connection:
             assert connection.execute(text(
                 "SELECT to_regrole('scm_api') IS NULL"
@@ -428,7 +429,7 @@ def test_article_subtype_helper_grant_upgrade_and_downgrade_with_missing_role():
         # Also cover removal of the optional role after this revision grants it.
         with admin_engine.begin() as connection:
             connection.execute(text("CREATE ROLE scm_api NOLOGIN"))
-        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        _run_flask_db(schema_url, "upgrade", ARTICLE_FUNCTION_GRANT_REVISION)
         with schema_engine.begin() as connection:
             preparer = connection.dialect.identifier_preparer
             quoted_schema = preparer.quote_identifier(schema)
@@ -570,7 +571,7 @@ def test_assignment_correction_downgrade_preserves_preexisting_capability():
                     """))
                 }
                 assert roles_before == {"MAQUINISTA"}
-            _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+            _run_flask_db(schema_url, "upgrade", "f99a1b2c3d09")
             with schema_engine.connect() as connection:
                 roles_after_upgrade = {
                     row[0] for row in connection.execute(text("""
@@ -2607,7 +2608,7 @@ def test_legacy_kit_contract_aborta_con_evidencia_y_luego_retira_esquema():
         failed = _run_flask_db_failure(
             schema_url,
             "upgrade",
-            HEAD_REVISION,
+            "a61c8d2f4e90",
         )
         assert "LEGACY_KIT_PRECONDITION_FAILED" in (
             failed.stdout + failed.stderr
@@ -2618,7 +2619,7 @@ def test_legacy_kit_contract_aborta_con_evidencia_y_luego_retira_esquema():
                 WHERE sku = 'KIT-CONTRACT-01'
             """))
 
-        _run_flask_db(schema_url, "upgrade", HEAD_REVISION)
+        _run_flask_db(schema_url, "upgrade", "a61c8d2f4e90")
         inspector = inspect(schema_engine)
         assert "pieza_componente" not in inspector.get_table_names()
         assert "tipo" not in {
@@ -2710,7 +2711,7 @@ def test_article_r1_backfills_catalogs_and_enforces_deferred_subtype():
                     )
             """))
 
-        _upgrade_head_after_global_kg_recovery(schema_url, schema_engine)
+        _upgrade_after_global_kg_recovery(schema_url, schema_engine, target="fc4e5f607182")
 
         with schema_engine.connect() as connection:
             assert connection.execute(text("""
@@ -3477,7 +3478,7 @@ def test_molde_pieza_migration_preserva_identidades_y_bloquea_downgrade_nm():
                 ("SKU-MIG-105", 105),
             ]
 
-        _upgrade_head_after_global_kg_recovery(schema_url, schema_engine)
+        _upgrade_after_global_kg_recovery(schema_url, schema_engine)
         with schema_engine.connect() as connection:
             assert connection.execute(text("""
                 SELECT id, pieza_id
@@ -4077,14 +4078,13 @@ def test_purchase_revision_restringe_datos_y_bloquea_downgrade_con_datos():
             ).scalar_one_or_none() is None
 
         _run_flask_db(schema_url, "check")
-        failed_downgrade = _run_flask_db_failure(
-            schema_url,
-            "downgrade",
-            CONTRACT_REVISION,
-        )
-        assert "downgrade destructivo bloqueado" in (
-            failed_downgrade.stdout + failed_downgrade.stderr
-        ).lower()
+        # Exercise the purchase guard itself. Later append-only ledgers also
+        # reject a full downgrade and would mask the purchase-specific error.
+        purchase_revision = ScriptDirectory(str(BACKEND_ROOT / "migrations")).get_revision(PURCHASE_REVISION)
+        with pytest.raises(DBAPIError, match="downgrade destructivo bloqueado"):
+            with schema_engine.begin() as connection:
+                with Operations.context(MigrationContext.configure(connection)):
+                    purchase_revision.module.downgrade()
 
         expected_purchase_tables = {
             "scm_evento",
