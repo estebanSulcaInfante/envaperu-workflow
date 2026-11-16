@@ -315,8 +315,6 @@ ROLES_SCM_INICIALES = (
         (
             "CALIDAD_RESOLVER",
             "CALIDAD_CONTROL_REGISTRAR",
-            "OT_VER",
-            "OF_VER",
             "ARTICULO_VER",
             "ESTRUCTURA_VER",
             "RUTA_VER",

@@ -226,6 +226,34 @@ def _decimal(value, field, *, integral=False):
     return parsed.quantize(Decimal("0.001"))
 
 
+_QUALITY_QUOTA_MISSING = object()
+
+
+def _quality_periodic_quota(data, *, default=_QUALITY_QUOTA_MISSING):
+    """Read the OT quality quota independently from production quantity."""
+    value = _QUALITY_QUOTA_MISSING
+    for field in (
+        "calidad_visitas_periodicas_previstas",
+        "visitas_periodicas_previstas",
+        "periodic_quota",
+    ):
+        if field in data:
+            value = data[field]
+            break
+    if value is _QUALITY_QUOTA_MISSING:
+        return default
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ScmServiceError(
+            "QUALITY_PERIODIC_QUOTA_INVALID",
+            "calidad_visitas_periodicas_previstas debe ser un entero no negativo o null.",
+            status_code=422,
+            details={"field": "calidad_visitas_periodicas_previstas"},
+        )
+    return value
+
+
 def _parse_date(value):
     try:
         return date.fromisoformat(str(value))
@@ -2009,6 +2037,9 @@ def create_fabrication_ot_header(
             "fecha_operativa",
             "turno",
             "maquinista_predeterminado_id",
+            "calidad_visitas_periodicas_previstas",
+            "visitas_periodicas_previstas",
+            "periodic_quota",
         },
     )
     try:
@@ -2078,6 +2109,9 @@ def create_fabrication_ot_header(
             maquinista_previsto_id=worker.id if worker else None,
             maquina_codigo_snapshot=machine.codigo,
             maquina_nombre_snapshot=machine.nombre,
+            calidad_visitas_periodicas_previstas=_quality_periodic_quota(
+                data, default=None
+            ),
         )
         session.add(ot)
         session.flush()
@@ -4185,6 +4219,9 @@ def create_ot(
             maquina_codigo_snapshot=machine.codigo,
             maquina_nombre_snapshot=machine.nombre,
             snapshot_peso_colada_gr=order.snapshot_peso_colada_gr,
+            calidad_visitas_periodicas_previstas=_quality_periodic_quota(
+                data, default=None
+            ),
         )
         session.add(ot)
         session.flush()
@@ -4400,6 +4437,9 @@ def create_fabrication_ot(
                 maquinista_previsto_id=worker.id,
                 maquina_codigo_snapshot=machine.codigo,
                 maquina_nombre_snapshot=machine.nombre,
+                calidad_visitas_periodicas_previstas=_quality_periodic_quota(
+                    data, default=None
+                ),
             )
             session.add(ot)
             session.flush()
@@ -4409,6 +4449,19 @@ def create_fabrication_ot(
                 "La cabecera del turno ya esta cerrada.",
                 status_code=409,
             )
+        requested_quality_quota = _quality_periodic_quota(data)
+        if requested_quality_quota is not _QUALITY_QUOTA_MISSING:
+            if (
+                ot.calidad_visitas_periodicas_previstas is not None
+                and requested_quality_quota is not None
+                and requested_quality_quota != ot.calidad_visitas_periodicas_previstas
+            ):
+                raise ScmServiceError(
+                    "QUALITY_PERIODIC_QUOTA_CONFLICT",
+                    "La OT ya tiene una cuota de Calidad configurada distinta.",
+                    status_code=409,
+                )
+            ot.calidad_visitas_periodicas_previstas = requested_quality_quota
         duplicate = session.scalar(
             select(ScmTrabajoOt)
             .join(ScmTrabajoColor)
@@ -4611,6 +4664,9 @@ def _serialize_ot_summary(
         "maquina_id": ot.maquina_id,
         "maquina": machine_name,
         "maquina_codigo": machine_code,
+        "calidad_visitas_periodicas_previstas": getattr(
+            ot, "calidad_visitas_periodicas_previstas", None
+        ),
         "centro_trabajo": center_payload,
         "responsable_id": ot.responsable_id,
         "responsable": _summary_worker_name(getattr(ot, "responsable", None)),
@@ -4635,6 +4691,12 @@ def _serialize_ot_summary(
         payload.update(assembly_context)
     if quality:
         payload["visitas_calidad_confirmadas"] = quality_visits or []
+        payload["disponibilidad"] = {
+            "maquina_id": ot.maquina_id,
+            "maquina_activa": getattr(machine, "activo", None),
+            "maquina_estado": getattr(machine, "estado", None),
+            "fuente": "OT_CENTRAL",
+        }
     return payload
 
 
@@ -4647,6 +4709,21 @@ def _summary_view(value):
             "OT_VIEW_INVALID", "vista debe ser resumen o calidad.", status_code=400
         )
     return normalized
+
+
+def _load_quality_read_actor(session, actor_id):
+    """Allow the bounded projection to existing readers or quality writers."""
+    actor = load_actor(session, actor_id)
+    if actor.tiene_capacidad("CALIDAD_CONTROL_REGISTRAR"):
+        return actor
+    if actor.tiene_capacidad("OT_VER") and actor.tiene_capacidad("OF_VER"):
+        return actor
+    raise ScmServiceError(
+        "CAPABILITY_REQUIRED",
+        "El actor requiere Calidad o las capacidades OT_VER y OF_VER.",
+        status_code=403,
+        details={"capabilities_any": ["CALIDAD_CONTROL_REGISTRAR", "OT_VER+OF_VER"]},
+    )
 
 
 def _summary_machine_id(value):
@@ -5152,9 +5229,10 @@ def _list_ots_summary(
         RegistroDiarioProduccion.orden_operacion_id,
         RegistroDiarioProduccion.cantidad_objetivo,
         RegistroDiarioProduccion.cantidad_confirmada,
+        RegistroDiarioProduccion.calidad_visitas_periodicas_previstas,
         RegistroDiarioProduccion.trabajo_color_contexto_id,
         RegistroDiarioProduccion.ot_fabricacion_contexto_id,
-        Maquina.id.label("machine_row_id"), Maquina.nombre.label("machine_name"), Maquina.codigo.label("machine_code"),
+        Maquina.id.label("machine_row_id"), Maquina.nombre.label("machine_name"), Maquina.codigo.label("machine_code"), Maquina.activo.label("machine_active"), Maquina.estado.label("machine_state"),
         ScmCentroTrabajo.id.label("center_id"), ScmCentroTrabajo.codigo.label("center_code"), ScmCentroTrabajo.nombre.label("center_name"), ScmCentroTrabajo.tipo.label("center_type"),
     ).select_from(RegistroDiarioProduccion)
     # Use scalar worker lookups to retain one row per OT without ORM graph loading.
@@ -5201,7 +5279,7 @@ def _list_ots_summary(
     for row in rows:
         data = row._mapping
         headers.append(SimpleNamespace(
-            id=data["ot_id"], public_id=data["public_id"], codigo_ot=data["codigo_ot"], estado=data["estado"], tipo_ot=data["tipo_ot"], version=data["version"], fecha=data["fecha"], turno=data["turno"], maquina_id=data["maquina_id"], maquina_nombre_snapshot=data["maquina_nombre_snapshot"] or data["machine_name"], maquina_codigo_snapshot=data["maquina_codigo_snapshot"] or data["machine_code"], maquina=SimpleNamespace(id=data["machine_row_id"], nombre=data["machine_name"], codigo=data["machine_code"]) if data["machine_row_id"] else None, centro_trabajo=SimpleNamespace(id=data["center_id"], codigo=data["center_code"], nombre=data["center_name"], tipo=data["center_type"]) if data["center_id"] else None, responsable_id=data["responsable_id"], responsable=data["responsible_name"], maquinista_previsto_id=data["maquinista_previsto_id"], maquinista_previsto=data["planned_name"], modo_ejecucion_ensamble=data["modo_ejecucion_ensamble"], orden_operacion_id=data["orden_operacion_id"], cantidad_objetivo=data["cantidad_objetivo"], cantidad_confirmada=data["cantidad_confirmada"], trabajo_color_contexto_id=data["trabajo_color_contexto_id"], ot_fabricacion_contexto_id=data["ot_fabricacion_contexto_id"],
+            id=data["ot_id"], public_id=data["public_id"], codigo_ot=data["codigo_ot"], estado=data["estado"], tipo_ot=data["tipo_ot"], version=data["version"], fecha=data["fecha"], turno=data["turno"], maquina_id=data["maquina_id"], maquina_nombre_snapshot=data["maquina_nombre_snapshot"] or data["machine_name"], maquina_codigo_snapshot=data["maquina_codigo_snapshot"] or data["machine_code"], maquina=SimpleNamespace(id=data["machine_row_id"], nombre=data["machine_name"], codigo=data["machine_code"], activo=data["machine_active"], estado=data["machine_state"]) if data["machine_row_id"] else None, centro_trabajo=SimpleNamespace(id=data["center_id"], codigo=data["center_code"], nombre=data["center_name"], tipo=data["center_type"]) if data["center_id"] else None, responsable_id=data["responsable_id"], responsable=data["responsible_name"], maquinista_previsto_id=data["maquinista_previsto_id"], maquinista_previsto=data["planned_name"], modo_ejecucion_ensamble=data["modo_ejecucion_ensamble"], orden_operacion_id=data["orden_operacion_id"], cantidad_objetivo=data["cantidad_objetivo"], cantidad_confirmada=data["cantidad_confirmada"], calidad_visitas_periodicas_previstas=data["calidad_visitas_periodicas_previstas"], trabajo_color_contexto_id=data["trabajo_color_contexto_id"], ot_fabricacion_contexto_id=data["ot_fabricacion_contexto_id"],
         ))
     ot_ids = [item.id for item in headers]
     works, _work_rows = _summary_work_rows(session, ot_ids, quality=quality)
@@ -5229,10 +5307,11 @@ def _list_ots_summary(
 
 
 def get_ot(session, *, actor_id, public_id, view=None):
-    load_actor(session, actor_id, capability="OT_VER")
     view_mode = _summary_view(view)
     if view_mode == "calidad":
-        load_actor(session, actor_id, capability="OF_VER")
+        _load_quality_read_actor(session, actor_id)
+    else:
+        load_actor(session, actor_id, capability="OT_VER")
     statement = select(RegistroDiarioProduccion).where(
         RegistroDiarioProduccion.public_id == public_id
     )
@@ -5358,10 +5437,11 @@ def list_ots(
     shift=None,
     view=None,
 ):
-    load_actor(session, actor_id, capability="OT_VER")
     view_mode = _summary_view(view)
     if view_mode == "calidad":
-        load_actor(session, actor_id, capability="OF_VER")
+        _load_quality_read_actor(session, actor_id)
+    else:
+        load_actor(session, actor_id, capability="OT_VER")
     if view_mode in {"resumen", "calidad"}:
         return _list_ots_summary(
             session,
@@ -5721,9 +5801,10 @@ def list_plant_journeys(
     view=None,
 ):
     """Aggregate both plant journey families in one authenticated request."""
-    load_actor(session, actor_id, capability="OT_VER")
     if _summary_view(view) == "calidad":
-        load_actor(session, actor_id, capability="OF_VER")
+        _load_quality_read_actor(session, actor_id)
+    else:
+        load_actor(session, actor_id, capability="OT_VER")
     parsed_date = _parse_date(operational_date)
     normalized_shift = required_text(
         shift,

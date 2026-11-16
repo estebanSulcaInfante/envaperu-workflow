@@ -14,11 +14,19 @@ from app.models.scm_ot import ScmTrabajoOt
 from app.models.scm_ot import ScmManga, ScmTramoMangaTrabajo
 from app.models.scm_production_orders import ScmOrdenOperacionSalida
 from app.models.scm_quality import ScmVisitaCalidad
-from app.services.scm_ot_service import _complete_operation, _event, _reserve_operation
+from app.services.scm_ot_service import (
+    _complete_operation,
+    _event,
+    _QUALITY_QUOTA_MISSING,
+    _load_quality_read_actor,
+    _reserve_operation,
+    _quality_periodic_quota,
+)
 from app.services.scm_service_support import (
     ScmServiceError,
     expected_version,
     load_actor,
+    load_actor_any,
     reject_unknown_fields,
     required_text,
 )
@@ -48,8 +56,9 @@ def _parse_datetime(value):
 
 
 def _load_quality_context(session, *, actor_id, public_id, trabajo_id=None):
-    load_actor(session, actor_id, capability="OT_VER")
-    load_actor(session, actor_id, capability="OF_VER")
+    # Read visibility is bounded to the quality capability or the pre-existing
+    # pair of OT/OF readers; it never grants either capability.
+    _load_quality_read_actor(session, actor_id)
     ot = session.scalar(
         select(RegistroDiarioProduccion).where(
             RegistroDiarioProduccion.public_id == public_id,
@@ -378,6 +387,29 @@ def _next_free_visit_number(session, *, ot_id, start):
     return candidate
 
 
+def _quality_quota_summary(session, *, ot):
+    confirmed = int(session.scalar(select(func.count()).where(
+        ScmVisitaCalidad.ot_id == ot.id,
+        ScmVisitaCalidad.tipo == "PERIODICA",
+        ScmVisitaCalidad.estado == "CONFIRMED",
+    )) or 0)
+    drafts = int(session.scalar(select(func.count()).where(
+        ScmVisitaCalidad.ot_id == ot.id,
+        ScmVisitaCalidad.tipo == "PERIODICA",
+        ScmVisitaCalidad.estado == "DRAFT",
+    )) or 0)
+    quota = ot.calidad_visitas_periodicas_previstas
+    return {
+        "periodic_quota": quota,
+        "calidad_visitas_periodicas_previstas": quota,
+        "periodic_confirmed": confirmed,
+        "periodic_drafts": drafts,
+        "periodic_remaining": (
+            max(0, quota - confirmed) if quota is not None else None
+        ),
+    }
+
+
 def list_quality_visits(session, *, actor_id, public_id):
     ot, _ = _load_quality_context(session, actor_id=actor_id, public_id=public_id)
     visits = session.scalars(
@@ -386,30 +418,121 @@ def list_quality_visits(session, *, actor_id, public_id):
         .where(ScmVisitaCalidad.ot_id == ot.id)
         .order_by(ScmVisitaCalidad.tipo, ScmVisitaCalidad.numero, ScmVisitaCalidad.recorded_at)
     ).all()
-    confirmed = sum(item.estado == "CONFIRMED" and item.tipo == "PERIODICA" for item in visits)
-    drafts = sum(item.estado == "DRAFT" and item.tipo == "PERIODICA" for item in visits)
+    quota_summary = _quality_quota_summary(session, ot=ot)
+    machine = ot.maquina
     return {
         "items": [_serialize_visit(item) for item in visits],
         "next_periodic_number": _next_visit_number(session, ot_id=ot.id),
-        # The pilot has no approved numeric quota yet; make that explicit so a
-        # client cannot mistake the current count for an enforced limit.
-        "periodic_quota": None,
-        "periodic_confirmed": confirmed,
-        "periodic_drafts": drafts,
+        **quota_summary,
         "availability": {
             "maquina_id": ot.maquina_id,
+            "maquina_codigo": ot.maquina_codigo_snapshot or (
+                machine.codigo if machine is not None else None
+            ),
+            "maquina_nombre": ot.maquina_nombre_snapshot or (
+                machine.nombre if machine is not None else None
+            ),
+            "maquina_activa": machine.activo if machine is not None else None,
+            "maquina_estado": machine.estado if machine is not None else None,
+            "fuente": "OT_CENTRAL",
             "fecha_operativa": ot.fecha.isoformat() if ot.fecha else None,
             "turno": ot.turno,
         },
     }
 
 
+def update_quality_configuration(
+    session, *, actor_id, public_id, operation_id, data
+):
+    """Edit only the Quality quota through the existing planning capability."""
+    actor = load_actor_any(
+        session, actor_id, capabilities=("OT_CREAR", "OPERACION_PLANIFICAR")
+    )
+    reject_unknown_fields(
+        data,
+        allowed={
+            "version",
+            "calidad_visitas_periodicas_previstas",
+            "visitas_periodicas_previstas",
+            "periodic_quota",
+        },
+    )
+    operation, replay = _reserve_operation(
+        session,
+        operation_id,
+        f"/ots/{public_id}/calidad-configuracion",
+        actor,
+        data,
+    )
+    if replay is not None:
+        return replay
+    try:
+        ot = session.scalar(select(RegistroDiarioProduccion).where(
+            RegistroDiarioProduccion.public_id == public_id,
+            RegistroDiarioProduccion.codigo_ot_sintetico.is_(False),
+        ).with_for_update())
+        if ot is None:
+            raise ScmServiceError("OT_NOT_FOUND", "La OT SCM no existe.", status_code=404)
+        if ot.estado not in {"PLANIFICADA", "EN_EJECUCION"}:
+            raise ScmServiceError(
+                "QUALITY_PERIODIC_QUOTA_STATE_INVALID",
+                "La cuota de Calidad solo se puede configurar en una OT planificada o en ejecución.",
+                status_code=409,
+            )
+        if "version" not in data or expected_version(data.get("version")) != ot.version:
+            raise ScmServiceError(
+                "VERSION_CONFLICT",
+                "La OT cambio. Actualiza antes de editar la configuración.",
+                status_code=409,
+            )
+        quota = _quality_periodic_quota(data)
+        if quota is _QUALITY_QUOTA_MISSING:
+            raise ScmServiceError(
+                "QUALITY_PERIODIC_QUOTA_REQUIRED",
+                "La configuración debe indicar la cuota de visitas periódicas o null.",
+                status_code=400,
+            )
+        confirmed = int(session.scalar(select(func.count()).where(
+            ScmVisitaCalidad.ot_id == ot.id,
+            ScmVisitaCalidad.tipo == "PERIODICA",
+            ScmVisitaCalidad.estado == "CONFIRMED",
+        )) or 0)
+        if quota is not None and quota < confirmed:
+            raise ScmServiceError(
+                "QUALITY_PERIODIC_QUOTA_BELOW_CONFIRMED",
+                "La cuota no puede ser menor que las visitas periódicas confirmadas.",
+                status_code=409,
+                details={"periodic_confirmed": confirmed},
+            )
+        ot.calidad_visitas_periodicas_previstas = quota
+        ot.version += 1
+        session.flush()
+        summary = _quality_quota_summary(session, ot=ot)
+        response = {
+            "ot": {
+                "public_id": str(ot.public_id),
+                "codigo_ot": ot.codigo_ot,
+                "version": ot.version,
+                "calidad_visitas_periodicas_previstas": quota,
+            },
+            **summary,
+        }
+        session.add(_event(
+            "ORDEN_TRABAJO", ot.id, "QUALITY_PERIODIC_QUOTA_UPDATED",
+            actor, operation, response,
+        ))
+        _complete_operation(operation, response, status=200)
+        session.commit()
+        return response
+    except Exception:
+        session.rollback()
+        raise
+
+
 def save_quality_visit_draft(session, *, actor_id, public_id, operation_id, data):
     actor = _require_register_actor(session, actor_id)
     # Read visibility is part of the write contract, including idempotent
     # replays; never reveal a previous response after OF/OT access is revoked.
-    load_actor(session, actor_id, capability="OT_VER")
-    load_actor(session, actor_id, capability="OF_VER")
     reject_unknown_fields(
         data,
         allowed={"id", "trabajo_id", "tipo", "numero", "version", "observed_at", "payload"},
@@ -527,8 +650,6 @@ def save_quality_visit_draft(session, *, actor_id, public_id, operation_id, data
 
 def confirm_quality_visit(session, *, actor_id, public_id, visit_id, operation_id, data):
     actor = _require_register_actor(session, actor_id)
-    load_actor(session, actor_id, capability="OT_VER")
-    load_actor(session, actor_id, capability="OF_VER")
     reject_unknown_fields(data, allowed={"version"})
     operation, replay = _reserve_operation(
         session, operation_id, f"/ots/{public_id}/calidad-visitas/{visit_id}/confirmar", actor, data,
@@ -560,6 +681,23 @@ def confirm_quality_visit(session, *, actor_id, public_id, visit_id, operation_i
         if work is None:
             raise ScmServiceError("QUALITY_WORK_NOT_FOUND", "El trabajo no pertenece a la OT.", status_code=404)
         _validate_confirmation_payload(session, visit=visit, work=work)
+        if visit.tipo == "PERIODICA":
+            quota = ot.calidad_visitas_periodicas_previstas
+            confirmed_periodic = int(session.scalar(select(func.count()).where(
+                ScmVisitaCalidad.ot_id == ot.id,
+                ScmVisitaCalidad.tipo == "PERIODICA",
+                ScmVisitaCalidad.estado == "CONFIRMED",
+            )) or 0)
+            if quota is not None and confirmed_periodic >= quota:
+                raise ScmServiceError(
+                    "QUALITY_PERIODIC_QUOTA_EXCEEDED",
+                    "La cuota de visitas periódicas de la OT ya fue alcanzada.",
+                    status_code=409,
+                    details={
+                        "periodic_quota": quota,
+                        "periodic_confirmed": confirmed_periodic,
+                    },
+                )
         if visit.tipo == "INICIAL" and _initial_window_closed(ot):
             raise ScmServiceError(
                 "QUALITY_INITIAL_WINDOW_CLOSED",

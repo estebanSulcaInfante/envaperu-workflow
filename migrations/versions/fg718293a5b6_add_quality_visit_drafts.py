@@ -65,9 +65,7 @@ def upgrade():
         SELECT rol.id, capacidad.id
           FROM rol_operativo rol
           JOIN scm_capacidad capacidad
-            ON capacidad.codigo IN (
-                'CALIDAD_CONTROL_REGISTRAR', 'OT_VER', 'OF_VER'
-            )
+            ON capacidad.codigo = 'CALIDAD_CONTROL_REGISTRAR'
          WHERE rol.codigo IN ('CALIDAD', 'SUPERVISOR', 'GERENCIA', 'GERENTE_GENERAL')
         ON CONFLICT DO NOTHING
     """))

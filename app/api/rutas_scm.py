@@ -136,6 +136,7 @@ from app.services.scm_quality_visit_service import (
     confirm_quality_visit,
     list_quality_visits,
     save_quality_visit_draft,
+    update_quality_configuration,
 )
 from app.services.scm_weighing_service import (
     annul_manga_weighing,
@@ -1754,6 +1755,17 @@ def ots_calidad_visitas(public_id):
         actor_id=_actor_id(),
         public_id=public_id,
     ))
+
+
+@scm_bp.patch("/ots/<uuid:public_id>/calidad-configuracion")
+def ots_calidad_configuracion_actualizar(public_id):
+    return jsonify(update_quality_configuration(
+        db.session,
+        actor_id=_actor_id(),
+        public_id=public_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 200
 
 
 @scm_bp.patch("/ots/<uuid:public_id>/calidad-visitas")

@@ -50,6 +50,11 @@ class RegistroDiarioProduccion(db.Model):
             name="ck_registro_diario_cantidad_objetivo",
         ),
         db.CheckConstraint(
+            "calidad_visitas_periodicas_previstas IS NULL OR "
+            "calidad_visitas_periodicas_previstas >= 0",
+            name="ck_registro_diario_calidad_visitas_periodicas_previstas",
+        ),
+        db.CheckConstraint(
             "(tipo_ot = 'ENSAMBLE' AND modo_ejecucion_ensamble IN "
             "('MESA', 'CONCURRENTE')) OR "
             "(tipo_ot <> 'ENSAMBLE' AND modo_ejecucion_ensamble IS NULL)",
@@ -228,6 +233,9 @@ class RegistroDiarioProduccion(db.Model):
     cantidad_confirmada = db.Column(
         db.Numeric(15, 3), nullable=False, default=0, server_default="0"
     )
+    # Quality planning quota.  It is deliberately independent from the
+    # production quantity and nullable for legacy OT rows.
+    calidad_visitas_periodicas_previstas = db.Column(db.Integer, nullable=True)
     
     # INPUTS: DATOS GENERALES (CABECERA)
     fecha = db.Column(db.Date, nullable=False)
@@ -414,6 +422,9 @@ class RegistroDiarioProduccion(db.Model):
             ),
             'cantidad_confirmada': format(
                 self.cantidad_confirmada or 0, 'f'
+            ),
+            'calidad_visitas_periodicas_previstas': (
+                self.calidad_visitas_periodicas_previstas
             ),
             'orden': self.orden_id,
             'orden_operacion_id': (

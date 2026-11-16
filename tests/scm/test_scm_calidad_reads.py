@@ -103,11 +103,40 @@ def test_quality_projection_keeps_ot_ver_capability_boundary(app, client, scm_co
         )
 
     assert denied_journey.status_code == 403
-    assert denied_journey.get_json()["error"]["details"] == {"capability": "OF_VER"}
+    assert denied_journey.get_json()["error"]["details"] == {
+        "capabilities_any": ["CALIDAD_CONTROL_REGISTRAR", "OT_VER+OF_VER"]
+    }
     assert denied_list.status_code == 403
-    assert denied_list.get_json()["error"]["details"] == {"capability": "OF_VER"}
+    assert denied_list.get_json()["error"]["details"] == {
+        "capabilities_any": ["CALIDAD_CONTROL_REGISTRAR", "OT_VER+OF_VER"]
+    }
     assert denied_detail.status_code == 403
-    assert denied_detail.get_json()["error"]["details"] == {"capability": "OF_VER"}
+
+
+def test_quality_inspector_reads_bounded_projection_without_normal_ot_navigation(
+    app, client, scm_config,
+):
+    from test_scm_production_observability import _actor, _seed_observability_graph
+
+    with app.app_context():
+        seeded = _seed_observability_graph()
+        inspector = _actor("INSPECTOR-QUALITY", {"CALIDAD_CONTROL_REGISTRAR"})
+        quality_detail = client.get(
+            f"/api/scm/v1/ots/{seeded['fab'].public_id}",
+            query_string={"vista": "calidad"},
+            headers={"X-Actor-Id": str(inspector.id)},
+        )
+        assert quality_detail.status_code == 200
+        normal_detail = client.get(
+            f"/api/scm/v1/ots/{seeded['fab'].public_id}",
+            headers={"X-Actor-Id": str(inspector.id)},
+        )
+        assert normal_detail.status_code == 403
+        quality_visits = client.get(
+            f"/api/scm/v1/ots/{seeded['fab'].public_id}/calidad-visitas",
+            headers={"X-Actor-Id": str(inspector.id)},
+        )
+        assert quality_visits.status_code == 200
 
 
 @pytest.mark.parametrize("two_works", [False, True])

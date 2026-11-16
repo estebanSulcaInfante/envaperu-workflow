@@ -3,11 +3,13 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from test_scm_production_observability import _actor
-from test_scm_ot_service import _seed_two_work_aggregate
+from test_scm_ot_service import _seed_fabrication_order, _seed_two_work_aggregate
 from app.extensions import db
 from app.models.scm_quality import ScmVisitaCalidad
+from app.models.registro import RegistroDiarioProduccion
 from app.models.trabajador import RolOperativo
 from app.services.scm_quality_visit_service import _initial_cutoff, _initial_window_closed
+from app.services.scm_ot_service import create_fabrication_ot_header
 
 
 def _headers(actor_id, operation_id=None):
@@ -387,7 +389,170 @@ def test_quality_register_capability_is_assigned_only_to_confirmed_roles(app, sc
             if {cap.codigo for cap in row.capacidades} >= {"OT_VER", "OF_VER"}
         }
     assert granted == {"CALIDAD", "SUPERVISOR", "GERENCIA", "GERENTE_GENERAL"}
-    assert {"CALIDAD", "SUPERVISOR", "GERENCIA", "GERENTE_GENERAL"} <= read_granted
+    assert {"SUPERVISOR", "GERENCIA", "GERENTE_GENERAL"} <= read_granted
+    assert "CALIDAD" not in read_granted
+
+
+def test_quality_projection_reader_pair_can_read_but_cannot_register(
+    app, client, scm_config,
+):
+    with app.app_context():
+        seeded = _seed_two_work_aggregate(first_quantity=20)
+        reader = _actor("CAL-READ-ONLY", {"OT_VER", "OF_VER"})
+        ot_id = seeded["header"]["public_id"]
+        work_id = seeded["first"]["trabajo_color"]["id"]
+        assert client.get(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            headers={"X-Actor-Id": str(reader.id)},
+        ).status_code == 200
+        response = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            json={"trabajo_id": work_id, "tipo": "PERIODICA", "payload": {}},
+            headers=_headers(reader.id),
+        )
+        assert response.status_code == 403
+        assert response.get_json()["error"]["code"] == "CAPABILITY_REQUIRED"
+
+
+def test_quality_inspector_can_write_without_general_ot_of_reads(
+    app, client, scm_config,
+):
+    with app.app_context():
+        seeded = _seed_two_work_aggregate(first_quantity=20)
+        inspector = _actor("CAL-INSPECTOR", {"CALIDAD_CONTROL_REGISTRAR"})
+        ot_id = seeded["header"]["public_id"]
+        work_id = seeded["first"]["trabajo_color"]["id"]
+        _output_id, payload = _wire_payload(client, ot_id, work_id, inspector.id)
+        response = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            json={
+                "trabajo_id": work_id,
+                "tipo": "PERIODICA",
+                "numero": 2,
+                "observed_at": "2026-11-14T14:00:00-05:00",
+                "payload": payload,
+            },
+            headers=_headers(inspector.id),
+        )
+        assert response.status_code == 200, response.get_json()
+
+
+def test_quality_quota_is_persisted_on_ot_and_edited_with_planning_version(
+    app, client, scm_config,
+):
+    with app.app_context():
+        seeded = _seed_two_work_aggregate(first_quantity=20)
+        planner = _actor("CAL-PLANNER", {"OT_CREAR"})
+        ot_id = seeded["header"]["public_id"]
+        response = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-configuracion",
+            json={
+                "version": seeded["header"]["version"],
+                "calidad_visitas_periodicas_previstas": 3,
+            },
+            headers=_headers(planner.id),
+        )
+        assert response.status_code == 200, response.get_json()
+        assert response.get_json()["periodic_quota"] == 3
+        quality_reader = _register_actor()
+        visits = client.get(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            headers={"X-Actor-Id": str(quality_reader.id)},
+        )
+        assert visits.status_code == 200
+        assert visits.get_json()["periodic_quota"] == 3
+        ot = db.session.scalar(
+            db.select(RegistroDiarioProduccion).where(
+                RegistroDiarioProduccion.public_id == UUID(ot_id)
+            )
+        )
+        assert ot.calidad_visitas_periodicas_previstas == 3
+        assert ot.cantidad_objetivo is None
+
+
+def test_quality_quota_is_accepted_when_creating_the_ot_header(
+    app, scm_config,
+):
+    with app.app_context():
+        creator, _approver, order, _run, _output = _seed_fabrication_order()
+        header = create_fabrication_ot_header(
+            db.session,
+            actor_id=creator.id,
+            operation_id=uuid4(),
+            data={
+                "maquina_id": order.fabricacion.maquina_prevista_id,
+                "fecha_operativa": "2026-11-16",
+                "turno": "DIA",
+                "calidad_visitas_periodicas_previstas": 3,
+            },
+        )["ot"]
+        assert header["calidad_visitas_periodicas_previstas"] == 3
+        ot = db.session.scalar(
+            db.select(RegistroDiarioProduccion).where(
+                RegistroDiarioProduccion.public_id == UUID(header["public_id"])
+            )
+        )
+        assert ot.calidad_visitas_periodicas_previstas == 3
+
+
+def test_quality_quota_blocks_confirmation_after_confirmed_count(
+    app, client, scm_config,
+):
+    with app.app_context():
+        seeded = _seed_two_work_aggregate(first_quantity=20)
+        planner = _actor("CAL-PLANNER-LIMIT", {"OT_CREAR"})
+        actor = _register_actor()
+        ot_id = seeded["header"]["public_id"]
+        configured = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-configuracion",
+            json={
+                "version": seeded["header"]["version"],
+                "calidad_visitas_periodicas_previstas": 1,
+            },
+            headers=_headers(planner.id),
+        )
+        assert configured.status_code == 200, configured.get_json()
+        work_id = seeded["first"]["trabajo_color"]["id"]
+        _output_id, payload = _wire_payload(client, ot_id, work_id, actor.id)
+        saved = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            json={
+                "trabajo_id": work_id,
+                "tipo": "PERIODICA",
+                "numero": 2,
+                "observed_at": "2026-11-14T14:00:00-05:00",
+                "payload": payload,
+            },
+            headers=_headers(actor.id),
+        )
+        assert saved.status_code == 200, saved.get_json()
+        first_confirmed = client.put(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas/{saved.get_json()['visit']['id']}/confirmar",
+            json={"version": saved.get_json()["visit"]["version"]},
+            headers=_headers(actor.id),
+        )
+        assert first_confirmed.status_code == 200, first_confirmed.get_json()
+        second_work_id = seeded["second"]["trabajo_color"]["id"]
+        _output_id, second_payload = _wire_payload(client, ot_id, second_work_id, actor.id)
+        second_saved = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            json={
+                "trabajo_id": second_work_id,
+                "tipo": "PERIODICA",
+                "numero": 3,
+                "observed_at": "2026-11-14T15:00:00-05:00",
+                "payload": second_payload,
+            },
+            headers=_headers(actor.id),
+        )
+        assert second_saved.status_code == 200, second_saved.get_json()
+        confirmed = client.put(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas/{second_saved.get_json()['visit']['id']}/confirmar",
+            json={"version": second_saved.get_json()["visit"]["version"]},
+            headers=_headers(actor.id),
+        )
+        assert confirmed.status_code == 409
+        assert confirmed.get_json()["error"]["code"] == "QUALITY_PERIODIC_QUOTA_EXCEEDED"
 
 
 def test_quality_initial_cutoff_uses_lima_date_and_shift():
