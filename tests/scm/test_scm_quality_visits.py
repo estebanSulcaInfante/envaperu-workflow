@@ -570,6 +570,17 @@ def test_quality_quota_is_advisory_and_retries_are_idempotent(
             f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
             headers={"X-Actor-Id": str(actor.id)},
         ).get_json()["periodic_confirmed"] == 2
+        lowered = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-configuracion",
+            json={
+                "version": configured_again.get_json()["ot"]["version"],
+                "calidad_visitas_periodicas_previstas": 1,
+            },
+            headers=_headers(planner.id),
+        )
+        assert lowered.status_code == 200, lowered.get_json()
+        assert lowered.get_json()["periodic_confirmed"] == 2
+        assert lowered.get_json()["periodic_quota"] == 1
         replay = client.put(
             f"/api/scm/v1/ots/{ot_id}/calidad-visitas/{second_saved.get_json()['visit']['id']}/confirmar",
             json={"version": second_saved.get_json()["visit"]["version"]},

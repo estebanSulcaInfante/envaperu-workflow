@@ -492,18 +492,6 @@ def update_quality_configuration(
                 "La configuración debe indicar la cuota de visitas periódicas o null.",
                 status_code=400,
             )
-        confirmed = int(session.scalar(select(func.count()).where(
-            ScmVisitaCalidad.ot_id == ot.id,
-            ScmVisitaCalidad.tipo == "PERIODICA",
-            ScmVisitaCalidad.estado == "CONFIRMED",
-        )) or 0)
-        if quota is not None and quota < confirmed:
-            raise ScmServiceError(
-                "QUALITY_PERIODIC_QUOTA_BELOW_CONFIRMED",
-                "La cuota no puede ser menor que las visitas periódicas confirmadas.",
-                status_code=409,
-                details={"periodic_confirmed": confirmed},
-            )
         ot.calidad_visitas_periodicas_previstas = quota
         ot.version += 1
         session.flush()
