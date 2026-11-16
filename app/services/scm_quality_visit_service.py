@@ -681,23 +681,6 @@ def confirm_quality_visit(session, *, actor_id, public_id, visit_id, operation_i
         if work is None:
             raise ScmServiceError("QUALITY_WORK_NOT_FOUND", "El trabajo no pertenece a la OT.", status_code=404)
         _validate_confirmation_payload(session, visit=visit, work=work)
-        if visit.tipo == "PERIODICA":
-            quota = ot.calidad_visitas_periodicas_previstas
-            confirmed_periodic = int(session.scalar(select(func.count()).where(
-                ScmVisitaCalidad.ot_id == ot.id,
-                ScmVisitaCalidad.tipo == "PERIODICA",
-                ScmVisitaCalidad.estado == "CONFIRMED",
-            )) or 0)
-            if quota is not None and confirmed_periodic >= quota:
-                raise ScmServiceError(
-                    "QUALITY_PERIODIC_QUOTA_EXCEEDED",
-                    "La cuota de visitas periódicas de la OT ya fue alcanzada.",
-                    status_code=409,
-                    details={
-                        "periodic_quota": quota,
-                        "periodic_confirmed": confirmed_periodic,
-                    },
-                )
         if visit.tipo == "INICIAL" and _initial_window_closed(ot):
             raise ScmServiceError(
                 "QUALITY_INITIAL_WINDOW_CLOSED",

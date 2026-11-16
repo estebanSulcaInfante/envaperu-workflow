@@ -495,7 +495,7 @@ def test_quality_quota_is_accepted_when_creating_the_ot_header(
         assert ot.calidad_visitas_periodicas_previstas == 3
 
 
-def test_quality_quota_blocks_confirmation_after_confirmed_count(
+def test_quality_quota_is_advisory_and_retries_are_idempotent(
     app, client, scm_config,
 ):
     with app.app_context():
@@ -507,7 +507,7 @@ def test_quality_quota_blocks_confirmation_after_confirmed_count(
             f"/api/scm/v1/ots/{ot_id}/calidad-configuracion",
             json={
                 "version": seeded["header"]["version"],
-                "calidad_visitas_periodicas_previstas": 1,
+                "calidad_visitas_periodicas_previstas": 0,
             },
             headers=_headers(planner.id),
         )
@@ -532,6 +532,19 @@ def test_quality_quota_blocks_confirmation_after_confirmed_count(
             headers=_headers(actor.id),
         )
         assert first_confirmed.status_code == 200, first_confirmed.get_json()
+        assert client.get(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            headers={"X-Actor-Id": str(actor.id)},
+        ).get_json()["periodic_confirmed"] == 1
+        configured_again = client.patch(
+            f"/api/scm/v1/ots/{ot_id}/calidad-configuracion",
+            json={
+                "version": configured.get_json()["ot"]["version"],
+                "calidad_visitas_periodicas_previstas": 1,
+            },
+            headers=_headers(planner.id),
+        )
+        assert configured_again.status_code == 200, configured_again.get_json()
         second_work_id = seeded["second"]["trabajo_color"]["id"]
         _output_id, second_payload = _wire_payload(client, ot_id, second_work_id, actor.id)
         second_saved = client.patch(
@@ -546,13 +559,24 @@ def test_quality_quota_blocks_confirmation_after_confirmed_count(
             headers=_headers(actor.id),
         )
         assert second_saved.status_code == 200, second_saved.get_json()
+        retry_id = uuid4()
         confirmed = client.put(
             f"/api/scm/v1/ots/{ot_id}/calidad-visitas/{second_saved.get_json()['visit']['id']}/confirmar",
             json={"version": second_saved.get_json()["visit"]["version"]},
-            headers=_headers(actor.id),
+            headers=_headers(actor.id, retry_id),
         )
-        assert confirmed.status_code == 409
-        assert confirmed.get_json()["error"]["code"] == "QUALITY_PERIODIC_QUOTA_EXCEEDED"
+        assert confirmed.status_code == 200, confirmed.get_json()
+        assert client.get(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas",
+            headers={"X-Actor-Id": str(actor.id)},
+        ).get_json()["periodic_confirmed"] == 2
+        replay = client.put(
+            f"/api/scm/v1/ots/{ot_id}/calidad-visitas/{second_saved.get_json()['visit']['id']}/confirmar",
+            json={"version": second_saved.get_json()["visit"]["version"]},
+            headers=_headers(actor.id, retry_id),
+        )
+        assert replay.status_code == 200
+        assert replay.get_json() == confirmed.get_json()
 
 
 def test_quality_initial_cutoff_uses_lima_date_and_shift():
