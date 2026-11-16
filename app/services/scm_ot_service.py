@@ -4664,9 +4664,6 @@ def _serialize_ot_summary(
         "maquina_id": ot.maquina_id,
         "maquina": machine_name,
         "maquina_codigo": machine_code,
-        "calidad_visitas_periodicas_previstas": getattr(
-            ot, "calidad_visitas_periodicas_previstas", None
-        ),
         "centro_trabajo": center_payload,
         "responsable_id": ot.responsable_id,
         "responsable": _summary_worker_name(getattr(ot, "responsable", None)),
@@ -4690,6 +4687,9 @@ def _serialize_ot_summary(
     if assembly_context is not None:
         payload.update(assembly_context)
     if quality:
+        payload["calidad_visitas_periodicas_previstas"] = getattr(
+            ot, "calidad_visitas_periodicas_previstas", None
+        )
         payload["visitas_calidad_confirmadas"] = quality_visits or []
         payload["disponibilidad"] = {
             "maquina_id": ot.maquina_id,
