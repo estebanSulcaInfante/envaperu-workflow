@@ -220,3 +220,4 @@ from app.models.scm_postpesaje_reprint import (
     ScmPostpesajeReprintAudit,
 )
 from app.models.scm_mn31 import ScmClienteMn31, ScmMn31LoteAsignacion
+from app.models.scm_quality import ScmVisitaCalidad

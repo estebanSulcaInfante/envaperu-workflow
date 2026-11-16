@@ -132,6 +132,11 @@ from app.services.scm_ot_service import (
     transition_color_work,
     transition_ot,
 )
+from app.services.scm_quality_visit_service import (
+    confirm_quality_visit,
+    list_quality_visits,
+    save_quality_visit_draft,
+)
 from app.services.scm_weighing_service import (
     annul_manga_weighing,
     approve_weighing_correction,
@@ -1738,7 +1743,40 @@ def ots_detalle(public_id):
         db.session,
         actor_id=_actor_id(),
         public_id=public_id,
+        view=request.args.get("vista"),
     ))
+
+
+@scm_bp.get("/ots/<uuid:public_id>/calidad-visitas")
+def ots_calidad_visitas(public_id):
+    return jsonify(list_quality_visits(
+        db.session,
+        actor_id=_actor_id(),
+        public_id=public_id,
+    ))
+
+
+@scm_bp.patch("/ots/<uuid:public_id>/calidad-visitas")
+def ots_calidad_visita_borrador(public_id):
+    return jsonify(save_quality_visit_draft(
+        db.session,
+        actor_id=_actor_id(),
+        public_id=public_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 200
+
+
+@scm_bp.put("/ots/<uuid:public_id>/calidad-visitas/<uuid:visit_id>/confirmar")
+def ots_calidad_visita_confirmar(public_id, visit_id):
+    return jsonify(confirm_quality_visit(
+        db.session,
+        actor_id=_actor_id(),
+        public_id=public_id,
+        visit_id=visit_id,
+        operation_id=_idempotency_key(),
+        data=_json_body(),
+    )), 200
 
 
 @scm_bp.get("/ots")

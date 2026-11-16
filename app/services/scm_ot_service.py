@@ -17,9 +17,10 @@ from sqlalchemy.orm import aliased, selectinload
 from app.extensions import db
 from app.models.lote import LoteSalidaPiezaColor
 from app.models.maquina import Maquina
+from app.models.molde import Molde
 from app.models.orden import OrdenProduccion
 from app.models.registro import RegistroDiarioProduccion
-from app.models.producto import ColorBase, ColorProduccion, FamiliaColor
+from app.models.producto import ColorBase, ColorProduccion, FamiliaColor, PiezaColor
 from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
 from app.models.scm_auditoria import ScmEvento, ScmOperacion
 from app.models.scm_empaque import (
@@ -31,6 +32,7 @@ from app.models.scm_empaque import (
 from app.models.scm_ot import (
     ScmAsignacionPersonalTrabajoOt,
     ScmAsignacionPlanMangaOt,
+    ScmCorreccionAsignacionManga,
     ScmEtiquetaManga,
     ScmControlPesoManga,
     ScmCierreProductivoKg,
@@ -46,6 +48,7 @@ from app.models.scm_ot import (
     utc_now,
 )
 from app.models.scm_internal_supply import ScmSolicitudAbastecimiento
+from app.models.scm_quality import ScmVisitaCalidad
 from app.models.scm_inventory import ScmUbicacionInventario
 from app.models.scm_inline_wip import (
     ScmReservaWipSalida,
@@ -53,6 +56,7 @@ from app.models.scm_inline_wip import (
 )
 from app.models.scm_production_orders import (
     ScmCorridaFabricacion,
+    ScmOrdenFabricacion,
     ScmOrdenOperacion,
     ScmOrdenOperacionSalida,
 )
@@ -322,6 +326,84 @@ def _serialize_manga_segment(segment):
     return payload
 
 
+def _serialize_quality_label(label):
+    if label is None:
+        return None
+    return {
+        "id": label.id,
+        "public_id": str(label.public_id),
+        "tipo": label.tipo,
+        "version": label.version,
+        "estado": label.estado,
+    }
+
+
+def _serialize_quality_manga(manga, *, work=None):
+    """Compact station read model; avoids per-manga controls/segments payloads."""
+    current_segment = effective_segment(manga)
+    current_work = work or effective_work(manga)
+    correction = getattr(manga, "correccion_asignacion", None)
+    origin_work = (
+        correction.origen_trabajo
+        if correction is not None and correction.origen_trabajo is not None
+        else manga.trabajo
+    )
+    current_assignment = effective_assignment(manga)
+    current_label = next(
+        (
+            label for label in reversed(manga.etiquetas)
+            if label.tipo == "PREPESAJE" and label.estado != "INVALIDADA"
+        ),
+        None,
+    )
+    article = (
+        manga.lote_articulo.articulo
+        if manga.lote_articulo is not None else None
+    )
+    return {
+        "id": manga.id,
+        "public_id": str(manga.public_id),
+        "codigo": manga.codigo,
+        "trabajo_color_id": str(current_work.id) if current_work else None,
+        "trabajo_color_codigo": current_work.codigo if current_work else None,
+        "trabajo_color_origen_id": str(manga.trabajo_ot_id) if manga.trabajo_ot_id else None,
+        "trabajo_color_origen_codigo": origin_work.codigo if origin_work else None,
+        "trabajo_color_actual_id": str(current_work.id) if current_work else None,
+        "trabajo_color_actual_codigo": current_work.codigo if current_work else None,
+        "asignacion_personal_trabajo_id": str(current_assignment.id) if current_assignment else None,
+        "tipo": manga.tipo,
+        "estado": manga.estado,
+        "unidad_inventario": article.unidad_inventario if article else None,
+        "secuencia_ot": manga.secuencia_ot,
+        "cantidad_planificada_un": _compact_number(manga.cantidad_planificada_un),
+        "cantidad_asignada_un": _compact_number(manga.cantidad_asignada_un),
+        "cantidad_confirmada_un": (
+            _compact_number(manga.cantidad_confirmada_un)
+            if manga.cantidad_confirmada_un is not None else None
+        ),
+        "pieza_color_sku": manga.pieza_color_sku_snapshot,
+        "articulo_codigo": manga.articulo_codigo_snapshot,
+        "articulo_nombre": manga.articulo_nombre_snapshot,
+        "color": manga.color_snapshot,
+        "tipo_manga": manga.tipo_contenedor_nombre_snapshot,
+        "maquinista_previsto_id": manga.maquinista_previsto_id,
+        "version": manga.version,
+        "etiqueta_vigente": _serialize_quality_label(current_label),
+        "heredada_de_ot_anterior": bool(
+            manga.trabajo_ot_id and current_work and manga.trabajo_ot_id != current_work.id
+        ),
+        "resuelta_para_trabajo": _manga_resolved_for_work(manga, work or current_work)
+        if (work or current_work) else False,
+        "continuidad": {
+            "estado": (
+                "PENDIENTE_VINCULO" if manga.estado == "CONTINUIDAD_PENDIENTE"
+                and current_segment is None else "CON_SEGMENTO" if current_segment else "SIN_CORTE"
+            ),
+            "qr_preservado": bool(current_segment),
+        },
+    }
+
+
 def _serialize_manga(manga):
     current_label = next(
         (
@@ -516,8 +598,11 @@ def _work_confirmed_quantity(work):
     return segmented + direct + inline
 
 
-def _serialize_manga_for_work(manga, work):
-    payload = _serialize_manga(manga)
+def _serialize_manga_for_work(manga, work, *, quality=False):
+    payload = (
+        _serialize_quality_manga(manga, work=work)
+        if quality else _serialize_manga(manga)
+    )
     payload["heredada_de_ot_anterior"] = (
         manga.trabajo_ot_id is not None and manga.trabajo_ot_id != work.id
     )
@@ -613,7 +698,7 @@ def _work_output_articles(work):
     return _deduplicated_output_articles(operation_outputs)
 
 
-def _serialize_color_work(work, *, output_articles=None):
+def _serialize_color_work(work, *, output_articles=None, quality_mangas=False):
     color = work.trabajo_color
     catalog_color = (
         color.corrida.color_produccion
@@ -682,7 +767,9 @@ def _serialize_color_work(work, *, output_articles=None):
             if current_assignment else None
         ),
         "mangas": [
-            _serialize_manga_for_work(item, work) for item in _work_mangas(work)
+            _serialize_manga_for_work(
+                item, work, quality=quality_mangas
+            ) for item in _work_mangas(work)
         ],
         "continuidades_heredadas": [
             _serialize_manga_segment(item)
@@ -849,6 +936,7 @@ def _serialize_ot(
     assembly_context=_SERIALIZATION_CONTEXT_UNSET,
     color_context=_SERIALIZATION_CONTEXT_UNSET,
     output_articles_by_work=None,
+    quality_mangas=False,
 ):
     if mangas is None:
         mangas = ScmManga.query.filter_by(ot_id=ot.id).order_by(
@@ -897,11 +985,16 @@ def _serialize_ot(
                 if output_articles_by_work is not None
                 else None
             ),
+            quality_mangas=quality_mangas,
         )
         if contextual_work is not None
         else None
     )
-    payload["mangas"] = [_serialize_manga(manga) for manga in mangas]
+    payload["mangas"] = [
+        _serialize_quality_manga(manga)
+        if quality_mangas else _serialize_manga(manga)
+        for manga in mangas
+    ]
     units = {
         str(item.lote_articulo.articulo.unidad_inventario).upper()
         for item in mangas
@@ -961,6 +1054,7 @@ def _serialize_ot(
                 if output_articles_by_work is not None
                 else None
             ),
+            quality_mangas=quality_mangas,
         )
         for item in color_works
     ]
@@ -4440,14 +4534,15 @@ def _summary_article(article):
 
 
 def _serialize_ot_summary(
-    ot, *, works, manga_summaries, assembly_context=None,
+    ot, *, works, manga_summaries, assembly_context=None, quality=False,
+    quality_visits=None,
 ):
     """Serialize the opt-in OT read model without touching ``_serialize_ot``."""
     work_payloads = []
     for work in works:
         work_id = work.id
         assignment = getattr(work, "asignacion_vigente", None)
-        work_payloads.append({
+        work_payload = {
             "id": str(work_id),
             "codigo": work.codigo,
             "secuencia": work.secuencia,
@@ -4477,7 +4572,16 @@ def _serialize_ot_summary(
             },
             "asignacion_vigente": assignment,
             "mangas_resumen": manga_summaries.get(work_id, _empty_manga_summary()),
-        })
+        }
+        if quality:
+            work_payload.update({
+                "molde_id": getattr(work, "molde_id", None),
+                "molde_nombre": getattr(work, "molde_nombre", None),
+                "snapshot_tiempo_ciclo_seg": getattr(
+                    work, "snapshot_tiempo_ciclo_seg", None
+                ),
+            })
+        work_payloads.append(work_payload)
 
     ot_summary = manga_summaries.get(ot.id, _empty_manga_summary())
     center = getattr(ot, "centro_trabajo", None)
@@ -4529,6 +4633,8 @@ def _serialize_ot_summary(
     }
     if assembly_context is not None:
         payload.update(assembly_context)
+    if quality:
+        payload["visitas_calidad_confirmadas"] = quality_visits or []
     return payload
 
 
@@ -4536,9 +4642,9 @@ def _summary_view(value):
     normalized = str(value or "").strip().lower()
     if not normalized:
         return None
-    if normalized != "resumen":
+    if normalized not in {"resumen", "calidad"}:
         raise ScmServiceError(
-            "OT_VIEW_INVALID", "vista debe ser resumen.", status_code=400
+            "OT_VIEW_INVALID", "vista debe ser resumen o calidad.", status_code=400
         )
     return normalized
 
@@ -4655,7 +4761,41 @@ def _summary_manga_aggregates(session, *, ot_ids, work_ids):
     return summaries
 
 
-def _summary_work_rows(session, ot_ids):
+def _quality_confirmed_summary(session, ot_ids):
+    if not ot_ids:
+        return {}
+    rows = session.execute(
+        select(
+            ScmVisitaCalidad.id,
+            ScmVisitaCalidad.ot_id,
+            ScmVisitaCalidad.tipo,
+            ScmVisitaCalidad.numero,
+            ScmVisitaCalidad.trabajo_ot_id,
+            ScmTrabajoOt.codigo,
+            ScmVisitaCalidad.confirmed_at,
+        ).join(
+            ScmTrabajoOt, ScmTrabajoOt.id == ScmVisitaCalidad.trabajo_ot_id,
+        ).where(
+            ScmVisitaCalidad.ot_id.in_(ot_ids),
+            ScmVisitaCalidad.estado == "CONFIRMED",
+        ).order_by(
+            ScmVisitaCalidad.ot_id, ScmVisitaCalidad.numero,
+        )
+    ).all()
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row.ot_id, []).append({
+            "visita_id": str(row.id),
+            "tipo": row.tipo,
+            "numero": row.numero,
+            "trabajo_id": str(row.trabajo_ot_id),
+            "trabajo_codigo": row.codigo,
+            "confirmado_at": row.confirmed_at.isoformat() if row.confirmed_at else None,
+        })
+    return grouped
+
+
+def _summary_work_rows(session, ot_ids, *, quality=False):
     if not ot_ids:
         return [], {}
     assignment_id = (
@@ -4753,6 +4893,32 @@ def _summary_work_rows(session, ot_ids):
         .where(ScmTrabajoOt.orden_trabajo_id.in_(ot_ids))
         .order_by(ScmTrabajoOt.orden_trabajo_id, ScmTrabajoOt.secuencia, ScmOrdenOperacionSalida.id)
     )
+    if quality:
+        statement = statement.outerjoin(
+            ScmArticuloPiezaColor,
+            ScmArticuloPiezaColor.articulo_id == ScmArticulo.id,
+        ).outerjoin(
+            PiezaColor,
+            PiezaColor.sku == ScmArticuloPiezaColor.pieza_color_sku,
+        ).outerjoin(
+            ScmOrdenFabricacion,
+            ScmOrdenFabricacion.orden_operacion_id == ScmTrabajoOt.orden_operacion_id,
+        ).outerjoin(
+            Molde,
+            Molde.codigo == func.coalesce(
+                ScmTrabajoColor.molde_codigo_snapshot,
+                ScmOrdenFabricacion.molde_id,
+            ),
+        )
+        statement = statement.add_columns(
+            func.coalesce(
+                ScmTrabajoColor.molde_codigo_snapshot,
+                ScmOrdenFabricacion.molde_id,
+            ).label("mold_id"),
+            Molde.nombre.label("mold_name"),
+            ScmOrdenFabricacion.snapshot_tiempo_ciclo_seg.label("cycle_seconds"),
+            PiezaColor.pieza_id.label("piece_id"),
+        )
     by_work = {}
     for row in session.execute(statement).all():
         mapping = row._mapping
@@ -4786,6 +4952,12 @@ def _summary_work_rows(session, ot_ids):
                 if mapping["assignment_id"] is not None else None
             ),
             "articulos_salida": [],
+            "molde_id": mapping.get("mold_id") if quality else None,
+            "molde_nombre": mapping.get("mold_name") if quality else None,
+            "snapshot_tiempo_ciclo_seg": (
+                _compact_number(mapping["cycle_seconds"])
+                if quality and mapping.get("cycle_seconds") is not None else None
+            ),
             "output_ids": set(),
             "run_outputs": [],
             "operation_outputs": [],
@@ -4800,6 +4972,8 @@ def _summary_work_rows(session, ot_ids):
                 "clase": mapping["article_class"],
                 "unidad": mapping["article_unit"],
             }
+            if quality:
+                article["pieza_id"] = mapping.get("piece_id")
             # Keep the exact run as the preferred source.  The operation-level
             # fallback intentionally retains every operation output, matching
             # _batch_work_output_articles when a run has no own outputs.
@@ -4938,6 +5112,7 @@ def _summary_assembly_contexts(session, ot_ids):
 def _list_ots_summary(
     session, *, actor_id, op_number=None, operation_order_id=None, tipo_ot=None,
     operational_date=None, machine_id=None, machine=None, shift=None,
+    quality=False, fabrication_context_public_id=None,
 ):
     normalized_type = str(tipo_ot or "").strip().upper()
     if normalized_type and normalized_type not in ("FABRICACION", "ENSAMBLE"):
@@ -5005,6 +5180,12 @@ def _list_ots_summary(
         filters.append(or_(func.upper(RegistroDiarioProduccion.maquina_codigo_snapshot) == normalized_machine, func.upper(RegistroDiarioProduccion.maquina_nombre_snapshot) == normalized_machine))
     if normalized_shift:
         filters.append(RegistroDiarioProduccion.turno == normalized_shift)
+    if fabrication_context_public_id is not None:
+        filters.extend((
+            RegistroDiarioProduccion.tipo_ot == "ENSAMBLE",
+            RegistroDiarioProduccion.modo_ejecucion_ensamble == "CONCURRENTE",
+            RegistroDiarioProduccion.ot_fabricacion_contexto_id == fabrication_context_public_id,
+        ))
     if op_number:
         filters.append(RegistroDiarioProduccion.orden_id == op_number)
     if operation_order_id:
@@ -5023,7 +5204,7 @@ def _list_ots_summary(
             id=data["ot_id"], public_id=data["public_id"], codigo_ot=data["codigo_ot"], estado=data["estado"], tipo_ot=data["tipo_ot"], version=data["version"], fecha=data["fecha"], turno=data["turno"], maquina_id=data["maquina_id"], maquina_nombre_snapshot=data["maquina_nombre_snapshot"] or data["machine_name"], maquina_codigo_snapshot=data["maquina_codigo_snapshot"] or data["machine_code"], maquina=SimpleNamespace(id=data["machine_row_id"], nombre=data["machine_name"], codigo=data["machine_code"]) if data["machine_row_id"] else None, centro_trabajo=SimpleNamespace(id=data["center_id"], codigo=data["center_code"], nombre=data["center_name"], tipo=data["center_type"]) if data["center_id"] else None, responsable_id=data["responsable_id"], responsable=data["responsible_name"], maquinista_previsto_id=data["maquinista_previsto_id"], maquinista_previsto=data["planned_name"], modo_ejecucion_ensamble=data["modo_ejecucion_ensamble"], orden_operacion_id=data["orden_operacion_id"], cantidad_objetivo=data["cantidad_objetivo"], cantidad_confirmada=data["cantidad_confirmada"], trabajo_color_contexto_id=data["trabajo_color_contexto_id"], ot_fabricacion_contexto_id=data["ot_fabricacion_contexto_id"],
         ))
     ot_ids = [item.id for item in headers]
-    works, _work_rows = _summary_work_rows(session, ot_ids)
+    works, _work_rows = _summary_work_rows(session, ot_ids, quality=quality)
     work_ids = [work.id for work in works]
     # Keep the mapping from the SQL row list without a second query.
     work_by_ot = {}
@@ -5031,24 +5212,137 @@ def _list_ots_summary(
     for work_id, raw in _work_rows.items():
         work_by_ot.setdefault(raw["ot_id"], []).append(work_by_id[work_id])
     summaries = _summary_manga_aggregates(session, ot_ids=ot_ids, work_ids=work_ids)
+    quality_visits = _quality_confirmed_summary(session, ot_ids) if quality else {}
     assembly_contexts = _summary_assembly_contexts(session, [item.id for item in headers if item.tipo_ot == "ENSAMBLE"])
     items = []
     for header in headers:
         assembly = assembly_contexts.get(header.id)
-        items.append(_serialize_ot_summary(header, works=work_by_ot.get(header.id, []), manga_summaries=summaries, assembly_context=assembly))
+        items.append(_serialize_ot_summary(
+            header,
+            works=work_by_ot.get(header.id, []),
+            manga_summaries=summaries,
+            assembly_context=assembly,
+            quality=quality,
+            quality_visits=quality_visits.get(header.id, []),
+        ))
     return {"items": items}
 
 
-def get_ot(session, *, actor_id, public_id):
+def get_ot(session, *, actor_id, public_id, view=None):
     load_actor(session, actor_id, capability="OT_VER")
-    ot = session.scalar(select(RegistroDiarioProduccion).where(
+    view_mode = _summary_view(view)
+    if view_mode == "calidad":
+        load_actor(session, actor_id, capability="OF_VER")
+    statement = select(RegistroDiarioProduccion).where(
         RegistroDiarioProduccion.public_id == public_id
-    ))
+    )
+    if view_mode == "calidad":
+        statement = statement.options(
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.trabajo_color)
+            .selectinload(ScmTrabajoColor.corrida)
+            .selectinload(ScmCorridaFabricacion.salidas)
+            .selectinload(ScmOrdenOperacionSalida.articulo),
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.orden_operacion)
+            .selectinload(ScmOrdenOperacion.salidas)
+            .selectinload(ScmOrdenOperacionSalida.articulo),
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.mangas)
+            .selectinload(ScmManga.lote_articulo)
+            .selectinload(ScmLoteArticulo.articulo),
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.mangas)
+            .selectinload(ScmManga.correccion_asignacion)
+            .selectinload(ScmCorreccionAsignacionManga.origen_trabajo),
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.mangas)
+            .selectinload(ScmManga.correccion_asignacion)
+            .selectinload(ScmCorreccionAsignacionManga.destino_trabajo),
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.mangas)
+            .selectinload(ScmManga.correccion_asignacion)
+            .selectinload(ScmCorreccionAsignacionManga.destino_asignacion),
+            selectinload(RegistroDiarioProduccion.trabajos_ot)
+            .selectinload(ScmTrabajoOt.mangas)
+            .selectinload(ScmManga.tramos_trabajo)
+            .selectinload(ScmTramoMangaTrabajo.trabajo),
+        )
+    ot = session.scalar(statement)
     if ot is None or ot.codigo_ot_sintetico:
         raise ScmServiceError(
             "OT_NOT_FOUND", "La OT SCM no existe.", status_code=404
         )
+    if view_mode == "calidad":
+        return {"ot": _quality_ot_payload(session, ot=ot, actor_id=actor_id)}
     return {"ot": _serialize_ot(ot)}
+
+
+def _quality_ot_payload(session, *, ot, actor_id):
+    """Read-only quality projection for one OT, keeping legacy fields intact."""
+    mangas = session.scalars(
+        select(ScmManga)
+        .options(
+            selectinload(ScmManga.lote_articulo)
+            .selectinload(ScmLoteArticulo.articulo),
+            selectinload(ScmManga.correccion_asignacion)
+            .selectinload(ScmCorreccionAsignacionManga.origen_trabajo),
+            selectinload(ScmManga.correccion_asignacion)
+            .selectinload(ScmCorreccionAsignacionManga.destino_trabajo),
+            selectinload(ScmManga.correccion_asignacion)
+            .selectinload(ScmCorreccionAsignacionManga.destino_asignacion),
+            selectinload(ScmManga.tramos_trabajo)
+            .selectinload(ScmTramoMangaTrabajo.trabajo),
+        )
+        .where(ScmManga.ot_id == ot.id)
+        .order_by(ScmManga.secuencia_ot)
+    ).all()
+    serialization_context = _batch_ot_serialization_context(session, [ot])
+    payload = _serialize_ot(
+        ot,
+        mangas=mangas,
+        assembly_context=serialization_context["assembly_by_ot"].get(ot.id, (None, None)),
+        color_context=serialization_context["color_context_by_ot"].get(ot.id),
+        output_articles_by_work=serialization_context["output_articles_by_work"],
+        quality_mangas=True,
+    )
+    works, _rows = _summary_work_rows(session, [ot.id], quality=True)
+    by_work = {str(work.id): work for work in works}
+    for work_payload in payload.get("trabajos_color", []):
+        work = by_work.get(str(work_payload.get("id")))
+        if work is None:
+            continue
+        work_payload.update({
+            "molde_id": getattr(work, "molde_id", None),
+            "molde_nombre": getattr(work, "molde_nombre", None),
+            "snapshot_tiempo_ciclo_seg": getattr(
+                work, "snapshot_tiempo_ciclo_seg", None
+            ),
+        })
+        piece_ids = {
+            article.get("id"): article.get("pieza_id")
+            for article in (getattr(work, "articulos_salida", None) or [])
+            if article.get("id") is not None
+        }
+        for article in work_payload.get("articulos_salida", []):
+            article["pieza_id"] = piece_ids.get(article.get("id"))
+
+    linked_assembly = _list_ots_summary(
+        session,
+        actor_id=actor_id,
+        tipo_ot="ENSAMBLE",
+        quality=True,
+        fabrication_context_public_id=ot.public_id,
+    )
+    payload["ots_armado"] = linked_assembly["items"]
+    quality_visits = session.scalars(
+        select(ScmVisitaCalidad)
+        .options(selectinload(ScmVisitaCalidad.trabajo))
+        .where(ScmVisitaCalidad.ot_id == ot.id)
+        .order_by(ScmVisitaCalidad.numero, ScmVisitaCalidad.recorded_at)
+    ).all()
+    payload["visitas_calidad"] = [item.to_dict() for item in quality_visits]
+    return payload
 
 
 def list_ots(
@@ -5065,7 +5359,10 @@ def list_ots(
     view=None,
 ):
     load_actor(session, actor_id, capability="OT_VER")
-    if _summary_view(view) == "resumen":
+    view_mode = _summary_view(view)
+    if view_mode == "calidad":
+        load_actor(session, actor_id, capability="OF_VER")
+    if view_mode in {"resumen", "calidad"}:
         return _list_ots_summary(
             session,
             actor_id=actor_id,
@@ -5076,6 +5373,7 @@ def list_ots(
             machine_id=machine_id,
             machine=machine,
             shift=shift,
+            quality=view_mode == "calidad",
         )
     statement = (
         select(RegistroDiarioProduccion)
@@ -5424,6 +5722,8 @@ def list_plant_journeys(
 ):
     """Aggregate both plant journey families in one authenticated request."""
     load_actor(session, actor_id, capability="OT_VER")
+    if _summary_view(view) == "calidad":
+        load_actor(session, actor_id, capability="OF_VER")
     parsed_date = _parse_date(operational_date)
     normalized_shift = required_text(
         shift,

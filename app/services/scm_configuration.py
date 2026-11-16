@@ -33,6 +33,7 @@ CAPACIDADES_SCM_INICIALES = (
         "Regularizar entradas excepcionales",
     ),
     ("CALIDAD_RESOLVER", "Resolver decisiones de Calidad"),
+    ("CALIDAD_CONTROL_REGISTRAR", "Registrar borradores y visitas de Calidad"),
     (
         "LIBERACION_DIRECTA_ADMINISTRAR",
         "Administrar políticas de liberación directa",
@@ -313,6 +314,9 @@ ROLES_SCM_INICIALES = (
         "Calidad",
         (
             "CALIDAD_RESOLVER",
+            "CALIDAD_CONTROL_REGISTRAR",
+            "OT_VER",
+            "OF_VER",
             "ARTICULO_VER",
             "ESTRUCTURA_VER",
             "RUTA_VER",
@@ -333,6 +337,7 @@ ROLES_SCM_INICIALES = (
         "Gerencia",
         (
             "OC_APROBAR",
+            "CALIDAD_CONTROL_REGISTRAR",
             "CORRECCION_APROBAR",
             "AUTORIZACION_SCM_ADMINISTRAR",
             "OP_APROBAR",
@@ -351,6 +356,7 @@ ROLES_SCM_INICIALES = (
         "Supervisor",
         (
             "OT_ANULAR",
+            "CALIDAD_CONTROL_REGISTRAR",
             "ENTRADA_EXCEPCIONAL_REGULARIZAR",
             *_VISTAS_PRODUCCION,
             "OT_CREAR",
