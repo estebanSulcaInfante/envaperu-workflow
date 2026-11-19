@@ -250,7 +250,17 @@ def _resolve_unit(session, code, *, lock=False):
     # L1|UUID and compact JSON. Keep this import lazy to avoid the service
     # import cycle.
     from app.services.scm_kg_custody_service import _unit_by_code as canonical_resolver
-    unit = canonical_resolver(session, value)
+    # The printed PREPESAJE sticker is the short ``L1|<label_uuid>`` form.
+    # Custody's canonical parser consumes the compact JSON representation, so
+    # normalize only this transport wrapper before delegating.  The raw value
+    # is retained for the legacy resolver below and for audit/error semantics.
+    canonical_value = value
+    if value.upper().startswith("L1|"):
+        canonical_value = json.dumps(
+            {"v": 1, "label_id": value[3:].strip()},
+            separators=(",", ":"),
+        )
+    unit = canonical_resolver(session, canonical_value)
     if unit is None and not value.upper().startswith("KG-"):
         unit = canonical_resolver(session, f"KG-{value}")
     if unit is not None:
