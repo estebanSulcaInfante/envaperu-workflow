@@ -1,0 +1,846 @@
+"""Central adapter for the station-2 physical inventory campaign.
+
+The station edge and this service intentionally share the same small JSON
+contract. Observations are evidence only; they never write the central KG
+saldo. A later, explicit adjustment command creates a local audited movement
+and is guarded by ``INVENTARIO_AJUSTAR``.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+from sqlalchemy import or_, select
+
+from app.extensions import db
+from app.models.scm_articulos import ScmArticulo
+from app.models.scm_inventory import ScmUbicacionInventario
+from app.models.scm_inventory_kg import ScmUnidadFisicaKg
+from app.models.scm_inventory_kg import (
+    ScmEtiquetaUnidadKg,
+    ScmExistenciaMangaKg,
+    ScmMovimientoInventarioKg,
+    ScmReservaUnidadKg,
+    ScmRetiroArmadoKg,
+    ScmRetiroArmadoKgItem,
+    ScmSaldoInventarioKg,
+)
+from app.models.scm_mesa_inventory import (
+    ScmMesaInventarioCampana,
+    ScmMesaInventarioLectura,
+    ScmMesaInventarioManga,
+    ScmMesaInventarioMovimiento,
+    ScmMesaInventarioPesaje,
+    ScmMesaInventarioRevision,
+    ScmMesaInventarioSesion,
+    ScmMesaInventarioSolicitud,
+)
+from app.models.scm_auditoria import ScmOperacion
+from app.services.scm_service_support import (
+    ScmServiceError, acquire_kg_productive_write_lock, load_actor, required_text,
+)
+from app.services.scm_warehouse_scope_service import assert_location_scope
+
+
+QUANTUM = Decimal("0.001")
+STATION_ID = "ESTACION-2"
+SALDO_KEY = "PRODUCCION_KG"
+ZONES = (
+    ("Z-ALMACEN-PIEZAS", "Almacén de piezas general"),
+    ("Z-ALMACEN-ARMADO-3P", "Almacén de armado – 3.er piso"),
+    ("Z-ALMACEN-LLANTAS-3P", "Almacén de llantas – 3.er piso"),
+    ("Z-ALMACEN-ARMADO-4P", "Almacén de armado – 4.º piso"),
+)
+ZONE_IDS = {item[0] for item in ZONES}
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _iso(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def _text(value, field, *, max_length=120, required=True):
+    if not required and (value is None or (isinstance(value, str) and not value.strip())):
+        return None
+    return required_text(value, field=field, max_length=max_length)
+
+
+def _decimal(value, field, *, positive=False, non_negative=False):
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ScmServiceError("INVALID_DECIMAL", f"El campo {field} debe ser decimal.", status_code=422, details={"field": field}) from error
+    if not parsed.is_finite() or (positive and parsed <= 0) or (non_negative and parsed < 0):
+        raise ScmServiceError("INVALID_DECIMAL", f"El campo {field} no es válido.", status_code=422, details={"field": field})
+    rounded = parsed.quantize(QUANTUM)
+    if parsed != rounded:
+        raise ScmServiceError("INVALID_DECIMAL_SCALE", f"El campo {field} admite como máximo tres decimales.", status_code=422, details={"field": field})
+    return rounded
+
+
+def _uuid(value, field="operation_id"):
+    try:
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise ScmServiceError("INVALID_UUID", f"{field} debe ser UUID.", status_code=400) from error
+
+
+def _actor(session, actor_id, capability="INVENTARIO_VER"):
+    return load_actor(session, actor_id, capability=capability)
+
+
+def _assert_zone(session, actor_id, zone_id):
+    zone_id = _text(zone_id, "zona", max_length=64)
+    if zone_id not in ZONE_IDS:
+        raise ScmServiceError("ZONE_NOT_FOUND", "La zona de hallazgo no existe.", status_code=404)
+    # If the central catalog already maps this code to a location, enforce its
+    # warehouse scope. The four pilot zones remain finding labels, not saldo
+    # locations, when the catalog has no such row yet.
+    location = session.scalar(select(ScmUbicacionInventario).where(ScmUbicacionInventario.codigo == zone_id))
+    if location is not None:
+        assert_location_scope(session, actor_id=actor_id, location=location)
+    return zone_id
+
+
+def _article(session, article_id):
+    try:
+        article_id = int(article_id)
+    except (TypeError, ValueError) as error:
+        raise ScmServiceError("ARTICLE_NOT_FOUND", "El artículo PIEZA_COLOR no existe.", status_code=404) from error
+    article = session.get(ScmArticulo, article_id)
+    if article is None or not article.activo or article.clase != "PIEZA_COLOR" or article.unidad_inventario != "KG":
+        raise ScmServiceError("ARTICLE_NOT_FOUND", "El artículo PIEZA_COLOR no existe.", status_code=404)
+    return article
+
+
+def _campaign(session, actor_id):
+    campaign = session.scalar(select(ScmMesaInventarioCampana).order_by(ScmMesaInventarioCampana.created_at).limit(1).with_for_update())
+    if campaign is None:
+        campaign = ScmMesaInventarioCampana(codigo="MESA-INV-001", creado_por_id=actor_id)
+        session.add(campaign)
+        session.flush()
+    if campaign.estado != "ABIERTA":
+        raise ScmServiceError("CAMPAIGN_CLOSED", "La campaña de inventario ya está cerrada.", status_code=409)
+    return campaign
+
+
+def _require_complete_walk(session):
+    """Require a closed walk for every physical pilot zone.
+
+    Boolean flags from the client are not evidence of coverage.  A missing
+    zone or an open session keeps the review/faltante command blocked.
+    """
+    campaign = session.scalar(
+        select(ScmMesaInventarioCampana).order_by(ScmMesaInventarioCampana.created_at).limit(1)
+    )
+    if campaign is None:
+        raise ScmServiceError("WALK_INCOMPLETE", "El recorrido de las cuatro zonas aún no está cerrado.", status_code=409)
+    sessions = session.scalars(
+        select(ScmMesaInventarioSesion).where(ScmMesaInventarioSesion.campana_id == campaign.id)
+    ).all()
+    covered = {item.zona_id for item in sessions if item.estado == "CERRADA" and item.cobertura_confirmada}
+    if covered != ZONE_IDS or any(item.estado != "CERRADA" for item in sessions):
+        raise ScmServiceError("WALK_INCOMPLETE", "Debe cerrar y confirmar cobertura explícita de las cuatro zonas antes de confirmar faltantes.", status_code=409)
+
+
+def _production_existence(session, unit):
+    if unit.estado != "ACTIVA" or unit.estado_logistico not in {
+        "RECIBIDA_ALMACEN", "ALMACENADA_CONTROLADA", "DISPONIBLE_PRODUCCION",
+    }:
+        return None
+    location = session.scalar(select(ScmUbicacionInventario).where(
+        ScmUbicacionInventario.codigo == SALDO_KEY,
+        ScmUbicacionInventario.activo.is_(True),
+    ))
+    if location is None or unit.ubicacion_id != location.id:
+        return None
+    return session.scalar(select(ScmExistenciaMangaKg).where(
+        ScmExistenciaMangaKg.unidad_fisica_kg_id == unit.id,
+        ScmExistenciaMangaKg.ubicacion_id == location.id,
+        ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+    ).order_by(ScmExistenciaMangaKg.recibida_at.desc()))
+
+
+def _hydrate_manga_from_own_existence(session, manga, unit):
+    """Refresh only an observational shadow when its own unit returns to KG."""
+    existence = _production_existence(session, unit)
+    if manga.neto_kg is None and existence is not None and existence.cantidad_fisica_kg is not None and Decimal(existence.cantidad_fisica_kg) > 0:
+        manga.kardex_existence_id = existence.id
+        manga.neto_kg = Decimal(existence.cantidad_fisica_kg).quantize(QUANTUM)
+        if manga.estado == "HALLAZGO":
+            manga.estado = "DISPONIBLE"
+    elif manga.neto_kg is None and manga.estado == "DISPONIBLE":
+        manga.estado = "HALLAZGO"
+    return existence
+
+
+def _manga_by_code(session, code, *, lock=False, require_inventory=False):
+    code = _text(code, "codigo", max_length=120)
+    query_manga = select(ScmMesaInventarioManga).where(ScmMesaInventarioManga.codigo == code)
+    if lock:
+        query_manga = query_manga.with_for_update()
+    manga = session.scalar(query_manga)
+    if manga is not None:
+        if manga.estado in {"HALLAZGO", "DISPONIBLE"} and manga.neto_kg is None and manga.unidad_fisica_id:
+            unit = session.get(ScmUnidadFisicaKg, manga.unidad_fisica_id, with_for_update=lock)
+            if unit is not None:
+                existence = _hydrate_manga_from_own_existence(session, manga, unit)
+                if require_inventory and (existence is None or manga.kardex_existence_id is None or manga.neto_kg is None):
+                    raise ScmServiceError("IDENTITY_NOT_ELIGIBLE", "La identidad no tiene existencia vigente en PRODUCCION_KG.", status_code=409)
+        return manga
+    unit = _resolve_unit(session, code, lock=lock)
+    if unit is None:
+        raise ScmServiceError("QR_NOT_FOUND", "El QR o código no corresponde a una identidad global.", status_code=404)
+    existing_by_unit = session.scalar(select(ScmMesaInventarioManga).where(
+        ScmMesaInventarioManga.unidad_fisica_id == unit.id
+    ))
+    if existing_by_unit is not None:
+        # Repair a legacy shadow only from this unit's own active
+        # PRODUCCION_KG existence; never borrow another unit's balance.
+        existence = _hydrate_manga_from_own_existence(session, existing_by_unit, unit)
+        if require_inventory and (existence is None or existing_by_unit.kardex_existence_id is None or existing_by_unit.neto_kg is None):
+            raise ScmServiceError("IDENTITY_NOT_ELIGIBLE", "La identidad no tiene existencia vigente en PRODUCCION_KG.", status_code=409)
+        return existing_by_unit
+    existence = _production_existence(session, unit)
+    if require_inventory and (existence is None or existence.cantidad_fisica_kg is None or Decimal(existence.cantidad_fisica_kg) <= 0):
+        raise ScmServiceError("IDENTITY_NOT_ELIGIBLE", "La identidad no tiene existencia vigente en PRODUCCION_KG.", status_code=409)
+    if existence is None or existence.cantidad_fisica_kg is None or Decimal(existence.cantidad_fisica_kg) <= 0:
+        # Read-only scans may record a finding for a unit in custody or a
+        # different location, but cannot activate it as inventory.
+        manga_state = "HALLAZGO"
+        net = None
+        existence_id = None
+    else:
+        manga_state = "DISPONIBLE"
+        net = Decimal(existence.cantidad_fisica_kg).quantize(QUANTUM)
+        existence_id = existence.id
+    manga = ScmMesaInventarioManga(
+        codigo=unit.codigo,
+        unidad_fisica_id=unit.id,
+        articulo_id=unit.articulo_scm_id,
+        estado=manga_state,
+        kardex_existence_id=existence_id,
+        neto_kg=net,
+    )
+    session.add(manga)
+    session.flush()
+    return manga
+
+
+def _resolve_unit(session, code, *, lock=False):
+    """Resolve canonical unit/label aliases used by production stickers."""
+    value = _text(code, "codigo", max_length=512)
+    # Custody owns the authoritative resolver for PREPESAJE labels, including
+    # L1|UUID and compact JSON. Keep this import lazy to avoid the service
+    # import cycle.
+    from app.services.scm_kg_custody_service import _unit_by_code as canonical_resolver
+    unit = canonical_resolver(session, value)
+    if unit is None and not value.upper().startswith("KG-"):
+        unit = canonical_resolver(session, f"KG-{value}")
+    if unit is not None:
+        query = select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit.id)
+        return session.scalar(query.with_for_update()) if lock else unit
+
+    # Legacy rows without a label record still resolve by UUID or exact code.
+    label_public_id = None
+    if value.upper().startswith("L1|"):
+        try:
+            label_public_id = uuid.UUID(value[3:].strip())
+        except (TypeError, ValueError):
+            raise ScmServiceError("QR_INVALID", "El QR L1 no contiene una identidad válida.", status_code=422)
+    try:
+        decoded = json.loads(value) if label_public_id is None else None
+        if isinstance(decoded, dict) and decoded.get("v") == 1:
+            label_public_id = uuid.UUID(str(decoded.get("label_id")))
+    except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+        pass
+    if label_public_id is not None:
+        label = session.scalar(select(ScmEtiquetaUnidadKg).where(
+            or_(ScmEtiquetaUnidadKg.public_id == label_public_id, ScmEtiquetaUnidadKg.id == label_public_id)
+        ))
+        if label is None:
+            return None
+        current = session.scalar(select(ScmEtiquetaUnidadKg).where(
+            ScmEtiquetaUnidadKg.unidad_id == label.unidad_id,
+        ).order_by(ScmEtiquetaUnidadKg.version.desc()).limit(1))
+        if label.estado == "INVALIDADA":
+            raise ScmServiceError("KG_LABEL_NOT_PRINTABLE", "La etiqueta KG está invalidada.", status_code=409)
+        if current is None or current.id != label.id:
+            raise ScmServiceError("KG_LABEL_VERSION_CONFLICT", "La etiqueta KG ya no es la versión vigente.", status_code=409)
+        query = select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == label.unidad_id)
+    else:
+        parsed = None
+        try:
+            parsed = uuid.UUID(value)
+        except (TypeError, ValueError):
+            pass
+        query = select(ScmUnidadFisicaKg).where(
+            (or_(ScmUnidadFisicaKg.codigo == value, ScmUnidadFisicaKg.public_id == parsed) if parsed else ScmUnidadFisicaKg.codigo == value)
+        )
+    if lock:
+        query = query.with_for_update()
+    return session.scalar(query)
+
+
+def _ledger_location(session, actor_id, article):
+    """Resolve the preconfigured station-owned pilot location.
+
+    The adapter must never create a warehouse/location or silently invent a
+    second accounting bucket. ``PRODUCCION_KG`` is provisioned by SCM config.
+    """
+    location = session.scalar(
+        select(ScmUbicacionInventario)
+        .where(ScmUbicacionInventario.codigo == SALDO_KEY)
+        .with_for_update()
+    )
+    if location is None or not location.activo or not location.permite_saldo_libre:
+        raise ScmServiceError("LOCATION_NOT_FOUND", "La ubicación PRODUCCION_KG no está configurada para la estación.", status_code=409)
+    assert_location_scope(session, actor_id=actor_id, location=location, article_class=article.clase)
+    return location
+
+
+def _active_existence(session, unit_id, *, lock=True):
+    query = select(ScmExistenciaMangaKg).where(
+        ScmExistenciaMangaKg.unidad_fisica_kg_id == unit_id,
+        ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+    )
+    if lock:
+        query = query.with_for_update()
+    return session.scalar(query)
+
+
+def _project_kardex_positive(session, *, actor_id, operation_id, manga, net, reason):
+    unit = session.get(ScmUnidadFisicaKg, manga.unidad_fisica_id, with_for_update=True)
+    article = session.get(ScmArticulo, manga.articulo_id)
+    reappearance = manga.baja_motivo == "FALTANTE"
+    if unit is None or (unit.estado != "ACTIVA" and not (reappearance and unit.estado == "HISTORICA")):
+        raise ScmServiceError("IDENTITY_NOT_ACTIVE", "La confirmación requiere una identidad Mesa activa.", status_code=409)
+    if not reappearance and unit.estado_logistico not in {
+        "PENDIENTE_VERIFICACION", "RECIBIDA_ALMACEN", "ALMACENADA_CONTROLADA", "DISPONIBLE_PRODUCCION",
+    }:
+        raise ScmServiceError("IDENTITY_NOT_ELIGIBLE", "La identidad está en custodia o en otro flujo operativo.", status_code=409)
+    location = _ledger_location(session, actor_id, article)
+    if _active_existence(session, unit.id) is not None:
+        raise ScmServiceError("KARDEX_ALREADY_ACTIVE", "La identidad ya tiene una existencia activa en el Kardex.", status_code=409)
+    balance = session.scalar(select(ScmSaldoInventarioKg).where(
+        ScmSaldoInventarioKg.articulo_scm_id == article.id,
+        ScmSaldoInventarioKg.ubicacion_id == location.id,
+    ).with_for_update())
+    if balance is None:
+        # The location is canonical and already validated above.  A first
+        # movement may legitimately materialize its zero balance row; never
+        # create a location or another accounting bucket here.
+        balance = ScmSaldoInventarioKg(articulo_scm_id=article.id, ubicacion_id=location.id)
+        session.add(balance)
+        session.flush()
+    result = (Decimal(balance.cantidad_fisica_kg) + net).quantize(QUANTUM)
+    balance.cantidad_fisica_kg = result
+    balance.version += 1
+    movement_id = uuid.uuid4()
+    movement = ScmMovimientoInventarioKg(
+        id=movement_id, saldo_id=balance.id, tipo="AJUSTE_POSITIVO",
+        cantidad_delta_kg=net, saldo_fisico_resultante_kg=result,
+        motivo=reason, referencia_tipo=SALDO_KEY,
+        referencia_id=manga.codigo, actor_id=actor_id,
+        operation_id=operation_id, projection_sha256=_hash([manga.codigo, str(operation_id)]),
+        peso_neto_snapshot_kg=net, pesada_at_snapshot=_now(),
+        fuente_tipo="KG_MESA_INVENTARIO", atributo_proceso="PROCESO",
+    )
+    session.add(movement)
+    session.flush()
+    existence = ScmExistenciaMangaKg(
+        id=uuid.uuid4(), manga_id=None, sesion_id=None, etiqueta_resuelta_id=None,
+        unidad_fisica_kg_id=unit.id, articulo_scm_id=article.id,
+        saldo_id=balance.id, ubicacion_id=location.id,
+        movimiento_ingreso_id=movement.id, operation_id=operation_id,
+        resuelta_por="MESA_INVENTARIO", estado_logistico="RECIBIDA_ALMACEN",
+        estado_calidad="SIN_CONTROL", cantidad_fisica_kg=net,
+        peso_neto_snapshot_kg=net, pesaje_public_id=None,
+        projection_sha256=movement.projection_sha256, pesada_at_snapshot=_now(),
+        recibida_por_id=actor_id, origen_tipo="PRODUCCION", atributo_proceso="PROCESO",
+    )
+    session.add(existence)
+    session.flush()
+    unit.saldo_id, unit.ubicacion_id, unit.recepcion_vigente_id = balance.id, location.id, existence.id
+    # Armado's batch withdrawal validates this ownership against the balance;
+    # preserve the configured warehouse instead of leaving a Mesa-only unit
+    # orphaned from the custody flow.
+    unit.almacen_responsable_id = location.almacen_id
+    unit.kg_verificados, unit.kg_verificados_at = net, _now()
+    unit.estado, unit.estado_logistico, unit.estado_calidad = "ACTIVA", "RECIBIDA_ALMACEN", "SIN_CONTROL"
+    unit.version += 1
+    manga.kardex_existence_id = existence.id
+    return movement, existence
+
+
+def _project_kardex_negative(session, *, actor_id, operation_id, manga, net, reason):
+    unit = session.get(ScmUnidadFisicaKg, manga.unidad_fisica_id, with_for_update=True)
+    if unit is None or unit.estado != "ACTIVA":
+        raise ScmServiceError("IDENTITY_NOT_ACTIVE", "La baja requiere una identidad global activa.", status_code=409)
+    if session.scalar(select(ScmReservaUnidadKg.id).where(
+        ScmReservaUnidadKg.unidad_id == unit.id,
+        ScmReservaUnidadKg.estado == "ACTIVA",
+    ).with_for_update()) is not None:
+        raise ScmServiceError("IDENTITY_RESERVED", "La identidad tiene una reserva o custodia activa.", status_code=409)
+    if session.scalar(select(ScmRetiroArmadoKgItem.id).join(ScmRetiroArmadoKg).where(
+        ScmRetiroArmadoKgItem.unidad_id == unit.id,
+        ScmRetiroArmadoKg.estado.in_(("ABIERTO", "CONCILIACION_PENDIENTE")),
+    ).with_for_update()) is not None:
+        raise ScmServiceError("IDENTITY_IN_CUSTODY", "La identidad está en custodia de Armado.", status_code=409)
+    existence = _active_existence(session, unit.id)
+    if existence is None:
+        raise ScmServiceError("KARDEX_EXISTENCE_NOT_FOUND", "La identidad no tiene existencia elegible en el Kardex.", status_code=409)
+    balance = session.get(ScmSaldoInventarioKg, existence.saldo_id, with_for_update=True)
+    result = (Decimal(balance.cantidad_fisica_kg) - net).quantize(QUANTUM)
+    if result < 0 or Decimal(balance.cantidad_reservada_kg) + Decimal(balance.cantidad_no_disponible_kg) > result:
+        raise ScmServiceError("KARDEX_RESERVED_CONFLICT", "La baja dejaría un saldo comprometido o negativo.", status_code=409)
+    balance.cantidad_fisica_kg, balance.version = result, balance.version + 1
+    movement = ScmMovimientoInventarioKg(
+        id=uuid.uuid4(), saldo_id=balance.id, tipo="AJUSTE_NEGATIVO",
+        cantidad_delta_kg=-net, saldo_fisico_resultante_kg=result,
+        motivo=reason, referencia_tipo=SALDO_KEY, referencia_id=manga.codigo,
+        actor_id=actor_id, operation_id=operation_id,
+        projection_sha256=_hash([manga.codigo, str(operation_id)]),
+        peso_neto_snapshot_kg=net, pesada_at_snapshot=_now(),
+        fuente_tipo="KG_MESA_INVENTARIO", atributo_proceso="PROCESO",
+    )
+    session.add(movement)
+    existence.estado_logistico = "REVERSADA"
+    unit.estado, unit.estado_logistico, unit.version = "HISTORICA", "REVERSADA", unit.version + 1
+    session.flush()
+    return movement, existence
+
+
+def _manga_payload(manga):
+    article = manga.articulo
+    return {
+        "codigo": manga.codigo,
+        "unidad_id": str(manga.unidad_fisica.public_id) if manga.unidad_fisica else None,
+        "articulo": str(article.id if article else manga.articulo_id),
+        "articulo_id": str(manga.articulo_id),
+        "pieza": article.nombre if article else None,
+        "color": _article_color(article),
+        "zona": manga.zona_hallazgo,
+        "zona_hallazgo": manga.zona_hallazgo,
+        "estado": manga.estado,
+        "bruto": _fmt(manga.bruto_kg),
+        "tara": _fmt(manga.tara_kg),
+        "neto": _fmt(manga.neto_kg),
+    }
+
+
+def _fmt(value):
+    return format(Decimal(value), ".3f") if value is not None else None
+
+
+def _article_color(article):
+    """Return the catalog color without exposing unrelated personal data."""
+    subtype = getattr(article, "pieza_color", None) if article else None
+    variant = getattr(subtype, "pieza_color", None) if subtype else None
+    return getattr(getattr(variant, "color_produccion_rel", None), "nombre", None)
+
+
+def _fingerprint(data):
+    return _hash(data)
+
+
+def _operation(session, operation_id, endpoint, actor_id, data):
+    operation_id = _uuid(operation_id)
+    digest = _fingerprint({"endpoint": endpoint, "actor_id": actor_id, "data": data})
+    prior = session.get(ScmOperacion, operation_id)
+    if prior is not None:
+        if prior.endpoint != endpoint or prior.request_sha256 != digest:
+            raise ScmServiceError("IDEMPOTENCY_CONFLICT", "La operación ya fue usada con otra intención.", status_code=409)
+        if prior.response_json is None:
+            raise ScmServiceError("IDEMPOTENCY_OPERATION_INCOMPLETE", "La operación anterior no terminó.", status_code=409)
+        return operation_id, copy.deepcopy(prior.response_json), prior.estado_http or 200
+    operation = ScmOperacion(operation_id=operation_id, endpoint=endpoint, actor_id=actor_id, request_sha256=digest)
+    session.add(operation)
+    session.flush()
+    return operation_id, None, operation
+
+
+def _complete(session, operation_id, response, status=201):
+    operation = session.get(ScmOperacion, operation_id)
+    operation.response_json = copy.deepcopy(response)
+    operation.estado_http = status
+    session.commit()
+    return response, status
+
+
+def _rollback(session):
+    try:
+        session.rollback()
+    except Exception:
+        pass
+
+
+def _session(session, actor_id, session_id, *, lock=False):
+    try:
+        parsed = _uuid(session_id, "session_id")
+    except ScmServiceError:
+        raise ScmServiceError("SESSION_NOT_FOUND", "La sesión no existe.", status_code=404)
+    value = session.get(ScmMesaInventarioSesion, parsed, with_for_update=lock)
+    if value is None:
+        raise ScmServiceError("SESSION_NOT_FOUND", "La sesión no existe.", status_code=404)
+    _assert_zone(session, actor_id, value.zona_id)
+    return value
+
+
+def _reading(session, actor_id, session_obj, manga, data):
+    existing = session.scalar(select(ScmMesaInventarioLectura).where(
+        ScmMesaInventarioLectura.sesion_id == session_obj.id,
+        ScmMesaInventarioLectura.manga_id == manga.id,
+    ))
+    if existing is not None:
+        return "Lectura ya registrada"
+    previous_zone, previous_state, previous_net = manga.zona_hallazgo, manga.estado, manga.neto_kg
+    if manga.zona_hallazgo and manga.zona_hallazgo != session_obj.zona_id:
+        if data.get("confirmar_zona") is not True or data.get("zona_anterior") != manga.zona_hallazgo:
+            raise ScmServiceError("ZONE_CONFLICT", "La identidad figura en otra zona; confirme el hallazgo.", status_code=409, details={"zona_anterior": manga.zona_hallazgo, "zona_actual": session_obj.zona_id})
+    manga.zona_hallazgo = session_obj.zona_id
+    if manga.estado == "BAJA_COMPROBADA":
+        manga.estado = "PENDIENTE_PESAJE"
+        manga.bruto_kg = manga.tara_kg = manga.neto_kg = None
+    session.add(ScmMesaInventarioLectura(
+        sesion_id=session_obj.id, manga_id=manga.id,
+        zona_anterior=previous_zone, estado_anterior=previous_state,
+        neto_anterior_kg=previous_net, actor_id=actor_id,
+    ))
+    return "Lectura registrada"
+
+
+def _state(session):
+    zones = [{"id": item[0], "nombre": item[1]} for item in ZONES]
+    articles = []
+    for article in session.scalars(select(ScmArticulo).where(ScmArticulo.activo.is_(True), ScmArticulo.clase == "PIEZA_COLOR", ScmArticulo.unidad_inventario == "KG").order_by(ScmArticulo.codigo)).all():
+        articles.append({"id": str(article.id), "codigo": article.codigo, "nombre": article.nombre, "color": _article_color(article)})
+    mangas = [_manga_payload(item) for item in session.scalars(select(ScmMesaInventarioManga).order_by(ScmMesaInventarioManga.codigo)).all()]
+    sessions = []
+    for item in session.scalars(select(ScmMesaInventarioSesion).order_by(ScmMesaInventarioSesion.created_at)).all():
+        sessions.append({"id": str(item.id), "zona": item.zona_id, "estado": item.estado, "lecturas": [{"codigo": row.manga.codigo} for row in item.lecturas]})
+    pending = [_manga_payload(item) for item in session.scalars(select(ScmMesaInventarioManga).where(ScmMesaInventarioManga.estado.in_(("PENDIENTE_PESAJE", "PESADA_PENDIENTE_CONFIRMACION"))).order_by(ScmMesaInventarioManga.codigo)).all()]
+    movements = [{"id": str(item.id), "codigo": item.manga.codigo, "tipo": item.tipo, "delta": _fmt(item.delta_kg), "motivo": item.motivo, "vinculo_baja": str(item.vinculo_baja_id) if item.vinculo_baja_id else None, "kardex_movimiento_id": str(item.kardex_movimiento_id) if item.kardex_movimiento_id else None} for item in session.scalars(select(ScmMesaInventarioMovimiento).order_by(ScmMesaInventarioMovimiento.created_at)).all()]
+    campaign = session.scalar(select(ScmMesaInventarioCampana).order_by(ScmMesaInventarioCampana.created_at).limit(1))
+    return {
+        "campana": {"id": str(campaign.id), "codigo": campaign.codigo, "estado": campaign.estado} if campaign else None,
+        "saldo": {"clave": SALDO_KEY, "clase": "PIEZA_COLOR", "unidad": "KG"},
+        "cuenta": STATION_ID,
+        "zonas": zones, "articulos": articles, "mangas": mangas,
+        "sesiones": sessions, "pendientes": pending, "movimientos": movements,
+        "preetiquetas": [],
+    }
+
+
+def vista_state(session, actor_id):
+    """Return the Mesa contract for a server-resolved actor."""
+    _actor(session, actor_id, "INVENTARIO_VER")
+    return _state(session)
+
+
+def label(session, actor_id, codigo):
+    _actor(session, actor_id, "INVENTARIO_VER")
+    manga = _manga_by_code(session, codigo)
+    payload = _manga_payload(manga)
+    return {"codigo": payload["codigo"], "pieza": payload["pieza"], "color": payload["color"], "zona": payload["zona"], "neto": payload["neto"], "bruto": payload["bruto"], "tara": payload["tara"]}
+
+
+def _open_session(session, actor_id, data, operation_id):
+    actor = _actor(session, actor_id)
+    zone = _assert_zone(session, actor.id, data.get("zona"))
+    key = _text(data.get("clave"), "clave")
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones", actor.id, {"zona": zone, "clave": key})
+    if replay is not None:
+        return replay, status
+    campaign = _campaign(session, actor.id)
+    value = ScmMesaInventarioSesion(campana_id=campaign.id, zona_id=zone, clave=key, creado_por_id=actor.id)
+    session.add(value)
+    session.flush()
+    return _complete(session, op_id, {"id": str(value.id), "zona": zone, "estado": value.estado}, 201)
+
+
+def _read_session(session, actor_id, session_id, data, operation_id):
+    actor = _actor(session, actor_id)
+    obj = _session(session, actor.id, session_id, lock=True)
+    if obj.estado != "ABIERTA":
+        raise ScmServiceError("SESSION_CLOSED", "La sesión ya está cerrada.", status_code=409)
+    code = _text(data.get("codigo"), "codigo")
+    manga = _manga_by_code(session, code, lock=True)
+    operation_data = {"session_id": str(obj.id), "codigo": manga.codigo, "confirmar_zona": data.get("confirmar_zona"), "zona_anterior": data.get("zona_anterior")}
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones/lecturas", actor.id, operation_data)
+    if replay is not None:
+        return replay, status
+    message = _reading(session, actor.id, obj, manga, data)
+    session.flush()
+    return _complete(session, op_id, {"mensaje": message}, 201 if message == "Lectura registrada" else 200)
+
+
+def _delete_reading(session, actor_id, session_id, code, data, operation_id):
+    actor = _actor(session, actor_id)
+    obj = _session(session, actor.id, session_id, lock=True)
+    if obj.estado != "ABIERTA":
+        raise ScmServiceError("SESSION_CLOSED", "La sesión ya está cerrada.", status_code=409)
+    manga = _manga_by_code(session, code, lock=True)
+    row = session.scalar(select(ScmMesaInventarioLectura).where(ScmMesaInventarioLectura.sesion_id == obj.id, ScmMesaInventarioLectura.manga_id == manga.id))
+    if row is None:
+        raise ScmServiceError("READING_NOT_FOUND", "La lectura no existe en la sesión.", status_code=404)
+    if manga.estado in {"PESADA_PENDIENTE_CONFIRMACION", "DISPONIBLE"}:
+        raise ScmServiceError("READING_IMMUTABLE", "No se puede retirar una lectura con pesaje o saldo confirmado.", status_code=409)
+    op_id, replay, status = _operation(session, operation_id, "DELETE /inventario/sesiones/lecturas", actor.id, {"session_id": str(obj.id), "codigo": manga.codigo})
+    if replay is not None:
+        return replay, status
+    manga.zona_hallazgo, manga.estado, manga.neto_kg = row.zona_anterior, row.estado_anterior or manga.estado, row.neto_anterior_kg
+    session.delete(row)
+    return _complete(session, op_id, {"mensaje": "Lectura eliminada"}, 200)
+
+
+def _close_session(session, actor_id, session_id, data, operation_id):
+    actor = _actor(session, actor_id)
+    obj = _session(session, actor.id, session_id, lock=True)
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones/cerrar", actor.id, {"session_id": str(obj.id)})
+    if replay is not None:
+        return replay, status
+    if obj.estado == "ABIERTA":
+        obj.estado = "CERRADA"
+        obj.closed_at = _now()
+        obj.cobertura_confirmada = data.get("cobertura") is True or data.get("cobertura_completa") is True
+    return _complete(session, op_id, {"mensaje": "Sesión cerrada", "closed_at": _iso(obj.closed_at), "cantidad": len(obj.lecturas), "cobertura_confirmada": bool(obj.cobertura_confirmada)}, 200)
+
+
+def _old_unit(session, actor_id, data, operation_id):
+    actor = _actor(session, actor_id)
+    code = _text(data.get("codigo"), "codigo", required=False)
+    article = _article(session, data.get("articulo"))
+    zone = _assert_zone(session, actor.id, data.get("zona"))
+    key = _text(data.get("clave"), "clave")
+    normalized = {"codigo": code, "articulo": article.id, "zona": zone, "sesion": data.get("sesion")}
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/antiguas", actor.id, normalized | {"clave": key})
+    if replay is not None:
+        return replay, status
+    if code:
+        manga = _manga_by_code(session, code, lock=True)
+        unit = manga.unidad_fisica
+        if unit is None or unit.articulo_scm_id != article.id:
+            raise ScmServiceError("IDENTITY_NOT_FOUND", "El código no corresponde a una identidad global de la pieza.", status_code=404)
+        if unit.estado != "ACTIVA" or unit.estado_logistico != "PENDIENTE_VERIFICACION":
+            raise ScmServiceError("IDENTITY_NOT_ELIGIBLE", "La identidad ya pertenece a otro flujo y no puede registrarse como antigua.", status_code=409)
+        if manga.articulo_id != article.id or manga.zona_hallazgo not in (None, zone):
+            raise ScmServiceError("IDENTITY_CONFLICT", "La identidad ya está vinculada a otra pieza o zona.", status_code=409)
+    else:
+        code = f"INV-MESA-{uuid.uuid4().hex[:12].upper()}"
+        unit = ScmUnidadFisicaKg(public_id=uuid.uuid4(), codigo=code, articulo_scm_id=article.id, estado="ACTIVA", estado_logistico="PENDIENTE_VERIFICACION", estado_calidad="SIN_CONTROL")
+        session.add(unit)
+        session.flush()
+        manga = ScmMesaInventarioManga(codigo=code, unidad_fisica_id=unit.id, articulo_id=article.id)
+        session.add(manga)
+    manga.zona_hallazgo = zone
+    manga.estado = "PENDIENTE_PESAJE"
+    session.flush()
+    session_id = data.get("sesion")
+    if session_id:
+        obj = _session(session, actor.id, session_id, lock=True)
+        if obj.zona_id != zone:
+            raise ScmServiceError("ZONE_CONFLICT", "La sesión pertenece a otra zona.", status_code=409)
+        _reading(session, actor.id, obj, manga, {"codigo": code})
+    response = {"codigo": code, "unidad_id": str(unit.public_id), "estado": manga.estado}
+    return _complete(session, op_id, response, 201)
+
+
+def _weigh(session, actor_id, data, operation_id):
+    actor = _actor(session, actor_id)
+    code = _text(data.get("codigo"), "codigo")
+    key = _text(data.get("clave"), "clave")
+    capture = data.get("captura")
+    if not isinstance(capture, dict) or not capture.get("token"):
+        raise ScmServiceError("CAPTURE_REQUIRED", "El pesaje requiere una lectura capturada por la estación.", status_code=409)
+    if capture.get("codigo") != code:
+        raise ScmServiceError("CAPTURE_IDENTITY_CONFLICT", "La lectura capturada pertenece a otra identidad.", status_code=409)
+    if capture.get("base") not in {"NT", "GS"}:
+        raise ScmServiceError("CAPTURE_INVALID", "La base de la lectura física no es válida.", status_code=422)
+    bruto = _decimal(data.get("bruto"), "bruto", positive=True)
+    tara = _decimal(data.get("tara"), "tara", non_negative=True)
+    if bruto <= tara:
+        raise ScmServiceError("INVALID_NET", "Se requiere bruto > tara >= 0.", status_code=422)
+    captured_kg = _decimal(capture.get("kg"), "captura.kg", positive=True)
+    if captured_kg != bruto:
+        raise ScmServiceError("CAPTURE_WEIGHT_CONFLICT", "El bruto no coincide con la lectura capturada.", status_code=409)
+    manga = _manga_by_code(session, code, lock=True)
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/pesajes", actor.id, {"codigo": code, "bruto": str(bruto), "tara": str(tara), "clave": key})
+    if replay is not None:
+        return replay, status
+    if manga.estado not in {"PENDIENTE_PESAJE", "BAJA_COMPROBADA"}:
+        raise ScmServiceError("WEIGHING_NOT_PENDING", "La manga no está pendiente de pesaje.", status_code=409)
+    net = (bruto - tara).quantize(QUANTUM)
+    manga.bruto_kg, manga.tara_kg, manga.neto_kg, manga.estado = bruto, tara, net, "PESADA_PENDIENTE_CONFIRMACION"
+    captured_at = capture.get("captured_at")
+    try:
+        captured_at = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00")) if captured_at else _now()
+    except ValueError as error:
+        raise ScmServiceError("CAPTURE_INVALID", "captured_at no es una fecha válida.", status_code=422) from error
+    session.add(ScmMesaInventarioPesaje(
+        manga_id=manga.id, bruto_kg=bruto, tara_kg=tara, neto_kg=net,
+        lectura_id=_text(capture.get("reading_id") or uuid.uuid4().hex, "reading_id", max_length=120),
+        station_id=STATION_ID, captura_base=capture["base"], captura_kg=captured_kg,
+        captura_at=captured_at, clave=key, actor_id=actor.id,
+    ))
+    return _complete(session, op_id, {"codigo": code, "neto": _fmt(net), "estado": manga.estado}, 201)
+
+
+def _review(session, actor_id, data, operation_id):
+    actor = _actor(session, actor_id)
+    code = _text(data.get("codigo"), "codigo")
+    _require_complete_walk(session)
+    if not all(data.get(flag) is True for flag in ("cobertura", "movimientos_revisados", "busqueda")):
+        raise ScmServiceError("REVIEW_INCOMPLETE", "La revisión requiere cobertura, movimientos y búsqueda dirigida.", status_code=409)
+    manga = _manga_by_code(session, code, lock=True, require_inventory=True)
+    if manga.estado != "DISPONIBLE":
+        raise ScmServiceError("REVIEW_NOT_ACTIVE", "La manga no está activa para revisión.", status_code=409)
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/revision", actor.id, {"codigo": code, "cobertura": True, "movimientos_revisados": True, "busqueda": True})
+    if replay is not None:
+        return replay, status
+    existing = session.scalar(select(ScmMesaInventarioRevision).where(ScmMesaInventarioRevision.codigo == code, ScmMesaInventarioRevision.estado == "ACTIVA"))
+    if existing is not None:
+        return _complete(session, op_id, {"token": str(existing.id), "neto": _fmt(manga.neto_kg)}, 200)
+    review = ScmMesaInventarioRevision(id=uuid.uuid4(), codigo=code, actor_id=actor.id)
+    session.add(review)
+    return _complete(session, op_id, {"token": str(review.id), "neto": _fmt(manga.neto_kg)}, 201)
+
+
+def _missing(session, actor_id, data, operation_id):
+    actor = _actor(session, actor_id, "INVENTARIO_AJUSTAR")
+    code = _text(data.get("codigo"), "codigo")
+    token = _text(data.get("token"), "token")
+    reason = _text(data.get("motivo"), "motivo", max_length=240)
+    key = _text(data.get("clave"), "clave")
+    op_id, replay, status = _operation(
+        session, operation_id, "POST /inventario/faltantes", actor.id,
+        {"codigo": code, "token": token, "motivo": reason, "clave": key},
+    )
+    # Idempotent replay must win before checking the now-consumed review or
+    # current unit state.  This is essential after a successful debit.
+    if replay is not None:
+        return replay, status
+    _require_complete_walk(session)
+    manga = _manga_by_code(session, code, lock=True, require_inventory=True)
+    review = session.get(ScmMesaInventarioRevision, _uuid(token, "token"))
+    if review is None or review.codigo != code or review.estado != "ACTIVA":
+        raise ScmServiceError("REVIEW_INVALID", "La revisión no está activa.", status_code=409)
+    if session.scalar(select(ScmMesaInventarioLectura.id).where(
+        ScmMesaInventarioLectura.manga_id == manga.id,
+        ScmMesaInventarioLectura.created_at > review.created_at,
+    ).limit(1)) is not None:
+        raise ScmServiceError("REVIEW_STALE", "La revisión quedó obsoleta por una lectura posterior.", status_code=409)
+    existence = session.get(ScmExistenciaMangaKg, manga.kardex_existence_id) if manga.kardex_existence_id else None
+    if existence is not None and session.scalar(select(ScmMovimientoInventarioKg.id).where(
+        ScmMovimientoInventarioKg.saldo_id == existence.saldo_id,
+        ScmMovimientoInventarioKg.created_at > review.created_at,
+    ).limit(1)) is not None:
+        raise ScmServiceError("REVIEW_STALE", "El saldo cambió después de la revisión.", status_code=409)
+    if manga.estado != "DISPONIBLE" or manga.neto_kg is None:
+        raise ScmServiceError("MANGA_NOT_ACTIVE", "La manga ya no está activa o no tiene neto vigente.", status_code=409)
+    canonical, existence = _project_kardex_negative(
+        session, actor_id=actor.id, operation_id=op_id,
+        manga=manga, net=Decimal(manga.neto_kg), reason=reason,
+    )
+    movement = ScmMesaInventarioMovimiento(
+        id=uuid.uuid4(), manga_id=manga.id, tipo="AJUSTE_FALTANTE",
+        delta_kg=-Decimal(manga.neto_kg), motivo=reason, clave=key,
+        actor_id=actor.id, kardex_movimiento_id=canonical.id,
+    )
+    session.add(movement)
+    session.flush()
+    manga.estado, manga.baja_motivo, manga.baja_movimiento_id = "BAJA_COMPROBADA", "FALTANTE", movement.id
+    review.estado, review.used_at = "CONSUMIDA", _now()
+    session.flush()
+    return _complete(session, op_id, {"codigo": code, "comprobante": f"AJ-{str(movement.id)[:8].upper()}", "movimiento_id": str(movement.id), "kardex_movimiento_id": str(canonical.id)}, 201)
+
+
+def _confirm(session, actor_id, data, operation_id):
+    actor = _actor(session, actor_id, "INVENTARIO_AJUSTAR")
+    code = _text(data.get("codigo"), "codigo")
+    reason = _text(data.get("motivo"), "motivo", max_length=240)
+    key = _text(data.get("clave"), "clave")
+    manga = _manga_by_code(session, code, lock=True)
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/confirmaciones", actor.id, {"codigo": code, "motivo": reason, "clave": key})
+    if replay is not None:
+        return replay, status
+    if manga.estado != "PESADA_PENDIENTE_CONFIRMACION" or manga.neto_kg is None:
+        raise ScmServiceError("WEIGHT_REQUIRED", "La manga requiere un pesaje físico vigente antes de confirmar.", status_code=409)
+    link = manga.baja_movimiento_id
+    canonical, existence = _project_kardex_positive(
+        session, actor_id=actor.id, operation_id=op_id,
+        manga=manga, net=Decimal(manga.neto_kg), reason=reason,
+    )
+    movement = ScmMesaInventarioMovimiento(
+        id=uuid.uuid4(), manga_id=manga.id,
+        tipo="REINGRESO" if link else "ALTA_INVENTARIO",
+        delta_kg=Decimal(manga.neto_kg), motivo=reason, clave=key,
+        vinculo_baja_id=link, actor_id=actor.id,
+        kardex_movimiento_id=canonical.id,
+    )
+    session.add(movement)
+    manga.estado, manga.baja_motivo, manga.baja_movimiento_id = "DISPONIBLE", None, None
+    session.flush()
+    return _complete(session, op_id, {"codigo": code, "movimiento_id": str(movement.id), "kardex_movimiento_id": str(canonical.id), "vinculo_baja": str(link) if link else None}, 201)
+
+
+def dispatch(session, actor_id, method, path, data=None, operation_id=None):
+    """Dispatch a relative ``/inventario`` command using the server actor."""
+    data = data if isinstance(data, dict) else {}
+    method = str(method or "GET").upper()
+    parts = [part for part in str(path or "").strip("/").split("/") if part]
+    if parts and parts[0] == "inventario":
+        parts = parts[1:]
+    try:
+        if method != "GET":
+            # Serialize the pilot's productive writes with the same KG lock as
+            # the canonical ledger.  This covers sessions/readings as well as
+            # balance mutations and closes the select-then-insert campaign race.
+            acquire_kg_productive_write_lock(session)
+        if method == "GET" and parts == ["estado"]:
+            return vista_state(session, actor_id)
+        if method == "POST" and parts == ["sesiones"]:
+            return _open_session(session, actor_id, data, operation_id or uuid.uuid4())
+        if len(parts) == 3 and parts[0] == "sesiones" and parts[2] == "lecturas":
+            if method == "POST":
+                return _read_session(session, actor_id, parts[1], data, operation_id or uuid.uuid4())
+        if len(parts) == 4 and parts[0] == "sesiones" and parts[2] == "lecturas" and method == "DELETE":
+            return _delete_reading(session, actor_id, parts[1], parts[3], data, operation_id or uuid.uuid4())
+        if len(parts) == 3 and parts[0] == "sesiones" and parts[2] == "cerrar" and method == "POST":
+            return _close_session(session, actor_id, parts[1], data, operation_id or uuid.uuid4())
+        if method == "POST" and parts == ["antiguas"]:
+            return _old_unit(session, actor_id, data, operation_id or uuid.uuid4())
+        if method == "POST" and parts == ["pesajes"]:
+            return _weigh(session, actor_id, data, operation_id or uuid.uuid4())
+        if method == "POST" and parts == ["revision"]:
+            return _review(session, actor_id, data, operation_id or uuid.uuid4())
+        if method == "POST" and parts == ["faltantes"]:
+            return _missing(session, actor_id, data, operation_id or uuid.uuid4())
+        if method == "POST" and parts == ["confirmaciones"]:
+            return _confirm(session, actor_id, data, operation_id or uuid.uuid4())
+    except ScmServiceError:
+        _rollback(session)
+        raise
+    except Exception:
+        _rollback(session)
+        raise
+    raise ScmServiceError("MESA_ROUTE_NOT_FOUND", "Operación de inventario no reconocida.", status_code=404)
+
+
+__all__ = ["dispatch", "label", "vista_state", "ZONES", "STATION_ID"]

@@ -69,6 +69,8 @@ def require_station_auth(view):
         ).one_or_none()
         if station is None:
             return _error(401, "INVALID_TOKEN", "Credencial de estacion invalida")
+        if station.codigo == "MESA-ESTACION-2":
+            return _error(403, "STATION_SCOPE", "La credencial de Mesa solo admite inventario y retornos.")
         if station.estado_admin == "RETIRADA":
             return _error(403, "STATION_RETIRED", "La estacion fue retirada")
 

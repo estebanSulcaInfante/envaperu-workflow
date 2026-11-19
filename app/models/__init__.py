@@ -221,3 +221,18 @@ from app.models.scm_postpesaje_reprint import (
 )
 from app.models.scm_mn31 import ScmClienteMn31, ScmMn31LoteAsignacion
 from app.models.scm_quality import ScmVisitaCalidad
+from app.models.scm_mesa_inventory import (
+    ScmMesaInventarioCampana,
+    ScmMesaInventarioSesion,
+    ScmMesaInventarioManga,
+    ScmMesaInventarioLectura,
+    ScmMesaInventarioPesaje,
+    ScmMesaInventarioRevision,
+    ScmMesaInventarioMovimiento,
+    ScmMesaInventarioSolicitud,
+)
+from app.models.scm_mesa_returns import (
+    ScmMesaRetornoUnion,
+    ScmMesaRetornoOrigen,
+    ScmMesaRetornoRecibo,
+)

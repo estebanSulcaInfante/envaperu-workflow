@@ -95,6 +95,8 @@ def create_app():
     app.register_blueprint(scm_packaging_reads_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(scm_reprocessing_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(scm_warehouse_bp, url_prefix='/api/scm/v1')
+    from app.api.rutas_mesa_central import mesa_bp
+    app.register_blueprint(mesa_bp, url_prefix='/api/integration/v1/mesa')
     app.register_blueprint(scm_kg_pt_bp, url_prefix='/api/scm/v1')
     app.register_blueprint(talonarios_bp)
     app.register_blueprint(sync_bp, url_prefix='/api')
