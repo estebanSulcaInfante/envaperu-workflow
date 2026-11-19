@@ -226,6 +226,7 @@ from app.models.scm_mesa_inventory import (
     ScmMesaInventarioSesion,
     ScmMesaInventarioManga,
     ScmMesaInventarioLectura,
+    ScmMesaInventarioNoHabida,
     ScmMesaInventarioPesaje,
     ScmMesaInventarioRevision,
     ScmMesaInventarioMovimiento,

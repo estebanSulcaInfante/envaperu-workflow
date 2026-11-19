@@ -57,6 +57,17 @@ class ScmMesaInventarioSesion(db.Model):
     zona_id = db.Column(db.String(64), nullable=False)
     estado = db.Column(db.String(16), nullable=False, default="ABIERTA", server_default="ABIERTA")
     clave = db.Column(db.String(120), nullable=False)
+    # A named piece-count session is a shared, resumable observation.  The
+    # JSON columns intentionally keep the frozen scope independent from the
+    # live catalog; no later catalog edit can silently broaden a count.
+    nombre = db.Column(db.String(160), nullable=True)
+    piezas_json = db.Column(db.JSON, nullable=False, default=list, server_default="[]")
+    esperadas_json = db.Column(db.JSON, nullable=False, default=list, server_default="[]")
+    zonas_json = db.Column(db.JSON, nullable=False, default=list, server_default="[]")
+    saldo_snapshot_json = db.Column(db.JSON, nullable=False, default=dict, server_default="{}")
+    corte_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    cierre_fingerprint = db.Column(db.String(64), nullable=True)
+    cierre_response_json = db.Column(db.JSON, nullable=True)
     cobertura_confirmada = db.Column(db.Boolean, nullable=False, default=False, server_default=db.false())
     creado_por_id = db.Column(db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utc_now, server_default=db.func.now())
@@ -111,10 +122,31 @@ class ScmMesaInventarioLectura(db.Model):
     zona_anterior = db.Column(db.String(64), nullable=True)
     estado_anterior = db.Column(db.String(48), nullable=True)
     neto_anterior_kg = db.Column(db.Numeric(15, 3), nullable=True)
+    zona_lectura = db.Column(db.String(64), nullable=True)
+    zona_existente = db.Column(db.String(64), nullable=True)
+    movimiento_corte_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    pesaje_corte_at = db.Column(db.DateTime(timezone=True), nullable=True)
     actor_id = db.Column(db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utc_now, server_default=db.func.now())
 
     sesion = db.relationship("ScmMesaInventarioSesion", back_populates="lecturas")
+    manga = db.relationship("ScmMesaInventarioManga")
+
+
+class ScmMesaInventarioNoHabida(db.Model):
+    """Historical count result; it never creates a Kardex movement."""
+    __tablename__ = "scm_mesa_inventario_no_habida"
+    __table_args__ = (
+        db.UniqueConstraint("sesion_id", "manga_id", name="uq_mesa_inv_no_habida_sesion_manga"),
+    )
+
+    id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    sesion_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_mesa_inventario_sesion.id", ondelete="CASCADE"), nullable=False)
+    manga_id = db.Column(Uuid(as_uuid=True), db.ForeignKey("scm_mesa_inventario_manga.id", ondelete="RESTRICT"), nullable=False)
+    actor_id = db.Column(db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utc_now, server_default=db.func.now())
+
+    sesion = db.relationship("ScmMesaInventarioSesion")
     manga = db.relationship("ScmMesaInventarioManga")
 
 
@@ -194,6 +226,7 @@ MesaInventoryRequest = ScmMesaInventarioSolicitud
 __all__ = [
     "ScmMesaInventarioCampana", "ScmMesaInventarioSesion",
     "ScmMesaInventarioManga", "ScmMesaInventarioLectura",
+    "ScmMesaInventarioNoHabida",
     "ScmMesaInventarioPesaje", "ScmMesaInventarioRevision",
     "ScmMesaInventarioMovimiento", "ScmMesaInventarioSolicitud",
 ]

@@ -15,10 +15,12 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import selectinload
 
 from app.extensions import db
-from app.models.scm_articulos import ScmArticulo
+from app.models.scm_articulos import ScmArticulo, ScmArticuloPiezaColor
+from app.models.producto import PiezaColor
 from app.models.scm_inventory import ScmUbicacionInventario
 from app.models.scm_inventory_kg import ScmUnidadFisicaKg
 from app.models.scm_inventory_kg import (
@@ -39,10 +41,11 @@ from app.models.scm_mesa_inventory import (
     ScmMesaInventarioRevision,
     ScmMesaInventarioSesion,
     ScmMesaInventarioSolicitud,
+    ScmMesaInventarioNoHabida,
 )
 from app.models.scm_auditoria import ScmOperacion
 from app.services.scm_service_support import (
-    ScmServiceError, acquire_kg_productive_write_lock, load_actor, required_text,
+    ScmServiceError, acquire_kg_productive_write_lock, load_actor, load_actor_any, required_text,
 )
 from app.services.scm_warehouse_scope_service import assert_location_scope
 
@@ -69,6 +72,26 @@ def _iso(value):
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _after(value, cutoff):
+    if value is None:
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    return value > cutoff
+
+
+def _at_or_after(value, cutoff):
+    if value is None:
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    return value >= cutoff
 
 
 def _hash(value):
@@ -105,6 +128,11 @@ def _actor(session, actor_id, capability="INVENTARIO_VER"):
     return load_actor(session, actor_id, capability=capability)
 
 
+def _count_actor(session, actor_id):
+    """Named counts are usable by the legacy station or the web C66 role."""
+    return load_actor_any(session, actor_id, capabilities=("INVENTARIO_VER", "INVENTARIO_CONTEO_C66"))
+
+
 def _assert_zone(session, actor_id, zone_id):
     zone_id = _text(zone_id, "zona", max_length=64)
     if zone_id not in ZONE_IDS:
@@ -127,6 +155,166 @@ def _article(session, article_id):
     if article is None or not article.activo or article.clase != "PIEZA_COLOR" or article.unidad_inventario != "KG":
         raise ScmServiceError("ARTICLE_NOT_FOUND", "El artículo PIEZA_COLOR no existe.", status_code=404)
     return article
+
+
+def _piece_names(article):
+    """Return the canonical selector name, never a SKU or fuzzy prefix."""
+    values = set()
+    variant = getattr(getattr(article, "pieza_color", None), "pieza_color", None)
+    base = getattr(getattr(variant, "pieza_rel", None), "nombre", None)
+    values.add(base or article.nombre)
+    return {str(value).strip() for value in values if value}
+
+
+def _named_articles(session, pieces):
+    article_options = selectinload(ScmArticulo.pieza_color).selectinload(
+        ScmArticuloPiezaColor.pieza_color
+    ).options(
+        selectinload(PiezaColor.pieza_rel),
+        selectinload(PiezaColor.color_produccion_rel),
+    )
+    articles = session.scalars(select(ScmArticulo).options(article_options).where(
+        ScmArticulo.activo.is_(True),
+        ScmArticulo.clase == "PIEZA_COLOR",
+        ScmArticulo.unidad_inventario == 'KG',
+    ).order_by(ScmArticulo.id)).all()
+    wanted = {str(piece).strip() for piece in pieces}
+    selected = [article for article in articles if _piece_names(article) & wanted]
+    matched = {name for name in wanted if any(name in _piece_names(article) for article in selected)}
+    unknown = sorted(wanted - matched)
+    if unknown:
+        raise ScmServiceError(
+            "PIECE_NOT_FOUND", "Una pieza no existe en el catálogo local.",
+            status_code=422, details={"piezas": unknown},
+        )
+    return selected
+
+
+def _snapshot_named_codes(session, article_ids, cutoff):
+    """Freeze only active, positive KG identities at session creation."""
+    if not article_ids:
+        return []
+    codes = set()
+    rows = _eligible_named_units(session, article_ids=article_ids, cutoff=cutoff)
+    codes.update(unit.codigo for unit in rows)
+    return sorted(codes)
+
+
+def _eligible_named_units(session, *, article_ids=None, codes=None, cutoff=None):
+    location = session.scalar(select(ScmUbicacionInventario).where(
+        ScmUbicacionInventario.codigo == SALDO_KEY,
+        ScmUbicacionInventario.activo.is_(True),
+    ))
+    if location is None:
+        return []
+    query = select(ScmUnidadFisicaKg).join(
+        ScmExistenciaMangaKg,
+        ScmExistenciaMangaKg.unidad_fisica_kg_id == ScmUnidadFisicaKg.id,
+    ).where(
+        ScmUnidadFisicaKg.estado == "ACTIVA",
+        ScmUnidadFisicaKg.estado_logistico.in_(("RECIBIDA_ALMACEN", "ALMACENADA_CONTROLADA", "DISPONIBLE_PRODUCCION")),
+        ScmUnidadFisicaKg.ubicacion_id == location.id,
+        ScmExistenciaMangaKg.ubicacion_id == location.id,
+        ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        ScmExistenciaMangaKg.cantidad_fisica_kg > 0,
+    )
+    if cutoff is not None:
+        query = query.where(
+            ScmUnidadFisicaKg.updated_at <= cutoff,
+            ScmExistenciaMangaKg.recibida_at <= cutoff,
+        )
+    if article_ids is not None:
+        query = query.where(ScmUnidadFisicaKg.articulo_scm_id.in_(article_ids))
+    if codes is not None:
+        query = query.where(ScmUnidadFisicaKg.codigo.in_(codes))
+    # Do not DISTINCT the full ORM row: PostgreSQL cannot compare JSON
+    # columns. The positive join already filters eligible rows; group only by
+    # scalar identity/existence columns to avoid JSON equality.
+    query = query.with_only_columns(
+        ScmUnidadFisicaKg.id, ScmUnidadFisicaKg.public_id,
+        ScmUnidadFisicaKg.codigo, ScmUnidadFisicaKg.articulo_scm_id,
+        ScmUnidadFisicaKg.estado, ScmUnidadFisicaKg.estado_logistico,
+        ScmUnidadFisicaKg.updated_at, ScmUnidadFisicaKg.kg_verificados,
+        ScmUnidadFisicaKg.ubicacion_id, ScmExistenciaMangaKg.recibida_at,
+    ).group_by(
+        ScmUnidadFisicaKg.id, ScmUnidadFisicaKg.public_id,
+        ScmUnidadFisicaKg.codigo, ScmUnidadFisicaKg.articulo_scm_id,
+        ScmUnidadFisicaKg.estado, ScmUnidadFisicaKg.estado_logistico,
+        ScmUnidadFisicaKg.updated_at, ScmUnidadFisicaKg.kg_verificados,
+        ScmUnidadFisicaKg.ubicacion_id, ScmExistenciaMangaKg.recibida_at,
+    ).order_by(ScmUnidadFisicaKg.codigo)
+    return session.execute(query).all()
+
+
+def _snapshot_named_balances(session, article_ids):
+    location = session.scalar(select(ScmUbicacionInventario).where(ScmUbicacionInventario.codigo == SALDO_KEY))
+    if location is None:
+        return {}
+    rows = session.scalars(select(ScmSaldoInventarioKg).where(
+        ScmSaldoInventarioKg.articulo_scm_id.in_(article_ids),
+        ScmSaldoInventarioKg.ubicacion_id == location.id,
+    )).all()
+    return {
+        str(row.articulo_scm_id): {
+            "id": str(row.id), "version": row.version,
+            "cantidad_fisica_kg": _fmt(row.cantidad_fisica_kg),
+        }
+        for row in rows
+    }
+
+
+def _session_pieces(session_obj):
+    value = session_obj.piezas_json
+    if isinstance(value, dict):
+        return list(value.get("names", []))
+    return list(value or [])
+
+
+def _is_named_session(session_obj):
+    return bool(_session_pieces(session_obj))
+
+
+def _session_zones(session_obj):
+    value = session_obj.zonas_json or []
+    return list(value) if isinstance(value, list) and value else [session_obj.zona_id]
+
+
+def _named_pending(session, session_obj):
+    expected = set(session_obj.esperadas_json or [])
+    if not expected:
+        return []
+    found = set()
+    rows = session.execute(select(ScmMesaInventarioManga.codigo, ScmMesaInventarioLectura.created_at).join(
+        ScmMesaInventarioLectura,
+        ScmMesaInventarioLectura.manga_id == ScmMesaInventarioManga.id,
+    ).where(
+        ScmMesaInventarioManga.codigo.in_(expected),
+    )).all()
+    cutoff = session_obj.corte_at or session_obj.created_at
+    found.update(row.codigo for row in rows if _at_or_after(row.created_at, cutoff))
+    eligible = set()
+    eligible.update(unit.codigo for unit in _eligible_named_units(session, codes=expected, cutoff=session_obj.corte_at))
+    excluded = set(session.scalars(select(ScmMesaInventarioManga.codigo).join(
+        ScmMesaInventarioNoHabida,
+        ScmMesaInventarioNoHabida.manga_id == ScmMesaInventarioManga.id,
+    ).where(
+        ScmMesaInventarioNoHabida.sesion_id == session_obj.id,
+    )).all())
+    return sorted(eligible - found - excluded)
+
+
+def _lock_count_session(session, actor_id, session_id):
+    """Lock campaign before session, the common order for count mutations."""
+    unlocked = _session(session, actor_id, session_id, lock=False)
+    session.get(ScmMesaInventarioCampana, unlocked.campana_id, with_for_update=True)
+    return _session(session, actor_id, session_id, lock=True)
+
+
+def _lock_named_identities(session, codes):
+    if codes:
+        session.scalars(select(ScmUnidadFisicaKg).where(
+            ScmUnidadFisicaKg.codigo.in_(sorted(set(codes))),
+        ).order_by(ScmUnidadFisicaKg.codigo).with_for_update()).all()
 
 
 def _campaign(session, actor_id):
@@ -514,24 +702,34 @@ def _session(session, actor_id, session_id, *, lock=False):
 
 
 def _reading(session, actor_id, session_obj, manga, data):
+    requested_zone = data.get("zona") or session_obj.zona_id
+    if requested_zone not in _session_zones(session_obj):
+        raise ScmServiceError("ZONE_OUT_OF_SCOPE", "La habitación no pertenece al alcance de la sesión.", status_code=409)
     existing = session.scalar(select(ScmMesaInventarioLectura).where(
         ScmMesaInventarioLectura.sesion_id == session_obj.id,
         ScmMesaInventarioLectura.manga_id == manga.id,
     ))
     if existing is not None:
+        if _is_named_session(session_obj) and existing.zona_lectura != requested_zone:
+            raise ScmServiceError(
+                "ZONE_CONFLICT", "La identidad ya fue leída en otra habitación; quite la captura anterior.",
+                status_code=409,
+            )
         return "Lectura ya registrada"
     previous_zone, previous_state, previous_net = manga.zona_hallazgo, manga.estado, manga.neto_kg
-    if manga.zona_hallazgo and manga.zona_hallazgo != session_obj.zona_id:
+    if manga.zona_hallazgo and manga.zona_hallazgo != requested_zone:
         if data.get("confirmar_zona") is not True or data.get("zona_anterior") != manga.zona_hallazgo:
-            raise ScmServiceError("ZONE_CONFLICT", "La identidad figura en otra zona; confirme el hallazgo.", status_code=409, details={"zona_anterior": manga.zona_hallazgo, "zona_actual": session_obj.zona_id})
-    manga.zona_hallazgo = session_obj.zona_id
+            raise ScmServiceError("ZONE_CONFLICT", "La identidad figura en otra zona; confirme el hallazgo.", status_code=409, details={"zona_anterior": manga.zona_hallazgo, "zona_actual": requested_zone})
+    manga.zona_hallazgo = requested_zone
     if manga.estado == "BAJA_COMPROBADA":
         manga.estado = "PENDIENTE_PESAJE"
         manga.bruto_kg = manga.tara_kg = manga.neto_kg = None
     session.add(ScmMesaInventarioLectura(
         sesion_id=session_obj.id, manga_id=manga.id,
         zona_anterior=previous_zone, estado_anterior=previous_state,
-        neto_anterior_kg=previous_net, actor_id=actor_id,
+        neto_anterior_kg=previous_net, zona_lectura=requested_zone,
+        zona_existente=previous_zone, movimiento_corte_at=session_obj.corte_at,
+        pesaje_corte_at=session_obj.corte_at, actor_id=actor_id,
     ))
     return "Lectura registrada"
 
@@ -540,11 +738,35 @@ def _state(session):
     zones = [{"id": item[0], "nombre": item[1]} for item in ZONES]
     articles = []
     for article in session.scalars(select(ScmArticulo).where(ScmArticulo.activo.is_(True), ScmArticulo.clase == "PIEZA_COLOR", ScmArticulo.unidad_inventario == "KG").order_by(ScmArticulo.codigo)).all():
-        articles.append({"id": str(article.id), "codigo": article.codigo, "nombre": article.nombre, "color": _article_color(article)})
+        articles.append({
+            "id": str(article.id), "codigo": article.codigo,
+            "nombre": next(iter(_piece_names(article)), article.nombre),
+            "nombre_color": article.nombre,
+            "color": _article_color(article),
+        })
     mangas = [_manga_payload(item) for item in session.scalars(select(ScmMesaInventarioManga).order_by(ScmMesaInventarioManga.codigo)).all()]
     sessions = []
     for item in session.scalars(select(ScmMesaInventarioSesion).order_by(ScmMesaInventarioSesion.created_at)).all():
-        sessions.append({"id": str(item.id), "zona": item.zona_id, "estado": item.estado, "lecturas": [{"codigo": row.manga.codigo} for row in item.lecturas]})
+        named = _is_named_session(item)
+        readings = []
+        for row in item.lecturas:
+            readings.append({
+                "codigo": row.manga.codigo,
+                **({"zona": row.zona_lectura or item.zona_id, "zona_existente": row.zona_existente, "estado": "PRESENTE"} if named else {}),
+            })
+        projected = {"id": str(item.id), "zona": item.zona_id, "estado": item.estado, "lecturas": readings}
+        if named:
+            projected.update({
+                "nombre": item.nombre, "piezas": _session_pieces(item),
+                "esperadas": list(item.esperadas_json or []),
+                "no_habidas": [row.manga.codigo for row in session.scalars(select(ScmMesaInventarioNoHabida).where(ScmMesaInventarioNoHabida.sesion_id == item.id)).all()],
+                "pendientes_conteo": (
+                    list((item.cierre_response_json or {}).get("pendientes_conteo", []))
+                    if item.estado != "ABIERTA" and item.cierre_response_json
+                    else _named_pending(session, item)
+                ),
+            })
+        sessions.append(projected)
     pending = [_manga_payload(item) for item in session.scalars(select(ScmMesaInventarioManga).where(ScmMesaInventarioManga.estado.in_(("PENDIENTE_PESAJE", "PESADA_PENDIENTE_CONFIRMACION"))).order_by(ScmMesaInventarioManga.codigo)).all()]
     movements = [{"id": str(item.id), "codigo": item.manga.codigo, "tipo": item.tipo, "delta": _fmt(item.delta_kg), "motivo": item.motivo, "vinculo_baja": str(item.vinculo_baja_id) if item.vinculo_baja_id else None, "kardex_movimiento_id": str(item.kardex_movimiento_id) if item.kardex_movimiento_id else None} for item in session.scalars(select(ScmMesaInventarioMovimiento).order_by(ScmMesaInventarioMovimiento.created_at)).all()]
     campaign = session.scalar(select(ScmMesaInventarioCampana).order_by(ScmMesaInventarioCampana.created_at).limit(1))
@@ -555,13 +777,89 @@ def _state(session):
         "zonas": zones, "articulos": articles, "mangas": mangas,
         "sesiones": sessions, "pendientes": pending, "movimientos": movements,
         "preetiquetas": [],
+        "conteo_por_pieza": True,
+        "pendientes_conteo": sorted({code for item in session.scalars(select(ScmMesaInventarioSesion).where(ScmMesaInventarioSesion.estado == "ABIERTA")).all() if _is_named_session(item) for code in _named_pending(session, item)}),
     }
 
 
 def vista_state(session, actor_id):
     """Return the Mesa contract for a server-resolved actor."""
-    _actor(session, actor_id, "INVENTARIO_VER")
+    _count_actor(session, actor_id)
     return _state(session)
+
+
+def _catalogo_conteo(session):
+    variant = selectinload(ScmArticulo.pieza_color).selectinload(
+        ScmArticuloPiezaColor.pieza_color
+    )
+    article_rows = session.scalars(select(ScmArticulo).options(
+        variant.selectinload(PiezaColor.color_produccion_rel),
+        variant.selectinload(PiezaColor.pieza_rel),
+    ).where(
+        ScmArticulo.activo.is_(True), ScmArticulo.clase == "PIEZA_COLOR",
+        ScmArticulo.unidad_inventario == "KG",
+    ).order_by(ScmArticulo.codigo)).all()
+    return [{
+        "id": str(article.id), "codigo": article.codigo,
+        "nombre": next(iter(_piece_names(article)), article.nombre),
+        "nombre_color": article.nombre, "color": _article_color(article),
+    } for article in article_rows]
+
+
+def vista_state_conteo(session, actor_id, session_id=None):
+    """Refresh a single count on scan. Load the catalog when entering the view."""
+    _count_actor(session, actor_id)
+    readings = selectinload(ScmMesaInventarioSesion.lecturas).selectinload(
+        ScmMesaInventarioLectura.manga
+    ).selectinload(ScmMesaInventarioManga.articulo)
+    query = select(ScmMesaInventarioSesion).options(readings).order_by(ScmMesaInventarioSesion.created_at)
+    if session_id is not None:
+        query = query.where(ScmMesaInventarioSesion.id == _uuid(session_id, "sesion_id"))
+    session_rows = session.scalars(query).all()
+    if session_id is not None and not session_rows:
+        raise ScmServiceError("SESSION_NOT_FOUND", "El conteo no existe.", status_code=404)
+    expected_all = {code for item in session_rows if item.estado == "ABIERTA" for code in (item.esperadas_json or [])}
+    eligible_rows = _eligible_named_units(session, codes=expected_all) if expected_all else []
+    last_seen = {}
+    if expected_all:
+        last_seen = dict(session.execute(select(
+            ScmMesaInventarioManga.codigo, func.max(ScmMesaInventarioLectura.created_at)
+        ).join(ScmMesaInventarioLectura, ScmMesaInventarioLectura.manga_id == ScmMesaInventarioManga.id)
+          .where(ScmMesaInventarioManga.codigo.in_(expected_all)).group_by(ScmMesaInventarioManga.codigo)).all())
+    sessions = []
+    for item in session_rows:
+        named = _is_named_session(item)
+        readings = [{
+            "codigo": row.manga.codigo,
+            "articulo_id": str(row.manga.articulo_id),
+            "articulo": row.manga.articulo.codigo if row.manga.articulo else None,
+            **({"zona": row.zona_lectura or item.zona_id, "zona_existente": row.zona_existente, "estado": "PRESENTE"} if named else {}),
+        } for row in item.lecturas]
+        projected = {"id": str(item.id), "zona": item.zona_id, "estado": item.estado, "lecturas": readings}
+        if named:
+            expected = set(item.esperadas_json or [])
+            cutoff = item.corte_at or item.created_at
+            found = {code for code in expected if code in last_seen and _at_or_after(last_seen[code], cutoff)}
+            missing = set((item.cierre_response_json or {}).get("no_habidas", []))
+            eligible = {
+                unit.codigo for unit in eligible_rows
+                if not _after(unit.updated_at, item.corte_at or item.created_at)
+                and not _after(unit.recibida_at, item.corte_at or item.created_at)
+            }
+            projected.update({
+                "nombre": item.nombre, "piezas": _session_pieces(item),
+                "esperadas": sorted(expected), "no_habidas": sorted(missing),
+                "pendientes_conteo": (
+                    list((item.cierre_response_json or {}).get("pendientes_conteo", []))
+                    if item.estado != "ABIERTA" and item.cierre_response_json
+                    else sorted((eligible & expected) - found - missing)
+                ),
+            })
+        sessions.append(projected)
+    if session_id is not None:
+        return {"sesiones": sessions}
+    return {"conteo_por_pieza": True, "zonas": [{"id": key, "nombre": name} for key, name in ZONES],
+            "articulos": _catalogo_conteo(session), "sesiones": sessions}
 
 
 def label(session, actor_id, codigo):
@@ -572,57 +870,171 @@ def label(session, actor_id, codigo):
 
 
 def _open_session(session, actor_id, data, operation_id):
-    actor = _actor(session, actor_id)
-    zone = _assert_zone(session, actor.id, data.get("zona"))
+    named = "nombre" in data or "piezas" in data
+    actor = _count_actor(session, actor_id) if named else _actor(session, actor_id)
+    raw_zones = data.get("zona")
+    if isinstance(raw_zones, list):
+        if not raw_zones:
+            raise ScmServiceError("ZONE_REQUIRED", "La sesión requiere al menos una habitación.", status_code=422)
+        zones = list(dict.fromkeys(_assert_zone(session, actor.id, item) for item in raw_zones))
+    else:
+        zones = [_assert_zone(session, actor.id, raw_zones)]
+    zone = zones[0]
     key = _text(data.get("clave"), "clave")
-    op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones", actor.id, {"zona": zone, "clave": key})
+    names = []
+    article_ids = []
+    name = None
+    if named:
+        if not isinstance(raw_zones, list):
+            # Web C66 starts from one room but can continue the same named
+            # count from another permitted room.
+            zones = [zone, *[item[0] for item in ZONES if item[0] != zone]]
+        name = _text(data.get("nombre"), "nombre", max_length=160)
+        raw_pieces = data.get("piezas")
+        if not isinstance(raw_pieces, list) or not raw_pieces or any(not isinstance(piece, str) or not piece.strip() for piece in raw_pieces):
+            raise ScmServiceError("PIECES_REQUIRED", "piezas debe ser una lista no vacía.", status_code=422)
+        names = list(dict.fromkeys(piece.strip() for piece in raw_pieces))
+        articles = _named_articles(session, names)
+        article_ids = [article.id for article in articles]
+    operation_payload = {"zona": zone, "zonas": zones, "clave": key, "nombre": name, "piezas": names}
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones", actor.id, operation_payload)
     if replay is not None:
         return replay, status
     campaign = _campaign(session, actor.id)
-    value = ScmMesaInventarioSesion(campana_id=campaign.id, zona_id=zone, clave=key, creado_por_id=actor.id)
+    cutoff = _now()
+    expected = _snapshot_named_codes(session, article_ids, cutoff) if named else []
+    saldo_snapshot = _snapshot_named_balances(session, article_ids) if named else {}
+    value = ScmMesaInventarioSesion(
+        campana_id=campaign.id, zona_id=zone, clave=key, creado_por_id=actor.id,
+        nombre=name, piezas_json={"names": names, "article_ids": article_ids} if named else [],
+        esperadas_json=expected, zonas_json=zones, saldo_snapshot_json=saldo_snapshot, corte_at=cutoff,
+    )
     session.add(value)
     session.flush()
-    return _complete(session, op_id, {"id": str(value.id), "zona": zone, "estado": value.estado}, 201)
+    response = {"id": str(value.id), "zona": zone, "zonas": zones, "estado": value.estado}
+    if named:
+        response.update({"nombre": name, "piezas": names, "esperadas": expected})
+    return _complete(session, op_id, response, 201)
 
 
 def _read_session(session, actor_id, session_id, data, operation_id):
-    actor = _actor(session, actor_id)
-    obj = _session(session, actor.id, session_id, lock=True)
+    actor = _count_actor(session, actor_id)
+    obj = _lock_count_session(session, actor.id, session_id)
     if obj.estado != "ABIERTA":
         raise ScmServiceError("SESSION_CLOSED", "La sesión ya está cerrada.", status_code=409)
     code = _text(data.get("codigo"), "codigo")
     manga = _manga_by_code(session, code, lock=True)
+    if _is_named_session(obj):
+        article_names = set(_session_pieces(obj))
+        if not (_piece_names(manga.articulo) & article_names):
+            raise ScmServiceError("PIECE_OUT_OF_SCOPE", "La pieza no pertenece al alcance de esta sesión.", status_code=409)
+        if manga.estado == "BAJA_NO_RECUPERABLE":
+            raise ScmServiceError("MANGA_BLOCKED", "La manga está bloqueada por una causa no recuperable.", status_code=409)
     operation_data = {"session_id": str(obj.id), "codigo": manga.codigo, "confirmar_zona": data.get("confirmar_zona"), "zona_anterior": data.get("zona_anterior")}
+    if _is_named_session(obj):
+        operation_data["zona"] = data.get("zona") or obj.zona_id
     op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones/lecturas", actor.id, operation_data)
     if replay is not None:
         return replay, status
     message = _reading(session, actor.id, obj, manga, data)
     session.flush()
-    return _complete(session, op_id, {"mensaje": message}, 201 if message == "Lectura registrada" else 200)
+    response = {"mensaje": message}
+    if _is_named_session(obj):
+        response.update({
+            "codigo": manga.codigo, "zona": manga.zona_hallazgo,
+            "zona_existente": next(
+                (item.zona_existente for item in obj.lecturas if item.manga_id == manga.id), None
+            ),
+            "estado": "PRESENTE",
+        })
+    return _complete(session, op_id, response, 201 if message == "Lectura registrada" else 200)
 
 
 def _delete_reading(session, actor_id, session_id, code, data, operation_id):
-    actor = _actor(session, actor_id)
-    obj = _session(session, actor.id, session_id, lock=True)
+    actor = _count_actor(session, actor_id)
+    obj = _lock_count_session(session, actor.id, session_id)
     if obj.estado != "ABIERTA":
         raise ScmServiceError("SESSION_CLOSED", "La sesión ya está cerrada.", status_code=409)
     manga = _manga_by_code(session, code, lock=True)
-    row = session.scalar(select(ScmMesaInventarioLectura).where(ScmMesaInventarioLectura.sesion_id == obj.id, ScmMesaInventarioLectura.manga_id == manga.id))
-    if row is None:
-        raise ScmServiceError("READING_NOT_FOUND", "La lectura no existe en la sesión.", status_code=404)
-    if manga.estado in {"PESADA_PENDIENTE_CONFIRMACION", "DISPONIBLE"}:
-        raise ScmServiceError("READING_IMMUTABLE", "No se puede retirar una lectura con pesaje o saldo confirmado.", status_code=409)
     op_id, replay, status = _operation(session, operation_id, "DELETE /inventario/sesiones/lecturas", actor.id, {"session_id": str(obj.id), "codigo": manga.codigo})
     if replay is not None:
         return replay, status
-    manga.zona_hallazgo, manga.estado, manga.neto_kg = row.zona_anterior, row.estado_anterior or manga.estado, row.neto_anterior_kg
+    row = session.scalar(select(ScmMesaInventarioLectura).where(ScmMesaInventarioLectura.sesion_id == obj.id, ScmMesaInventarioLectura.manga_id == manga.id))
+    if row is None:
+        raise ScmServiceError("READING_NOT_FOUND", "La lectura no existe en la sesión.", status_code=404)
+    if _is_named_session(obj):
+        post_cut_movement = session.scalar(select(ScmMesaInventarioMovimiento.id).where(
+            ScmMesaInventarioMovimiento.manga_id == manga.id,
+            ScmMesaInventarioMovimiento.created_at > (row.created_at or obj.corte_at),
+        ))
+        post_cut_weight = session.scalar(select(ScmMesaInventarioPesaje.id).where(
+            ScmMesaInventarioPesaje.manga_id == manga.id,
+            ScmMesaInventarioPesaje.created_at > (row.created_at or obj.corte_at),
+        ))
+        if post_cut_movement or post_cut_weight:
+            raise ScmServiceError("READING_IMMUTABLE", "No se puede retirar una lectura después de pesar o acreditar.", status_code=409)
+    elif manga.estado in {"PESADA_PENDIENTE_CONFIRMACION", "DISPONIBLE"}:
+        raise ScmServiceError("READING_IMMUTABLE", "No se puede retirar una lectura con pesaje o saldo confirmado.", status_code=409)
+    later = session.scalar(select(ScmMesaInventarioLectura).where(
+        ScmMesaInventarioLectura.manga_id == manga.id,
+        ScmMesaInventarioLectura.id != row.id,
+    ).order_by(ScmMesaInventarioLectura.created_at.desc(), ScmMesaInventarioLectura.id.desc()))
+    if later is not None and (
+        later.created_at is None
+        or row.created_at is None
+        or later.created_at > row.created_at
+        or (later.created_at == row.created_at and later.id.int > row.id.int)
+    ):
+        # Another room observed this identity after A. Removing A must not
+        # roll the shared shadow back over B's newer location/state.
+        manga.zona_hallazgo = later.zona_lectura or manga.zona_hallazgo
+    else:
+        manga.zona_hallazgo, manga.estado, manga.neto_kg = row.zona_anterior, row.estado_anterior or manga.estado, row.neto_anterior_kg
     session.delete(row)
     return _complete(session, op_id, {"mensaje": "Lectura eliminada"}, 200)
 
 
 def _close_session(session, actor_id, session_id, data, operation_id):
-    actor = _actor(session, actor_id)
-    obj = _session(session, actor.id, session_id, lock=True)
+    actor = _count_actor(session, actor_id)
+    obj = _lock_count_session(session, actor.id, session_id)
+    if _is_named_session(obj):
+        marked = data.get("marcar_no_habidas", False)
+        if not isinstance(marked, bool):
+            raise ScmServiceError("INVALID_MISSING_FLAG", "marcar_no_habidas debe ser booleano.", status_code=422)
+        raw_missing = data.get("no_habidas", [])
+        if not isinstance(raw_missing, list) or any(not isinstance(code, str) or not code.strip() for code in raw_missing):
+            raise ScmServiceError("INVALID_MISSING", "no_habidas debe ser una lista de códigos.", status_code=422)
+        missing = list(dict.fromkeys(code.strip() for code in raw_missing))
+        if len(missing) != len(raw_missing):
+            raise ScmServiceError("DUPLICATE_MISSING", "no_habidas no debe contener códigos repetidos.", status_code=422)
+        fingerprint = _fingerprint({"marcar_no_habidas": marked, "no_habidas": missing})
+        if obj.estado != "ABIERTA":
+            if obj.cierre_fingerprint == fingerprint and obj.cierre_response_json:
+                return copy.deepcopy(obj.cierre_response_json), 200
+            raise ScmServiceError("SESSION_CLOSED", "La sesión ya está cerrada.", status_code=409)
+        _lock_named_identities(session, obj.esperadas_json or [])
+        pending = _named_pending(session, obj)
+        if marked and set(missing) != set(pending):
+            raise ScmServiceError("MISSING_MISMATCH", "La lista de no habidas no coincide con las pendientes del corte.", status_code=409, details={"pendientes_conteo": pending})
+        if not marked and missing:
+            raise ScmServiceError("MISSING_FLAG_REQUIRED", "no_habidas requiere marcar_no_habidas=true.", status_code=422)
+        op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones/cerrar", actor.id, {"session_id": str(obj.id), "marcar_no_habidas": marked, "no_habidas": missing})
+        if replay is not None:
+            return replay, status
+        for code in (missing if marked else []):
+            manga = _manga_by_code(session, code, lock=True)
+            if code not in (obj.esperadas_json or []):
+                raise ScmServiceError("MISSING_OUT_OF_SCOPE", "Una no habida no pertenece al corte de la sesión.", status_code=409)
+            session.add(ScmMesaInventarioNoHabida(sesion_id=obj.id, manga_id=manga.id, actor_id=actor.id))
+        closed_at = _now()
+        response = {
+            "mensaje": "Sesión cerrada", "closed_at": _iso(closed_at),
+            "cantidad": len(obj.lecturas), "no_habidas": missing if marked else [],
+            "pendientes_conteo": [] if marked else pending,
+        }
+        obj.estado, obj.closed_at = "CERRADA", closed_at
+        obj.cierre_fingerprint, obj.cierre_response_json = fingerprint, response
+        return _complete(session, op_id, response, 200)
     op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones/cerrar", actor.id, {"session_id": str(obj.id)})
     if replay is not None:
         return replay, status
@@ -853,4 +1265,4 @@ def dispatch(session, actor_id, method, path, data=None, operation_id=None):
     raise ScmServiceError("MESA_ROUTE_NOT_FOUND", "Operación de inventario no reconocida.", status_code=404)
 
 
-__all__ = ["dispatch", "label", "vista_state", "ZONES", "STATION_ID"]
+__all__ = ["dispatch", "label", "vista_state", "vista_state_conteo", "ZONES", "STATION_ID"]
