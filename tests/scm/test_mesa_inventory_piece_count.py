@@ -135,7 +135,7 @@ def test_web_state_uses_reads_from_later_session_for_older_pending(app, count_ac
         first, _ = call(count_actor, "POST", "/sesiones", {"nombre": "A", "piezas": ["Tapa"], "zona": ZONE, "clave": "named-cross-a"})
         second, _ = call(count_actor, "POST", "/sesiones", {"nombre": "B", "piezas": ["Tapa"], "zona": OTHER_ZONE, "clave": "named-cross-b"})
         call(count_actor, "POST", f"/sesiones/{second['id']}/lecturas", {"codigo": "CENTRAL-TAPA-VERDE", "zona": OTHER_ZONE, "confirmar_zona": True, "zona_anterior": ZONE})
-        state = vista_state_conteo(db.session, count_actor)
+        state = vista_state_conteo(db.session, count_actor, first["id"])
         older = next(item for item in state["sesiones"] if item["id"] == first["id"])
         assert "CENTRAL-TAPA-VERDE" not in older["pendientes_conteo"]
         closed, status = call(count_actor, "POST", f"/sesiones/{first['id']}/cerrar", {"marcar_no_habidas": True, "no_habidas": older["pendientes_conteo"]})
@@ -186,7 +186,7 @@ def test_web_state_preserves_pending_from_partial_close(app, count_actor):
         opened, _ = call(count_actor, "POST", "/sesiones", {"nombre": "Tapas", "piezas": ["Tapa"], "zona": ZONE, "clave": "named-partial-get"})
         closed, status = call(count_actor, "POST", f"/sesiones/{opened['id']}/cerrar", {"marcar_no_habidas": False, "no_habidas": []})
         assert status == 200 and closed["pendientes_conteo"]
-        state = vista_state_conteo(db.session, count_actor)
+        state = vista_state_conteo(db.session, count_actor, opened["id"])
         current = next(item for item in state["sesiones"] if item["id"] == opened["id"])
         assert current["pendientes_conteo"] == closed["pendientes_conteo"]
 

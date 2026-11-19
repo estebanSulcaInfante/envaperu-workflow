@@ -53,6 +53,8 @@ def command(path, fields):
         raise ScmServiceError("INVALID_KEY", "La operación requiere una clave válida.") from exc
     if path == "/sesiones":
         body = {**body, "clave": str(key)}
+    else:
+        inventory.require_named_count(db.session, request.view_args["session_id"])
     result = inventory.dispatch(db.session, g.scm_actor_id, request.method, path, body, key)
     payload, status = result if isinstance(result, tuple) else (result, 200)
     return jsonify(payload), status

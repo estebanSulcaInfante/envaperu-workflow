@@ -806,17 +806,35 @@ def _catalogo_conteo(session):
     } for article in article_rows]
 
 
+def require_named_count(session, session_id):
+    sid = _uuid(session_id, "sesion_id")
+    if session.scalar(select(ScmMesaInventarioSesion.id).where(
+        ScmMesaInventarioSesion.id == sid, ScmMesaInventarioSesion.nombre.is_not(None)
+    )) is None:
+        raise ScmServiceError("SESSION_NOT_FOUND", "El conteo no existe.", status_code=404)
+
+
 def vista_state_conteo(session, actor_id, session_id=None):
     """Refresh a single count on scan. Load the catalog when entering the view."""
     _count_actor(session, actor_id)
+    named = ScmMesaInventarioSesion.nombre.is_not(None)
+    if session_id is None:
+        rows = session.execute(select(
+            ScmMesaInventarioSesion.id, ScmMesaInventarioSesion.nombre,
+            ScmMesaInventarioSesion.zona_id, ScmMesaInventarioSesion.piezas_json,
+            ScmMesaInventarioSesion.estado,
+        ).where(named).order_by(ScmMesaInventarioSesion.created_at.desc()))
+        summaries = [{"id": str(row.id), "nombre": row.nombre, "zona": row.zona_id,
+                      "piezas": _session_pieces(row), "estado": row.estado, "resumen": True} for row in rows]
+        return {"conteo_por_pieza": True, "zonas": [{"id": key, "nombre": name} for key, name in ZONES],
+                "articulos": _catalogo_conteo(session), "sesiones": summaries}
     readings = selectinload(ScmMesaInventarioSesion.lecturas).selectinload(
         ScmMesaInventarioLectura.manga
     ).selectinload(ScmMesaInventarioManga.articulo)
-    query = select(ScmMesaInventarioSesion).options(readings).order_by(ScmMesaInventarioSesion.created_at)
-    if session_id is not None:
-        query = query.where(ScmMesaInventarioSesion.id == _uuid(session_id, "sesion_id"))
+    query = select(ScmMesaInventarioSesion).options(readings).where(
+        named, ScmMesaInventarioSesion.id == _uuid(session_id, "sesion_id"))
     session_rows = session.scalars(query).all()
-    if session_id is not None and not session_rows:
+    if not session_rows:
         raise ScmServiceError("SESSION_NOT_FOUND", "El conteo no existe.", status_code=404)
     expected_all = {code for item in session_rows if item.estado == "ABIERTA" for code in (item.esperadas_json or [])}
     eligible_rows = _eligible_named_units(session, codes=expected_all) if expected_all else []
@@ -856,10 +874,7 @@ def vista_state_conteo(session, actor_id, session_id=None):
                 ),
             })
         sessions.append(projected)
-    if session_id is not None:
-        return {"sesiones": sessions}
-    return {"conteo_por_pieza": True, "zonas": [{"id": key, "nombre": name} for key, name in ZONES],
-            "articulos": _catalogo_conteo(session), "sesiones": sessions}
+    return {"sesiones": sessions}
 
 
 def label(session, actor_id, codigo):
