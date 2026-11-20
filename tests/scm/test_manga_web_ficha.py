@@ -234,6 +234,8 @@ def test_kg_control_close_reopen_and_continue_only_projects_delta(app):
         )
         assert ficha_reopened["pesaje"]["peso_neto_kg"] == "5.000"
         assert ficha_reopened["pesaje"]["origen"] == "CONTROL_REABIERTO"
+        assert ficha_reopened["acciones"]["cerrar_desde_control"]["elegible"] is False
+        assert ficha_reopened["acciones"]["cerrar_desde_control"]["razon"] == "KG_CONTROL_REQUIRED"
 
         second = register_manga_weighing_control(
             db.session, station_id=station.station_id, operation_id=uuid4(), actor_id=creator.id,

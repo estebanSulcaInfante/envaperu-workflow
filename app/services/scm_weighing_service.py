@@ -963,6 +963,7 @@ def resolve_manga_web_ficha(session, *, actor_id, entrada):
         .order_by(ScmTramoMangaTrabajo.secuencia)
     ).all()
     latest_segment = segments[-1] if segments else None
+    active_segment_control = None
     if latest_segment is not None:
         active_segment_control = session.scalar(
             select(ScmControlPesoManga)
@@ -1131,10 +1132,10 @@ def resolve_manga_web_ficha(session, *, actor_id, entrada):
         close_from_control_reason = "KG_ARTICLE_REQUIRED"
     elif manga.estado != "EN_LLENADO":
         close_from_control_reason = "MANGA_CLOSE_FROM_CONTROL_NOT_ALLOWED"
-    elif latest_control is None or latest_control.unidad_evidencia != "KG":
-        close_from_control_reason = "KG_CONTROL_REQUIRED"
     elif latest_segment is None or latest_segment.estado != "ACTIVO":
         close_from_control_reason = "KG_CONTROL_SEGMENT_REQUIRED"
+    elif active_segment_control is None:
+        close_from_control_reason = "KG_CONTROL_REQUIRED"
     elif active_kg is not None and (
         active_kg.estado_logistico != "EN_PRODUCCION"
         or Decimal(active_kg.cantidad_reservada_kg or 0) != 0
@@ -1158,7 +1159,7 @@ def resolve_manga_web_ficha(session, *, actor_id, entrada):
         )) is not None
     ):
         close_from_control_reason = "KG_CLOSE_DOWNSTREAM_REQUIRED"
-    elif Decimal(latest_control.peso_neto_kg) <= Decimal(
+    elif Decimal(active_segment_control.peso_neto_kg) <= Decimal(
         latest_segment.cantidad_inicio_kg or 0
     ):
         close_from_control_reason = "CONTROL_WEIGHT_NOT_MONOTONIC"
