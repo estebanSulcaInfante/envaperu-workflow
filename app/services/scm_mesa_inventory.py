@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.extensions import db
@@ -43,6 +43,7 @@ from app.models.scm_mesa_inventory import (
     ScmMesaInventarioSolicitud,
     ScmMesaInventarioNoHabida,
 )
+from app.models.scm_ot import ScmEtiquetaManga
 from app.models.scm_auditoria import ScmOperacion
 from app.services.scm_service_support import (
     ScmServiceError, acquire_kg_productive_write_lock, load_actor, load_actor_any, required_text,
@@ -385,6 +386,16 @@ def _manga_by_code(session, code, *, lock=False, require_inventory=False):
         query_manga = query_manga.with_for_update()
     manga = session.scalar(query_manga)
     if manga is not None:
+        # A materialized shadow used to return before the canonical resolver,
+        # which let a typed OF/KG-OF code bypass the PREPESAJE validity checks
+        # already applied to the printed JSON.  BAJA_COMPROBADA is deliberately
+        # exempt: its recovery path uses the persisted identity and must remain
+        # available for a documented reappearance/reweighing.
+        reappearance = _has_baja_reappearance_evidence(session, manga)
+        if _typed_unit_code(code) and not reappearance:
+            _resolve_unit(session, code, lock=lock)
+        elif reappearance and _typed_unit_code(code):
+            _validate_reappearance_shadow_label(session, manga)
         if manga.estado in {"HALLAZGO", "DISPONIBLE"} and manga.neto_kg is None and manga.unidad_fisica_id:
             unit = session.get(ScmUnidadFisicaKg, manga.unidad_fisica_id, with_for_update=lock)
             if unit is not None:
@@ -392,7 +403,18 @@ def _manga_by_code(session, code, *, lock=False, require_inventory=False):
                 if require_inventory and (existence is None or manga.kardex_existence_id is None or manga.neto_kg is None):
                     raise ScmServiceError("IDENTITY_NOT_ELIGIBLE", "La identidad no tiene existencia vigente en PRODUCCION_KG.", status_code=409)
         return manga
-    unit = _resolve_unit(session, code, lock=lock)
+    try:
+        unit = _resolve_unit(session, code, lock=lock)
+    except ScmServiceError as error:
+        # A documented BAJA_COMPROBADA reappearance is the one historical
+        # exception: recover its existing shadow using the current PREPESAJE
+        # label, for both JSON and typed input. Other historical identities
+        # continue to surface the canonical rejection unchanged.
+        if error.code in {"KG_UNIT_HISTORICAL", "KG_IDENTITY_MISSING"}:
+            recovery = _baja_reappearance_shadow(session, code, lock=lock)
+            if recovery is not None:
+                return recovery
+        raise
     if unit is None:
         raise ScmServiceError("QR_NOT_FOUND", "El QR o código no corresponde a una identidad global.", status_code=404)
     existing_by_unit = session.scalar(select(ScmMesaInventarioManga).where(
@@ -431,6 +453,208 @@ def _manga_by_code(session, code, *, lock=False, require_inventory=False):
     return manga
 
 
+def _typed_unit_code(value):
+    """Whether ``value`` is a human-entered OF identity, not a legacy alias."""
+    normalized = str(value or "").strip().upper()
+    if normalized.startswith("KG-"):
+        normalized = normalized[3:]
+    return normalized.startswith("OF")
+
+
+def _has_baja_reappearance_evidence(session, manga):
+    """Require the persisted negative FALTANTE movement for recovery."""
+    if (
+        manga.baja_motivo != "FALTANTE"
+        or manga.baja_movimiento_id is None
+        or manga.estado not in {
+            "BAJA_COMPROBADA",
+            "PENDIENTE_PESAJE",
+            "PESADA_PENDIENTE_CONFIRMACION",
+        }
+    ):
+        return False
+    movement = session.get(ScmMesaInventarioMovimiento, manga.baja_movimiento_id)
+    return (
+        movement is not None
+        and movement.tipo == "AJUSTE_FALTANTE"
+        and Decimal(movement.delta_kg) < 0
+    )
+
+
+def _baja_reappearance_shadow(session, value, *, lock=False):
+    """Resolve only an existing BAJA_COMPROBADA shadow for reappearance."""
+    raw = str(value or "").strip()
+    label_id = None
+    try:
+        decoded = json.loads(raw)
+        if isinstance(decoded, dict) and decoded.get("v") == 1:
+            label_id = uuid.UUID(str(decoded.get("label_id")))
+    except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+        if raw.upper().startswith("L1|"):
+            try:
+                label_id = uuid.UUID(raw[3:].strip())
+            except (TypeError, ValueError):
+                return None
+    from app.services.scm_kg_custody_service import _unit_by_code as canonical_resolver
+
+    # The canonical resolver intentionally rejects historical units. Resolve
+    # the underlying identity directly only to inspect an already materialized
+    # BAJA_COMPROBADA shadow; no new shadow is created by this escape hatch.
+    if label_id is not None:
+        scanned = session.scalar(select(ScmEtiquetaManga).where(
+            ScmEtiquetaManga.public_id == label_id,
+        ))
+        if scanned is None or scanned.tipo != "PREPESAJE":
+            return None
+        existence = session.scalar(select(ScmExistenciaMangaKg).where(
+            ScmExistenciaMangaKg.manga_id == scanned.manga_id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        ).order_by(ScmExistenciaMangaKg.recibida_at.desc()))
+        if existence is None or existence.unidad_fisica_kg_id is None:
+            # Reversed historical records still need their original unit for
+            # the dedicated reappearance check below.
+            existence = session.scalar(select(ScmExistenciaMangaKg).where(
+                ScmExistenciaMangaKg.manga_id == scanned.manga_id,
+            ).order_by(ScmExistenciaMangaKg.recibida_at.desc()))
+        unit = session.get(ScmUnidadFisicaKg, existence.unidad_fisica_kg_id) if existence else None
+    else:
+        unit = canonical_resolver(session, raw)
+        if unit is None and not raw.upper().startswith("KG-"):
+            unit = canonical_resolver(session, f"KG-{raw}")
+    if unit is None:
+        return None
+    query = select(ScmMesaInventarioManga).where(
+        ScmMesaInventarioManga.unidad_fisica_id == unit.id,
+        or_(
+            ScmMesaInventarioManga.estado == "BAJA_COMPROBADA",
+            and_(
+                ScmMesaInventarioManga.estado.in_(
+                    ("PENDIENTE_PESAJE", "PESADA_PENDIENTE_CONFIRMACION")
+                ),
+                ScmMesaInventarioManga.baja_motivo == "FALTANTE",
+            ),
+        ),
+        ScmMesaInventarioManga.baja_motivo == "FALTANTE",
+        ScmMesaInventarioManga.baja_movimiento_id.is_not(None),
+    )
+    if lock:
+        query = query.with_for_update()
+    shadow = session.scalar(query)
+    if shadow is None:
+        return None
+    if not _has_baja_reappearance_evidence(session, shadow):
+        return None
+    existences = session.scalars(
+        select(ScmExistenciaMangaKg)
+        .where(ScmExistenciaMangaKg.unidad_fisica_kg_id == unit.id)
+        .order_by(ScmExistenciaMangaKg.recibida_at.desc())
+    ).all()
+    existence = next((item for item in existences if item.manga_id is not None), None)
+    if existence is None:
+        return None
+    labels = session.scalars(select(ScmEtiquetaManga).where(
+        ScmEtiquetaManga.manga_id == existence.manga_id,
+        ScmEtiquetaManga.tipo == "PREPESAJE",
+    ).order_by(ScmEtiquetaManga.version.desc(), ScmEtiquetaManga.id.desc())).all()
+    current = labels[0] if labels else None
+    if current is None or current.estado != "IMPRESA":
+        return None
+    if label_id is not None and (current.public_id != label_id):
+        return None
+    return shadow
+
+
+def _validate_reappearance_shadow_label(session, shadow):
+    """Keep the BAJA recovery exception within the current label state."""
+    if shadow.unidad_fisica_id is None:
+        return
+    existences = session.scalars(select(ScmExistenciaMangaKg).where(
+        ScmExistenciaMangaKg.unidad_fisica_kg_id == shadow.unidad_fisica_id,
+    ).order_by(ScmExistenciaMangaKg.recibida_at.desc())).all()
+    existence = next((item for item in existences if item.manga_id is not None), None)
+    if existence is None:
+        return
+    label = session.scalar(select(ScmEtiquetaManga).where(
+        ScmEtiquetaManga.manga_id == existence.manga_id,
+        ScmEtiquetaManga.tipo == "PREPESAJE",
+    ).order_by(ScmEtiquetaManga.version.desc(), ScmEtiquetaManga.id.desc()))
+    if label is None or label.estado == "IMPRESA":
+        return
+    if label.estado == "INVALIDADA":
+        raise ScmServiceError(
+            "ETIQUETA_INVALIDADA",
+            "La etiqueta fue reemplazada. Escanea la versión vigente.",
+            status_code=409,
+        )
+    raise ScmServiceError(
+        "ETIQUETA_NO_IMPRESA",
+        "La etiqueta PREPESAJE todavía no fue confirmada como impresa.",
+        status_code=409,
+    )
+
+
+def _validate_typed_unit_label_state(session, unit):
+    """Apply the PREPESAJE JSON decision to a typed OF identity.
+
+    Older KG identities can exist without an associated SCM manga/label; those
+    rows remain resolvable for legacy flows.  Once a PREPESAJE label exists,
+    however, delegating to the canonical JSON resolver guarantees identical
+    handling for invalidated/replaced labels and historical identities.
+    """
+    existences = session.scalars(
+        select(ScmExistenciaMangaKg)
+        .where(ScmExistenciaMangaKg.unidad_fisica_kg_id == unit.id)
+        .order_by(ScmExistenciaMangaKg.recibida_at.desc())
+    ).all()
+    # A later Mesa reappearance can materialize an existence without manga_id;
+    # prefer the current production-linked record so its PREPESAJE remains
+    # authoritative. Once a documented reappearance is confirmed, its new
+    # active receipt is intentionally unlinked; do not resurrect the old
+    # reversed label when resolving the now-active typed identity.
+    existence = next(
+        (
+            item for item in existences
+            if item.manga_id is not None and item.estado_logistico != "REVERSADA"
+        ),
+        None,
+    )
+    if existence is None and not any(
+        item.estado_logistico != "REVERSADA" for item in existences
+    ):
+        existence = next((item for item in existences if item.manga_id is not None), None)
+    if existence is None:
+        if unit.estado == "HISTORICA":
+            raise ScmServiceError(
+                "KG_UNIT_HISTORICAL",
+                "La identidad apunta a una unidad KG histórica; usa la identidad vigente.",
+                status_code=409,
+            )
+        return unit
+    label = session.scalar(
+        select(ScmEtiquetaManga)
+        .where(
+            ScmEtiquetaManga.manga_id == existence.manga_id,
+            ScmEtiquetaManga.tipo == "PREPESAJE",
+        )
+        .order_by(ScmEtiquetaManga.version.desc(), ScmEtiquetaManga.id.desc())
+    )
+    if label is None:
+        return unit
+    from app.services.scm_kg_custody_service import _unit_by_code as canonical_resolver
+
+    resolved = canonical_resolver(
+        session,
+        json.dumps({"v": 1, "label_id": str(label.public_id)}, separators=(",", ":")),
+    )
+    if resolved is not None and resolved.id != unit.id:
+        raise ScmServiceError(
+            "KG_IDENTITY_MISMATCH",
+            "La etiqueta PREPESAJE no corresponde a la identidad digitada.",
+            status_code=409,
+        )
+    return resolved or unit
+
+
 def _resolve_unit(session, code, *, lock=False):
     """Resolve canonical unit/label aliases used by production stickers."""
     value = _text(code, "codigo", max_length=512)
@@ -452,6 +676,8 @@ def _resolve_unit(session, code, *, lock=False):
     if unit is None and not value.upper().startswith("KG-"):
         unit = canonical_resolver(session, f"KG-{value}")
     if unit is not None:
+        if _typed_unit_code(value):
+            unit = _validate_typed_unit_label_state(session, unit)
         query = select(ScmUnidadFisicaKg).where(ScmUnidadFisicaKg.id == unit.id)
         return session.scalar(query.with_for_update()) if lock else unit
 

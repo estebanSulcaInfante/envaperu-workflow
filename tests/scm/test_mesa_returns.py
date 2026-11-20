@@ -42,6 +42,52 @@ def test_capture_token_is_deterministic_for_recovery():
     assert capture_id("edge-token-1") != capture_id("edge-token-2")
 
 
+def test_label_binding_uses_custody_resolver_for_current_identity(monkeypatch):
+    from uuid import uuid4
+
+    from app.services import scm_kg_custody_service
+    from app.services.scm_mesa_returns import _assert_current_label
+
+    label_id = uuid4()
+    unit = SimpleNamespace(id=uuid4())
+    calls = []
+
+    def resolve(_session, qr):
+        calls.append(qr)
+        return unit
+
+    monkeypatch.setattr(scm_kg_custody_service, "_unit_by_code", resolve)
+    _assert_current_label(SimpleNamespace(), unit, label_id)
+    assert calls == [f'{{"v":1,"label_id":"{label_id}"}}']
+
+    monkeypatch.setattr(scm_kg_custody_service, "_unit_by_code", lambda _session, _qr: None)
+    with pytest.raises(ScmServiceError) as error:
+        _assert_current_label(SimpleNamespace(), unit, label_id)
+    assert error.value.code == "LABEL_NOT_CURRENT"
+
+
+def test_confirmed_receive_operation_replays_even_after_source_state_changes(app):
+    from uuid import uuid4
+
+    from app import db
+    from app.models.scm_auditoria import ScmOperacion
+    from app.services.scm_mesa_returns import _operation
+
+    with app.app_context():
+        actor = _state_actor(db, uuid4)
+        operation_id = uuid4()
+        payload = {"codigo": "RET-REPLAY", "label_id": str(uuid4()), "captura": {"token": "replay", "base": "NT", "kg": "1.000", "captured_at": "2026-11-19T10:00:00+00:00"}}
+        _operation(db.session, operation_id, "POST /receive", actor.id, payload)
+        operation = db.session.get(ScmOperacion, operation_id)
+        operation.response_json = {"code": "RET-REPLAY", "net_kg": "1.000"}
+        operation.estado_http = 201
+        db.session.commit()
+
+        _, replay, status = _operation(db.session, operation_id, "POST /receive", actor.id, payload)
+        assert replay == {"code": "RET-REPLAY", "net_kg": "1.000"}
+        assert status == 201
+
+
 def _state_actor(db, uuid4):
     from app.models.scm_catalogos import ScmCapacidad
     from app.models.trabajador import RolOperativo, Trabajador

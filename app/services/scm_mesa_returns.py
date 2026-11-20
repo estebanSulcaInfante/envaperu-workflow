@@ -276,6 +276,18 @@ def _source_code(item):
     return item.get("codigo") or item.get("code") or item.get("unit_id") or item.get("unidad_id") or item.get("public_id")
 
 
+def _source_label_id(item, data=None):
+    """Read the scanned PREPESAJE identity without trusting display fields."""
+    value = item.get("label_id") if isinstance(item, dict) else None
+    if value is None and isinstance(data, dict):
+        labels = data.get("label_ids")
+        code = _source_code(item)
+        if labels is not None and not isinstance(labels, dict):
+            raise ScmServiceError("LABEL_ID_INVALID", "label_ids debe ser un objeto.", status_code=422)
+        value = labels.get(code) if isinstance(labels, dict) else None
+    return _uuid(value, "label_id") if value is not None else None
+
+
 def _source_identity(session, unit, *, lock=False):
     if unit is None:
         raise ScmServiceError("ORIGIN_NOT_FOUND", "La identidad de origen no existe.", status_code=404)
@@ -319,6 +331,22 @@ def _source_identity(session, unit, *, lock=False):
         "ot_shift": ot_shift,
         "piece_name": article.nombre,
     }
+
+
+def _assert_current_label(session, unit, label_id):
+    """Bind a scanned QR to the current manga or KG-unit label resolver."""
+    if label_id is None:
+        return
+    if unit is None:
+        raise ScmServiceError("LABEL_NOT_CURRENT", "La etiqueta no corresponde a una identidad vigente.", status_code=409)
+    from app.services.scm_kg_custody_service import _unit_by_code as resolve_custody_label
+    qr = json.dumps({"v": 1, "label_id": str(label_id)}, separators=(",", ":"))
+    try:
+        resolved = resolve_custody_label(session, qr)
+    except ScmServiceError as error:
+        raise ScmServiceError("LABEL_NOT_CURRENT", "La etiqueta ya no está vigente para esta identidad.", status_code=409) from error
+    if resolved is None or resolved.id != unit.id:
+        raise ScmServiceError("LABEL_NOT_CURRENT", "La etiqueta no corresponde a la identidad escaneada.", status_code=409)
 
 
 def _origin_items(data):
@@ -471,18 +499,24 @@ def _create_union(session, actor_id, station_id, data, operation_id):
     if len(origins) < 2:
         raise ScmServiceError("ORIGINS_REQUIRED", "Escanea al menos dos mangas para unirlas.", status_code=422)
     codes = []
+    label_ids = {}
     for item in origins:
         code = _text(_source_code(item), "origen")
         if code in codes:
             raise ScmServiceError("DUPLICATE_ORIGIN", "El mismo QR solo puede vincularse una vez.", status_code=409)
         codes.append(code)
-    normalized = {"station_id": station_value, "origenes": sorted(codes), "zona": data.get("zona")}
+        label_ids[code] = _source_label_id(item, data)
+    normalized_origins = sorted(codes)
+    if any(label_ids.values()):
+        normalized_origins = [{"code": code, "label_id": str(label_ids[code]) if label_ids[code] else None} for code in sorted(codes)]
+    normalized = {"station_id": station_value, "origenes": normalized_origins, "zona": data.get("zona")}
     op_id, replay, status = _operation(session, operation_id, "POST /unions", actor.id, normalized)
     if replay is not None:
         return replay, status
     resolved = []
     for code in codes:
         unit = _unit_by_code(session, code)
+        _assert_current_label(session, unit, label_ids.get(code))
         source = _source_identity(session, unit, lock=True)
         if any(origin["unit"].id == unit.id for origin in resolved):
             raise ScmServiceError("DUPLICATE_ORIGIN", "Los dos códigos identifican la misma manga.", status_code=409)
@@ -560,36 +594,36 @@ def _receive(session, actor_id, station_id, data, operation_id):
     acquire_kg_productive_write_lock(session)
     station_value = _assert_station(session, station_id)
     code = _text(data.get("codigo") or data.get("code") or data.get("codigo_retorno"), "codigo")
+    label_id = _source_label_id(data)
     union = session.scalar(select(ScmMesaRetornoUnion).where(ScmMesaRetornoUnion.codigo == code).order_by(ScmMesaRetornoUnion.ciclo.desc()).with_for_update())
     simple_source = None
     previous_cycle = union.ciclo if union is not None else 0
+    candidate = None
     if union is not None and union.estado == "RECIBIDA":
         # A received identity can be withdrawn again.  A later return is a
         # new cycle with the same QR, never a second credit on the old receipt.
         candidate = _unit_by_code(session, code)
         if candidate is not None and candidate.estado == "ACTIVA" and candidate.estado_logistico == "RETIRADA_ARMADO":
-            simple_source = _source_identity(session, candidate, lock=True)
             union = None
-    if union is None:
-        # A complete manga may return in its original bag.  It does not need a
-        # new printed identity, but it still gets the same receipt ledger and
-        # one-use origin lock as a union.
-        if simple_source is None:
-            source_unit = _unit_by_code(session, code)
-            simple_source = _source_identity(session, source_unit, lock=True)
-        class _Code:
-            pass
-        marker = _Code()
-        marker.codigo = code
-        token, base, measured, gross, tare, net, captured_at = _capture_values(data, marker)
-    else:
-        token, base, measured, gross, tare, net, captured_at = _capture_values(data, union)
+    class _Code:
+        pass
+    marker = _Code()
+    marker.codigo = code
+    capture_target = union if union is not None else marker
+    token, base, measured, gross, tare, net, captured_at = _capture_values(data, capture_target)
     if data.get("net_kg") is not None and _decimal(data.get("net_kg"), "net_kg", positive=True) != net:
         raise ScmServiceError("CAPTURE_WEIGHT_CONFLICT", "net_kg no coincide con la captura atestada.", status_code=409)
     op_id, replay, status = _operation(session, operation_id, "POST /receive", actor.id,
-                                       {"codigo": code, "captura": {"token": token, "base": base, "kg": str(measured), "captured_at": captured_at.isoformat()}})
+                                       {"codigo": code, "label_id": str(label_id) if label_id else None,
+                                        "captura": {"token": token, "base": base, "kg": str(measured), "captured_at": captured_at.isoformat()}})
     if replay is not None:
         return replay, status
+    if union is None:
+        # A complete manga may return in its original bag.  It does not need a
+        # new printed identity, but its scanned PREPESAJE must still be current.
+        source_unit = candidate if candidate is not None and candidate.estado == "ACTIVA" and candidate.estado_logistico == "RETIRADA_ARMADO" else _unit_by_code(session, code)
+        _assert_current_label(session, source_unit, label_id)
+        simple_source = _source_identity(session, source_unit, lock=True)
     if union is None:
         union = ScmMesaRetornoUnion(
             codigo=code, articulo_scm_id=simple_source["article"].id,
