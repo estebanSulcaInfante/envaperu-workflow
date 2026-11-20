@@ -1,5 +1,6 @@
 """TS-010D core: connected weighing of a simple SCM manga."""
 
+import json
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -25,14 +26,19 @@ from app.models.scm_ot import (
     ScmPesajeManga,
     ScmAtribucionProduccionKg,
     ScmReaperturaManga,
+    ScmReaperturaControlPesoKg,
     ScmTrabajoImpresionManga,
     ScmTramoMangaTrabajo,
     utc_now,
 )
 from app.models.scm_warehouse import ScmExistenciaManga
 from app.models.scm_inventory_kg import (
+    ScmDivisionUnidadKg,
     ScmExistenciaMangaKg,
+    ScmMedicionUnidadKg,
     ScmMovimientoInventarioKg,
+    ScmReservaUnidadKg,
+    ScmRetiroArmadoKgItem,
     ScmSaldoInventarioKg,
     ScmUnidadFisicaKg,
 )
@@ -59,6 +65,7 @@ from app.services.scm_service_support import (
     acquire_kg_productive_write_lock,
     expected_version,
     load_actor,
+    load_actor_any,
     reject_unknown_fields,
     required_text,
 )
@@ -176,6 +183,23 @@ def _latest_weight_reference(manga):
                 ),
                 tara_kg=Decimal(reopening.pesaje.tara_kg).quantize(KG_QUANTUM),
                 tara_fuente=reopening.pesaje.tara_fuente,
+                pesado_at=reopening.reabierta_at,
+            ),
+        ))
+    for reopening in getattr(manga, "reaperturas_control_kg", ()) or ():
+        control = reopening.control
+        if control is None:
+            continue
+        candidates.append((
+            reopening.reabierta_at,
+            reopening.id,
+            SimpleNamespace(
+                fuente="CIERRE_CONTROL_REABIERTO",
+                peso_neto_kg=Decimal(reopening.peso_base_neto_kg).quantize(
+                    KG_QUANTUM
+                ),
+                tara_kg=Decimal(control.tara_kg).quantize(KG_QUANTUM),
+                tara_fuente=control.tara_fuente,
                 pesado_at=reopening.reabierta_at,
             ),
         ))
@@ -776,6 +800,486 @@ def resolve_manga_label(session, *, label_id):
             },
         )
     return _resolve_payload(label)
+
+
+def resolve_manga_web_ficha(session, *, actor_id, entrada):
+    """Resolve a manga web ficha without creating an operational intention.
+
+    Physical prelabels contain either the compact ``{"v": 1, "label_id":
+    "..."}`` envelope or the older JSON payload with the same ``label_id``.
+    The manual fallback is the canonical unique manga code (for example
+    ``OF000001-OT002-M001``). This adapter is strictly read-only.
+    """
+    # La ficha es una consulta operativa compacta.  No debe obligar al PDA a
+    # tener acceso a la historia privada de pesajes: cualquiera de las
+    # capacidades de lectura SCM autorizadas habilita la misma proyección.
+    actor = load_actor_any(
+        session,
+        actor_id,
+        capabilities=(
+            "MANGA_PESAJE_VER",
+            "INVENTARIO_VER",
+            "INVENTARIO_CONTEO_C66",
+        ),
+    )
+    raw = str(entrada or "").strip()
+    if not raw or len(raw) > 512:
+        raise ScmServiceError(
+            "MANGA_IDENTIFIER_INVALID",
+            "entrada debe contener el QR JSON o código de manga.",
+            status_code=422,
+        )
+
+    source = None
+    label_id = None
+    manga = None
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ScmServiceError(
+                "MANGA_IDENTIFIER_INVALID",
+                "El QR no contiene un JSON válido.",
+                status_code=422,
+            ) from error
+        if not isinstance(payload, dict) or not payload.get("label_id"):
+            raise ScmServiceError(
+                "MANGA_IDENTIFIER_INVALID",
+                "El QR JSON requiere label_id.",
+                status_code=422,
+            )
+        if payload.get("v") not in (None, 1, "1"):
+            raise ScmServiceError(
+                "MANGA_IDENTIFIER_VERSION_UNSUPPORTED",
+                "La versión del QR no está soportada.",
+                status_code=422,
+            )
+        try:
+            label_id = uuid.UUID(str(payload["label_id"]))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ScmServiceError(
+                "MANGA_IDENTIFIER_INVALID",
+                "label_id debe ser un UUID válido.",
+                status_code=422,
+            ) from error
+        source = "QR_JSON"
+    else:
+        try:
+            label_id = uuid.UUID(raw)
+            source = "LABEL_UUID"
+        except (TypeError, ValueError, AttributeError):
+            source = "MANGA_CODE"
+            manga = session.scalar(
+                select(ScmManga).where(ScmManga.codigo == raw.upper())
+            )
+            if manga is None:
+                raise ScmServiceError(
+                    "MANGA_NOT_FOUND",
+                    "No existe una manga con ese código.",
+                    status_code=404,
+                )
+
+    if label_id is not None:
+        label = session.scalar(
+            select(ScmEtiquetaManga).where(
+                ScmEtiquetaManga.public_id == label_id
+            )
+        )
+        if label is None:
+            raise ScmServiceError(
+                "LABEL_NOT_FOUND", "La etiqueta no existe.", status_code=404
+            )
+        manga = label.manga
+        if manga is None:
+            raise ScmServiceError(
+                "MANGA_NOT_FOUND", "La manga no existe.", status_code=404
+            )
+        if manga.estado == "ANULADA":
+            raise ScmServiceError(
+                "MANGA_ANULADA", "La manga fue anulada y no puede utilizarse.",
+                status_code=409,
+            )
+        if label.estado == "INVALIDADA":
+            current = _current_label(manga, label.tipo)
+            raise ScmServiceError(
+                "LABEL_INVALIDATED",
+                "La etiqueta fue invalidada y no puede utilizarse.",
+                status_code=409,
+                details={
+                    "current_label_id": (
+                        str(current.public_id) if current else None
+                    )
+                },
+            )
+
+    active_kg = session.scalar(
+        select(ScmExistenciaMangaKg)
+        .where(
+            ScmExistenciaMangaKg.manga_id == manga.id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        )
+        .order_by(ScmExistenciaMangaKg.recibida_at.desc())
+    )
+    kg_unit = (
+        session.get(ScmUnidadFisicaKg, active_kg.unidad_fisica_kg_id)
+        if active_kg is not None and active_kg.unidad_fisica_kg_id is not None
+        else None
+    )
+    current_prelabel = next(
+        (
+            item for item in reversed(manga.etiquetas)
+            if item.tipo == "PREPESAJE" and item.estado != "INVALIDADA"
+        ),
+        None,
+    )
+    active_weighing = session.scalar(
+        select(ScmPesajeManga)
+        .where(
+            ScmPesajeManga.manga_id == manga.id,
+            ScmPesajeManga.estado == "VIGENTE",
+        )
+        .order_by(ScmPesajeManga.id.desc())
+    )
+    latest_weighing = active_weighing or session.scalar(
+        select(ScmPesajeManga)
+        .where(ScmPesajeManga.manga_id == manga.id)
+        .order_by(ScmPesajeManga.id.desc())
+    )
+    current_projection = (
+        _effective_projection(active_weighing)
+        if active_weighing is not None else None
+    )
+    latest_control = session.scalar(
+        select(ScmControlPesoManga)
+        .where(ScmControlPesoManga.manga_id == manga.id)
+        .order_by(
+            ScmControlPesoManga.created_at.desc(),
+            ScmControlPesoManga.id.desc(),
+        )
+    )
+    segments = session.scalars(
+        select(ScmTramoMangaTrabajo)
+        .where(ScmTramoMangaTrabajo.manga_id == manga.id)
+        .order_by(ScmTramoMangaTrabajo.secuencia)
+    ).all()
+    latest_segment = segments[-1] if segments else None
+    if latest_segment is not None:
+        active_segment_control = session.scalar(
+            select(ScmControlPesoManga)
+            .where(
+                ScmControlPesoManga.manga_id == manga.id,
+                ScmControlPesoManga.tramo_id == latest_segment.id,
+                ScmControlPesoManga.unidad_evidencia == "KG",
+            )
+            .order_by(
+                ScmControlPesoManga.created_at.desc(),
+                ScmControlPesoManga.id.desc(),
+            )
+        )
+        if active_segment_control is not None:
+            latest_control = active_segment_control
+    latest_control_reopen = session.scalar(
+        select(ScmReaperturaControlPesoKg)
+        .where(ScmReaperturaControlPesoKg.manga_id == manga.id)
+        .order_by(
+            ScmReaperturaControlPesoKg.reabierta_at.desc(),
+            ScmReaperturaControlPesoKg.id.desc(),
+        )
+    )
+    latest_regular_reopen = session.scalar(
+        select(ScmReaperturaManga)
+        .where(ScmReaperturaManga.manga_id == manga.id)
+        .order_by(
+            ScmReaperturaManga.reabierta_at.desc(),
+            ScmReaperturaManga.id.desc(),
+        )
+    )
+
+    def _reference_time(value):
+        if value is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    reference_net = None
+    reference_origin = None
+    if active_weighing is not None and current_projection is not None:
+        reference_net = current_projection.get("peso_fisico_neto_kg")
+        reference_origin = (
+            "CORRECCION_AUTORIZADA"
+            if reference_net != format(active_weighing.peso_fisico_neto_kg, "f")
+            else "PESAJE_FINAL"
+        )
+    elif latest_control_reopen is not None and (
+        latest_control is None
+        or _reference_time(latest_control_reopen.reabierta_at)
+        >= _reference_time(latest_control.created_at or latest_control.pesado_at)
+    ):
+        reference_net = format(latest_control_reopen.peso_base_neto_kg, "f")
+        reference_origin = "CONTROL_REABIERTO"
+    elif latest_regular_reopen is not None and (
+        latest_regular_reopen.tipo_reapertura == "CONTINUAR_LLENADO"
+        and (
+            latest_control is None
+            or _reference_time(latest_regular_reopen.reabierta_at)
+            >= _reference_time(latest_control.created_at or latest_control.pesado_at)
+        )
+    ):
+        reference_net = format(latest_regular_reopen.peso_base_neto_kg, "f")
+        reference_origin = "REAPERTURA_CONTINUAR_LLENADO"
+    elif latest_control is not None:
+        reference_net = format(latest_control.peso_neto_kg, "f")
+        if (
+            latest_segment is not None
+            and latest_segment.calidad_evidencia_kg
+            == "MEDIDA_DIRECTA_CIERRE_CONTROL"
+        ):
+            reference_origin = "CONTROL_CIERRE"
+        else:
+            reference_origin = "CONTROL_PESO"
+    regular_reopen_reason = None
+    control_reopen_reason = None
+    close_from_control_reason = None
+    is_kg = (
+        manga.lote_articulo is not None
+        and manga.lote_articulo.articulo is not None
+        and manga.lote_articulo.articulo.unidad_inventario == "KG"
+    )
+    if not actor.tiene_capacidad("MANGA_REABRIR"):
+        regular_reopen_reason = control_reopen_reason = "CAPABILITY_REQUIRED"
+    elif manga.ot.tipo_ot != "FABRICACION" or manga.tipo != "NORMAL":
+        regular_reopen_reason = control_reopen_reason = "MANGA_REOPEN_NOT_AVAILABLE"
+    elif active_weighing is not None:
+        if manga.estado not in {
+            "PESADA", "ETIQUETADA_FINAL", "PENDIENTE_RECEPCION_ALMACEN"
+        }:
+            regular_reopen_reason = "MANGA_REOPEN_NOT_AVAILABLE"
+        elif active_kg is not None and (
+            active_kg.estado_logistico != "DISPONIBLE_PRODUCCION"
+            or Decimal(active_kg.cantidad_reservada_kg or 0) != 0
+            or kg_unit is None
+            or kg_unit.estado != "ACTIVA"
+            or kg_unit.estado_logistico != "DISPONIBLE_PRODUCCION"
+            or kg_unit.saldo_id is None
+            or kg_unit.ubicacion_id is None
+        ):
+            regular_reopen_reason = "KG_REOPEN_DOWNSTREAM_REQUIRED"
+        elif not is_kg and session.scalar(
+            select(ScmExistenciaManga)
+            .where(
+                ScmExistenciaManga.manga_id == manga.id,
+                ScmExistenciaManga.estado_logistico != "REVERSADA",
+            )
+        ) is not None:
+            regular_reopen_reason = "RECEIPT_REVERSAL_REQUIRED"
+        if is_kg and regular_reopen_reason is None and active_kg is not None and kg_unit is not None:
+            if session.scalar(select(ScmReservaUnidadKg.id).where(
+                ScmReservaUnidadKg.unidad_id == kg_unit.id,
+                ScmReservaUnidadKg.estado == "ACTIVA",
+            )) is not None or session.scalar(select(ScmRetiroArmadoKgItem.id).where(
+                ScmRetiroArmadoKgItem.unidad_id == kg_unit.id,
+            )) is not None or session.scalar(select(ScmMedicionUnidadKg.id).where(
+                ScmMedicionUnidadKg.unidad_id == kg_unit.id,
+            )) is not None or session.scalar(select(ScmDivisionUnidadKg.id).where(
+                ScmDivisionUnidadKg.padre_id == kg_unit.id,
+            )) is not None:
+                regular_reopen_reason = "KG_REOPEN_DOWNSTREAM_REQUIRED"
+        control_reopen_reason = regular_reopen_reason
+    else:
+        regular_reopen_reason = "WEIGHING_NOT_ACTIVE"
+        is_control_closure = (
+            is_kg
+            and manga.estado == "PENDIENTE_RECEPCION_ALMACEN"
+            and latest_segment is not None
+            and latest_segment.estado == "CERRADO"
+            and latest_segment.calidad_evidencia_kg == "MEDIDA_DIRECTA_CIERRE_CONTROL"
+        )
+        if is_control_closure:
+            if (
+                active_kg is None
+                or kg_unit is None
+                or active_kg.estado_logistico != "DISPONIBLE_PRODUCCION"
+                or Decimal(active_kg.cantidad_reservada_kg or 0) != 0
+                or kg_unit.estado != "ACTIVA"
+                or kg_unit.estado_logistico != "DISPONIBLE_PRODUCCION"
+                or kg_unit.saldo_id is None
+                or kg_unit.ubicacion_id is None
+                or session.scalar(select(ScmReservaUnidadKg.id).where(
+                    ScmReservaUnidadKg.unidad_id == kg_unit.id,
+                    ScmReservaUnidadKg.estado == "ACTIVA",
+                )) is not None
+                or session.scalar(select(ScmRetiroArmadoKgItem.id).where(
+                    ScmRetiroArmadoKgItem.unidad_id == kg_unit.id,
+                )) is not None
+                or session.scalar(select(ScmMedicionUnidadKg.id).where(
+                    ScmMedicionUnidadKg.unidad_id == kg_unit.id,
+                )) is not None
+                or session.scalar(select(ScmDivisionUnidadKg.id).where(
+                    ScmDivisionUnidadKg.padre_id == kg_unit.id,
+                )) is not None
+            ):
+                control_reopen_reason = "KG_REOPEN_DOWNSTREAM_REQUIRED"
+            else:
+                control_reopen_reason = None
+        else:
+            control_reopen_reason = "MANGA_REOPEN_NOT_AVAILABLE"
+
+    if not actor.tiene_capacidad("MANGA_FINALIZAR_PARCIAL"):
+        close_from_control_reason = "CAPABILITY_REQUIRED"
+    elif not is_kg:
+        close_from_control_reason = "KG_ARTICLE_REQUIRED"
+    elif manga.estado != "EN_LLENADO":
+        close_from_control_reason = "MANGA_CLOSE_FROM_CONTROL_NOT_ALLOWED"
+    elif latest_control is None or latest_control.unidad_evidencia != "KG":
+        close_from_control_reason = "KG_CONTROL_REQUIRED"
+    elif latest_segment is None or latest_segment.estado != "ACTIVO":
+        close_from_control_reason = "KG_CONTROL_SEGMENT_REQUIRED"
+    elif active_kg is not None and (
+        active_kg.estado_logistico != "EN_PRODUCCION"
+        or Decimal(active_kg.cantidad_reservada_kg or 0) != 0
+        or kg_unit is None
+        or kg_unit.estado != "ACTIVA"
+        or kg_unit.estado_logistico != "EN_PRODUCCION"
+        or kg_unit.saldo_id is None
+        or kg_unit.ubicacion_id is None
+        or session.scalar(select(ScmReservaUnidadKg.id).where(
+            ScmReservaUnidadKg.unidad_id == kg_unit.id,
+            ScmReservaUnidadKg.estado == "ACTIVA",
+        )) is not None
+        or session.scalar(select(ScmRetiroArmadoKgItem.id).where(
+            ScmRetiroArmadoKgItem.unidad_id == kg_unit.id,
+        )) is not None
+        or session.scalar(select(ScmMedicionUnidadKg.id).where(
+            ScmMedicionUnidadKg.unidad_id == kg_unit.id,
+        )) is not None
+        or session.scalar(select(ScmDivisionUnidadKg.id).where(
+            ScmDivisionUnidadKg.padre_id == kg_unit.id,
+        )) is not None
+    ):
+        close_from_control_reason = "KG_CLOSE_DOWNSTREAM_REQUIRED"
+    elif Decimal(latest_control.peso_neto_kg) <= Decimal(
+        latest_segment.cantidad_inicio_kg or 0
+    ):
+        close_from_control_reason = "CONTROL_WEIGHT_NOT_MONOTONIC"
+    compact_pesaje = {
+        "estado": manga.estado,
+        "final_vigente": active_weighing is not None,
+        "origen": reference_origin,
+        "peso_neto_kg": reference_net,
+        "ultimo_control_neto_kg": (
+            format(latest_control.peso_neto_kg, "f")
+            if latest_control is not None else None
+        ),
+    }
+    closed_states = {
+        "PESADA",
+        "ETIQUETADA_FINAL",
+        "PENDIENTE_RECEPCION_ALMACEN",
+        "RECIBIDA",
+        "DESPACHADA_CLIENTE_MN31",
+        "DESPACHO_MN31_REVERTIDO",
+    }
+    can_reopen = actor.tiene_capacidad("MANGA_REABRIR")
+    reopen_reason = (
+        control_reopen_reason
+        if regular_reopen_reason == "WEIGHING_NOT_ACTIVE"
+        else (
+            control_reopen_reason
+            if control_reopen_reason is None
+            else regular_reopen_reason
+        )
+    )
+    return {
+        "entrada": {
+            "tipo": source,
+            "label_id": str(label_id) if label_id is not None else None,
+            "codigo": manga.codigo,
+        },
+        "manga": {
+            "id": str(manga.public_id),
+            "codigo": manga.codigo,
+            "tipo": manga.tipo,
+            "estado": manga.estado,
+            "version": manga.version,
+            "articulo_codigo": manga.articulo_codigo_snapshot,
+            "articulo_nombre": manga.articulo_nombre_snapshot,
+            "pieza_color_sku": manga.pieza_color_sku_snapshot,
+            "color": manga.color_snapshot,
+            "tipo_manga": manga.tipo_contenedor_nombre_snapshot,
+            "cantidad_asignada_un": format(Decimal(manga.cantidad_asignada_un), "f"),
+        },
+        "etiqueta": {
+            "id": str(current_prelabel.public_id) if current_prelabel else None,
+            "estado": current_prelabel.estado if current_prelabel else None,
+            "sustituida": current_prelabel is None,
+        },
+        "pesaje": compact_pesaje,
+        "inventario_kg": {
+            "estado_logistico": active_kg.estado_logistico if active_kg else None,
+            "estado_calidad": active_kg.estado_calidad if active_kg else None,
+            "unidad_estado_logistico": kg_unit.estado_logistico if kg_unit else None,
+            "unidad_id": str(kg_unit.public_id) if kg_unit else None,
+        },
+        "estado_produccion": {
+            "cerrada": manga.estado in closed_states,
+            "estado_manga": manga.estado,
+            "dominio": "SCM_PRODUCCION_MANGA",
+        },
+        "acciones": {
+            "reabrir": {
+                "permitida_por_capacidad": can_reopen,
+                "elegible": (
+                    can_reopen
+                    and (
+                        regular_reopen_reason is None
+                        or control_reopen_reason is None
+                    )
+                ),
+                "razon": reopen_reason,
+                "permiso": "MANGA_REABRIR",
+                "endpoint": f"/api/scm/v1/mangas/{manga.public_id}/reabrir",
+                "version": manga.version,
+                "motivo_requerido": True,
+                "tipos": ["CIERRE_ACCIDENTAL", "CONTINUAR_LLENADO"],
+                "por_tipo": [
+                    {
+                        "tipo": "CIERRE_ACCIDENTAL",
+                        "elegible": can_reopen and regular_reopen_reason is None,
+                        "razon": regular_reopen_reason,
+                    },
+                    {
+                        "tipo": "CONTINUAR_LLENADO",
+                        "elegible": can_reopen and (
+                            control_reopen_reason is None
+                            or regular_reopen_reason is None
+                        ),
+                        "razon": (
+                            control_reopen_reason
+                            if control_reopen_reason is not None
+                            else regular_reopen_reason
+                        ),
+                    },
+                ],
+            },
+            "cerrar_desde_control": {
+                "permitida_por_capacidad": actor.tiene_capacidad(
+                    "MANGA_FINALIZAR_PARCIAL"
+                ),
+                "elegible": close_from_control_reason is None,
+                "razon": close_from_control_reason,
+                "permiso": "MANGA_FINALIZAR_PARCIAL",
+                "endpoint": f"/api/scm/v1/mangas/{manga.public_id}/cerrar-desde-control",
+                "version": manga.version,
+                "motivo_requerido": True,
+            },
+            "pesaje": {
+                "derivar_a": "PESAJE_1",
+                "identidad": str(manga.public_id),
+                "requiere_lectura_estable": True,
+            },
+        },
+    }
 
 
 def register_manga_weighing_control(
@@ -2498,6 +3002,238 @@ def _ensure_operational_order_mutable(manga):
         )
 
 
+def _reopen_kg_control_close(
+    session, *, actor, manga, article, operation, reason, evidence, version
+):
+    """Reopen a KG close sourced from a measured control, not a pesaje."""
+    if article is None or article.unidad_inventario != "KG":
+        raise ScmServiceError(
+            "WEIGHING_NOT_ACTIVE",
+            "La manga no tiene un pesaje final vigente para reabrir.",
+            status_code=409,
+        )
+    if manga.estado != "PENDIENTE_RECEPCION_ALMACEN":
+        raise ScmServiceError(
+            "MANGA_REOPEN_NOT_AVAILABLE",
+            "La manga no posee un cierre KG desde control vigente.",
+            status_code=409,
+        )
+    segments = session.scalars(
+        select(ScmTramoMangaTrabajo)
+        .where(ScmTramoMangaTrabajo.manga_id == manga.id)
+        .order_by(ScmTramoMangaTrabajo.secuencia)
+        .with_for_update()
+    ).all()
+    current_segment = segments[-1] if segments else None
+    if (
+        current_segment is None
+        or current_segment.estado != "CERRADO"
+        or current_segment.calidad_evidencia_kg != "MEDIDA_DIRECTA_CIERRE_CONTROL"
+    ):
+        raise ScmServiceError(
+            "MANGA_REOPEN_NOT_AVAILABLE",
+            "El cierre no proviene de un control KG medido vigente.",
+            status_code=409,
+        )
+    control = session.scalar(
+        select(ScmControlPesoManga)
+        .where(
+            ScmControlPesoManga.manga_id == manga.id,
+            ScmControlPesoManga.id == current_segment.controles_peso[-1].id,
+            ScmControlPesoManga.unidad_evidencia == "KG",
+        )
+        .with_for_update()
+    ) if current_segment.controles_peso else None
+    if control is None:
+        control = session.scalar(
+            select(ScmControlPesoManga)
+            .where(
+                ScmControlPesoManga.manga_id == manga.id,
+                ScmControlPesoManga.unidad_evidencia == "KG",
+            )
+            .order_by(ScmControlPesoManga.pesado_at.desc(), ScmControlPesoManga.id.desc())
+            .with_for_update()
+        )
+    if control is None:
+        raise ScmServiceError(
+            "KG_CONTROL_REQUIRED",
+            "No existe un control KG medido para reabrir.",
+            status_code=409,
+        )
+    base = Decimal(control.peso_neto_kg).quantize(KG_QUANTUM)
+    if Decimal(current_segment.cantidad_fin_kg or 0).quantize(KG_QUANTUM) != base:
+        raise ScmServiceError(
+            "MANGA_REOPEN_NOT_AVAILABLE",
+            "El cierre y el control fuente no concilian.",
+            status_code=409,
+        )
+
+    existence = session.scalar(
+        select(ScmExistenciaMangaKg)
+        .where(
+            ScmExistenciaMangaKg.manga_id == manga.id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        )
+        .with_for_update()
+    )
+    unit = None
+    if existence is not None and existence.unidad_fisica_kg_id is not None:
+        unit = session.scalar(
+            select(ScmUnidadFisicaKg)
+            .where(ScmUnidadFisicaKg.id == existence.unidad_fisica_kg_id)
+            .with_for_update()
+        )
+    if existence is None or unit is None:
+        raise ScmServiceError(
+            "KG_REOPEN_NOT_AVAILABLE",
+            "La existencia KG canónica no está disponible para reabrir.",
+            status_code=409,
+        )
+    downstream = (
+        existence.estado_logistico != "DISPONIBLE_PRODUCCION"
+        or existence.cantidad_reservada_kg != 0
+        or unit.estado != "ACTIVA"
+        or unit.estado_logistico != "DISPONIBLE_PRODUCCION"
+        or unit.saldo_id is None
+        or unit.ubicacion_id is None
+        or session.scalar(select(ScmReservaUnidadKg.id).where(
+            ScmReservaUnidadKg.unidad_id == unit.id,
+            ScmReservaUnidadKg.estado == "ACTIVA",
+        )) is not None
+        or session.scalar(select(ScmRetiroArmadoKgItem.id).where(
+            ScmRetiroArmadoKgItem.unidad_id == unit.id,
+        )) is not None
+        or session.scalar(select(ScmMedicionUnidadKg.id).where(
+            ScmMedicionUnidadKg.unidad_id == unit.id,
+        )) is not None
+        or session.scalar(select(ScmDivisionUnidadKg.id).where(
+            ScmDivisionUnidadKg.padre_id == unit.id,
+        )) is not None
+    )
+    if downstream:
+        raise ScmServiceError(
+            "KG_REOPEN_DOWNSTREAM_REQUIRED",
+            "La existencia KG tiene reserva, retiro, división o custodia posterior; primero debe resolverse ese flujo.",
+            status_code=409,
+        )
+    work = effective_work(manga)
+    personal = effective_assignment(manga)
+    plan = effective_plan_assignment(manga)
+    if work is None or personal is None or plan is None or work.estado not in {"EN_EJECUCION", "PAUSADO"}:
+        raise ScmServiceError(
+            "MANGA_REOPEN_NOT_AVAILABLE",
+            "El Trabajo y el responsable deben seguir habilitados para continuar la manga.",
+            status_code=409,
+        )
+    next_segment = ScmTramoMangaTrabajo(
+        manga=manga,
+        trabajo=work,
+        asignacion_personal_trabajo=personal,
+        asignacion_plan_id=plan.id,
+        secuencia=current_segment.secuencia + 1,
+        estado="ACTIVO",
+        cantidad_inicio_un=Decimal("0"),
+        cantidad_atribuida_un=Decimal("0"),
+        cantidad_inicio_kg=base,
+        cantidad_atribuida_kg=Decimal("0"),
+        iniciada_at=control.pesado_at,
+        created_by_id=actor.id,
+        operation_id=operation.operation_id,
+    )
+    session.add(next_segment)
+    existence.estado_logistico = "EN_PRODUCCION"
+    existence.estado_calidad = "SIN_CONTROL"
+    existence.atributo_proceso = "PROCESO"
+    existence.version += 1
+    unit.estado_logistico = "EN_PRODUCCION"
+    unit.estado_calidad = "SIN_CONTROL"
+    unit.atributo_proceso = "PROCESO"
+    unit.version += 1
+    manga.estado = "EN_LLENADO"
+    manga.version += 1
+    session.flush()
+    reopening = ScmReaperturaControlPesoKg(
+        manga=manga,
+        control=control,
+        peso_base_neto_kg=base,
+        motivo=reason,
+        evidencia=evidence,
+        reabierta_por_id=actor.id,
+        reabierta_at=utc_now(),
+        operation_id=operation.operation_id,
+    )
+    session.add(reopening)
+    session.flush()
+    response = {
+        "manga": _serialize_manga(manga),
+        "pesaje_invalidado": None,
+        "control_fuente": control.to_dict(),
+        "reapertura": reopening.to_dict(),
+        "postetiquetas_invalidadas": [],
+        "linea_base": {
+            "fuente": "CONTROL_PESO",
+            "peso_neto_kg": format(base, "f"),
+            "control_id": str(control.public_id),
+        },
+        "idempotent_replay": False,
+    }
+    session.add(_event(
+        "MANGA", manga.id, "MANGA_REOPENED_FOR_CONTINUED_FILLING_FROM_CONTROL",
+        actor, operation, response,
+    ))
+    _complete_operation(operation, response)
+    session.commit()
+    return response
+
+
+def _assert_kg_reopen_downstream_clear(session, manga_id):
+    """Lock and validate the canonical KG identity before reopening it."""
+    existence = session.scalar(
+        select(ScmExistenciaMangaKg)
+        .where(
+            ScmExistenciaMangaKg.manga_id == manga_id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        )
+        .with_for_update()
+    )
+    if existence is None or existence.unidad_fisica_kg_id is None:
+        return None
+    unit = session.scalar(
+        select(ScmUnidadFisicaKg)
+        .where(ScmUnidadFisicaKg.id == existence.unidad_fisica_kg_id)
+        .with_for_update()
+    )
+    blocked = (
+        existence.estado_logistico != "DISPONIBLE_PRODUCCION"
+        or existence.cantidad_reservada_kg != 0
+        or unit is None
+        or unit.estado != "ACTIVA"
+        or unit.estado_logistico != "DISPONIBLE_PRODUCCION"
+        or unit.saldo_id is None
+        or unit.ubicacion_id is None
+        or session.scalar(select(ScmReservaUnidadKg.id).where(
+            ScmReservaUnidadKg.unidad_id == unit.id,
+            ScmReservaUnidadKg.estado == "ACTIVA",
+        )) is not None
+        or session.scalar(select(ScmRetiroArmadoKgItem.id).where(
+            ScmRetiroArmadoKgItem.unidad_id == unit.id,
+        )) is not None
+        or session.scalar(select(ScmMedicionUnidadKg.id).where(
+            ScmMedicionUnidadKg.unidad_id == unit.id,
+        )) is not None
+        or session.scalar(select(ScmDivisionUnidadKg.id).where(
+            ScmDivisionUnidadKg.padre_id == unit.id,
+        )) is not None
+    )
+    if blocked:
+        raise ScmServiceError(
+            "KG_REOPEN_DOWNSTREAM_REQUIRED",
+            "La identidad KG tiene reserva, retiro, división o custodia posterior; primero debe resolverse ese flujo.",
+            status_code=409,
+        )
+    return existence, unit
+
+
 def reopen_manga_after_accidental_close(
     session, *, actor_id, manga_id, operation_id, data
 ):
@@ -2562,6 +3298,17 @@ def reopen_manga_after_accidental_close(
             .execution_options(populate_existing=True)
         )
         if weighing is None:
+            if reopening_type == "CONTINUAR_LLENADO":
+                return _reopen_kg_control_close(
+                    session,
+                    actor=actor,
+                    manga=manga,
+                    article=article,
+                    operation=operation,
+                    reason=reason,
+                    evidence=evidence,
+                    version=version,
+                )
             raise ScmServiceError(
                 "WEIGHING_NOT_ACTIVE",
                 "La manga no tiene un pesaje final vigente para reabrir.",
@@ -2592,16 +3339,18 @@ def reopen_manga_after_accidental_close(
                 status_code=409,
             )
 
-            is_kg = article is not None and article.unidad_inventario == "KG"
-            if (
-                not is_kg
-                and weighing.fuente_cantidad != "PLAN_CONFIRMADO_POR_PESAJE"
-            ):
-                raise ScmServiceError(
-                    "MANGA_REOPEN_NOT_AVAILABLE",
-                    "El cierre no es normal; use la recuperación supervisada de su origen.",
-                    status_code=409,
-                )
+        is_kg = article is not None and article.unidad_inventario == "KG"
+        if (
+            not is_kg
+            and weighing.fuente_cantidad != "PLAN_CONFIRMADO_POR_PESAJE"
+        ):
+            raise ScmServiceError(
+                "MANGA_REOPEN_NOT_AVAILABLE",
+                "El cierre no es normal; use la recuperación supervisada de su origen.",
+                status_code=409,
+            )
+        if is_kg:
+            _assert_kg_reopen_downstream_clear(session, manga.id)
         segments = session.scalars(
             select(ScmTramoMangaTrabajo)
             .where(ScmTramoMangaTrabajo.manga_id == manga.id)
@@ -2739,6 +3488,10 @@ def reopen_manga_after_accidental_close(
         manga.cantidad_confirmada_un = None
         manga.cantidad_contenida_un = None
         manga.version += 1
+        effective_weight = _effective_projection(weighing)
+        effective_base_kg = Decimal(
+            str(effective_weight["peso_fisico_neto_kg"])
+        ).quantize(KG_QUANTUM)
         reopening = ScmReaperturaManga(
             manga=manga,
             pesaje=weighing,
@@ -2746,7 +3499,7 @@ def reopen_manga_after_accidental_close(
             evidencia=evidence,
             tipo_reapertura=reopening_type,
             peso_base_neto_kg=(
-                weighing.peso_fisico_neto_kg
+                effective_base_kg
                 if reopening_type == "CONTINUAR_LLENADO" else None
             ),
             reabierta_por_id=actor.id,

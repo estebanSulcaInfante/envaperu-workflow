@@ -144,6 +144,7 @@ from app.services.scm_weighing_service import (
     get_manga_weighing,
     request_weighing_correction,
     reopen_manga_after_accidental_close,
+    resolve_manga_web_ficha,
 )
 from app.services.scm_kg_production_service import (
     close_kg_from_last_control,
@@ -2113,6 +2114,16 @@ def mangas_pesaje_detalle(manga_id):
         db.session,
         actor_id=_actor_id(),
         manga_id=manga_id,
+    ))
+
+
+@scm_bp.get("/mangas/ficha")
+def mangas_ficha_resolver():
+    entrada = request.args.get("entrada")
+    return jsonify(resolve_manga_web_ficha(
+        db.session,
+        actor_id=_actor_id(),
+        entrada=entrada,
     ))
 
 

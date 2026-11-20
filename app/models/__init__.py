@@ -54,6 +54,7 @@ from app.models.scm_ot import (
     ScmTrabajoOt,
     ScmPesajeManga,
     ScmReaperturaManga,
+    ScmReaperturaControlPesoKg,
     ScmAnulacionPesajeManga,
     ScmCorreccionPesajeManga,
     ScmCorreccionAsignacionManga,

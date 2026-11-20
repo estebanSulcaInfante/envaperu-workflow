@@ -1077,6 +1077,12 @@ class ScmManga(db.Model):
         lazy="selectin",
         order_by="ScmReaperturaManga.reabierta_at",
     )
+    reaperturas_control_kg = db.relationship(
+        "ScmReaperturaControlPesoKg",
+        back_populates="manga",
+        lazy="selectin",
+        order_by="ScmReaperturaControlPesoKg.reabierta_at",
+    )
     correccion_asignacion = db.relationship(
         "ScmCorreccionAsignacionManga",
         back_populates="manga",
@@ -1955,6 +1961,77 @@ class ScmReaperturaManga(db.Model):
             "evidencia": self.evidencia,
             "tipo_reapertura": self.tipo_reapertura,
             "peso_base_neto_kg": _decimal_text(self.peso_base_neto_kg),
+            "reabierta_por_id": self.reabierta_por_id,
+            "reabierta_at": _isoformat(self.reabierta_at),
+            "operation_id": str(self.operation_id),
+        }
+
+
+class ScmReaperturaControlPesoKg(db.Model):
+    """Append-only reopening of a KG closure sourced from a measured control.
+
+    ``close_kg_from_last_control`` intentionally does not create a
+    ``ScmPesajeManga``. This ledger preserves that distinction while allowing
+    the same physical manga to continue with a measured NET baseline.
+    """
+
+    __tablename__ = "scm_reapertura_control_peso_kg"
+    __table_args__ = (
+        db.UniqueConstraint("public_id", name="uq_scm_reapertura_control_kg_public"),
+        db.UniqueConstraint("control_id", name="uq_scm_reapertura_control_kg_control"),
+        db.UniqueConstraint("operation_id", name="uq_scm_reapertura_control_kg_operation"),
+        db.CheckConstraint(
+            "tipo_reapertura = 'CONTINUAR_LLENADO'",
+            name="ck_scm_reapertura_control_kg_tipo",
+        ),
+        db.CheckConstraint(
+            "peso_base_neto_kg > 0",
+            name="ck_scm_reapertura_control_kg_base",
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    public_id = db.Column(Uuid(as_uuid=True), nullable=False, default=uuid.uuid4)
+    manga_id = db.Column(
+        db.Integer, db.ForeignKey("scm_manga.id", ondelete="RESTRICT"), nullable=False
+    )
+    control_id = db.Column(
+        db.Integer,
+        db.ForeignKey("scm_control_peso_manga.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    tipo_reapertura = db.Column(
+        db.String(28), nullable=False, default="CONTINUAR_LLENADO",
+        server_default="CONTINUAR_LLENADO",
+    )
+    peso_base_neto_kg = db.Column(db.Numeric(15, 3), nullable=False)
+    motivo = db.Column(db.String(500), nullable=False)
+    evidencia = db.Column(db.String(500), nullable=True)
+    reabierta_por_id = db.Column(
+        db.Integer, db.ForeignKey("trabajador.id", ondelete="RESTRICT"), nullable=False
+    )
+    reabierta_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, default=utc_now,
+        server_default=db.func.now(),
+    )
+    operation_id = db.Column(
+        Uuid(as_uuid=True), db.ForeignKey("scm_operacion.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    manga = db.relationship("ScmManga", back_populates="reaperturas_control_kg")
+    control = db.relationship("ScmControlPesoManga")
+    reabierta_por = db.relationship("Trabajador")
+
+    def to_dict(self):
+        return {
+            "id": str(self.public_id),
+            "manga_id": str(self.manga.public_id),
+            "control_id": str(self.control.public_id),
+            "tipo_reapertura": self.tipo_reapertura,
+            "peso_base_neto_kg": _decimal_text(self.peso_base_neto_kg),
+            "motivo": self.motivo,
+            "evidencia": self.evidencia,
             "reabierta_por_id": self.reabierta_por_id,
             "reabierta_at": _isoformat(self.reabierta_at),
             "operation_id": str(self.operation_id),

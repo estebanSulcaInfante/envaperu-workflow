@@ -31,6 +31,14 @@ from app.models.scm_ot import (
     utc_now,
 )
 from app.models.scm_production_orders import ScmOrdenOperacion
+from app.models.scm_inventory_kg import (
+    ScmDivisionUnidadKg,
+    ScmExistenciaMangaKg,
+    ScmMedicionUnidadKg,
+    ScmReservaUnidadKg,
+    ScmRetiroArmadoKgItem,
+    ScmUnidadFisicaKg,
+)
 from app.services.scm_ot_service import (
     _complete_operation,
     _event,
@@ -1148,14 +1156,6 @@ def close_kg_from_last_control(
     _kg_article(manga)
     if manga.estado != "EN_LLENADO":
         raise ScmServiceError("MANGA_CLOSE_FROM_CONTROL_NOT_ALLOWED", "La manga no está en llenado.", status_code=409)
-    latest = session.scalar(
-        select(ScmControlPesoManga)
-        .where(ScmControlPesoManga.manga_id == manga.id)
-        .order_by(ScmControlPesoManga.pesado_at.desc(), ScmControlPesoManga.id.desc())
-        .with_for_update()
-    )
-    if latest is None or latest.unidad_evidencia != "KG":
-        raise ScmServiceError("KG_CONTROL_REQUIRED", "No existe un control KG vigente para cerrar.", status_code=409)
     if requested_version != manga.version:
         raise ScmServiceError("VERSION_CONFLICT", "La manga cambió desde la última lectura.", status_code=409)
     segments = session.scalars(
@@ -1164,6 +1164,66 @@ def close_kg_from_last_control(
     active = next((item for item in reversed(segments) if item.estado == "ACTIVO"), None)
     if active is None:
         raise ScmServiceError("KG_CONTROL_SEGMENT_REQUIRED", "No existe tramo activo para cerrar.", status_code=409)
+    latest = session.scalar(
+        select(ScmControlPesoManga)
+        .where(
+            ScmControlPesoManga.manga_id == manga.id,
+            ScmControlPesoManga.tramo_id == active.id,
+            ScmControlPesoManga.unidad_evidencia == "KG",
+        )
+        .order_by(
+            ScmControlPesoManga.created_at.desc(),
+            ScmControlPesoManga.id.desc(),
+        )
+        .with_for_update()
+    )
+    if latest is None:
+        raise ScmServiceError("KG_CONTROL_REQUIRED", "No existe un control KG vigente para el tramo activo.", status_code=409)
+    existence = session.scalar(
+        select(ScmExistenciaMangaKg)
+        .where(
+            ScmExistenciaMangaKg.manga_id == manga.id,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        )
+        .with_for_update()
+    )
+    if existence is not None:
+        unit = (
+            session.scalar(
+                select(ScmUnidadFisicaKg)
+                .where(ScmUnidadFisicaKg.id == existence.unidad_fisica_kg_id)
+                .with_for_update()
+            )
+            if existence.unidad_fisica_kg_id is not None else None
+        )
+        downstream = (
+            existence.estado_logistico != "EN_PRODUCCION"
+            or Decimal(existence.cantidad_reservada_kg or 0) != 0
+            or unit is None
+            or unit.estado != "ACTIVA"
+            or unit.estado_logistico != "EN_PRODUCCION"
+            or unit.saldo_id is None
+            or unit.ubicacion_id is None
+            or session.scalar(select(ScmReservaUnidadKg.id).where(
+                ScmReservaUnidadKg.unidad_id == unit.id,
+                ScmReservaUnidadKg.estado == "ACTIVA",
+            )) is not None
+            or session.scalar(select(ScmRetiroArmadoKgItem.id).where(
+                ScmRetiroArmadoKgItem.unidad_id == unit.id,
+            )) is not None
+            or session.scalar(select(ScmMedicionUnidadKg.id).where(
+                ScmMedicionUnidadKg.unidad_id == unit.id,
+            )) is not None
+            or session.scalar(select(ScmDivisionUnidadKg.id).where(
+                ScmDivisionUnidadKg.padre_id == unit.id,
+            )) is not None
+        )
+        if downstream:
+            raise ScmServiceError(
+                "KG_CLOSE_DOWNSTREAM_REQUIRED",
+                "La existencia KG tiene custodia posterior incompatible con un cierre desde control.",
+                status_code=409,
+            )
     final_net = Decimal(latest.peso_neto_kg).quantize(KG_QUANTUM)
     start = Decimal(active.cantidad_inicio_kg or 0).quantize(KG_QUANTUM)
     if final_net <= start:
