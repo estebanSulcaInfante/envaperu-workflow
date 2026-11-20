@@ -21,7 +21,18 @@ def authorize():
     actor_id = getattr(g, "scm_actor_id", None)
     if actor_id is None:
         raise ScmServiceError("AUTH_REQUIRED", "Inicia sesión en SCM.", status_code=401)
-    load_actor(db.session, actor_id, capability="INVENTARIO_CONTEO_C66")
+    # Reviewing a candidate is an observation operation. Confirming a
+    # missing manga is deliberately checked again by ``_missing`` with the
+    # stronger INVENTARIO_AJUSTAR capability.
+    if request.path.endswith("/faltantes"):
+        capability = "INVENTARIO_AJUSTAR"
+    elif request.path.endswith("/revision"):
+        # Review is a read/review workflow in SCM web. It must not grant the
+        # station's physical count capability as a side effect.
+        capability = "INVENTARIO_VER"
+    else:
+        capability = "INVENTARIO_CONTEO_C66"
+    load_actor(db.session, actor_id, capability=capability)
     scope = warehouse_scope(db.session, actor_id=actor_id)
     if scope["configured"] and not scope["transversal"]:
         warehouse_id = db.session.scalar(select(ScmAlmacen.id).where(
@@ -41,6 +52,12 @@ def state():
     return jsonify(inventory.vista_state_conteo(db.session, g.scm_actor_id, request.args.get("sesion_id")))
 
 
+@conteo_c66_bp.get("/revision")
+def revision_state():
+    """Review queue for SCM web, next to the C66 count workspace."""
+    return jsonify(inventory.vista_state_revision(db.session, g.scm_actor_id))
+
+
 def command(path, fields):
     body = request.get_json(silent=True)
     if body is None and request.method == "DELETE" and not request.data:
@@ -54,7 +71,9 @@ def command(path, fields):
     if path == "/sesiones":
         body = {**body, "clave": str(key)}
     else:
-        inventory.require_named_count(db.session, request.view_args["session_id"])
+        session_id = (request.view_args or {}).get("session_id")
+        if session_id is not None:
+            inventory.require_named_count(db.session, session_id)
     result = inventory.dispatch(db.session, g.scm_actor_id, request.method, path, body, key)
     payload, status = result if isinstance(result, tuple) else (result, 200)
     return jsonify(payload), status
@@ -81,3 +100,13 @@ def remove(session_id, code):
 @conteo_c66_bp.post("/sesiones/<uuid:session_id>/cerrar")
 def close(session_id):
     return command(f"/sesiones/{session_id}/cerrar", {"cobertura", "marcar_no_habidas", "no_habidas"})
+
+
+@conteo_c66_bp.post("/revision")
+def review():
+    return command("/revision", {"codigo", "cobertura", "movimientos_revisados", "busqueda"})
+
+
+@conteo_c66_bp.post("/faltantes")
+def missing():
+    return command("/faltantes", {"codigo", "token", "motivo", "clave"})

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -346,6 +347,114 @@ def _require_complete_walk(session):
     covered = {item.zona_id for item in sessions if item.estado == "CERRADA" and item.cobertura_confirmada}
     if covered != ZONE_IDS or any(item.estado != "CERRADA" for item in sessions):
         raise ScmServiceError("WALK_INCOMPLETE", "Debe cerrar y confirmar cobertura explícita de las cuatro zonas antes de confirmar faltantes.", status_code=409)
+
+
+def _require_movement_gate():
+    """Keep central Kardex writes behind the same pilot activation gate.
+
+    The review queue is read-only and remains available while the gate is
+    closed. A missing confirmation is a real stock mutation, so reject it
+    before creating an idempotency record or changing any state.
+    """
+    if os.environ.get("SCM_MESA_MOVIMIENTOS_HABILITADOS") != "1":
+        raise ScmServiceError(
+            "MOVEMENTS_DISABLED",
+            "Los ajustes de inventario están cerrados; no se puede confirmar el faltante todavía.",
+            status_code=409,
+            details={"habilitado": False},
+        )
+
+
+def _invalidate_active_reviews(session, code):
+    """Invalidate review tokens when new evidence changes their basis."""
+    rows = session.scalars(select(ScmMesaInventarioRevision).where(
+        ScmMesaInventarioRevision.codigo == code,
+        ScmMesaInventarioRevision.estado == "ACTIVA",
+    )).all()
+    for row in rows:
+        row.estado = "INVALIDADA"
+        row.used_at = _now()
+
+
+def _require_review_scope(session, manga):
+    """Require four-zone evidence for this manga's piece only.
+
+    A count for Tapa cannot certify Asa. A named count with explicit coverage
+    each closed count contributes only its own zone. Open counts for the same
+    piece remain a hard block. Historical unnamed counts are considered only
+    when they explicitly declared coverage and contain a reading for this
+    identity.
+    """
+    names = _piece_names(manga.articulo)
+    if not names:
+        return
+    relevant_sessions = _review_sessions_for_manga(session, manga)
+    if any(item.estado != "CERRADA" for item in relevant_sessions):
+        raise ScmServiceError(
+            "WALK_INCOMPLETE",
+            "Hay un conteo abierto para la pieza; ciérrelo antes de revisar faltantes.",
+            status_code=409,
+        )
+    covered = set()
+    for item in relevant_sessions:
+        if item.estado == "CERRADA" and item.cobertura_confirmada:
+            covered.add(item.zona_id)
+    missing_zones = sorted(set(ZONE_IDS) - covered)
+    if missing_zones:
+        raise ScmServiceError(
+            "WALK_INCOMPLETE",
+            "El conteo de la pieza no cubre las cuatro zonas.",
+            status_code=409,
+            details={"zonas_faltantes": missing_zones, "piezas": sorted(names)},
+        )
+
+
+def _review_sessions_for_manga(session, manga, *, exclude_id=None):
+    names = _piece_names(manga.articulo)
+    rows = session.scalars(select(ScmMesaInventarioSesion)).all()
+    relevant = []
+    for item in rows:
+        if item.id == exclude_id:
+            continue
+        pieces = _session_pieces(item)
+        if names.intersection(pieces):
+            relevant.append(item)
+            continue
+        # Named counts without a piece snapshot retain their frozen expected
+        # identity list. Historical unnamed sessions are narrower: they can
+        # contribute only with explicit coverage and a linked reading.
+        if not pieces and manga.codigo in (item.esperadas_json or []):
+            if item.nombre is not None or (
+                item.cobertura_confirmada and session.scalar(select(ScmMesaInventarioLectura.id).where(
+                    ScmMesaInventarioLectura.sesion_id == item.id,
+                    ScmMesaInventarioLectura.manga_id == manga.id,
+                )) is not None
+            ):
+                relevant.append(item)
+                continue
+        if not pieces and item.nombre is None and item.cobertura_confirmada and session.scalar(select(ScmMesaInventarioLectura.id).where(
+            ScmMesaInventarioLectura.sesion_id == item.id,
+            ScmMesaInventarioLectura.manga_id == manga.id,
+        )) is not None:
+            relevant.append(item)
+    return relevant
+
+
+def _canonical_inventory_snapshot(session, manga, *, lock=False):
+    """Resolve the active canonical existence and balance for a Mesa shadow."""
+    location = session.scalar(select(ScmUbicacionInventario).where(
+        ScmUbicacionInventario.codigo == SALDO_KEY,
+        ScmUbicacionInventario.activo.is_(True),
+    ))
+    if location is None or not manga.unidad_fisica_id:
+        return None, None
+    existence = _active_existence(session, manga.unidad_fisica_id, lock=lock)
+    if existence is None or existence.ubicacion_id != location.id or existence.articulo_scm_id != manga.articulo_id:
+        return None, None
+    balance = session.get(ScmSaldoInventarioKg, existence.saldo_id, with_for_update=lock)
+    if balance is None or balance.ubicacion_id != location.id or balance.articulo_scm_id != manga.articulo_id:
+        return existence, None
+    return existence, balance
 
 
 def _production_existence(session, unit):
@@ -830,7 +939,15 @@ def _project_kardex_negative(session, *, actor_id, operation_id, manga, net, rea
     existence = _active_existence(session, unit.id)
     if existence is None:
         raise ScmServiceError("KARDEX_EXISTENCE_NOT_FOUND", "La identidad no tiene existencia elegible en el Kardex.", status_code=409)
+    location = session.scalar(select(ScmUbicacionInventario).where(
+        ScmUbicacionInventario.codigo == SALDO_KEY,
+        ScmUbicacionInventario.activo.is_(True),
+    ))
+    if location is None or existence.ubicacion_id != location.id or existence.articulo_scm_id != manga.articulo_id:
+        raise ScmServiceError("KARDEX_EXISTENCE_NOT_FOUND", "La identidad no tiene una existencia canónica vigente en PRODUCCION_KG.", status_code=409)
     balance = session.get(ScmSaldoInventarioKg, existence.saldo_id, with_for_update=True)
+    if balance is None or balance.ubicacion_id != location.id or balance.articulo_scm_id != manga.articulo_id:
+        raise ScmServiceError("KARDEX_EXISTENCE_NOT_FOUND", "El saldo canónico de la identidad no coincide con PRODUCCION_KG.", status_code=409)
     result = (Decimal(balance.cantidad_fisica_kg) - net).quantize(QUANTUM)
     if result < 0 or Decimal(balance.cantidad_reservada_kg) + Decimal(balance.cantidad_no_disponible_kg) > result:
         raise ScmServiceError("KARDEX_RESERVED_CONFLICT", "La baja dejaría un saldo comprometido o negativo.", status_code=409)
@@ -943,6 +1060,7 @@ def _reading(session, actor_id, session_obj, manga, data):
             )
         return "Lectura ya registrada"
     previous_zone, previous_state, previous_net = manga.zona_hallazgo, manga.estado, manga.neto_kg
+    _invalidate_active_reviews(session, manga.codigo)
     if manga.zona_hallazgo and manga.zona_hallazgo != requested_zone:
         if data.get("confirmar_zona") is not True or data.get("zona_anterior") != manga.zona_hallazgo:
             raise ScmServiceError("ZONE_CONFLICT", "La identidad figura en otra zona; confirme el hallazgo.", status_code=409, details={"zona_anterior": manga.zona_hallazgo, "zona_actual": requested_zone})
@@ -994,7 +1112,19 @@ def _state(session):
             })
         sessions.append(projected)
     pending = [_manga_payload(item) for item in session.scalars(select(ScmMesaInventarioManga).where(ScmMesaInventarioManga.estado.in_(("PENDIENTE_PESAJE", "PESADA_PENDIENTE_CONFIRMACION"))).order_by(ScmMesaInventarioManga.codigo)).all()]
-    movements = [{"id": str(item.id), "codigo": item.manga.codigo, "tipo": item.tipo, "delta": _fmt(item.delta_kg), "motivo": item.motivo, "vinculo_baja": str(item.vinculo_baja_id) if item.vinculo_baja_id else None, "kardex_movimiento_id": str(item.kardex_movimiento_id) if item.kardex_movimiento_id else None} for item in session.scalars(select(ScmMesaInventarioMovimiento).order_by(ScmMesaInventarioMovimiento.created_at)).all()]
+    movement_rows = session.execute(select(
+        ScmMesaInventarioMovimiento,
+        ScmMesaInventarioManga.codigo,
+    ).join(
+        ScmMesaInventarioManga,
+        ScmMesaInventarioManga.id == ScmMesaInventarioMovimiento.manga_id,
+    ).order_by(ScmMesaInventarioMovimiento.created_at)).all()
+    movements = [{
+        "id": str(item.id), "codigo": code, "tipo": item.tipo,
+        "delta": _fmt(item.delta_kg), "motivo": item.motivo,
+        "vinculo_baja": str(item.vinculo_baja_id) if item.vinculo_baja_id else None,
+        "kardex_movimiento_id": str(item.kardex_movimiento_id) if item.kardex_movimiento_id else None,
+    } for item, code in movement_rows]
     campaign = session.scalar(select(ScmMesaInventarioCampana).order_by(ScmMesaInventarioCampana.created_at).limit(1))
     return {
         "campana": {"id": str(campaign.id), "codigo": campaign.codigo, "estado": campaign.estado} if campaign else None,
@@ -1008,10 +1138,271 @@ def _state(session):
     }
 
 
+def _latest_no_habida(session, code, *, lock=False):
+    """Return the latest closed-count missing mark for a manga, if any."""
+    statement = select(ScmMesaInventarioNoHabida).join(
+        ScmMesaInventarioSesion,
+        ScmMesaInventarioSesion.id == ScmMesaInventarioNoHabida.sesion_id,
+    ).join(
+        ScmMesaInventarioManga,
+        ScmMesaInventarioManga.id == ScmMesaInventarioNoHabida.manga_id,
+    ).where(
+        ScmMesaInventarioManga.codigo == code,
+        ScmMesaInventarioSesion.estado == "CERRADA",
+    ).order_by(
+        ScmMesaInventarioNoHabida.created_at.desc(),
+        ScmMesaInventarioNoHabida.id.desc(),
+    ).limit(1)
+    if lock:
+        statement = statement.with_for_update()
+    return session.scalar(statement)
+
+
+def _no_habida_is_current(session, row):
+    """A later physical reading invalidates a missing mark from review."""
+    later = session.scalar(select(ScmMesaInventarioLectura.id).where(
+        ScmMesaInventarioLectura.manga_id == row.manga_id,
+        ScmMesaInventarioLectura.created_at > row.created_at,
+    ).limit(1))
+    return later is None
+
+
 def vista_state(session, actor_id):
     """Return the Mesa contract for a server-resolved actor."""
     _count_actor(session, actor_id)
     return _state(session)
+
+
+def vista_state_revision(session, actor_id):
+    """Return the review queue used by the SCM web inventory workspace.
+
+    Observing candidates requires only ``INVENTARIO_VER``. The adjustment
+    itself remains guarded by ``INVENTARIO_AJUSTAR`` in ``_missing``. Keeping
+    the two capabilities separate lets a reviewer inspect and prepare
+    evidence without silently changing Kardex.
+    """
+    actor = _actor(session, actor_id, "INVENTARIO_VER")
+    movements_enabled = os.environ.get("SCM_MESA_MOVIMIENTOS_HABILITADOS") == "1"
+    can_adjust = actor.tiene_capacidad("INVENTARIO_AJUSTAR")
+    active_reviews = {
+        item.codigo: {
+            "token": str(item.id),
+            "created_at": _iso(item.created_at),
+        }
+        for item in session.scalars(select(ScmMesaInventarioRevision).where(
+            ScmMesaInventarioRevision.estado == "ACTIVA",
+        )).all()
+    }
+    candidates = []
+    actionable_candidates = []
+    history = []
+    manga_load = selectinload(ScmMesaInventarioNoHabida.manga)
+    no_habidas = session.scalars(select(ScmMesaInventarioNoHabida).join(
+        ScmMesaInventarioSesion,
+        ScmMesaInventarioSesion.id == ScmMesaInventarioNoHabida.sesion_id,
+    ).options(
+        manga_load.selectinload(ScmMesaInventarioManga.unidad_fisica),
+        manga_load.selectinload(ScmMesaInventarioManga.articulo).selectinload(ScmArticulo.pieza_color).selectinload(ScmArticuloPiezaColor.pieza_color).selectinload(PiezaColor.color_produccion_rel),
+        manga_load.selectinload(ScmMesaInventarioManga.articulo).selectinload(ScmArticulo.pieza_color).selectinload(ScmArticuloPiezaColor.pieza_color).selectinload(PiezaColor.pieza_rel),
+        selectinload(ScmMesaInventarioNoHabida.sesion),
+    ).where(
+        ScmMesaInventarioSesion.estado == "CERRADA",
+    ).order_by(
+        ScmMesaInventarioNoHabida.created_at.desc(),
+    )).all()
+    # Keep the latest mark per identity. A manga missing in several counts is
+    # still one adjustment candidate, while the linked counts remain visible
+    # in its history.
+    grouped = {}
+    for row in no_habidas:
+        grouped.setdefault(row.manga.codigo, []).append(row)
+    latest_rows = [rows[0] for rows in grouped.values()]
+    coverage_by_piece = {}
+    coverage_sessions = session.scalars(select(ScmMesaInventarioSesion).where(
+        ScmMesaInventarioSesion.nombre.is_not(None),
+    )).all()
+    for coverage_session in coverage_sessions:
+        zones = {coverage_session.zona_id} if coverage_session.cobertura_confirmada else set()
+        for piece in _session_pieces(coverage_session):
+            coverage_by_piece.setdefault(piece, set()).update(zones)
+    unit_ids = [row.manga.unidad_fisica_id for row in latest_rows if row.manga.unidad_fisica_id]
+    manga_code_by_id = {row.manga_id: row.manga.codigo for row in latest_rows}
+    coverage_by_code = {}
+    unnamed_coverage = [item for item in session.scalars(select(ScmMesaInventarioSesion)).all()
+                        if item.nombre is None and item.cobertura_confirmada]
+    unnamed_ids = {item.id for item in unnamed_coverage}
+    if unnamed_ids:
+        for session_id, manga_id in session.execute(select(
+            ScmMesaInventarioLectura.sesion_id,
+            ScmMesaInventarioLectura.manga_id,
+        ).where(ScmMesaInventarioLectura.sesion_id.in_(unnamed_ids))).all():
+            code = manga_code_by_id.get(manga_id)
+            if code:
+                zone = next((item.zona_id for item in unnamed_coverage if item.id == session_id), None)
+                if zone:
+                    coverage_by_code.setdefault(code, set()).add(zone)
+    active_existence = {}
+    for existence in session.scalars(select(ScmExistenciaMangaKg).where(
+            ScmExistenciaMangaKg.unidad_fisica_kg_id.in_(unit_ids) if unit_ids else False,
+            ScmExistenciaMangaKg.estado_logistico != "REVERSADA",
+        ).order_by(ScmExistenciaMangaKg.recibida_at.desc())).all():
+        active_existence.setdefault(existence.unidad_fisica_kg_id, existence)
+    saldo_ids = {item.saldo_id for item in active_existence.values() if item.saldo_id}
+    balances = {
+        item.id: item
+        for item in session.scalars(select(ScmSaldoInventarioKg).where(
+            ScmSaldoInventarioKg.id.in_(saldo_ids) if saldo_ids else False,
+        )).all()
+    }
+    canonical_location = session.scalar(select(ScmUbicacionInventario).where(
+        ScmUbicacionInventario.codigo == SALDO_KEY,
+        ScmUbicacionInventario.activo.is_(True),
+    ))
+    manga_ids = [row.manga_id for row in latest_rows]
+    later_reads = dict(session.execute(select(
+        ScmMesaInventarioLectura.manga_id,
+        func.max(ScmMesaInventarioLectura.created_at),
+    ).where(
+        ScmMesaInventarioLectura.manga_id.in_(manga_ids) if manga_ids else False,
+    ).group_by(ScmMesaInventarioLectura.manga_id)).all())
+    movement_latest = dict(session.execute(select(
+        ScmMovimientoInventarioKg.saldo_id,
+        func.max(ScmMovimientoInventarioKg.created_at),
+    ).where(
+        ScmMovimientoInventarioKg.saldo_id.in_(saldo_ids) if saldo_ids else False,
+    ).group_by(ScmMovimientoInventarioKg.saldo_id)).all())
+    for row in latest_rows:
+        manga_payload = _manga_payload(row.manga)
+        piece_names = _piece_names(row.manga.articulo)
+        covered_zones = set().union(*(coverage_by_piece.get(piece, set()) for piece in piece_names)) if piece_names else set()
+        covered_zones.update(coverage_by_code.get(row.manga.codigo, set()))
+        if not _session_pieces(row.sesion) and row.sesion.cobertura_confirmada:
+            covered_zones.add(row.sesion.zona_id)
+        current = (
+            later_reads.get(row.manga.id) is None
+            or later_reads[row.manga.id] <= row.created_at
+        )
+        existence = active_existence.get(row.manga.unidad_fisica_id)
+        balance = balances.get(existence.saldo_id) if existence is not None else None
+        canonical_available = (
+            existence is not None
+            and canonical_location is not None
+            and existence.ubicacion_id == canonical_location.id
+            and existence.ubicacion_id == (balance.ubicacion_id if balance is not None else None)
+            and existence.articulo_scm_id == row.manga.articulo_id
+            and existence.cantidad_fisica_kg is not None
+            and Decimal(existence.cantidad_fisica_kg) > 0
+            and balance is not None
+            and balance.articulo_scm_id == row.manga.articulo_id
+            and balance.cantidad_fisica_kg is not None
+            and Decimal(balance.cantidad_fisica_kg) > 0
+        )
+        movement_changed = (
+            existence is not None
+            and movement_latest.get(existence.saldo_id) is not None
+            and movement_latest[existence.saldo_id] > row.created_at
+        )
+        current = current and not movement_changed
+        scope_complete = covered_zones == set(ZONE_IDS)
+        actionable = current and scope_complete and row.manga.estado == "DISPONIBLE" and row.manga.neto_kg is not None and canonical_available
+        history_item = {
+            **manga_payload,
+            "vigente": actionable,
+            "motivo_bloqueo": None if actionable else (
+                "La manga fue hallada después del conteo." if not current and not movement_changed else
+                "El saldo cambió después del conteo." if movement_changed else
+                "El conteo de la pieza no cubre las cuatro zonas." if not scope_complete else
+                "La manga ya no tiene saldo disponible para ajustar."
+            ),
+            "conteo": {
+                "id": str(row.sesion_id),
+                "nombre": row.sesion.nombre,
+                "zona": row.sesion.zona_id,
+                "piezas": _session_pieces(row.sesion),
+                "cobertura_confirmada": bool(row.sesion.cobertura_confirmada),
+                "cerrado_at": _iso(row.sesion.closed_at),
+            },
+            "cobertura_pieza": {
+                "zonas_cubiertas": sorted(covered_zones),
+                "zonas_faltantes": sorted(set(ZONE_IDS) - covered_zones),
+                "completa": covered_zones == set(ZONE_IDS),
+            },
+            "conteos": [{
+                "id": str(item.sesion_id), "nombre": item.sesion.nombre,
+                "zona": item.sesion.zona_id, "marcado_at": _iso(item.created_at),
+            } for item in grouped[row.manga.codigo]],
+            "marcado_no_habida_at": _iso(row.created_at),
+        }
+        if row.manga.codigo in active_reviews:
+            history_item["revision"] = active_reviews[row.manga.codigo]
+        history.append(history_item)
+        # Keep a current, positively-backed missing mark visible even when
+        # the four-zone review scope is still incomplete. The UI can explain
+        # the block from ``vigente``/``motivo_bloqueo``; stale marks (later
+        # hallazgo or movement) remain history only.
+        if current and row.manga.estado == "DISPONIBLE" and canonical_available:
+            candidates.append(history_item)
+        if actionable:
+            actionable_candidates.append(history_item)
+    sessions = []
+    for item in session.scalars(select(ScmMesaInventarioSesion).order_by(ScmMesaInventarioSesion.created_at.desc())).all():
+        sessions.append({
+            "id": str(item.id), "nombre": item.nombre, "zona": item.zona_id,
+            "estado": item.estado, "piezas": _session_pieces(item),
+            "cobertura_confirmada": bool(item.cobertura_confirmada),
+            "closed_at": _iso(item.closed_at),
+            "no_habidas": [code for code, rows in grouped.items() if any(mark.sesion_id == item.id for mark in rows)],
+        })
+    movement_rows = session.execute(select(
+        ScmMesaInventarioMovimiento,
+        ScmMesaInventarioManga.codigo,
+    ).join(
+        ScmMesaInventarioManga,
+        ScmMesaInventarioManga.id == ScmMesaInventarioMovimiento.manga_id,
+    ).order_by(ScmMesaInventarioMovimiento.created_at)).all()
+    movements = [{
+        "id": str(item.id), "codigo": code, "tipo": item.tipo,
+        "delta": _fmt(item.delta_kg), "motivo": item.motivo,
+        "vinculo_baja": str(item.vinculo_baja_id) if item.vinculo_baja_id else None,
+        "kardex_movimiento_id": str(item.kardex_movimiento_id) if item.kardex_movimiento_id else None,
+    } for item, code in movement_rows]
+    campaign = session.scalar(select(ScmMesaInventarioCampana).order_by(ScmMesaInventarioCampana.created_at).limit(1))
+    articles = []
+    seen_articles = set()
+    for item in history:
+        if item["articulo_id"] in seen_articles:
+            continue
+        seen_articles.add(item["articulo_id"])
+        articles.append({
+            "id": item["articulo_id"], "nombre": item["pieza"],
+            "nombre_color": item["pieza"], "color": item["color"],
+        })
+    payload = {
+        "campana": {"id": str(campaign.id), "codigo": campaign.codigo, "estado": campaign.estado} if campaign else None,
+        "saldo": {"clave": SALDO_KEY, "clase": "PIEZA_COLOR", "unidad": "KG"},
+        "cuenta": STATION_ID, "zonas": [{"id": key, "nombre": name} for key, name in ZONES],
+        "articulos": articles, "mangas": history, "sesiones": sessions,
+        "pendientes": [], "movimientos": movements, "preetiquetas": [],
+        "conteo_por_pieza": True, "pendientes_conteo": [],
+    }
+    adjustment_reason = None
+    if not can_adjust and not movements_enabled:
+        adjustment_reason = "Tu rol no tiene INVENTARIO_AJUSTAR y el gate central de movimientos está cerrado."
+    elif not can_adjust:
+        adjustment_reason = "Tu rol no tiene INVENTARIO_AJUSTAR."
+    elif not movements_enabled:
+        adjustment_reason = "Los movimientos centrales están deshabilitados temporalmente."
+    payload["revision"] = {
+        "candidatas": candidates,
+        "vigentes": actionable_candidates,
+        "activas": active_reviews,
+        "historial": history,
+        "movimientos_habilitados": movements_enabled,
+        "puede_ajustar": can_adjust,
+        "ajuste_habilitado": movements_enabled and can_adjust,
+        "motivo_ajuste": adjustment_reason,
+    }
+    return payload
 
 
 def _catalogo_conteo(session):
@@ -1248,9 +1639,11 @@ def _close_session(session, actor_id, session_id, data, operation_id):
         missing = list(dict.fromkeys(code.strip() for code in raw_missing))
         if len(missing) != len(raw_missing):
             raise ScmServiceError("DUPLICATE_MISSING", "no_habidas no debe contener códigos repetidos.", status_code=422)
-        fingerprint = _fingerprint({"marcar_no_habidas": marked, "no_habidas": missing})
+        coverage_confirmed = data.get("cobertura") is True or data.get("cobertura_completa") is True
+        fingerprint = _fingerprint({"marcar_no_habidas": marked, "no_habidas": missing, "cobertura": coverage_confirmed})
+        legacy_fingerprint = _fingerprint({"marcar_no_habidas": marked, "no_habidas": missing})
         if obj.estado != "ABIERTA":
-            if obj.cierre_fingerprint == fingerprint and obj.cierre_response_json:
+            if obj.cierre_fingerprint in {fingerprint, legacy_fingerprint} and obj.cierre_response_json:
                 return copy.deepcopy(obj.cierre_response_json), 200
             raise ScmServiceError("SESSION_CLOSED", "La sesión ya está cerrada.", status_code=409)
         _lock_named_identities(session, obj.esperadas_json or [])
@@ -1259,19 +1652,25 @@ def _close_session(session, actor_id, session_id, data, operation_id):
             raise ScmServiceError("MISSING_MISMATCH", "La lista de no habidas no coincide con las pendientes del corte.", status_code=409, details={"pendientes_conteo": pending})
         if not marked and missing:
             raise ScmServiceError("MISSING_FLAG_REQUIRED", "no_habidas requiere marcar_no_habidas=true.", status_code=422)
-        op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones/cerrar", actor.id, {"session_id": str(obj.id), "marcar_no_habidas": marked, "no_habidas": missing})
+        op_id, replay, status = _operation(session, operation_id, "POST /inventario/sesiones/cerrar", actor.id, {
+            "session_id": str(obj.id), "marcar_no_habidas": marked,
+            "no_habidas": missing, "cobertura": coverage_confirmed,
+        })
         if replay is not None:
             return replay, status
         for code in (missing if marked else []):
             manga = _manga_by_code(session, code, lock=True)
             if code not in (obj.esperadas_json or []):
                 raise ScmServiceError("MISSING_OUT_OF_SCOPE", "Una no habida no pertenece al corte de la sesión.", status_code=409)
+            _invalidate_active_reviews(session, code)
             session.add(ScmMesaInventarioNoHabida(sesion_id=obj.id, manga_id=manga.id, actor_id=actor.id))
         closed_at = _now()
+        obj.cobertura_confirmada = coverage_confirmed
         response = {
             "mensaje": "Sesión cerrada", "closed_at": _iso(closed_at),
             "cantidad": len(obj.lecturas), "no_habidas": missing if marked else [],
             "pendientes_conteo": [] if marked else pending,
+            "cobertura_confirmada": coverage_confirmed,
         }
         obj.estado, obj.closed_at = "CERRADA", closed_at
         obj.cierre_fingerprint, obj.cierre_response_json = fingerprint, response
@@ -1368,15 +1767,40 @@ def _weigh(session, actor_id, data, operation_id):
 def _review(session, actor_id, data, operation_id):
     actor = _actor(session, actor_id)
     code = _text(data.get("codigo"), "codigo")
-    _require_complete_walk(session)
+    normalized = {
+        "codigo": code,
+        "cobertura": data.get("cobertura") is True,
+        "movimientos_revisados": data.get("movimientos_revisados") is True,
+        "busqueda": data.get("busqueda") is True,
+    }
+    # Resolve an idempotent replay before reading mutable manga/saldo state.
+    # A lost response must remain recoverable even after the original review
+    # token was consumed or the underlying balance changed.
+    op_id, replay, status = _operation(session, operation_id, "POST /inventario/revision", actor.id, normalized)
+    if replay is not None:
+        return replay, status
     if not all(data.get(flag) is True for flag in ("cobertura", "movimientos_revisados", "busqueda")):
         raise ScmServiceError("REVIEW_INCOMPLETE", "La revisión requiere cobertura, movimientos y búsqueda dirigida.", status_code=409)
     manga = _manga_by_code(session, code, lock=True, require_inventory=True)
+    missing_mark = _latest_no_habida(session, code, lock=True)
+    if missing_mark is None:
+        _require_complete_walk(session)
+        raise ScmServiceError("REVIEW_NOT_MISSING", "La manga no está marcada como no habida en un conteo cerrado.", status_code=409)
+    _require_review_scope(session, manga)
+    if not _no_habida_is_current(session, missing_mark):
+        _invalidate_active_reviews(session, code)
+        raise ScmServiceError("REVIEW_STALE", "La revisión quedó obsoleta porque la manga fue hallada después del conteo.", status_code=409)
+    existence, balance = _canonical_inventory_snapshot(session, manga, lock=True)
+    if existence is None or balance is None or balance.cantidad_fisica_kg is None or Decimal(balance.cantidad_fisica_kg) <= 0:
+        raise ScmServiceError("REVIEW_NOT_ACTIVE", "La manga no tiene saldo canónico disponible para revisión.", status_code=409)
+    latest_movement = session.scalar(select(func.max(ScmMovimientoInventarioKg.created_at)).where(
+        ScmMovimientoInventarioKg.saldo_id == existence.saldo_id,
+    ))
+    if latest_movement is not None and latest_movement > missing_mark.created_at:
+        _invalidate_active_reviews(session, code)
+        raise ScmServiceError("REVIEW_STALE", "El saldo cambió después del conteo.", status_code=409)
     if manga.estado != "DISPONIBLE":
         raise ScmServiceError("REVIEW_NOT_ACTIVE", "La manga no está activa para revisión.", status_code=409)
-    op_id, replay, status = _operation(session, operation_id, "POST /inventario/revision", actor.id, {"codigo": code, "cobertura": True, "movimientos_revisados": True, "busqueda": True})
-    if replay is not None:
-        return replay, status
     existing = session.scalar(select(ScmMesaInventarioRevision).where(ScmMesaInventarioRevision.codigo == code, ScmMesaInventarioRevision.estado == "ACTIVA"))
     if existing is not None:
         return _complete(session, op_id, {"token": str(existing.id), "neto": _fmt(manga.neto_kg)}, 200)
@@ -1399,21 +1823,36 @@ def _missing(session, actor_id, data, operation_id):
     # current unit state.  This is essential after a successful debit.
     if replay is not None:
         return replay, status
-    _require_complete_walk(session)
+    _require_movement_gate()
     manga = _manga_by_code(session, code, lock=True, require_inventory=True)
+    missing_mark = _latest_no_habida(session, code, lock=True)
+    if missing_mark is None:
+        _require_complete_walk(session)
+        raise ScmServiceError("REVIEW_NOT_MISSING", "La manga no está marcada como no habida en un conteo cerrado.", status_code=409)
+    _require_review_scope(session, manga)
+    if not _no_habida_is_current(session, missing_mark):
+        _invalidate_active_reviews(session, code)
+        raise ScmServiceError("REVIEW_STALE", "La revisión quedó obsoleta porque la manga fue hallada después del conteo.", status_code=409)
     review = session.get(ScmMesaInventarioRevision, _uuid(token, "token"))
     if review is None or review.codigo != code or review.estado != "ACTIVA":
         raise ScmServiceError("REVIEW_INVALID", "La revisión no está activa.", status_code=409)
+    if review.created_at < missing_mark.created_at:
+        review.estado, review.used_at = "INVALIDADA", _now()
+        raise ScmServiceError("REVIEW_STALE", "La revisión pertenece a un conteo anterior.", status_code=409)
     if session.scalar(select(ScmMesaInventarioLectura.id).where(
         ScmMesaInventarioLectura.manga_id == manga.id,
         ScmMesaInventarioLectura.created_at > review.created_at,
     ).limit(1)) is not None:
+        review.estado, review.used_at = "INVALIDADA", _now()
         raise ScmServiceError("REVIEW_STALE", "La revisión quedó obsoleta por una lectura posterior.", status_code=409)
-    existence = session.get(ScmExistenciaMangaKg, manga.kardex_existence_id) if manga.kardex_existence_id else None
-    if existence is not None and session.scalar(select(ScmMovimientoInventarioKg.id).where(
+    existence, balance = _canonical_inventory_snapshot(session, manga, lock=True)
+    if existence is None or balance is None or balance.cantidad_fisica_kg is None or Decimal(balance.cantidad_fisica_kg) <= 0:
+        raise ScmServiceError("MANGA_NOT_ACTIVE", "La manga ya no tiene saldo canónico disponible.", status_code=409)
+    if session.scalar(select(ScmMovimientoInventarioKg.id).where(
         ScmMovimientoInventarioKg.saldo_id == existence.saldo_id,
         ScmMovimientoInventarioKg.created_at > review.created_at,
     ).limit(1)) is not None:
+        review.estado, review.used_at = "INVALIDADA", _now()
         raise ScmServiceError("REVIEW_STALE", "El saldo cambió después de la revisión.", status_code=409)
     if manga.estado != "DISPONIBLE" or manga.neto_kg is None:
         raise ScmServiceError("MANGA_NOT_ACTIVE", "La manga ya no está activa o no tiene neto vigente.", status_code=409)
@@ -1506,4 +1945,7 @@ def dispatch(session, actor_id, method, path, data=None, operation_id=None):
     raise ScmServiceError("MESA_ROUTE_NOT_FOUND", "Operación de inventario no reconocida.", status_code=404)
 
 
-__all__ = ["dispatch", "label", "vista_state", "vista_state_conteo", "ZONES", "STATION_ID"]
+__all__ = [
+    "dispatch", "label", "vista_state", "vista_state_conteo",
+    "vista_state_revision", "ZONES", "STATION_ID",
+]

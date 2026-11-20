@@ -15,11 +15,15 @@ from app.models.scm_inventory_kg import (
     ScmUnidadFisicaKg,
 )
 from app.models.scm_inventory import ScmUbicacionInventario
-from app.models.scm_mesa_inventory import ScmMesaInventarioManga, ScmMesaInventarioMovimiento, ScmMesaInventarioPesaje
+from app.models.scm_mesa_inventory import (
+    ScmMesaInventarioManga, ScmMesaInventarioMovimiento,
+    ScmMesaInventarioPesaje, ScmMesaInventarioRevision,
+)
 from app.models.trabajador import RolOperativo, Trabajador
-from app.services.scm_mesa_inventory import dispatch, vista_state
+from app.services.scm_mesa_inventory import dispatch, vista_state, vista_state_revision
 from app.services.scm_kg_custody_service import resolve_kg_outgoing
 from app.services.scm_service_support import ScmServiceError
+from sqlalchemy.exc import IntegrityError
 
 
 @pytest.fixture
@@ -78,6 +82,36 @@ def test_state_requires_view_capability(app):
         with pytest.raises(ScmServiceError) as error:
             vista_state(db.session, actor.id)
         assert error.value.code == "CAPABILITY_REQUIRED"
+
+
+def test_revision_index_keeps_history_but_allows_only_one_active_token(app, mesa_actor):
+    actor_id, _article_id = mesa_actor
+    with app.app_context():
+        db.session.add_all([
+            ScmMesaInventarioRevision(codigo="REV-CYCLE-001", estado="INVALIDADA", actor_id=actor_id),
+            ScmMesaInventarioRevision(codigo="REV-CYCLE-001", estado="CONSUMIDA", actor_id=actor_id),
+        ])
+        db.session.commit()
+        db.session.add(ScmMesaInventarioRevision(codigo="REV-CYCLE-001", estado="ACTIVA", actor_id=actor_id))
+        db.session.commit()
+        db.session.add(ScmMesaInventarioRevision(codigo="REV-CYCLE-001", estado="ACTIVA", actor_id=actor_id))
+        with pytest.raises(IntegrityError):
+            db.session.commit()
+        db.session.rollback()
+        assert db.session.query(ScmMesaInventarioRevision).filter_by(codigo="REV-CYCLE-001").count() == 3
+
+
+def test_revision_read_uses_inventory_view_without_c66_count_capability(app, mesa_actor):
+    actor_id, _article_id = mesa_actor
+    with app.app_context():
+        actor = db.session.get(Trabajador, actor_id)
+        for role in actor.roles:
+            role.capacidades = [item for item in role.capacidades if item.codigo != "INVENTARIO_CONTEO_C66"]
+        db.session.commit()
+        assert actor.tiene_capacidad("INVENTARIO_VER")
+        assert not actor.tiene_capacidad("INVENTARIO_CONTEO_C66")
+        state = vista_state_revision(db.session, actor_id)
+        assert state["revision"]["candidatas"] == []
 
 
 def test_faltante_is_blocked_until_all_zone_sessions_are_closed(app, mesa_actor):
@@ -143,7 +177,7 @@ def test_manual_weight_is_rejected_and_confirmation_projects_canonical_ledger(ap
         assert "token" not in db.session.query(ScmMesaInventarioPesaje).one().__dict__
 
 
-def test_faltante_and_reappearance_project_one_negative_and_one_new_positive(app, mesa_actor):
+def test_faltante_and_reappearance_project_one_negative_and_one_new_positive(app, mesa_actor, monkeypatch):
     actor_id, article_id = mesa_actor
     with app.app_context():
         old, _ = _call(actor_id, "POST", "/antiguas", {"articulo": article_id, "zona": "Z-ALMACEN-PIEZAS", "clave": "old-2"})
@@ -153,7 +187,28 @@ def test_faltante_and_reappearance_project_one_negative_and_one_new_positive(app
         _call(actor_id, "POST", "/pesajes", {"codigo": code, "bruto": "5.000", "tara": "1.000", "captura": _capture(code, 5), "clave": "weight-2"})
         _call(actor_id, "POST", "/confirmaciones", {"codigo": code, "motivo": "Confirmación", "clave": "confirm-2"})
         _close_full_walk(actor_id, ((session["id"], "Z-ALMACEN-PIEZAS"),))
+        zones = ("Z-ALMACEN-PIEZAS", "Z-ALMACEN-ARMADO-3P", "Z-ALMACEN-LLANTAS-3P", "Z-ALMACEN-ARMADO-4P")
+        for index, zone in enumerate(zones):
+            named, _ = _call(actor_id, "POST", "/sesiones", {
+                "nombre": "Conteo pieza de prueba",
+                "piezas": ["Pieza Mesa de prueba"],
+                "zona": zone,
+                "clave": f"named-missing-2-{index}",
+            })
+            _call(actor_id, "POST", f"/sesiones/{named['id']}/cerrar", {
+                "cobertura": True,
+                "marcar_no_habidas": index == len(zones) - 1,
+                "no_habidas": [code] if index == len(zones) - 1 else [],
+            })
         review, _ = _call(actor_id, "POST", "/revision", {"codigo": code, "cobertura": True, "movimientos_revisados": True, "busqueda": True})
+        with pytest.raises(ScmServiceError) as error:
+            _call(actor_id, "POST", "/faltantes", {
+                "codigo": code, "token": review["token"],
+                "motivo": "No localizado", "clave": "missing-gate-2",
+            })
+        assert error.value.code == "MOVEMENTS_DISABLED"
+        assert db.session.query(ScmMesaInventarioMovimiento).filter_by(tipo="AJUSTE_FALTANTE").count() == 0
+        monkeypatch.setenv("SCM_MESA_MOVIMIENTOS_HABILITADOS", "1")
         missing_operation = uuid.uuid4()
         missing_body = {"codigo": code, "token": review["token"], "motivo": "No localizado", "clave": "missing-2"}
         missing, _ = _call(actor_id, "POST", "/faltantes", missing_body, missing_operation)
@@ -179,6 +234,68 @@ def test_faltante_and_reappearance_project_one_negative_and_one_new_positive(app
         assert db.session.query(ScmExistenciaMangaKg).filter_by(estado_logistico="RECIBIDA_ALMACEN").count() == 1
 
 
+def test_second_review_cycle_after_hallazgo_keeps_prior_invalidated_token(app, mesa_actor):
+    actor_id, article_id = mesa_actor
+    zones = (
+        "Z-ALMACEN-PIEZAS", "Z-ALMACEN-ARMADO-3P",
+        "Z-ALMACEN-LLANTAS-3P", "Z-ALMACEN-ARMADO-4P",
+    )
+    with app.app_context():
+        old, _ = _call(actor_id, "POST", "/antiguas", {
+            "articulo": article_id, "zona": zones[0], "clave": "cycle-old",
+        })
+        code = old["codigo"]
+        _call(actor_id, "POST", "/pesajes", {
+            "codigo": code, "bruto": "5.000", "tara": "1.000",
+            "captura": _capture(code, 5), "clave": "cycle-weight",
+        })
+        _call(actor_id, "POST", "/confirmaciones", {
+            "codigo": code, "motivo": "Cycle", "clave": "cycle-confirm",
+        })
+
+        def mark_missing(prefix):
+            for index, zone in enumerate(zones):
+                opened, _ = _call(actor_id, "POST", "/sesiones", {
+                    "nombre": "Conteo ciclo", "piezas": ["Pieza Mesa de prueba"],
+                    "zona": zone, "clave": f"{prefix}-{index}",
+                })
+                _call(actor_id, "POST", f"/sesiones/{opened['id']}/cerrar", {
+                    "cobertura": True,
+                    "marcar_no_habidas": index == len(zones) - 1,
+                    "no_habidas": [code] if index == len(zones) - 1 else [],
+                })
+
+        mark_missing("cycle-one")
+        first, _ = _call(actor_id, "POST", "/revision", {
+            "codigo": code, "cobertura": True,
+            "movimientos_revisados": True, "busqueda": True,
+        })
+
+        # A later physical observation invalidates the first token; this is
+        # the historical row that previously collided on the old constraint.
+        later, _ = _call(actor_id, "POST", "/sesiones", {
+            "zona": zones[0], "clave": "cycle-hallazgo",
+        })
+        _call(actor_id, "POST", f"/sesiones/{later['id']}/lecturas", {"codigo": code})
+        _call(actor_id, "POST", f"/sesiones/{later['id']}/cerrar", {"cobertura": True})
+
+        mark_missing("cycle-two")
+        operation_id = uuid.uuid4()
+        second, status = _call(actor_id, "POST", "/revision", {
+            "codigo": code, "cobertura": True,
+            "movimientos_revisados": True, "busqueda": True,
+        }, operation_id)
+        replay, replay_status = _call(actor_id, "POST", "/revision", {
+            "codigo": code, "cobertura": True,
+            "movimientos_revisados": True, "busqueda": True,
+        }, operation_id)
+        assert status == 201 and replay_status == 201 and replay == second
+        assert first["token"] != second["token"]
+        assert db.session.query(ScmMesaInventarioRevision).filter_by(codigo=code).count() == 2
+        assert db.session.query(ScmMesaInventarioRevision).filter_by(codigo=code, estado="INVALIDADA").count() == 1
+        assert db.session.query(ScmMesaInventarioRevision).filter_by(codigo=code, estado="ACTIVA").count() == 1
+
+
 def test_custody_scan_is_observation_only_and_cannot_be_weighed_or_confirmed(app, mesa_actor):
     actor_id, article_id = mesa_actor
     with app.app_context():
@@ -201,6 +318,55 @@ def test_custody_scan_is_observation_only_and_cannot_be_weighed_or_confirmed(app
             })
         assert error.value.code == "WEIGHING_NOT_PENDING"
         with pytest.raises(ScmServiceError) as error:
-            _call(actor_id, "POST", "/confirmaciones", {"codigo": unit.codigo, "motivo": "No debe ingresar", "clave": "custody-confirm"})
+            _call(actor_id, "POST", "/confirmaciones", {
+                "codigo": unit.codigo, "motivo": "No debe ingresar", "clave": "custody-confirm",
+            })
         assert error.value.code == "WEIGHT_REQUIRED"
         assert db.session.query(ScmMovimientoInventarioKg).count() == 0
+
+
+def test_revision_queue_only_contains_current_no_habidas_and_discards_later_hallazgo(app, mesa_actor):
+    actor_id, article_id = mesa_actor
+    with app.app_context():
+        old, _ = _call(actor_id, "POST", "/antiguas", {
+            "articulo": article_id, "zona": "Z-ALMACEN-PIEZAS", "clave": "old-stale-1",
+        })
+        code = old["codigo"]
+        _call(actor_id, "POST", "/pesajes", {
+            "codigo": code, "bruto": "5.000", "tara": "1.000",
+            "captura": _capture(code, 5), "clave": "weight-stale-1",
+        })
+        _call(actor_id, "POST", "/confirmaciones", {
+            "codigo": code, "motivo": "Confirmación", "clave": "confirm-stale-1",
+        })
+        _close_full_walk(actor_id)
+        zones = ("Z-ALMACEN-PIEZAS", "Z-ALMACEN-ARMADO-3P", "Z-ALMACEN-LLANTAS-3P", "Z-ALMACEN-ARMADO-4P")
+        for index, zone in enumerate(zones):
+            named, _ = _call(actor_id, "POST", "/sesiones", {
+                "nombre": "Conteo para revisión", "piezas": ["Pieza Mesa de prueba"],
+                "zona": zone, "clave": f"named-stale-1-{index}",
+            })
+            _call(actor_id, "POST", f"/sesiones/{named['id']}/cerrar", {
+                "cobertura": True,
+                "marcar_no_habidas": index == len(zones) - 1,
+                "no_habidas": [code] if index == len(zones) - 1 else [],
+            })
+
+        # A later observation makes the historical missing mark stale; it
+        # must remain in history but must not be actionable.
+        later, _ = _call(actor_id, "POST", "/sesiones", {
+            "zona": "Z-ALMACEN-PIEZAS", "clave": "later-hallazgo-1",
+        })
+        _call(actor_id, "POST", f"/sesiones/{later['id']}/lecturas", {"codigo": code})
+        _call(actor_id, "POST", f"/sesiones/{later['id']}/cerrar", {"cobertura": True})
+        state = vista_state_revision(db.session, actor_id)
+        assert state["revision"]["candidatas"] == []
+        assert state["revision"]["historial"][0]["codigo"] == code
+        assert state["revision"]["historial"][0]["vigente"] is False
+        assert "hallada" in state["revision"]["historial"][0]["motivo_bloqueo"]
+        with pytest.raises(ScmServiceError) as error:
+            _call(actor_id, "POST", "/revision", {
+                "codigo": code, "cobertura": True,
+                "movimientos_revisados": True, "busqueda": True,
+            })
+        assert error.value.code == "REVIEW_STALE"

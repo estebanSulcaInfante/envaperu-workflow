@@ -173,7 +173,18 @@ class ScmMesaInventarioPesaje(db.Model):
 
 class ScmMesaInventarioRevision(db.Model):
     __tablename__ = "scm_mesa_inventario_revision"
-    __table_args__ = (db.UniqueConstraint("codigo", "estado", name="uq_mesa_inv_revision_codigo_estado"),)
+    # A manga may have many historical reviews, but only one live token at a
+    # time. Keep the invariant at the database level for both supported test
+    # (SQLite) and production (PostgreSQL) engines.
+    __table_args__ = (
+        db.Index(
+            "uq_mesa_inv_revision_codigo_activa",
+            "codigo",
+            unique=True,
+            postgresql_where=db.text("estado = 'ACTIVA'"),
+            sqlite_where=db.text("estado = 'ACTIVA'"),
+        ),
+    )
 
     id = db.Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     codigo = db.Column(db.String(120), nullable=False)
