@@ -154,6 +154,79 @@ def test_vista_state_lists_two_pending_unions_with_aliases(app):
         assert len(state["units"]) == 2
         assert {item["code"] for item in state["units"]} == {"RET-P-1", "RET-P-2"}
         assert all(item["status"] == "pending" and item["aliases"] == [item["code"]] for item in state["units"])
+        assert all(item["color_hex"] is None for item in state["units"])
+
+
+def test_vista_state_exposes_matching_variant_hex_for_normal_and_pending_units(app):
+    from uuid import uuid4
+
+    from app import db
+    from app.models.producto import ColorBase, ColorProduccion, FamiliaColor, PiezaColor
+    from app.models.scm_articulos import ScmArticulo
+    from app.models.scm_auditoria import ScmOperacion
+    from app.models.scm_inventory_kg import (
+        ScmReservaUnidadKg,
+        ScmRetiroArmadoKg,
+        ScmRetiroArmadoKgItem,
+        ScmUnidadFisicaKg,
+    )
+    from app.models.scm_mesa_returns import ScmMesaRetornoUnion
+    from app.services.scm_mesa_returns import vista_state
+
+    with app.app_context():
+        actor = _state_actor(db, uuid4)
+        family = FamiliaColor(codigo=uuid4().int % 1000000, nombre=f"FAM-{uuid4().hex[:8]}")
+        base = ColorBase(nombre=f"BASE-{uuid4().hex[:8]}")
+        production = ColorProduccion(color_base_rel=base, familia_color_rel=family, hex_referencia="#12AB34")
+        variant = PiezaColor(sku=f"PC-H-{uuid4().hex[:8]}".upper(), piezas="Pieza hex", color_produccion_rel=production)
+        db.session.add_all([family, base, production, variant])
+        db.session.flush()
+        article = db.session.query(ScmArticulo).filter_by(codigo=variant.sku).one()
+
+        normal = ScmUnidadFisicaKg(public_id=uuid4(), codigo="RET-H-NORMAL", articulo_scm_id=article.id,
+                                   estado="ACTIVA", estado_logistico="RETIRADA_ARMADO", estado_calidad="SIN_CONTROL")
+        pending = ScmUnidadFisicaKg(public_id=uuid4(), codigo="RET-H-PENDING", articulo_scm_id=article.id,
+                                    estado="ACTIVA", estado_logistico="PENDIENTE_VERIFICACION", estado_calidad="SIN_CONTROL")
+        db.session.add_all([normal, pending])
+        db.session.flush()
+        normal.unidad_raiz_id = normal.id
+        pending.unidad_raiz_id = pending.id
+
+        operation = ScmOperacion(operation_id=uuid4(), endpoint="state-hex", actor_id=actor.id,
+                                  request_sha256="h" * 64, response_json=None)
+        db.session.add(operation)
+        db.session.flush()
+        withdrawal = ScmRetiroArmadoKg(codigo=f"RET-H-{uuid4().hex[:8]}", actor_id=actor.id,
+                                       operation_id=operation.operation_id)
+        db.session.add(withdrawal)
+        db.session.flush()
+        reservation = ScmReservaUnidadKg(unidad_id=normal.id, cantidad_snapshot_kg=1,
+                                         estado="RETIRADA", actor_id=actor.id,
+                                         operation_id=operation.operation_id)
+        db.session.add(reservation)
+        db.session.flush()
+        db.session.add(ScmRetiroArmadoKgItem(retiro_id=withdrawal.id, unidad_id=normal.id,
+                                             reserva_id=reservation.id, neto_entregado_kg=1))
+        union = ScmMesaRetornoUnion(codigo=pending.codigo, ciclo=1, articulo_scm_id=article.id,
+                                    pieza_color_sku=variant.sku, color=production.nombre,
+                                    unidad_fisica_id=pending.id, station_id="station-2",
+                                    actor_id=actor.id, operation_id=operation.operation_id)
+        db.session.add(union)
+        db.session.commit()
+
+        state = vista_state(db.session, actor.id)
+        by_code = {item["code"]: item for item in state["units"]}
+        assert by_code[normal.codigo]["color"] == production.nombre
+        assert by_code[normal.codigo]["color_hex"] == "#12AB34"
+        assert by_code[pending.codigo]["color"] == production.nombre
+        assert by_code[pending.codigo]["color_hex"] == "#12AB34"
+
+        union.color = "LEGACY SNAPSHOT"
+        db.session.commit()
+        state = vista_state(db.session, actor.id)
+        pending_payload = next(item for item in state["units"] if item["code"] == pending.codigo)
+        assert pending_payload["color"] == "LEGACY SNAPSHOT"
+        assert pending_payload["color_hex"] is None
 
 
 def test_simple_return_can_complete_a_second_cycle(app):

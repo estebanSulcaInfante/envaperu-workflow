@@ -158,6 +158,22 @@ def _article_color(article):
     )
 
 
+def _article_color_hex(article, expected_color=None):
+    """Return the variant hex only when it still names the shown color.
+
+    Pending unions carry a historical color snapshot.  A later catalog edit
+    must not make that snapshot display a hex from a different color.
+    """
+    variant = getattr(article, "pieza_color", None) if article is not None else None
+    piece_color = getattr(variant, "pieza_color", None) if variant is not None else None
+    color_rel = getattr(piece_color, "color_produccion_rel", None) if piece_color is not None else None
+    if color_rel is None:
+        return None
+    if expected_color is not None and getattr(color_rel, "nombre", None) != expected_color:
+        return None
+    return getattr(color_rel, "hex_referencia", None)
+
+
 def _unit_by_code(session, code):
     code = _text(code, "codigo")
     # Use the canonical custody resolver first.  It validates current label
@@ -367,7 +383,7 @@ def _union_payload(value):
         "id": str(value.id), "code": value.codigo, "codigo": value.codigo, "ciclo": value.ciclo, "estado": value.estado,
         "articulo_id": value.articulo_scm_id, "pieza": value.articulo.nombre if value.articulo else None,
         "pieza_codigo": value.pieza_color_sku,
-        "color": value.color, "zona": value.zona_hallazgo,
+        "color": value.color, "color_hex": _article_color_hex(value.articulo, value.color), "zona": value.zona_hallazgo,
         "bruto": _fmt(value.bruto_kg), "tara": _fmt(value.tara_kg), "neto": _fmt(value.neto_kg),
         "unidad_id": str(value.unidad_fisica_id),
         "origenes": [{"code": row.unidad_fisica.codigo if row.unidad_fisica else None, "unidad_id": str(row.unidad_fisica_id), "retiro_id": str(row.retiro_id) if row.retiro_id else None,
@@ -436,6 +452,7 @@ def vista_state(session, actor_id):
         if item is None or article is None or article.clase != "PIEZA_COLOR" or article.unidad_inventario != "KG":
             continue
         piece_sku, color = _article_color(article)
+        color_hex = _article_color_hex(article, color)
         existence = original_existence.get(unit.id)
         manga = existence.manga if existence is not None else None
         lote = getattr(getattr(manga, "lote_articulo", None), "codigo", None) if manga is not None else None
@@ -448,11 +465,15 @@ def vista_state(session, actor_id):
                       "aliases": list(dict.fromkeys([unit.codigo, *current_aliases])), "cycle_id": str(item.retiro_id),
                       "unidad_id": str(unit.id), "articulo_id": unit.articulo_scm_id,
                       "piece": article.nombre, "pieza": article.nombre, "pieza_codigo": piece_sku, "color": color,
+                      "color_hex": color_hex,
                       "lot": lote, "status": "available", "estado": "DISPONIBLE", "origins": [],
                       "ot_date": ot_date, "ot_shift": getattr(ot, "turno", None),
                       "kg_pendiente": f"{Decimal(item.neto_entregado_kg):.3f}", "retiro_id": str(item.retiro_id)})
     all_unions = session.scalars(select(ScmMesaRetornoUnion).options(
-        selectinload(ScmMesaRetornoUnion.articulo),
+        selectinload(ScmMesaRetornoUnion.articulo)
+        .selectinload(ScmArticulo.pieza_color)
+        .selectinload(ScmArticuloPiezaColor.pieza_color)
+        .selectinload(PiezaColor.color_produccion_rel),
         selectinload(ScmMesaRetornoUnion.unidad_fisica),
         selectinload(ScmMesaRetornoUnion.origenes).selectinload(ScmMesaRetornoOrigen.unidad_fisica),
     ).order_by(ScmMesaRetornoUnion.created_at.desc(), ScmMesaRetornoUnion.ciclo.desc())).all()
@@ -470,7 +491,8 @@ def vista_state(session, actor_id):
                       "aliases": _unit_aliases(session, item.unidad_fisica), "cycle_id": str(item.id),
                       "piece": item.articulo.nombre if item.articulo else None,
                       "pieza": item.articulo.nombre if item.articulo else None, "pieza_codigo": item.pieza_color_sku,
-                      "color": item.color, "lot": first_origin.lote_snapshot if first_origin else None,
+                      "color": item.color, "color_hex": _article_color_hex(item.articulo, item.color),
+                      "lot": first_origin.lote_snapshot if first_origin else None,
                       "status": "pending", "estado": item.estado,
                       "origins": [row.unidad_fisica.codigo if row.unidad_fisica else str(row.unidad_fisica_id) for row in item.origenes],
                       "ot_date": first_origin.ot_date if first_origin else None,
